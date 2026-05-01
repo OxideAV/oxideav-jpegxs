@@ -1,20 +1,18 @@
 //! Slice / precinct / packet geometry walker — ISO/IEC 21122-1:2022,
 //! Annex B.5 / B.6 / B.7 / B.8 / B.9 / B.10.
 //!
-//! Round-4 scope (#106): build the per-precinct geometry the entropy
+//! Round-5 scope (#129): build the per-precinct geometry the entropy
 //! decoder needs from the picture header / component table / weights
-//! table, including the per-precinct list of [`PacketLayout`]s computed
-//! by the algorithm in Annex B.7, Table B.4.
+//! table for the multi-component (`Nc ≥ 1`), 4:4:4 / 4:2:2 / 4:2:0
+//! sub-sampled cases. `Sd == 0` only — `Sd > 0` (CWD-driven
+//! decomposition suppression) is still deferred.
 //!
-//! Round-4 limits the configurations the walker accepts to keep the
-//! initial end-to-end decode tractable: single component (`Nc == 1`),
-//! `Sd == 0` (no decomposition suppression), `sx == sy == 1` (no
-//! subsampling), `Cw == 0` (single-precinct rows). Multi-component,
-//! 4:2:2/4:2:0, and CWD-driven `Sd > 0` configurations follow in later
-//! rounds. The walker still computes the spec-accurate quantities — the
-//! restrictions are guarded at the entry point so the decoder fails
-//! cleanly rather than silently producing garbage on out-of-scope
-//! codestreams.
+//! Spec band-index layout (Annex B.2): for `i < Nc - Sd`, the band id
+//! is `b = (Nc - Sd) * β + i`. So bands are *interleaved* by component
+//! within each β level — for 3 components and 4 βs the order is
+//! (β=0, i=0), (β=0, i=1), (β=0, i=2), (β=1, i=0), … (β=3, i=2).
+//! Annex B.7 Table B.4 also walks them in that order, which is why
+//! the first packet in 5/0 / 4:4:4 contains all 18 bands.
 //!
 //! Derived quantities:
 //!
@@ -72,6 +70,12 @@ pub struct PrecinctPlan {
     /// `Cs` — column width of all but the rightmost precinct, in
     /// sample-grid columns (Annex B.5).
     pub cs: u32,
+    /// Per-band component index `i[b]`, parallel to `geometry.bands`.
+    /// Round-5: every band is associated with exactly one component;
+    /// for `Sd == 0`, `i[b] = b % (Nc - Sd)`.
+    pub band_component: Vec<u8>,
+    /// Per-band β (filter type) index, parallel to `geometry.bands`.
+    pub band_beta: Vec<u32>,
 }
 
 /// Plan for a single slice: a contiguous run of precincts.
@@ -102,6 +106,16 @@ pub struct PicturePlan {
     /// Picture width and height (sample grid).
     pub wf: u32,
     pub hf: u32,
+    /// Number of decomposed components (`Nc - Sd`). For `Sd == 0` this
+    /// equals `Nc`. The walker uses this everywhere it computes a band
+    /// index `b = (Nc - Sd) × β + i`.
+    pub n_decomposed: u32,
+    /// Number of total components.
+    pub nc: u8,
+    /// Per-component sampling factors (`sx[i]`, `sy[i]`), parallel to
+    /// the component table.
+    pub sx: Vec<u8>,
+    pub sy: Vec<u8>,
 }
 
 /// Parse the WGT body into `(gain, priority)` pairs, one per existing
@@ -151,28 +165,16 @@ fn beta_levels(beta: u32, nlx: u8, nly: u8) -> (u32, u32, bool, bool) {
     let nly = nly as u32;
     debug_assert!(nlx >= nly, "round 4 walker assumes NL,x >= NL,y");
 
-    // Case 1 — wholly horizontal decomposition (nly == 0, or β within
-    // the first nlx + 1 indices). Spec: β = NL,x − dx + τx where
-    // τx ∈ {0, 1}; β = 0 → dx = nlx, τx = 0 (LL band).
-    // β = 1 → dx = nlx, τx = 1 (HL_nlx).
-    // β = 2 → dx = nlx − 1, τx = 1 (HL_{nlx-1}). … and so on.
     if nly == 0 {
-        // LL_nlx is β = 0.
         if beta == 0 {
             return (nlx, 0, false, false);
         }
-        // β = 1 .. nlx maps to HL_{nlx + 1 - β}.
         let dx = nlx + 1 - beta;
         return (dx, 0, true, false);
     }
 
-    // β1 = nlx − nly + 1 — number of bands in the first packet (the
-    // shaded area in Figure B.3). For 5/2 this is 4: LL_5, HL_5, HL_4,
-    // HL_3.
     let beta1 = nlx - nly + 1;
     if beta < beta1 {
-        // First-packet bands. β = 0 is LL_nlx, β = 1..beta1 is HL_{nlx
-        // + 1 - β}.
         if beta == 0 {
             return (nlx, nly, false, false);
         }
@@ -180,13 +182,11 @@ fn beta_levels(beta: u32, nlx: u8, nly: u8) -> (u32, u32, bool, bool) {
         return (dx, nly, true, false);
     }
 
-    // For β >= β1, bands come in groups of three at decreasing dy:
-    // (HL, LH, HH)_{level}, with level = nly, nly-1, ..., 1.
-    let group_in = beta - beta1; // 0 .. 3*nly
+    let group_in = beta - beta1;
     let triple = group_in / 3;
     let within = group_in % 3;
     let dy = nly - triple;
-    let dx = dy; // diagonal: HL_dy, LH_dy, HH_dy
+    let dx = dy;
     match within {
         0 => (dx, dy, true, false), // HL
         1 => (dx, dy, false, true), // LH
@@ -196,47 +196,45 @@ fn beta_levels(beta: u32, nlx: u8, nly: u8) -> (u32, u32, bool, bool) {
 }
 
 /// Compute `b'x[b]` per Annex B.4.
-fn band_exists(beta: u32, i: usize, nly: u8, dy: u32, sy: u8) -> bool {
-    if beta > 0 && i >= 1 {
-        // Round-4 assumes Nc - Sd == Nc (Sd == 0). For multi-component
-        // round 5 the proper guard is `i >= Nc - Sd`.
-        // Single-component round-4: this guard never fires.
-    }
+fn band_exists(beta: u32, _i_in_decomposed: usize, nly: u8, dy: u32, sy: u8, tau_y: bool) -> bool {
     if sy == 0 {
         return false;
     }
+    let _ = beta;
     // Test: 2^max(NL,y - dy) × τy[β] mod sy[i] != 0 → not exists.
-    // For sy == 1, the modulus is always 0 → always exists.
-    let _ = (nly, dy);
-    true
+    let pow = if dy > nly as u32 {
+        1u32
+    } else {
+        1u32 << (nly as u32 - dy)
+    };
+    let l0 = if tau_y { pow } else { 0 };
+    let sy_u = sy as u32;
+    if sy_u == 0 {
+        return false;
+    }
+    (l0 % sy_u) == 0
 }
 
 /// Build a [`PicturePlan`] from the picture header / component table /
 /// WGT body. Returns an error if the configuration is outside the
-/// round-4 supported subset.
+/// round-5 supported subset.
 pub fn build_plan(
     pih: &PictureHeader,
     cdt: &ComponentTable,
     wgt_body: &[u8],
 ) -> Result<(PicturePlan, Vec<BandWeight>)> {
-    // Round-4 restrictions.
-    if pih.nc != 1 {
-        return Err(Error::Unsupported(format!(
-            "jpegxs round-4 walker only supports Nc == 1 (got {})",
+    if pih.cw != 0 {
+        return Err(Error::Unsupported(
+            "jpegxs walker: Cw != 0 (custom precinct width) is round-6".into(),
+        ));
+    }
+    if cdt.components.len() != pih.nc as usize {
+        return Err(Error::invalid(format!(
+            "jpegxs walker: CDT has {} components but PIH says Nc={}",
+            cdt.components.len(),
             pih.nc
         )));
     }
-    if pih.cw != 0 {
-        return Err(Error::Unsupported(
-            "jpegxs round-4 walker only supports Cw == 0 (full-width precincts)".into(),
-        ));
-    }
-    if cdt.components.len() != 1 || cdt.components[0].sx != 1 || cdt.components[0].sy != 1 {
-        return Err(Error::Unsupported(
-            "jpegxs round-4 walker only supports single-component, sx==sy==1".into(),
-        ));
-    }
-    let comp = cdt.components[0];
     let nlx = pih.nlx;
     let nly = pih.nly;
     if nlx == 0 {
@@ -246,7 +244,7 @@ pub fn build_plan(
     }
     if nly > nlx {
         return Err(Error::Unsupported(
-            "jpegxs round-4 walker assumes NL,x >= NL,y".into(),
+            "jpegxs walker assumes NL,x >= NL,y".into(),
         ));
     }
     let wf = pih.wf as u32;
@@ -256,54 +254,104 @@ pub fn build_plan(
             "jpegxs: picture dimensions {wf}x{hf} exceed walker cap {MAX_DIM}"
         )));
     }
+
+    // Annex F.2 mandates Cpih == 0 unless Nc >= 3 and sx[i]=sy[i]=1 for
+    // i < 3. For Cpih == 1, all three sub-sampled components have to be
+    // 1:1. Cpih == 3 needs Nc >= 4. The walker doesn't enforce these
+    // (the decoder does); it only validates the geometry it sees.
+
     let nbeta = n_beta(nlx, nly);
-    // Sd == 0 → NL = Nc × Nβ.
-    let n_bands = (pih.nc as u32) * nbeta;
+    let nc = pih.nc as u32;
+    let n_decomposed = nc; // Sd == 0 always for round 5.
+    let n_bands = n_decomposed * nbeta; // Sd == 0 → no tail term.
 
-    // Component-level dimensions (Annex B.1).
-    let wc = wf / (comp.sx as u32);
-    let hc = hf / (comp.sy as u32);
+    // Per-component sampling factors.
+    let sx: Vec<u8> = cdt.components.iter().map(|c| c.sx).collect();
+    let sy: Vec<u8> = cdt.components.iter().map(|c| c.sy).collect();
+    for (i, &s) in sx.iter().enumerate() {
+        if s == 0 {
+            return Err(Error::invalid(format!(
+                "jpegxs: component {i} sx must be >= 1, got 0"
+            )));
+        }
+    }
+    for (i, &s) in sy.iter().enumerate() {
+        if s == 0 {
+            return Err(Error::invalid(format!(
+                "jpegxs: component {i} sy must be >= 1, got 0"
+            )));
+        }
+    }
+    // Per-component effective decomposition levels (Annex B.2):
+    // N'L,y[i] = NL,y - log2(sy[i]) for i < Nc - Sd, else 0.
+    // For round 5 we restrict to sy[i] in {1, 2} (4:2:0 only, as per the
+    // CDT validation) — log2 is then 0 or 1.
+    let nly_per_component: Vec<u8> = sy
+        .iter()
+        .map(|&s| {
+            let log2 = match s as u32 {
+                1 => 0u8,
+                2 => 1u8,
+                4 => 2u8,
+                _ => 0u8, // anything else falls to 0 — caller should reject upstream
+            };
+            nly.saturating_sub(log2)
+        })
+        .collect();
 
-    // Pre-compute per-(β, i) band geometry (round 4 → i is always 0).
-    let mut wb = vec![0u32; nbeta as usize];
-    let mut hb = vec![0u32; nbeta as usize];
-    let mut dx_arr = vec![0u32; nbeta as usize];
-    let mut dy_arr = vec![0u32; nbeta as usize];
-    let mut tau_x = vec![false; nbeta as usize];
-    let mut tau_y = vec![false; nbeta as usize];
-    for beta in 0..nbeta {
-        let (dx, dy, tx, ty) = beta_levels(beta, nlx, nly);
-        dx_arr[beta as usize] = dx;
-        dy_arr[beta as usize] = dy;
-        tau_x[beta as usize] = tx;
-        tau_y[beta as usize] = ty;
-        // Wb[β,i] = ⌈Wc / 2^dx⌉ for low-pass-horizontal,
-        //          ⌈Wc / 2^(dx-1)⌉ / 2 for high-pass-horizontal.
-        // Equivalent to ⌈Wc / 2^dx⌉ in both cases (the high-pass form
-        // halves a doubled denominator). The spec writes it differently
-        // to expose the τx parity. For 5/3 dyadic decomposition the
-        // result is identical: ⌈Wc / 2^dx⌉.
-        let wb_b = if !tx {
-            (wc + (1u32 << dx) - 1) >> dx
-        } else {
-            // ⌈Wc / 2^(dx-1)⌉ / 2 (integer division). This is the
-            // high-pass dimension: spec literal form, kept distinct for
-            // traceability.
-            let denom_minus1 = if dx == 0 { 1 } else { 1u32 << (dx - 1) };
-            wc.div_ceil(denom_minus1) / 2
-        };
-        let hb_b = if !ty {
-            if dy == 0 {
-                hc
+    // Pre-compute per-(β, i) band geometry. Index into `wb` / `hb` /
+    // `dx_arr` / `dy_arr` / `tau_y` is `i * nbeta + beta`.
+    let arr_size = (nbeta as usize) * (nc as usize);
+    let mut wb = vec![0u32; arr_size];
+    let mut hb = vec![0u32; arr_size];
+    let mut dx_arr = vec![0u32; arr_size];
+    let mut dy_arr = vec![0u32; arr_size];
+    let mut tau_x = vec![false; arr_size];
+    let mut tau_y = vec![false; arr_size];
+    let mut exists_arr = vec![false; arr_size];
+    for (i, comp) in cdt.components.iter().enumerate() {
+        let wc = wf / (comp.sx as u32);
+        let hc = hf / (comp.sy as u32);
+        let nlx_i = nlx; // Annex B.2: N'L,x[i] = NL,x for i < Nc - Sd
+        let nly_i = nly_per_component[i];
+        for beta in 0..nbeta {
+            let (dx, dy, tx, ty) = beta_levels(beta, nlx_i, nly_i);
+            let idx = i * (nbeta as usize) + beta as usize;
+            dx_arr[idx] = dx;
+            dy_arr[idx] = dy;
+            tau_x[idx] = tx;
+            tau_y[idx] = ty;
+            // Cap β by the per-component number of filter types: if a
+            // β is not defined for component i (because nly_i < nly),
+            // mark the band non-existent. n_beta(nlx_i, nly_i) gives the
+            // per-component count.
+            let nbeta_i = n_beta(nlx_i, nly_i);
+            let exists_per_comp = beta < nbeta_i;
+            // Band geometry per Annex B.2.
+            let wb_b = if !tx {
+                if dx == 0 {
+                    wc
+                } else {
+                    (wc + (1u32 << dx) - 1) >> dx
+                }
             } else {
-                (hc + (1u32 << dy) - 1) >> dy
-            }
-        } else {
-            let denom_minus1 = if dy == 0 { 1 } else { 1u32 << (dy - 1) };
-            hc.div_ceil(denom_minus1) / 2
-        };
-        wb[beta as usize] = wb_b;
-        hb[beta as usize] = hb_b;
+                let denom_minus1 = if dx == 0 { 1 } else { 1u32 << (dx - 1) };
+                wc.div_ceil(denom_minus1) / 2
+            };
+            let hb_b = if !ty {
+                if dy == 0 {
+                    hc
+                } else {
+                    (hc + (1u32 << dy) - 1) >> dy
+                }
+            } else {
+                let denom_minus1 = if dy == 0 { 1 } else { 1u32 << (dy - 1) };
+                hc.div_ceil(denom_minus1) / 2
+            };
+            wb[idx] = wb_b;
+            hb[idx] = hb_b;
+            exists_arr[idx] = exists_per_comp && band_exists(beta, i, nly, dy, comp.sy, ty);
+        }
     }
 
     // Precinct grid (Annex B.5). Cw == 0 → Cs = Wf, Np_x = 1.
@@ -315,19 +363,64 @@ pub fn build_plan(
     let hp = hp_pow;
     let np_y = hf.div_ceil(hp_pow);
 
-    // Per-band gain/priority from WGT (round 4 — every band exists).
-    let weights = parse_wgt(wgt_body, nbeta as usize)?;
+    // Per-band gain/priority from WGT. Annex A.4.11 Table A.24 lists
+    // a (G[b], P[b]) pair only for existing bands (`if (b'x[b])`); we
+    // therefore feed `parse_wgt` the count of existing bands.
+    let n_existing: usize = exists_arr.iter().filter(|e| **e).count();
+    let weights_existing = parse_wgt(wgt_body, n_existing)?;
+    // Build a band-indexed weights array (size `n_bands`); non-existent
+    // bands get a placeholder zero pair that the walker never reads.
+    let mut weights_by_band = vec![
+        BandWeight {
+            gain: 0,
+            priority: 0
+        };
+        n_bands as usize
+    ];
+    {
+        let mut wgt_cursor = 0;
+        for beta in 0..nbeta {
+            for i in 0..nc as usize {
+                let idx = i * (nbeta as usize) + beta as usize;
+                if !exists_arr[idx] {
+                    continue;
+                }
+                let b = (n_decomposed * beta + i as u32) as usize;
+                weights_by_band[b] = weights_existing[wgt_cursor];
+                wgt_cursor += 1;
+            }
+        }
+        debug_assert_eq!(wgt_cursor, n_existing);
+    }
 
     // Per-precinct plans.
     let mut precincts: Vec<PrecinctPlan> = Vec::with_capacity(np_y as usize);
-    let mut precinct_index_y: Vec<u32> = (0..np_y).collect();
-    let _ = &mut precinct_index_y;
     for py in 0..np_y {
         for px in 0..np_x {
             let p = py * np_x + px;
             let plan = build_precinct_plan(
-                p, px, py, nlx, nly, nbeta, comp.sx, comp.sy, cs, hp, np_x, hf, &dx_arr, &dy_arr,
-                &tau_y, &wb, &hb, &weights, pih,
+                p,
+                px,
+                py,
+                nlx,
+                nly,
+                nbeta,
+                nc,
+                &sx,
+                &sy,
+                &nly_per_component,
+                cs,
+                hp,
+                np_x,
+                hf,
+                &dx_arr,
+                &dy_arr,
+                &tau_y,
+                &exists_arr,
+                &wb,
+                &hb,
+                &weights_by_band,
+                pih,
             )?;
             precincts.push(plan);
         }
@@ -342,9 +435,6 @@ pub fn build_plan(
     let mut p_cursor = 0u32;
     let mut t = 0u32;
     while p_cursor < precincts.len() as u32 {
-        // n_per_slice from Annex B.10:
-        // If (t+1)*Hsl > ⌈Hf / Hp⌉ → Np[t] = Np_x × (⌈Hf/Hp⌉ mod Hsl)
-        // else Np[t] = Np_x × Hsl
         let total_rows = np_y;
         let next_row = (t + 1) * hsl;
         let rows_in_slice = if next_row > total_rows {
@@ -380,8 +470,12 @@ pub fn build_plan(
             n_beta: nbeta,
             wf,
             hf,
+            n_decomposed,
+            nc: pih.nc,
+            sx,
+            sy,
         },
-        weights,
+        weights_existing,
     ))
 }
 
@@ -393,8 +487,10 @@ fn build_precinct_plan(
     nlx: u8,
     nly: u8,
     nbeta: u32,
-    sx: u8,
-    sy: u8,
+    nc: u32,
+    sx: &[u8],
+    sy: &[u8],
+    nly_per_component: &[u8],
     cs: u32,
     hp: u32,
     np_x: u32,
@@ -402,56 +498,76 @@ fn build_precinct_plan(
     dx: &[u32],
     dy: &[u32],
     tau_y: &[bool],
+    exists_arr: &[bool],
     _wb: &[u32],
     hb: &[u32],
-    weights: &[BandWeight],
+    weights_by_band: &[BandWeight],
     pih: &PictureHeader,
 ) -> Result<PrecinctPlan> {
     // Wp[p] (Annex B.5): all but the rightmost precinct are Cs wide,
-    // last precinct picks up the remainder. Round-4 has Np_x == 1, so
-    // the last is always the only.
+    // last precinct picks up the remainder.
     let wp = if (p % np_x) < np_x - 1 {
         cs
     } else {
         ((pih.wf as u32 - 1) % cs) + 1
     };
 
-    // Per-band geometry within this precinct.
-    let mut bands: Vec<BandGeometry> = Vec::with_capacity(nbeta as usize);
+    let n_bands = nc * nbeta;
+    let mut bands: Vec<BandGeometry> = Vec::with_capacity(n_bands as usize);
+    let mut band_component: Vec<u8> = Vec::with_capacity(n_bands as usize);
+    let mut band_beta: Vec<u32> = Vec::with_capacity(n_bands as usize);
+    // Fill per-band geometry in band-id order: b = nc * β + i.
     for beta in 0..nbeta {
-        let beta_i = beta as usize;
-        let dx_b = dx[beta_i];
-        let dy_b = dy[beta_i];
-        let tau_y_b = if tau_y[beta_i] { 1u32 } else { 0u32 };
-        let exists = band_exists(beta, 0, nly, dy_b, sy);
-        // Wpb[p,b] = ⌈Wp[p] / (sx[i] × 2^dx[β,i])⌉ for low-pass H,
-        //          = ⌈Wp[p] / (sx[i] × 2^(dx-1))⌉ / 2 for high-pass H.
-        let denom = (sx as u32) * (1u32 << dx_b);
-        let wpb = if denom == 0 { 0 } else { wp.div_ceil(denom) };
-        // L0[p,b] (Annex B.6):
-        //   L0 = 2^max(NL,y - dy[i,β], 0) × τy[β]
-        let pow = if dy_b > nly as u32 {
-            1u32
-        } else {
-            1u32 << (nly as u32 - dy_b)
-        };
-        let l0 = pow * tau_y_b;
-        // L1 = L0 + min(Hb[β,i] − ⌊p / Np_x⌋ × 2^max(NL,y - dy, 0),
-        //                  2^max(NL,y - dy, 0))
-        let pow_dy = pow; // both maxes use NL,y - dy with floor 0
-        let row_offset = py * pow_dy;
-        let band_h_remaining = (hb[beta_i]).saturating_sub(row_offset);
-        let l1_extent = band_h_remaining.min(pow_dy);
-        let l1 = l0 + l1_extent;
-        let weight = weights[beta_i];
-        bands.push(BandGeometry {
-            wpb,
-            gain: weight.gain,
-            priority: weight.priority,
-            l0: l0 as u16,
-            l1: l1 as u16,
-            exists,
-        });
+        for i in 0..nc as usize {
+            let arr_idx = i * (nbeta as usize) + beta as usize;
+            let dx_b = dx[arr_idx];
+            let dy_b = dy[arr_idx];
+            let tau_y_b = if tau_y[arr_idx] { 1u32 } else { 0u32 };
+            let exists = exists_arr[arr_idx];
+
+            // Per-component precinct width: Wp / sx[i].
+            let denom = (sx[i] as u32) * (1u32 << dx_b);
+            let wpb = if denom == 0 { 0 } else { wp.div_ceil(denom) };
+
+            // L0[p,b] = 2^max(NL,y - dy[i,β], 0) × τy[β]
+            let nly_i = nly_per_component[i] as u32;
+            let dy_eff = if nly == 0 { 0 } else { dy_b };
+            let pow = if dy_eff > nly_i || nly_i == 0 {
+                1u32
+            } else {
+                1u32 << (nly_i - dy_eff)
+            };
+            let l0 = pow * tau_y_b;
+
+            // L1 — see spec subclause B.6:
+            //   L1 = L0 + min(Hb[β,i] − ⌊p / Np_x⌋ × 2^max(NL,y - dy, 0),
+            //                   2^max(NL,y - dy, 0))
+            // ⌊p / Np_x⌋ is the precinct row index py.
+            let row_offset = py * pow;
+            let band_h_remaining = (hb[arr_idx]).saturating_sub(row_offset);
+            let l1_extent = band_h_remaining.min(pow);
+            let l1 = l0 + l1_extent;
+
+            let weight = if exists {
+                let b = (nc * beta + i as u32) as usize;
+                weights_by_band[b]
+            } else {
+                BandWeight {
+                    gain: 0,
+                    priority: 0,
+                }
+            };
+            bands.push(BandGeometry {
+                wpb,
+                gain: weight.gain,
+                priority: weight.priority,
+                l0: l0 as u16,
+                l1: l1 as u16,
+                exists,
+            });
+            band_component.push(i as u8);
+            band_beta.push(beta);
+        }
     }
 
     let geometry = PrecinctGeometry {
@@ -467,8 +583,17 @@ fn build_precinct_plan(
         short_packet_header: (pih.wf as u32) * (pih.nc as u32) < 32752,
     };
 
-    let packets = compute_packet_layouts(nlx, nly, &bands, dy, hp);
+    let packets = compute_packet_layouts(nlx, nly, nc, &bands, dy, &band_component, sy);
 
+    // Sanity: the rightmost precinct's Wp is non-empty.
+    if wp == 0 {
+        return Err(Error::invalid(
+            "jpegxs slice walker: precinct width Wp[p] computed as zero",
+        ));
+    }
+    // Hf parameter is unused in the formula above (Hb already encodes it);
+    // keep it referenced for clarity.
+    let _ = (hf, hp);
     Ok(PrecinctPlan {
         geometry,
         packets,
@@ -476,50 +601,51 @@ fn build_precinct_plan(
         hp,
         wp,
         cs,
-    })
-    .and_then(|plan| {
-        // Sanity: the rightmost precinct's Wp is non-empty.
-        if plan.wp == 0 {
-            return Err(Error::invalid(
-                "jpegxs slice walker: precinct width Wp[p] computed as zero",
-            ));
-        }
-        // Hf parameter is unused in the formula above (Hb already
-        // encodes it); keep it referenced for clarity.
-        let _ = hf;
-        Ok(plan)
+        band_component,
+        band_beta,
     })
 }
 
 /// Annex B.7 / Table B.4 — compute `I[p,b,λ,s]` and `Npc[p]` for one
 /// precinct's bands. Returns one [`PacketLayout`] per packet `s`.
 ///
-/// Round-4 simplifications: `Sd == 0` (no `i ≥ Nc − Sd` tail loop),
-/// single component (`Nc - Sd == 1`), `sy[0] == 1` (the subsampling
-/// guard `(λ + L0[p,b]) umod sy[i] == 0` is always true).
+/// Round-5 multi-component handling: bands are interleaved by component
+/// per the spec band-id rule `b = (Nc - Sd) × β + i`. The first packet
+/// covers β1 bands × Nc components on line 0; subsequent packets group
+/// 3 βs × Nc components on each line of the proxy level.
+#[allow(clippy::too_many_arguments)]
 fn compute_packet_layouts(
     nlx: u8,
     nly: u8,
+    nc: u32,
     bands: &[BandGeometry],
     dy: &[u32],
-    _hp: u32,
+    band_component: &[u8],
+    sy: &[u8],
 ) -> Vec<PacketLayout> {
     let mut layouts: Vec<Vec<PacketEntry>> = Vec::new();
 
-    // Step 1 — first packet covers β1 = max(NL,x, NL,y) − min(NL,x,
-    // NL,y) + 1 bands, all on line λ = 0.
+    // Step 1 — first packet: β1 = max(NL,x, NL,y) − min(NL,x, NL,y) + 1
+    // bands × all components, all on line λ = 0.
     let nlx_u = nlx as u32;
     let nly_u = nly as u32;
     let beta1 = nlx_u.max(nly_u) - nlx_u.min(nly_u) + 1;
     let mut first_pkt: Vec<PacketEntry> = Vec::new();
     for beta in 0..beta1 {
-        let bi = beta as usize;
-        if bi < bands.len() && bands[bi].exists {
-            // Single-component → b = β.
-            first_pkt.push(PacketEntry {
-                band: bi as u16,
-                line: 0,
-            });
+        for i in 0..nc {
+            let b = (nc * beta + i) as usize;
+            if b < bands.len() && bands[b].exists {
+                let l0 = bands[b].l0 as u32;
+                // Subsampling guard from Table B.4: (λ + L0) umod sy[i] == 0.
+                let sy_i = sy[i as usize] as u32;
+                if sy_i != 0 && (l0 % sy_i) != 0 {
+                    continue;
+                }
+                first_pkt.push(PacketEntry {
+                    band: b as u16,
+                    line: l0 as u16,
+                });
+            }
         }
     }
     if !first_pkt.is_empty() {
@@ -527,51 +653,56 @@ fn compute_packet_layouts(
     }
 
     // Step 2 — proxy levels: for β0 = β1, β1+3, ..., < Nβ:
-    //   lines_in_level = 2^(NL,y - dy[0,β0])    (Table B.4)
-    //   for λ = 0 .. lines_in_level - 1:
+    //   lines_in_level = 2^(NL,y - dy[β0])    (Table B.4)
+    //   for λ within level (in image-grid lines):
     //     for β = β0 .. β0+2:
-    //       if (λ + L0[p,b] < L1[p,b]) → new packet (r=1) per band.
-    let nbeta = bands.len() as u32;
+    //       for i = 0 .. Nc-1:
+    //         if exists && (λ + L0[p,b]) umod sy[i] == 0:
+    //           start a new packet (r = 1) per band per component
+    let nbeta_u = (bands.len() as u32) / nc;
     let mut beta0 = beta1;
-    while beta0 < nbeta {
-        let bi0 = beta0 as usize;
-        if bi0 >= dy.len() {
+    while beta0 < nbeta_u {
+        // Use β0's dy for the loop bound — should match across all
+        // components since dy depends on β only (not i). Look up via
+        // component 0's array index.
+        let arr_idx0 = beta0 as usize;
+        if arr_idx0 >= dy.len() {
             break;
         }
-        let dy_b0 = dy[bi0];
-        let pow = if dy_b0 > nly_u {
+        let dy_b0 = dy[arr_idx0];
+        let pow = if dy_b0 > nly_u || nly_u == 0 {
             1u32
         } else {
             1u32 << (nly_u - dy_b0)
         };
         let lines_in_level = pow;
         for lambda_within in 0..lines_in_level {
-            for beta in beta0..(beta0 + 3).min(nbeta) {
-                let bi = beta as usize;
-                if !bands[bi].exists {
-                    continue;
+            for beta in beta0..(beta0 + 3).min(nbeta_u) {
+                for i in 0..nc {
+                    let b = (nc * beta + i) as usize;
+                    if b >= bands.len() || !bands[b].exists {
+                        continue;
+                    }
+                    let l0 = bands[b].l0 as u32;
+                    let l1 = bands[b].l1 as u32;
+                    let line_in_precinct = l0 + lambda_within;
+                    if line_in_precinct >= l1 {
+                        continue;
+                    }
+                    let sy_i = sy[i as usize] as u32;
+                    if sy_i != 0 && (line_in_precinct % sy_i) != 0 {
+                        continue;
+                    }
+                    layouts.push(vec![PacketEntry {
+                        band: b as u16,
+                        line: line_in_precinct as u16,
+                    }]);
                 }
-                let l0 = bands[bi].l0 as u32;
-                let l1 = bands[bi].l1 as u32;
-                let line_in_precinct = l0 + lambda_within;
-                if line_in_precinct >= l1 {
-                    continue;
-                }
-                // Each band starts a new packet (r = 1 in Table B.4
-                // resets per band; the `r = 0` after the first
-                // included component within a band is the
-                // multi-component aggregation we don't have here).
-                layouts.push(vec![PacketEntry {
-                    band: bi as u16,
-                    line: line_in_precinct as u16,
-                }]);
             }
         }
         beta0 += 3;
     }
-
-    // Round-4 ignores the `Sd > 0` tail loop (no non-decomposed
-    // components present).
+    let _ = band_component;
 
     layouts
         .into_iter()
@@ -622,6 +753,28 @@ mod tests {
         }
     }
 
+    fn cdt_three_444() -> ComponentTable {
+        ComponentTable {
+            components: vec![
+                Component {
+                    bit_depth: 8,
+                    sx: 1,
+                    sy: 1,
+                },
+                Component {
+                    bit_depth: 8,
+                    sx: 1,
+                    sy: 1,
+                },
+                Component {
+                    bit_depth: 8,
+                    sx: 1,
+                    sy: 1,
+                },
+            ],
+        }
+    }
+
     #[test]
     fn n_beta_matches_spec() {
         assert_eq!(n_beta(5, 0), 6);
@@ -633,10 +786,6 @@ mod tests {
 
     #[test]
     fn beta_levels_5_0() {
-        // NL,x=5 NL,y=0 → 6 bands β = 0..5
-        // β=0 → LL5 (dx=5, dy=0, τx=0)
-        // β=1 → HL5 (dx=5, τx=1)
-        // β=5 → HL1 (dx=1, τx=1)
         let (dx, dy, tx, ty) = beta_levels(0, 5, 0);
         assert_eq!((dx, dy, tx, ty), (5, 0, false, false));
         let (dx, _, tx, _) = beta_levels(1, 5, 0);
@@ -647,11 +796,6 @@ mod tests {
 
     #[test]
     fn beta_levels_1_1() {
-        // NL,x=1 NL,y=1 → Nβ = 4. β1 = 1.
-        // β=0 → LL1 (dx=1, dy=1, τx=0, τy=0)
-        // β=1 → HL1 (dx=1, dy=1, τx=1, τy=0)
-        // β=2 → LH1 (τx=0, τy=1)
-        // β=3 → HH1 (τx=1, τy=1)
         assert_eq!(beta_levels(0, 1, 1), (1, 1, false, false));
         assert_eq!(beta_levels(1, 1, 1), (1, 1, true, false));
         assert_eq!(beta_levels(2, 1, 1), (1, 1, false, true));
@@ -660,70 +804,60 @@ mod tests {
 
     #[test]
     fn build_plan_minimum_1x1_decomp() {
-        // 4x4 image, NL,x=1 NL,y=1 → 4 bands, 1 precinct (since Hp=2,
-        // ⌈4/2⌉ = 2 precincts vertically).
         let pih = pih_min(1, 1, 4, 4);
         let cdt = cdt_one(8);
-        // WGT body: 4 bands × 2 bytes.
         let wgt = vec![0u8, 0, 0, 0, 0, 0, 0, 0];
         let (plan, weights) = build_plan(&pih, &cdt, &wgt).expect("build plan");
         assert_eq!(plan.n_bands, 4);
         assert_eq!(plan.n_beta, 4);
         assert_eq!(weights.len(), 4);
-        // Hp = 2^NL,y = 2 → Np_y = ⌈4/2⌉ = 2 precincts vertically.
         assert_eq!(plan.slices.len(), 2);
         assert_eq!(plan.slices[0].n_precincts, 1);
         let p0 = &plan.slices[0].precincts[0];
-        // Wp = 4. LL band Wpb = ⌈4 / 2^1⌉ = 2.
         assert_eq!(p0.geometry.bands.len(), 4);
         assert_eq!(p0.geometry.bands[0].wpb, 2);
-        // L0 / L1 for LL band (τy = 0, dy=1, NL,y=1): L0 = 0,
-        // L1 = min(Hb_LL=2, 2^(NL,y-dy)=1) = 1. (LL has one line in
-        // the precinct because the precinct holds Hp = 2^NL,y = 2
-        // image rows but only one LL coefficient row.)
         assert_eq!(p0.geometry.bands[0].l0, 0);
         assert_eq!(p0.geometry.bands[0].l1, 1);
-        // LH band (β=2, τy=1): L0=1, L1=2.
         assert_eq!(p0.geometry.bands[2].l0, 1);
         assert_eq!(p0.geometry.bands[2].l1, 2);
     }
 
     #[test]
     fn build_plan_horizontal_only() {
-        // 8x4 image, NL,x=2 NL,y=0. Nβ = 3. Hp = 1 → 4 precincts
-        // vertically.
         let pih = pih_min(2, 0, 8, 4);
         let cdt = cdt_one(8);
         let wgt = vec![0u8; 6];
         let (plan, _) = build_plan(&pih, &cdt, &wgt).expect("build plan");
         assert_eq!(plan.n_beta, 3);
-        // Each precinct is 1 line tall. 4 precincts in 4 slices (Hsl=1).
         assert_eq!(plan.slices.len(), 4);
         let p0 = &plan.slices[0].precincts[0];
-        // LL2 width = ⌈8 / 4⌉ = 2.
         assert_eq!(p0.geometry.bands[0].wpb, 2);
-        // HL2 width = ⌈8 / 4⌉ = 2 (high-pass form: ⌈8/2⌉/2 = 2).
-        // HL1 width = ⌈8 / 2⌉ = 4 (high-pass form: ⌈8/1⌉/2 = 4).
         assert_eq!(p0.geometry.bands[1].wpb, 2);
         assert_eq!(p0.geometry.bands[2].wpb, 4);
     }
 
     #[test]
-    fn rejects_multi_component_for_round_4() {
+    fn build_plan_three_components_4x4_1x1() {
+        // 4x4 image, NL,x = NL,y = 1, 3 components 4:4:4. Total bands =
+        // 3 * 4 = 12. WGT body has 12 (gain, priority) pairs.
         let mut pih = pih_min(1, 1, 4, 4);
         pih.nc = 3;
-        let cdt = ComponentTable {
-            components: vec![
-                Component {
-                    bit_depth: 8,
-                    sx: 1,
-                    sy: 1
-                };
-                3
-            ],
-        };
-        let wgt = vec![0u8; 8];
-        assert!(build_plan(&pih, &cdt, &wgt).is_err());
+        let cdt = cdt_three_444();
+        let wgt = vec![0u8; 24];
+        let (plan, weights) = build_plan(&pih, &cdt, &wgt).expect("3-comp plan");
+        assert_eq!(plan.n_bands, 12);
+        assert_eq!(plan.n_beta, 4);
+        assert_eq!(weights.len(), 12);
+        assert_eq!(plan.nc, 3);
+        // Verify band[0] is component 0 of β=0 (LL); band[1] is comp 1
+        // of β=0; band[2] is comp 2 of β=0.
+        let p0 = &plan.slices[0].precincts[0];
+        assert_eq!(p0.band_component[0], 0);
+        assert_eq!(p0.band_beta[0], 0);
+        assert_eq!(p0.band_component[1], 1);
+        assert_eq!(p0.band_beta[1], 0);
+        assert_eq!(p0.band_component[3], 0);
+        assert_eq!(p0.band_beta[3], 1); // β=1 starts at band index 3
     }
 
     #[test]
@@ -754,31 +888,37 @@ mod tests {
 
     #[test]
     fn packet_layouts_for_1x1_decomp() {
-        // NL,x=1 NL,y=1 → β1 = 1, so first packet has 1 band (LL).
-        // Then proxy level β0=1 with 3 bands (HL, LH, HH), each on
-        // its own packet, on every line of the band.
         let pih = pih_min(1, 1, 4, 4);
         let cdt = cdt_one(8);
         let wgt = vec![0u8; 8];
         let (plan, _) = build_plan(&pih, &cdt, &wgt).unwrap();
         let p0 = &plan.slices[0].precincts[0];
-        // For NL,y=1 → Hp=2, lines_in_level for β0=1 = 1 (since dy=1,
-        // 2^(NL,y - dy) = 1). So 3 packets after the first.
-        // Total packets = 1 (LL on line 0) + 3 (HL, LH, HH on line 1).
         assert_eq!(p0.packets.len(), 4);
-        // Packet 0: LL band (β=0) on line 0.
         assert_eq!(p0.packets[0].entries.len(), 1);
         assert_eq!(p0.packets[0].entries[0].band, 0);
         assert_eq!(p0.packets[0].entries[0].line, 0);
-        // Packets 1..3: HL, LH, HH on line 1.
-        // β=1 (HL_1) τy=0 → L0=0, line=0. So HL is on line 0.
-        // β=2 (LH_1) τy=1 → L0=1, line=1. So LH is on line 1.
-        // β=3 (HH_1) τy=1 → L0=1, line=1. So HH is on line 1.
         assert_eq!(p0.packets[1].entries[0].band, 1);
         assert_eq!(p0.packets[1].entries[0].line, 0);
         assert_eq!(p0.packets[2].entries[0].band, 2);
         assert_eq!(p0.packets[2].entries[0].line, 1);
         assert_eq!(p0.packets[3].entries[0].band, 3);
         assert_eq!(p0.packets[3].entries[0].line, 1);
+    }
+
+    #[test]
+    fn packet_layouts_3_components_5_0() {
+        // 3 components, NL,x=5 NL,y=0 → Table B.5: one packet with 18
+        // bands on line 0.
+        let mut pih = pih_min(5, 0, 32, 1);
+        pih.nc = 3;
+        let cdt = cdt_three_444();
+        let wgt = vec![0u8; 18 * 2];
+        let (plan, _) = build_plan(&pih, &cdt, &wgt).expect("3-comp 5/0 plan");
+        // n_beta = 6. 6 bands × 3 components = 18 total.
+        assert_eq!(plan.n_beta, 6);
+        assert_eq!(plan.n_bands, 18);
+        let p0 = &plan.slices[0].precincts[0];
+        assert_eq!(p0.packets.len(), 1, "5/0 → 1 packet");
+        assert_eq!(p0.packets[0].entries.len(), 18, "all 18 bands grouped");
     }
 }
