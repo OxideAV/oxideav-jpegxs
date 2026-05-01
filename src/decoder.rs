@@ -29,9 +29,11 @@ use oxideav_core::{
 };
 
 use crate::codestream;
-use crate::colour_transform::inverse_rct;
+use crate::colour_transform::{inverse_rct, inverse_star_tetrix};
+use crate::crg::{cfa_pattern_type, parse_crg};
+use crate::cts::parse_cts;
 use crate::dequant::dequantize_precinct;
-use crate::dwt::inverse_2d;
+use crate::dwt::{inverse_2d, inverse_cascade_2d};
 use crate::entropy::packet_body::PrecinctState;
 use crate::entropy::{
     decode_packet_body, parse_packet_header, parse_precinct_header, precinct_truncation,
@@ -106,11 +108,6 @@ fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
             "jpegxs decoder: CWD (component-dependent wavelet decomposition) not supported".into(),
         ));
     }
-    if pih.cpih == 3 {
-        return Err(Error::Unsupported(
-            "jpegxs decoder: Cpih=3 (Star-Tetrix) requires CTS+CRG marker parsing (round 6)".into(),
-        ));
-    }
     // Annex F.2 hard requirements.
     if pih.cpih == 1 {
         if pih.nc < 3 {
@@ -136,13 +133,7 @@ fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
 
     let (plan, _weights) = build_plan(&pih, &cdt, &wgt)?;
 
-    // Round-5: only single-level DWT cascade is implemented.
-    if pih.nlx > 1 || pih.nly > 1 {
-        return Err(Error::Unsupported(format!(
-            "jpegxs decoder: NL,x={} NL,y={} requires multi-level DWT cascade (round 6)",
-            pih.nlx, pih.nly
-        )));
-    }
+    let multi_level = pih.nlx > 1 || pih.nly > 1;
 
     // Allocate per-component sample buffers sized at Wc[i] × Hc[i].
     let wf = pih.wf as usize;
@@ -154,6 +145,39 @@ fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
         let hc = hf / (c.sy as usize);
         samples.push(vec![0i32; wc * hc]);
         comp_dims.push((wc, hc));
+    }
+
+    // For multi-level cascade we gather all band coefficients into
+    // per-component, per-band picture-level arrays first, then run
+    // [`inverse_cascade_2d`] once per component. That avoids any
+    // cross-precinct vertical-prediction state because the cascade
+    // sees the entire picture's band data at once. Single-level paths
+    // still go through the streaming per-precinct synthesis kept as a
+    // fast path. `gathered[i][β]` is the picture-level band buffer for
+    // component i, filter type β.
+    let mut gathered: Vec<Vec<Vec<i32>>> = Vec::with_capacity(plan.nc as usize);
+    if multi_level {
+        for (i, c) in cdt.components.iter().enumerate() {
+            let wc = wf / (c.sx as usize);
+            let hc = hf / (c.sy as usize);
+            let nlx_i = pih.nlx;
+            // For sub-sampled components in multi-level we mirror the
+            // single-level path: drop vertical levels by log2(sy[i]).
+            let nly_i = pih.nly.saturating_sub(match c.sy {
+                1 => 0,
+                2 => 1,
+                4 => 2,
+                _ => 0,
+            });
+            let nb = beta_count(nlx_i, nly_i) as usize;
+            let mut bands_i: Vec<Vec<i32>> = Vec::with_capacity(nb);
+            for beta in 0..nb as u32 {
+                let (bw, bh) = band_dims(wc, hc, nlx_i, nly_i, beta);
+                bands_i.push(vec![0i32; bw * bh]);
+            }
+            let _ = i;
+            gathered.push(bands_i);
+        }
     }
 
     // Walk slices in order. Each slice contributes a contiguous run of
@@ -168,13 +192,70 @@ fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
         let slice_data = buf
             .get(slice.data_offset..slice.data_offset + slice.data_length)
             .ok_or_else(|| Error::invalid("jpegxs decoder: slice data range past buffer end"))?;
-        decode_slice(slice_data, slice_plan, &plan, &pih, &cdt, &mut samples)?;
+        decode_slice(
+            slice_data,
+            slice_plan,
+            &plan,
+            &pih,
+            &cdt,
+            &mut samples,
+            if multi_level {
+                Some(&mut gathered)
+            } else {
+                None
+            },
+        )?;
+    }
+
+    if multi_level {
+        // Run the inverse-DWT cascade per component now that all band
+        // coefficients have been gathered.
+        for (i, c) in cdt.components.iter().enumerate() {
+            let wc = wf / (c.sx as usize);
+            let hc = hf / (c.sy as usize);
+            let nlx_i = pih.nlx;
+            let nly_i = pih.nly.saturating_sub(match c.sy {
+                1 => 0,
+                2 => 1,
+                4 => 2,
+                _ => 0,
+            });
+            inverse_cascade_2d(wc, hc, nlx_i, nly_i, &gathered[i], &mut samples[i])?;
+        }
     }
 
     // Annex F inverse colour transform.
     if pih.cpih == 1 {
         let mut refs: Vec<&mut [i32]> = samples.iter_mut().map(|p| p.as_mut_slice()).collect();
         inverse_rct(&mut refs, wf, hf)?;
+    } else if pih.cpih == 3 {
+        // Star-Tetrix needs the CTS marker (chroma exponents + Cf) and
+        // CRG marker (CFA pattern type) per Annex F.5 / Tables F.9 /
+        // F.10. The codestream parser already enforced "Cpih=3 → CTS
+        // present", but CRG is also mandatory in this case (§A.4.9).
+        let cts_body = cs
+            .cts
+            .as_deref()
+            .ok_or_else(|| Error::invalid("jpegxs Cpih=3: CTS marker required (A.4.8)"))?;
+        let cts = parse_cts(cts_body)?;
+        let crg_body = cs
+            .crg
+            .as_deref()
+            .ok_or_else(|| Error::invalid("jpegxs Cpih=3: CRG marker required (A.4.9)"))?;
+        let crg = parse_crg(crg_body, pih.nc)?;
+        let ct = cfa_pattern_type(&crg).ok_or_else(|| {
+            Error::invalid(
+                "jpegxs Cpih=3: CRG entries do not match a Table F.9 CFA pattern (RGGB/BGGR/GRBG/GBRG)",
+            )
+        })?;
+        if pih.nc != 4 {
+            return Err(Error::invalid(format!(
+                "jpegxs Cpih=3: Star-Tetrix requires Nc=4, got {}",
+                pih.nc
+            )));
+        }
+        let mut refs: Vec<&mut [i32]> = samples.iter_mut().map(|p| p.as_mut_slice()).collect();
+        inverse_star_tetrix(&mut refs, wf, hf, cts.e1, cts.e2, ct, cts.cf.cf())?;
     }
 
     // Annex G output scaling, DC level shift, clipping per component.
@@ -200,6 +281,7 @@ fn decode_slice(
     pih: &crate::picture_header::PictureHeader,
     cdt: &crate::component_table::ComponentTable,
     samples: &mut [Vec<i32>],
+    mut gathered: Option<&mut Vec<Vec<Vec<i32>>>>,
 ) -> Result<()> {
     let mut cursor = 0usize;
     for precinct_plan in &slice_plan.precincts {
@@ -249,18 +331,261 @@ fn decode_slice(
         // Skip precinct filler bytes up to Lprc.
         cursor = entropy_end;
 
-        // Inverse-quantize and DWT-synthesise this precinct.
-        synthesise_precinct(
-            precinct_plan,
-            plan,
-            pih,
-            cdt,
-            &state.coefficients,
-            &precinct_header,
-            samples,
-        )?;
+        // Inverse-quantize. For single-level pictures, also DWT-
+        // synthesise the precinct in place. For multi-level pictures,
+        // accumulate band coefficients into the picture-level gather
+        // buffer; the cascade runs after all precincts are processed.
+        if let Some(g) = gathered.as_deref_mut() {
+            gather_precinct(
+                precinct_plan,
+                plan,
+                pih,
+                cdt,
+                &state.coefficients,
+                &precinct_header,
+                g,
+            )?;
+        } else {
+            synthesise_precinct(
+                precinct_plan,
+                plan,
+                pih,
+                cdt,
+                &state.coefficients,
+                &precinct_header,
+                samples,
+            )?;
+        }
     }
     Ok(())
+}
+
+/// Multi-level path — copy this precinct's dequantized band data into
+/// the picture-level gather buffers `gathered[i][β]`. The cascade runs
+/// later in [`decode_codestream`] once every precinct has contributed.
+#[allow(clippy::too_many_arguments)]
+fn gather_precinct(
+    precinct_plan: &PrecinctPlan,
+    plan: &PicturePlan,
+    pih: &crate::picture_header::PictureHeader,
+    cdt: &crate::component_table::ComponentTable,
+    bands: &[BandCoefficients],
+    precinct_header: &PrecinctHeader,
+    gathered: &mut [Vec<Vec<i32>>],
+) -> Result<()> {
+    let trunc = precinct_truncation(&precinct_plan.geometry, precinct_header);
+    let dequant = dequantize_precinct(pih.qpih, &precinct_plan.geometry, &trunc, bands);
+
+    let nc = plan.nc as u32;
+    let nbeta = plan.n_beta;
+    let py = precinct_plan.p as usize; // np_x == 1 → p = py.
+    let nly_pic = pih.nly;
+
+    for (i, c) in cdt.components.iter().enumerate().take(nc as usize) {
+        let sy_i = c.sy;
+        let nly_i = nly_pic.saturating_sub(match sy_i {
+            1 => 0,
+            2 => 1,
+            4 => 2,
+            _ => 0,
+        });
+        let nb_i = beta_count(pih.nlx, nly_i) as u32;
+        for beta in 0..nbeta.min(nb_i) {
+            let b = (nc * beta + i as u32) as usize;
+            let band_geom = &precinct_plan.geometry.bands[b];
+            if !band_geom.exists {
+                continue;
+            }
+            let lines = (band_geom.l1 - band_geom.l0) as usize;
+            if lines == 0 {
+                continue;
+            }
+            let wpb = band_geom.wpb as usize;
+            // Picture-level band dimensions for this (β, i).
+            let wc = (pih.wf as usize) / (c.sx as usize);
+            let hc = (pih.hf as usize) / (sy_i as usize);
+            let (pic_bw, pic_bh) = band_dims(wc, hc, pih.nlx, nly_i, beta);
+            // Map this precinct's band-line slice [0..lines) into the
+            // picture-level band rows. The first picture-band-line for
+            // precinct py is `py * (pow)`, where pow = 2^max(NL,y - dy, 0).
+            // Equivalently, lines per precinct = (L1 - L0); the row
+            // offset in the picture-level band = py * (lines per
+            // precinct from L0 alignment), but L0 is constant across
+            // precincts so we use py * pow. We recover pow from
+            // L1 - L0 + (anything truncated by Hb — handled by saturating
+            // the picture row at pic_bh).
+            //
+            // For the standard square cascade (NL,x = NL,y = N) and
+            // NL,y > 0, every band has pow = 2^max(N - dy, 0). The
+            // precinct contains exactly `pow` band-lines (or fewer at
+            // the picture's bottom edge), so picture-row = py * pow + λ
+            // where λ ∈ [0, lines).
+            let pow = pic_bh.div_ceil(
+                plan.slices
+                    .iter()
+                    .map(|s| s.n_precincts)
+                    .sum::<u32>()
+                    .max(1) as usize,
+            );
+            let _ = pow;
+            // Better: derive pow from the non-truncated case — the
+            // first precinct should have lines == pow, so we can just
+            // use the first precinct's `lines` directly via the band
+            // geometry's pow encoded as `min(pow, hb_remaining)`. For
+            // py = 0 it's `min(pow, hb)` = pow when hb >= pow, but
+            // when hb < pow it's hb. Since we want the offset into the
+            // picture-band, we compute it directly from band geometry.
+            let pow_h = cascade_band_pow_h(pih.nlx, nly_i, beta, hc);
+            let row_offset = py * pow_h;
+            let band_buf = &mut gathered[i][beta as usize];
+            if band_buf.len() != pic_bw * pic_bh {
+                return Err(Error::invalid(format!(
+                    "jpegxs decoder gather: band buffer for comp {i} β={beta} sized {} != {}*{}",
+                    band_buf.len(),
+                    pic_bw,
+                    pic_bh
+                )));
+            }
+            for line in 0..lines {
+                let pic_row = row_offset + line;
+                if pic_row >= pic_bh {
+                    break;
+                }
+                let dst = &mut band_buf[pic_row * pic_bw..pic_row * pic_bw + wpb.min(pic_bw)];
+                let src = &dequant[b][line * wpb..line * wpb + wpb.min(pic_bw)];
+                dst.copy_from_slice(src);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Compute the precinct height in band-lines for filter type `beta`.
+/// Mirrors `2^max(NL,y - dy, 0)`. Used to figure out the picture-row
+/// offset for a precinct's band slice.
+fn cascade_band_pow_h(nlx: u8, nly: u8, beta: u32, _hc: usize) -> usize {
+    let key = beta_key_for(beta, nlx, nly);
+    let nly_u = nly as u32;
+    let dy = key.dy;
+    if dy >= nly_u || nly_u == 0 {
+        1
+    } else {
+        1usize << (nly_u - dy)
+    }
+}
+
+/// Helper: forward the (dx, dy, τx, τy) computation by inlining the
+/// same algorithm as [`crate::dwt`] / the slice walker. Kept private to
+/// the decoder so we don't add a load-bearing crate-internal API.
+struct DecoderBandKey {
+    #[allow(dead_code)]
+    dx: u32,
+    dy: u32,
+    #[allow(dead_code)]
+    tau_x: bool,
+    #[allow(dead_code)]
+    tau_y: bool,
+}
+
+fn beta_key_for(beta: u32, nlx: u8, nly: u8) -> DecoderBandKey {
+    let nlx_u = nlx as u32;
+    let nly_u = nly as u32;
+    if nly_u == 0 {
+        if beta == 0 {
+            return DecoderBandKey {
+                dx: nlx_u,
+                dy: 0,
+                tau_x: false,
+                tau_y: false,
+            };
+        }
+        return DecoderBandKey {
+            dx: nlx_u + 1 - beta,
+            dy: 0,
+            tau_x: true,
+            tau_y: false,
+        };
+    }
+    let beta1 = nlx_u - nly_u + 1;
+    if beta < beta1 {
+        if beta == 0 {
+            return DecoderBandKey {
+                dx: nlx_u,
+                dy: nly_u,
+                tau_x: false,
+                tau_y: false,
+            };
+        }
+        return DecoderBandKey {
+            dx: nlx_u + 1 - beta,
+            dy: nly_u,
+            tau_x: true,
+            tau_y: false,
+        };
+    }
+    let group_in = beta - beta1;
+    let triple = group_in / 3;
+    let within = group_in % 3;
+    let dy = nly_u - triple;
+    let dx = dy;
+    match within {
+        0 => DecoderBandKey {
+            dx,
+            dy,
+            tau_x: true,
+            tau_y: false,
+        },
+        1 => DecoderBandKey {
+            dx,
+            dy,
+            tau_x: false,
+            tau_y: true,
+        },
+        _ => DecoderBandKey {
+            dx,
+            dy,
+            tau_x: true,
+            tau_y: true,
+        },
+    }
+}
+
+/// Number of filter types `Nβ` for a (NL,x, NL,y) decomposition.
+fn beta_count(nlx: u8, nly: u8) -> usize {
+    let mn = nlx.min(nly) as usize;
+    let mx = nlx.max(nly) as usize;
+    2 * mn + mx + 1
+}
+
+/// Picture-level dimensions of band β under (NL,x, NL,y) for a
+/// component sized `wc × hc`. Mirrors the slice walker formula.
+fn band_dims(wc: usize, hc: usize, nlx: u8, nly: u8, beta: u32) -> (usize, usize) {
+    let key = beta_key_for(beta, nlx, nly);
+    let dx = key.dx;
+    let dy = key.dy;
+    let tx = key.tau_x;
+    let ty = key.tau_y;
+    let w = if !tx {
+        if dx == 0 {
+            wc as u32
+        } else {
+            ((wc as u32) + (1u32 << dx) - 1) >> dx
+        }
+    } else {
+        let denom_minus1 = if dx == 0 { 1 } else { 1u32 << (dx - 1) };
+        (wc as u32).div_ceil(denom_minus1) / 2
+    };
+    let h = if !ty {
+        if dy == 0 {
+            hc as u32
+        } else {
+            ((hc as u32) + (1u32 << dy) - 1) >> dy
+        }
+    } else {
+        let denom_minus1 = if dy == 0 { 1 } else { 1u32 << (dy - 1) };
+        (hc as u32).div_ceil(denom_minus1) / 2
+    };
+    (w as usize, h as usize)
 }
 
 fn synthesise_precinct(
@@ -441,6 +766,68 @@ fn inverse_synth_1d(
 mod tests {
     use super::*;
     use oxideav_core::{CodecId, CodecParameters, TimeBase};
+
+    #[test]
+    #[ignore]
+    fn debug_multilevel_layout() {
+        use crate::component_table::{Component, ComponentTable};
+        use crate::picture_header::PictureHeader;
+        use crate::slice_walker::build_plan;
+        let pih = PictureHeader {
+            lcod: 0,
+            ppih: 0,
+            plev: 0,
+            wf: 4,
+            hf: 4,
+            cw: 0,
+            hsl: 1,
+            nc: 1,
+            ng: 4,
+            ss: 8,
+            bw: 20,
+            fq: 8,
+            br: 4,
+            fslc: 0,
+            ppoc: 0,
+            cpih: 0,
+            nlx: 2,
+            nly: 2,
+            lh: 0,
+            rl: 0,
+            qpih: 0,
+            fs: 0,
+            rm: 0,
+        };
+        let cdt = ComponentTable {
+            components: vec![Component {
+                bit_depth: 8,
+                sx: 1,
+                sy: 1,
+            }],
+        };
+        let wgt = vec![0u8; 14];
+        let (plan, _) = build_plan(&pih, &cdt, &wgt).unwrap();
+        eprintln!("nbeta={} nbands={}", plan.n_beta, plan.n_bands);
+        for s in &plan.slices {
+            for p in &s.precincts {
+                eprintln!("Precinct p={} packets={}", p.p, p.packets.len());
+                for (i, b) in p.geometry.bands.iter().enumerate() {
+                    eprintln!(
+                        "  band[{i}] wpb={} l0={} l1={} exists={}",
+                        b.wpb, b.l0, b.l1, b.exists
+                    );
+                }
+                for (i, pkt) in p.packets.iter().enumerate() {
+                    let entries: Vec<_> = pkt
+                        .entries
+                        .iter()
+                        .map(|e| format!("(b={} l={})", e.band, e.line))
+                        .collect();
+                    eprintln!("  packet[{i}] {}", entries.join(","));
+                }
+            }
+        }
+    }
 
     #[test]
     fn factory_returns_decoder() {
@@ -989,6 +1376,301 @@ mod tests {
         v.push(0x00);
         v.extend_from_slice(&[0xff, 0x11]);
         v
+    }
+
+    /// Build a 4×4 single-component JPEG XS codestream with
+    /// `NL,x = NL,y = 2` (multi-level cascade) and entropy data that
+    /// sets every quantization-index magnitude to zero. The expected
+    /// output is a single 4×4 plane of mid-grey samples (`128`).
+    ///
+    /// This is the minimum-viable multi-level fixture: 1 slice, 1
+    /// precinct, 7 bands (Nβ = 7 for NL,x = NL,y = 2), 10 packets
+    /// matching the layout the slice walker emits (verified via the
+    /// `debug_multilevel_layout` test).
+    fn build_zero_codestream_4x4_nl22() -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&[0xff, 0x10]);
+        v.extend_from_slice(&[0xff, 0x50]);
+        v.extend_from_slice(&2u16.to_be_bytes());
+        v.extend_from_slice(&[0xff, 0x12]);
+        v.extend_from_slice(&26u16.to_be_bytes());
+        v.extend_from_slice(&0u32.to_be_bytes());
+        v.extend_from_slice(&0u16.to_be_bytes());
+        v.extend_from_slice(&0u16.to_be_bytes());
+        v.extend_from_slice(&4u16.to_be_bytes()); // Wf
+        v.extend_from_slice(&4u16.to_be_bytes()); // Hf
+        v.extend_from_slice(&0u16.to_be_bytes()); // Cw
+        v.extend_from_slice(&1u16.to_be_bytes()); // Hsl
+        v.push(1); // Nc
+        v.push(4); // Ng
+        v.push(8); // Ss
+        v.push(20); // Bw
+        v.push(0x84); // Fq=8, Br=4
+        v.push(0x00); // Cpih=0
+        v.push(0x22); // NL,x=2, NL,y=2
+        v.push(0x00);
+        // CDT: 1 component, B=8, sx=sy=1.
+        v.extend_from_slice(&[0xff, 0x13]);
+        v.extend_from_slice(&4u16.to_be_bytes());
+        v.extend_from_slice(&[8, 0x11]);
+        // WGT: 7 bands × 2 = 14, +2 = 16.
+        v.extend_from_slice(&[0xff, 0x14]);
+        v.extend_from_slice(&16u16.to_be_bytes());
+        v.extend_from_slice(&[0u8; 14]);
+        // SLH
+        v.extend_from_slice(&[0xff, 0x20]);
+        v.extend_from_slice(&4u16.to_be_bytes());
+        v.extend_from_slice(&0u16.to_be_bytes());
+        // 10 packets, each 5-byte short header + 1-byte body.
+        let mut payload = Vec::new();
+        let mut packet_hdr = vec![0u8; 5];
+        let mut bits: u64 = 0;
+        bits = (bits << 1) | 0;
+        bits = (bits << 15) | 0;
+        bits = (bits << 13) | 1;
+        bits = (bits << 11) | 0;
+        for (i, b) in packet_hdr.iter_mut().enumerate() {
+            *b = ((bits >> (8 * (4 - i))) & 0xff) as u8;
+        }
+        for _ in 0..10 {
+            payload.extend_from_slice(&packet_hdr);
+            payload.push(0x00);
+        }
+        let lprc = payload.len() as u32;
+        // Precinct header: Lprc(24) + Q(8) + R(8) + D[7](14) = 54 bits → 7 bytes.
+        let mut prec_hdr = vec![0u8; 7];
+        prec_hdr[0] = ((lprc >> 16) & 0xff) as u8;
+        prec_hdr[1] = ((lprc >> 8) & 0xff) as u8;
+        prec_hdr[2] = (lprc & 0xff) as u8;
+        v.extend_from_slice(&prec_hdr);
+        v.extend_from_slice(&payload);
+        v.extend_from_slice(&[0xff, 0x11]);
+        v
+    }
+
+    #[test]
+    fn end_to_end_decode_zero_4x4_nl22() {
+        let buf = build_zero_codestream_4x4_nl22();
+        let params = CodecParameters::video(CodecId::new(crate::CODEC_ID_STR));
+        let mut dec = make_decoder(&params).unwrap();
+        let pkt = Packet::new(0, TimeBase::new(1, 25), buf);
+        dec.send_packet(&pkt).expect("multi-level send_packet");
+        let frame = dec.receive_frame().expect("multi-level receive_frame");
+        let Frame::Video(vf) = frame else {
+            panic!("expected video frame");
+        };
+        assert_eq!(vf.planes.len(), 1);
+        assert_eq!(vf.planes[0].stride, 4);
+        assert_eq!(vf.planes[0].data.len(), 16);
+        for (i, &px) in vf.planes[0].data.iter().enumerate() {
+            assert_eq!(
+                px, 128,
+                "pixel {i} should be mid-grey for all-zero coeffs through NL=2 cascade"
+            );
+        }
+    }
+
+    /// Build an 8×8 single-component JPEG XS codestream with
+    /// `NL,x = NL,y = 3` (3-level cascade) and entropy data that sets
+    /// every quantization-index magnitude to zero. Expected output is
+    /// a flat 8×8 plane of mid-grey samples.
+    fn build_zero_codestream_8x8_nl33() -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&[0xff, 0x10]);
+        v.extend_from_slice(&[0xff, 0x50]);
+        v.extend_from_slice(&2u16.to_be_bytes());
+        v.extend_from_slice(&[0xff, 0x12]);
+        v.extend_from_slice(&26u16.to_be_bytes());
+        v.extend_from_slice(&0u32.to_be_bytes());
+        v.extend_from_slice(&0u16.to_be_bytes());
+        v.extend_from_slice(&0u16.to_be_bytes());
+        v.extend_from_slice(&8u16.to_be_bytes()); // Wf
+        v.extend_from_slice(&8u16.to_be_bytes()); // Hf
+        v.extend_from_slice(&0u16.to_be_bytes()); // Cw
+        v.extend_from_slice(&1u16.to_be_bytes()); // Hsl
+        v.push(1); // Nc
+        v.push(4); // Ng
+        v.push(8); // Ss
+        v.push(20); // Bw
+        v.push(0x84);
+        v.push(0x00);
+        v.push(0x33); // NL,x=3, NL,y=3
+        v.push(0x00);
+        // CDT
+        v.extend_from_slice(&[0xff, 0x13]);
+        v.extend_from_slice(&4u16.to_be_bytes());
+        v.extend_from_slice(&[8, 0x11]);
+        // WGT — 10 bands × 2 = 20, +2 = 22.
+        v.extend_from_slice(&[0xff, 0x14]);
+        v.extend_from_slice(&22u16.to_be_bytes());
+        v.extend_from_slice(&[0u8; 20]);
+        // SLH
+        v.extend_from_slice(&[0xff, 0x20]);
+        v.extend_from_slice(&4u16.to_be_bytes());
+        v.extend_from_slice(&0u16.to_be_bytes());
+        // 22 packets × 6 bytes each.
+        let mut payload = Vec::new();
+        let mut packet_hdr = vec![0u8; 5];
+        let mut bits: u64 = 0;
+        bits = (bits << 1) | 0;
+        bits = (bits << 15) | 0;
+        bits = (bits << 13) | 1;
+        bits = (bits << 11) | 0;
+        for (i, b) in packet_hdr.iter_mut().enumerate() {
+            *b = ((bits >> (8 * (4 - i))) & 0xff) as u8;
+        }
+        for _ in 0..22 {
+            payload.extend_from_slice(&packet_hdr);
+            payload.push(0x00);
+        }
+        let lprc = payload.len() as u32;
+        // Precinct header: Lprc(24)+Q(8)+R(8)+D[10](20) = 60 bits → 8 bytes.
+        let mut prec_hdr = vec![0u8; 8];
+        prec_hdr[0] = ((lprc >> 16) & 0xff) as u8;
+        prec_hdr[1] = ((lprc >> 8) & 0xff) as u8;
+        prec_hdr[2] = (lprc & 0xff) as u8;
+        v.extend_from_slice(&prec_hdr);
+        v.extend_from_slice(&payload);
+        v.extend_from_slice(&[0xff, 0x11]);
+        v
+    }
+
+    /// Build a 4-component, 4×2 Star-Tetrix (`Cpih = 3`) codestream
+    /// with single-level wavelet (`NL,x = NL,y = 1`), 4:4:4:4 sampling,
+    /// CTS marker (`Cf = 0`, `e1 = 0`, `e2 = 0`), and CRG marker
+    /// configured for the RGGB pattern (`Ct = 0`). All entropy data
+    /// encodes magnitude zero. The decoder must accept the codestream,
+    /// run the inverse Star-Tetrix transform, and emit four 4×2 planes.
+    ///
+    /// With all-zero wavelet coefficients, the inverse cascade yields
+    /// flat-zero per-component planes. The Star-Tetrix lifting
+    /// (Tables F.5/F.6/F.7/F.8) then operates on flat zeros: every
+    /// average / delta / Y / CbCr lift adds floor(0/8) or floor(0/4)
+    /// = 0, so the output stays flat zero. After the +DC bias and
+    /// 8-bit clip from `apply_output_scaling`, every plane sits at 128.
+    fn build_zero_star_tetrix_4comp_4x2() -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&[0xff, 0x10]);
+        // CAP — bit 1 (Star-Tetrix) set per A.5.
+        v.extend_from_slice(&[0xff, 0x50]);
+        v.extend_from_slice(&3u16.to_be_bytes());
+        v.push(0x40); // bit 1 = 0x40
+                      // PIH
+        v.extend_from_slice(&[0xff, 0x12]);
+        v.extend_from_slice(&26u16.to_be_bytes());
+        v.extend_from_slice(&0u32.to_be_bytes());
+        v.extend_from_slice(&0u16.to_be_bytes());
+        v.extend_from_slice(&0u16.to_be_bytes());
+        v.extend_from_slice(&4u16.to_be_bytes()); // Wf
+        v.extend_from_slice(&2u16.to_be_bytes()); // Hf
+        v.extend_from_slice(&0u16.to_be_bytes()); // Cw
+        v.extend_from_slice(&1u16.to_be_bytes()); // Hsl
+        v.push(4); // Nc
+        v.push(4); // Ng
+        v.push(8); // Ss
+        v.push(20); // Bw
+        v.push(0x84);
+        v.push(0x03); // Fslc=0,Ppoc=0,Cpih=3
+        v.push(0x11); // NL,x=1,NL,y=1
+        v.push(0x00);
+        // CDT — 4 components 8-bit 4:4:4:4
+        v.extend_from_slice(&[0xff, 0x13]);
+        v.extend_from_slice(&10u16.to_be_bytes()); // 2*Nc + 2 = 10
+        v.extend_from_slice(&[8, 0x11, 8, 0x11, 8, 0x11, 8, 0x11]);
+        // CTS — Lcts=4, Cf=0, e1=0, e2=0
+        v.extend_from_slice(&[0xff, 0x18]);
+        v.extend_from_slice(&4u16.to_be_bytes());
+        v.extend_from_slice(&[0x00, 0x00]);
+        // CRG — Lcrg = 2 + 4*Nc = 18; RGGB (Ct=0).
+        v.extend_from_slice(&[0xff, 0x19]);
+        v.extend_from_slice(&18u16.to_be_bytes());
+        for &(x, y) in &[(0u16, 0u16), (32768, 0), (0, 32768), (32768, 32768)] {
+            v.extend_from_slice(&x.to_be_bytes());
+            v.extend_from_slice(&y.to_be_bytes());
+        }
+        // WGT — 16 bands × 2 bytes = 32, +2 = 34.
+        v.extend_from_slice(&[0xff, 0x14]);
+        v.extend_from_slice(&34u16.to_be_bytes());
+        v.extend_from_slice(&[0u8; 32]);
+        // SLH
+        v.extend_from_slice(&[0xff, 0x20]);
+        v.extend_from_slice(&4u16.to_be_bytes());
+        v.extend_from_slice(&0u16.to_be_bytes());
+        // 13 packets × 6 bytes (5 hdr + 1 body).
+        let mut payload = Vec::new();
+        let mut packet_hdr = vec![0u8; 5];
+        let mut bits: u64 = 0;
+        bits = (bits << 1) | 0;
+        bits = (bits << 15) | 0;
+        bits = (bits << 13) | 1;
+        bits = (bits << 11) | 0;
+        for (i, b) in packet_hdr.iter_mut().enumerate() {
+            *b = ((bits >> (8 * (4 - i))) & 0xff) as u8;
+        }
+        for _ in 0..13 {
+            payload.extend_from_slice(&packet_hdr);
+            payload.push(0x00);
+        }
+        let lprc = payload.len() as u32;
+        // Precinct hdr: 24 + 8 + 8 + 16*2 = 72 bits → 9 bytes.
+        let mut prec_hdr = vec![0u8; 9];
+        prec_hdr[0] = ((lprc >> 16) & 0xff) as u8;
+        prec_hdr[1] = ((lprc >> 8) & 0xff) as u8;
+        prec_hdr[2] = (lprc & 0xff) as u8;
+        v.extend_from_slice(&prec_hdr);
+        v.extend_from_slice(&payload);
+        v.extend_from_slice(&[0xff, 0x11]);
+        v
+    }
+
+    #[test]
+    fn end_to_end_decode_star_tetrix_4comp_4x2() {
+        let buf = build_zero_star_tetrix_4comp_4x2();
+        let params = CodecParameters::video(CodecId::new(crate::CODEC_ID_STR));
+        let mut dec = make_decoder(&params).unwrap();
+        let pkt = Packet::new(0, TimeBase::new(1, 25), buf);
+        dec.send_packet(&pkt).expect("star-tetrix send_packet");
+        let frame = dec.receive_frame().expect("star-tetrix receive_frame");
+        let Frame::Video(vf) = frame else {
+            panic!("expected video frame");
+        };
+        assert_eq!(
+            vf.planes.len(),
+            4,
+            "Star-Tetrix produces 4 component planes"
+        );
+        for (i, plane) in vf.planes.iter().enumerate() {
+            assert_eq!(plane.stride, 4, "comp {i} stride");
+            assert_eq!(plane.data.len(), 8, "comp {i} 4×2 plane");
+            for (x, &px) in plane.data.iter().enumerate() {
+                assert_eq!(
+                    px, 128,
+                    "comp {i} pixel {x}: all-zero coeffs through Star-Tetrix should give mid-grey"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn end_to_end_decode_zero_8x8_nl33() {
+        let buf = build_zero_codestream_8x8_nl33();
+        let params = CodecParameters::video(CodecId::new(crate::CODEC_ID_STR));
+        let mut dec = make_decoder(&params).unwrap();
+        let pkt = Packet::new(0, TimeBase::new(1, 25), buf);
+        dec.send_packet(&pkt).expect("nl=3 send_packet");
+        let frame = dec.receive_frame().expect("nl=3 receive_frame");
+        let Frame::Video(vf) = frame else {
+            panic!("expected video frame");
+        };
+        assert_eq!(vf.planes.len(), 1);
+        assert_eq!(vf.planes[0].stride, 8);
+        assert_eq!(vf.planes[0].data.len(), 64);
+        for (i, &px) in vf.planes[0].data.iter().enumerate() {
+            assert_eq!(
+                px, 128,
+                "pixel {i} should be mid-grey for all-zero coeffs through NL=3 cascade"
+            );
+        }
     }
 
     #[test]

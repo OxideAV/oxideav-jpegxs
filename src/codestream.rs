@@ -15,6 +15,7 @@
 
 use oxideav_core::{Error, Result};
 
+use crate::capabilities::{parse_capabilities_lossy, Capabilities};
 use crate::component_table::{self, ComponentTable};
 use crate::markers::Marker;
 use crate::picture_header::{self, PictureHeader};
@@ -56,6 +57,17 @@ pub struct Codestream {
     /// Byte offset of the EOC marker; `None` if the stream was
     /// truncated.
     pub eoc_offset: Option<usize>,
+}
+
+impl Codestream {
+    /// Decode the CAP marker's `cap[]` byte array into a strongly-typed
+    /// view of the supported capability bits per Annex A.5.4.
+    /// Lossy on the trailing-zero-byte rule (`A.4.3`) — see
+    /// [`parse_capabilities_lossy`] for details. For strict parsing
+    /// use [`crate::capabilities::parse_capabilities`].
+    pub fn capabilities(&self) -> Capabilities {
+        parse_capabilities_lossy(&self.cap)
+    }
 }
 
 /// Parse a JPEG XS codestream byte buffer.
@@ -564,6 +576,32 @@ mod tests {
         assert_eq!(cs.com.len(), 1);
         assert_eq!(&cs.com[0][..2], &[0u8, 0u8]);
         assert_eq!(&cs.com[0][2..], b"hi");
+    }
+
+    #[test]
+    fn capabilities_method_decodes_cap_bits() {
+        // Lcap = 3 with byte 0x40 → bit 1 (Star-Tetrix) set.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0xff, 0x10]);
+        buf.extend_from_slice(&[0xff, 0x50]);
+        buf.extend_from_slice(&3u16.to_be_bytes());
+        buf.push(0x40);
+        buf.extend_from_slice(&[0xff, 0x12]);
+        buf.extend_from_slice(&26u16.to_be_bytes());
+        buf.extend_from_slice(&build_pih_body(1, 4, 3, 0));
+        buf.extend_from_slice(&[0xff, 0x13]);
+        buf.extend_from_slice(&4u16.to_be_bytes());
+        buf.extend_from_slice(&[8, 0x11]);
+        buf.extend_from_slice(&[0xff, 0x14]);
+        buf.extend_from_slice(&2u16.to_be_bytes());
+        buf.extend_from_slice(&[0xff, 0x20]);
+        buf.extend_from_slice(&4u16.to_be_bytes());
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        buf.extend_from_slice(&[0xff, 0x11]);
+        let cs = parse(&buf).expect("cap caps parse");
+        let caps = cs.capabilities();
+        assert!(caps.star_tetrix);
+        assert!(!caps.nlt_quadratic);
     }
 
     #[test]

@@ -1,8 +1,9 @@
 //! JPEG XS — ISO/IEC 21122 low-latency image codec for production / IP
 //! video (SMPTE ST 2110-22).
 //!
-//! Round 5 ships a working end-to-end decoder for the multi-component,
-//! single-precinct-row subset of the standard:
+//! Round 6 ships a working end-to-end decoder for the multi-component,
+//! single-precinct-row subset of the standard with multi-level
+//! wavelet cascade and Star-Tetrix CFA support:
 //!
 //! * Round 1 — Part-1 codestream marker-chain parser
 //!   ([`codestream::parse`]); see [`codestream::Codestream`] for the
@@ -18,33 +19,40 @@
 //!   [`decoder`], inverse RCT colour transform (Annex F.3) in
 //!   [`colour_transform`], NLT marker parser + linear / quadratic /
 //!   extended output scaling (Annex G.3 / G.4 / G.5) in [`output`].
-//!   The decoder factory ([`make_decoder`]) returns a real decoder;
-//!   on codestreams outside the round-5 subset it returns
-//!   `Error::Unsupported` from `send_packet`.
+//! * Round 6 — multi-level inverse-DWT cascade
+//!   ([`dwt::inverse_cascade_2d`], Annex E.2 Table E.1) wired into the
+//!   decoder; inverse Star-Tetrix transform
+//!   ([`colour_transform::inverse_star_tetrix`], Annex F.5) with the
+//!   `access()` reflection from Table F.12; CTS marker parser
+//!   ([`cts`]), CRG marker parser ([`crg`]) including the Table F.9 /
+//!   F.10 / F.11 super-pixel look-up tables; CAP `cap[]` byte-array
+//!   decoder ([`capabilities`]).
 //!
-//! Round-5 supported subset (`make_decoder` accepts):
+//! Round-6 supported subset (`make_decoder` accepts):
 //!
 //! * `Nc ∈ {1, 2, 3, 4}`, `sx, sy ∈ {1, 2}` per component
 //!   (4:4:4, 4:2:2, 4:2:0).
 //! * `Cw == 0` (one precinct per row of the picture).
-//! * `NL,x ∈ {0, 1}`, `NL,y ∈ {0, 1}` (single-level inverse 2-D DWT
-//!   only — multi-level cascade is round 6).
-//! * `Cpih ∈ {0, 1}` — no transform or RGB↔YCbCr reversible
-//!   (Annex F.3). Cpih=3 (Star-Tetrix) needs CTS+CRG marker parsers.
+//! * `NL,x` ≥ `NL,y`, both bounded by typical spec values; tested at
+//!   `NL = 3/3` end-to-end and `NL = 5/5` at the cascade level.
+//! * `Cpih ∈ {0, 1, 3}` — no transform, RGB↔YCbCr reversible
+//!   (Annex F.3), or Star-Tetrix (Annex F.5).
 //! * `Qpih ∈ {0, 1}` (deadzone or uniform inverse quantizer).
 //! * `Fq ∈ {0, 8}` (lossless / regular per Table A.8). 8-bit output
 //!   samples (`B[i] == 8`); higher bit depths return `Unsupported`.
 //! * NLT marker present → quadratic / extended output scaling
 //!   dispatched per Annex G.4 / G.5.
 //!
-//! Out of round-5 scope (returns `Error::Unsupported`): `Cw > 0`
-//! (custom precinct widths), `Cpih == 3` (Star-Tetrix), CWD-driven
-//! `Sd > 0`, CAP-bit-driven feature gating, multi-level wavelet
-//! decomposition (`NL,x > 1` or `NL,y > 1`), output bit depths > 8.
+//! Out of round-6 scope (returns `Error::Unsupported`): `Cw > 0`
+//! (custom precinct widths), CWD-driven `Sd > 0`, output bit depths
+//! > 8, encoder side.
 
+pub mod capabilities;
 pub mod codestream;
 pub mod colour_transform;
 pub mod component_table;
+pub mod crg;
+pub mod cts;
 pub mod decoder;
 pub mod dequant;
 pub mod dwt;
@@ -56,8 +64,11 @@ pub mod probe;
 pub mod slice_header;
 pub mod slice_walker;
 
+pub use capabilities::{parse_capabilities, parse_capabilities_lossy, Capabilities};
 pub use codestream::{Codestream, Slice};
 pub use component_table::{Component, ComponentTable};
+pub use crg::{cfa_pattern_type, parse_crg, CrgEntry, CrgMarker};
+pub use cts::{parse_cts, CtsExtent, CtsMarker};
 pub use markers::Marker;
 pub use picture_header::PictureHeader;
 pub use probe::{probe, JpegXsFileInfo};
@@ -72,13 +83,14 @@ pub const CODEC_ID_STR: &str = "jpegxs";
 
 /// Register the JPEG XS decoder factory.
 ///
-/// Round 5 wires a working decoder for the multi-component
+/// Round 6 wires a working decoder for the multi-component
 /// (Nc ∈ {1, 2, 3, 4}), single-precinct-row subset of the standard
-/// with 4:4:4 / 4:2:2 / 4:2:0 sampling, Annex F.3 inverse RCT colour
-/// transform, and the full Annex G output path including the NLT
-/// marker. Multi-level wavelet decomposition (NL > 1), `Cw > 0`,
-/// `Cpih == 3` (Star-Tetrix), and CWD-driven `Sd > 0` arrive in
-/// round 6.
+/// with 4:4:4 / 4:2:2 / 4:2:0 sampling, multi-level inverse DWT
+/// cascade (Annex E.2 Table E.1), Annex F.3 inverse RCT and Annex F.5
+/// inverse Star-Tetrix colour transforms, and the full Annex G
+/// output path including the NLT marker. `Cw > 0` (custom precinct
+/// widths), CWD-driven `Sd > 0`, and output bit depths > 8 remain
+/// out of scope.
 pub fn register(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::video("jpegxs_sw")
         .with_lossy(true)
@@ -90,7 +102,8 @@ pub fn register(reg: &mut CodecRegistry) {
     );
 }
 
-/// Decoder factory — see [`decoder::make_decoder`].
+/// Decoder factory — see [`decoder::make_decoder`]. The `Decoder`
+/// trait alias is re-exported from `oxideav_core`.
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     decoder::make_decoder(params)
 }
