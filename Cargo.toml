@@ -1,0 +1,17 @@
+[package]
+name = "oxideav-jpegxs"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/OxideAV/oxideav-jpegxs"
+authors = ["Mark Karpeles"]
+description = "Pure-Rust JPEG XS (ISO/IEC 21122) low-latency image codec for production / IP video. Round-1 scaffold: codestream marker parsing only; pixel decode pending."
+
+readme = "README.md"
+homepage = "https://github.com/OxideAV/oxideav-jpegxs"
+keywords = ["multimedia", "image", "jpegxs", "codec"]
+categories = ["multimedia::encoding", "multimedia::images"]
+
+[dependencies]
+oxideav-core = "0.1"
