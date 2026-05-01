@@ -35,6 +35,7 @@
 
 pub mod codestream;
 pub mod component_table;
+pub mod dwt;
 pub mod markers;
 pub mod picture_header;
 pub mod probe;
