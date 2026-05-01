@@ -1,46 +1,51 @@
 //! JPEG XS — ISO/IEC 21122 low-latency image codec for production / IP
 //! video (SMPTE ST 2110-22).
 //!
-//! Round 1 ships:
+//! Round 4 ships a working end-to-end decoder for the single-component,
+//! single-precinct subset of the standard:
 //!
-//! * A pure-Rust parser for the Part-1 codestream marker chain
-//!   ([`codestream::parse`]) — SOC, CAP, PIH, CDT, WGT, plus optional
-//!   COM / NLT / CWD / CTS / CRG, followed by one or more
-//!   (SLH + entropy data) slices terminated by EOC. See
-//!   [`codestream::Codestream`] for the captured geometry.
-//! * A [`probe`] convenience that returns
-//!   [`probe::JpegXsFileInfo`] (width × height × component count ×
-//!   maximum bit depth × profile / level / colour transform id /
-//!   lossless flag) without instantiating a decoder.
-//! * Codec registration through
-//!   [`oxideav_core::CodecRegistry::register`] so the framework can
-//!   discover the codec under id `"jpegxs"`. The decoder factory
-//!   currently returns `Error::Unsupported` — pixel decode lands in
-//!   round 2 alongside the inverse DWT, the entropy coder, and the
-//!   precinct walker (Annexes B–G).
+//! * Round 1 — Part-1 codestream marker-chain parser
+//!   ([`codestream::parse`]); see [`codestream::Codestream`] for the
+//!   captured geometry. [`probe`] returns [`probe::JpegXsFileInfo`]
+//!   without instantiating a decoder.
+//! * Round 2 — reversible 5/3 inverse DWT (Annex E), in [`dwt`].
+//! * Round 3 — entropy decoder (Annex C) over hand-built precinct /
+//!   packet geometry, in [`entropy`].
+//! * Round 4 — slice / precinct / packet geometry walker (Annex
+//!   B.5–B.10) in [`slice_walker`], inverse quantization (Annex D) in
+//!   [`dequant`], and a wired-up [`Decoder`] in [`decoder`]. The
+//!   decoder factory ([`make_decoder`]) returns a real decoder; on
+//!   codestreams outside the round-4 subset it returns
+//!   `Error::Unsupported` from `send_packet`.
 //!
-//! Round 1 caveats:
+//! Round-4 supported subset (`make_decoder` accepts):
 //!
-//! * Slice boundaries are recovered by scanning forward for the next
-//!   `FF 20` (SLH) or `FF 11` (EOC) marker pair. JPEG XS does not byte-
-//!   stuff (Part-1 §A.3 NOTE 2), so the scan can over-shoot if the
-//!   entropy-coded body happens to contain those byte sequences.
-//!   Round-2 work replaces this with a length-driven walker once the
-//!   precinct + packet header parsers (Annex C.2) land. Hand-built
-//!   fixtures used by the test suite are crafted to avoid the
-//!   collision.
-//! * The CAP body is captured raw; the per-bit accessor that decodes
-//!   Star-Tetrix / quadratic NLT / extended NLT / CWD / lossless /
-//!   raw-mode-switch flags is deferred to round 2.
+//! * `Nc == 1` (single component), `sx == sy == 1`, `Cw == 0`.
+//! * `NL,x ∈ {0, 1}`, `NL,y ∈ {0, 1}` (single-level inverse 2-D DWT
+//!   only — multi-level cascade is round 5).
+//! * `Cpih == 0` (no inverse colour transform — Annex F is round 5).
+//! * `Qpih ∈ {0, 1}` (deadzone or uniform inverse quantizer).
+//! * 8-bit output samples; the round-4 output mapping is the obvious
+//!   linear path (`>> Fq` then add DC bias) — Annex G's full
+//!   non-linearity / clip pipeline is round 5.
+//!
+//! Out of round-4 scope (returns `Error::Unsupported`): multi-component
+//! configurations, 4:2:2 / 4:2:0 sampling, Annex F (RGB↔YCbCr,
+//! Star-Tetrix), Annex G (NLT, DC-shift, clip), CAP-bit-driven feature
+//! gating, multi-level wavelet decomposition (NL > 1), CWD-driven
+//! component-dependent decomposition.
 
 pub mod codestream;
 pub mod component_table;
+pub mod decoder;
+pub mod dequant;
 pub mod dwt;
 pub mod entropy;
 pub mod markers;
 pub mod picture_header;
 pub mod probe;
 pub mod slice_header;
+pub mod slice_walker;
 
 pub use codestream::{Codestream, Slice};
 pub use component_table::{Component, ComponentTable};
@@ -50,17 +55,21 @@ pub use probe::{probe, JpegXsFileInfo};
 pub use slice_header::SliceHeader;
 
 use oxideav_core::{
-    CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, Decoder, Error, Result,
+    CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, Decoder, Result,
 };
 
 /// Public codec id string. Matches the aggregator feature name `jpegxs`.
 pub const CODEC_ID_STR: &str = "jpegxs";
 
-/// Register the JPEG XS decoder factory. Pixel decode is unimplemented
-/// for round 1 — the factory returns `Error::Unsupported`. The encoder
-/// slot is intentionally left unregistered.
+/// Register the JPEG XS decoder factory.
+///
+/// Round 4 wires a working decoder for the single-component, single-
+/// precinct subset of the standard. Multi-component streams,
+/// 4:2:2/4:2:0 sampling, multi-level wavelet decomposition (NL > 1),
+/// inverse colour transforms (Annex F), and the full Annex G output
+/// path arrive in round 5.
 pub fn register(reg: &mut CodecRegistry) {
-    let caps = CodecCapabilities::video("jpegxs_headers_only")
+    let caps = CodecCapabilities::video("jpegxs_sw")
         .with_lossy(true)
         .with_intra_only(true);
     reg.register(
@@ -70,13 +79,9 @@ pub fn register(reg: &mut CodecRegistry) {
     );
 }
 
-/// Decoder factory. Round 1 returns `Error::Unsupported`; the codestream
-/// marker parser is exposed via [`codestream::parse`] / [`probe`] for
-/// callers who only need geometry.
-pub fn make_decoder(_params: &CodecParameters) -> Result<Box<dyn Decoder>> {
-    Err(Error::Unsupported(
-        "JPEG XS pixel decode not yet implemented".into(),
-    ))
+/// Decoder factory — see [`decoder::make_decoder`].
+pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
+    decoder::make_decoder(params)
 }
 
 #[cfg(test)]
@@ -148,19 +153,11 @@ mod tests {
     }
 
     #[test]
-    fn registration_yields_unsupported_decoder() {
+    fn registration_yields_decoder() {
         let mut reg = CodecRegistry::new();
         register(&mut reg);
         let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
-        let res = reg.make_decoder(&params);
-        let err = match res {
-            Ok(_) => panic!("expected Err from round-1 decoder factory"),
-            Err(e) => e,
-        };
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("not yet implemented"),
-            "expected unimplemented error, got {msg}"
-        );
+        let dec = reg.make_decoder(&params).expect("round-4 decoder factory");
+        assert_eq!(dec.codec_id().as_str(), CODEC_ID_STR);
     }
 }
