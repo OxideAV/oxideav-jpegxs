@@ -893,10 +893,10 @@ mod tests {
         // 2 packets, each 5-byte header + 1 byte body.
         let mut packet1_hdr = vec![0u8; 5];
         let mut bits: u64 = 0;
-        bits = (bits << 1) | 0;
-        bits = (bits << 15) | 0;
+        bits <<= 1;
+        bits <<= 15;
         bits = (bits << 13) | 1;
-        bits = (bits << 11) | 0;
+        bits <<= 11;
         for (i, b) in packet1_hdr.iter_mut().enumerate() {
             *b = ((bits >> (8 * (4 - i))) & 0xff) as u8;
         }
@@ -966,10 +966,10 @@ mod tests {
         v.extend_from_slice(&[0x00, 0x00, 24, 0, 0, 0x00]);
         let mut packet_hdr = vec![0u8; 5];
         let mut bits: u64 = 0;
-        bits = (bits << 1) | 0;
-        bits = (bits << 15) | 0;
+        bits <<= 1;
+        bits <<= 15;
         bits = (bits << 13) | 1;
-        bits = (bits << 11) | 0;
+        bits <<= 11;
         for (i, b) in packet_hdr.iter_mut().enumerate() {
             *b = ((bits >> (8 * (4 - i))) & 0xff) as u8;
         }
@@ -1035,10 +1035,10 @@ mod tests {
         v.extend_from_slice(&0u16.to_be_bytes());
         let mut payload = Vec::new();
         let mut bits1: u64 = 0;
-        bits1 = (bits1 << 1) | 0;
+        bits1 <<= 1;
         bits1 = (bits1 << 15) | 1;
         bits1 = (bits1 << 13) | 1;
-        bits1 = (bits1 << 11) | 0;
+        bits1 <<= 11;
         let mut hdr1 = vec![0u8; 5];
         for (i, b) in hdr1.iter_mut().enumerate() {
             *b = ((bits1 >> (8 * (4 - i))) & 0xff) as u8;
@@ -1047,10 +1047,10 @@ mod tests {
         payload.push(0b10000000);
         payload.push(0x0C);
         let mut bits2: u64 = 0;
-        bits2 = (bits2 << 1) | 0;
-        bits2 = (bits2 << 15) | 0;
+        bits2 <<= 1;
+        bits2 <<= 15;
         bits2 = (bits2 << 13) | 1;
-        bits2 = (bits2 << 11) | 0;
+        bits2 <<= 11;
         let mut hdr2 = vec![0u8; 5];
         for (i, b) in hdr2.iter_mut().enumerate() {
             *b = ((bits2 >> (8 * (4 - i))) & 0xff) as u8;
@@ -1134,10 +1134,10 @@ mod tests {
         let mut payload = Vec::new();
         let mut packet_hdr = vec![0u8; 5];
         let mut bits: u64 = 0;
-        bits = (bits << 1) | 0;
-        bits = (bits << 15) | 0;
+        bits <<= 1;
+        bits <<= 15;
         bits = (bits << 13) | 1;
-        bits = (bits << 11) | 0;
+        bits <<= 11;
         for (i, b) in packet_hdr.iter_mut().enumerate() {
             *b = ((bits >> (8 * (4 - i))) & 0xff) as u8;
         }
@@ -1263,10 +1263,10 @@ mod tests {
         let mut payload = Vec::new();
         let mut packet_hdr = vec![0u8; 5];
         let mut bits: u64 = 0;
-        bits = (bits << 1) | 0;
-        bits = (bits << 15) | 0;
+        bits <<= 1;
+        bits <<= 15;
         bits = (bits << 13) | 1;
-        bits = (bits << 11) | 0;
+        bits <<= 11;
         for (i, b) in packet_hdr.iter_mut().enumerate() {
             *b = ((bits >> (8 * (4 - i))) & 0xff) as u8;
         }
@@ -1363,10 +1363,10 @@ mod tests {
         v.extend_from_slice(&[0x00, 0x00, 12, 0, 0, 0x00]);
         let mut packet1_hdr = vec![0u8; 5];
         let mut bits: u64 = 0;
-        bits = (bits << 1) | 0;
-        bits = (bits << 15) | 0;
+        bits <<= 1;
+        bits <<= 15;
         bits = (bits << 13) | 1;
-        bits = (bits << 11) | 0;
+        bits <<= 11;
         for (i, b) in packet1_hdr.iter_mut().enumerate() {
             *b = ((bits >> (8 * (4 - i))) & 0xff) as u8;
         }
@@ -1425,10 +1425,10 @@ mod tests {
         let mut payload = Vec::new();
         let mut packet_hdr = vec![0u8; 5];
         let mut bits: u64 = 0;
-        bits = (bits << 1) | 0;
-        bits = (bits << 15) | 0;
+        bits <<= 1;
+        bits <<= 15;
         bits = (bits << 13) | 1;
-        bits = (bits << 11) | 0;
+        bits <<= 11;
         for (i, b) in packet_hdr.iter_mut().enumerate() {
             *b = ((bits >> (8 * (4 - i))) & 0xff) as u8;
         }
@@ -1512,10 +1512,10 @@ mod tests {
         let mut payload = Vec::new();
         let mut packet_hdr = vec![0u8; 5];
         let mut bits: u64 = 0;
-        bits = (bits << 1) | 0;
-        bits = (bits << 15) | 0;
+        bits <<= 1;
+        bits <<= 15;
         bits = (bits << 13) | 1;
-        bits = (bits << 11) | 0;
+        bits <<= 11;
         for (i, b) in packet_hdr.iter_mut().enumerate() {
             *b = ((bits >> (8 * (4 - i))) & 0xff) as u8;
         }
@@ -1600,10 +1600,10 @@ mod tests {
         let mut payload = Vec::new();
         let mut packet_hdr = vec![0u8; 5];
         let mut bits: u64 = 0;
-        bits = (bits << 1) | 0;
-        bits = (bits << 15) | 0;
+        bits <<= 1;
+        bits <<= 15;
         bits = (bits << 13) | 1;
-        bits = (bits << 11) | 0;
+        bits <<= 11;
         for (i, b) in packet_hdr.iter_mut().enumerate() {
             *b = ((bits >> (8 * (4 - i))) & 0xff) as u8;
         }
