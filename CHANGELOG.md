@@ -2,6 +2,16 @@
 
 ## Unreleased — standalone-friendly Cargo feature shape (#359)
 
+## [0.0.2](https://github.com/OxideAV/oxideav-jpegxs/compare/v0.0.1...v0.0.2) - 2026-05-03
+
+### Added
+
+- standalone-friendly Cargo feature shape ([#359](https://github.com/OxideAV/oxideav-jpegxs/pull/359))
+
+### Other
+
+- silence unused super::* import in gated tests mod
+
 Mirrors the vp8/webp standalone-friendly treatment so the crate can be
 built without `oxideav-core` in the dep tree. Default features stay on
 for existing consumers (`oxideav` umbrella, mp4 demuxer, mkv).
