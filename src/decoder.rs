@@ -724,6 +724,7 @@ fn inverse_synth_1d(
 // which are oxideav-core types.
 #[cfg(all(test, feature = "registry"))]
 mod tests {
+    #[allow(unused_imports)]
     use super::*;
     use crate::registry::make_decoder;
     use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, TimeBase};
