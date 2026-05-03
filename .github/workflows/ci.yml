@@ -1,8 +1,14 @@
 name: CI
 
-# Thin shim around the OxideAV org-level reusable workflow. See
-# https://github.com/OxideAV/.github for the actual job definitions and
-# the input surface. Miri runs by default per the org-wide policy.
+# Two CI paths:
+#
+# * `ci` (default-features) — uses the OxideAV org-level reusable workflow,
+#   which exercises the registry-integrated path (oxideav-core dep +
+#   Decoder trait impl).
+# * `ci-standalone` (no-default-features) — inline job that builds and
+#   tests the lib with `--no-default-features`, exercising the
+#   `oxideav-core`-free standalone path. Catches regressions where
+#   pipeline modules accidentally regrow an oxideav-core import.
 
 on:
   push:
@@ -10,7 +16,31 @@ on:
   pull_request:
     branches: [master]
 
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
 jobs:
   ci:
     uses: OxideAV/.github/.github/workflows/crate-ci.yml@master
     secrets: inherit
+
+  ci-standalone:
+    name: Build & test (no-default-features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: standalone
+
+      - name: Build (no-default-features)
+        run: cargo build --no-default-features --lib --verbose
+
+      - name: Test (no-default-features)
+        run: cargo test --no-default-features --lib --verbose

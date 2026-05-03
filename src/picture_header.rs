@@ -25,7 +25,7 @@
 //! form. The parser refuses obvious corruption (`Nc == 0` or `Nc > 8`,
 //! `Lpih != 26`).
 
-use oxideav_core::{Error, Result};
+use crate::error::{JpegXsError as Error, Result};
 
 /// Decoded picture header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

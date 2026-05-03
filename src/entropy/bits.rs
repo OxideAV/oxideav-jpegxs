@@ -11,7 +11,7 @@
 //! lengths against `Lprc[p] ≤ 2^20 - 1` per Table C.1, so no
 //! unbounded allocation is possible from this layer).
 
-use oxideav_core::{Error, Result};
+use crate::error::{JpegXsError as Error, Result};
 
 /// MSB-first bit reader over a byte slice.
 #[derive(Debug)]

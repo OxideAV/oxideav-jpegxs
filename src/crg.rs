@@ -14,7 +14,7 @@
 //! The `cfa_pattern_type` helper maps a parsed [`CrgMarker`] body back
 //! to the CFA pattern type `Ct ∈ {0, 1}` per Table F.9.
 
-use oxideav_core::{Error, Result};
+use crate::error::{JpegXsError as Error, Result};
 
 /// One component's registration entry (per Table A.21).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

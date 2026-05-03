@@ -40,7 +40,7 @@ pub use packet_body::{decode_packet_body, BandCoefficients, PacketDecode};
 pub use packet_header::{parse_packet_header, PacketHeader};
 pub use precinct_header::{parse_precinct_header, PrecinctHeader};
 
-use oxideav_core::{Error, Result};
+use crate::error::{JpegXsError as Error, Result};
 
 /// Geometry of a single band inside a precinct, in the form the
 /// entropy decoder needs. Mirrors the per-band quantities defined in

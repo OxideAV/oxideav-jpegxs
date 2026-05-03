@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased — standalone-friendly Cargo feature shape (#359)
+
+Mirrors the vp8/webp standalone-friendly treatment so the crate can be
+built without `oxideav-core` in the dep tree. Default features stay on
+for existing consumers (`oxideav` umbrella, mp4 demuxer, mkv).
+
+* `Cargo.toml` — `oxideav-core` is now an optional dep behind a
+  default-on `registry` feature.
+* `error.rs` — new crate-local `JpegXsError` enum + `Result` alias
+  (`std`-only, no `oxideav-core` dep).
+* `image.rs` — new crate-local `JpegXsImage` / `JpegXsPlane` types,
+  carrying the picture-header geometry (`width` / `height` /
+  `num_components` / `cpih` / `bit_depth`) inline since the
+  `oxideav_core::Frame` enum it used to be wrapped in carries that
+  out-of-band via `CodecParameters`.
+* `registry.rs` — gated `Decoder` trait impl, `JpegXsDecoder` struct,
+  `make_decoder` factory, `register()` entry point, and the
+  `From<JpegXsError>` / `From<JpegXsImage>` conversions back into
+  `oxideav_core::{Error, Frame}`. Re-exported from the crate root as
+  before when the default `registry` feature is on.
+* `decoder.rs` + every other internal module — switched from
+  `oxideav_core::{Error, Result}` to the crate-local `JpegXsError` /
+  `Result`. No behaviour change. `decode_codestream` now returns
+  `JpegXsImage` instead of `oxideav_core::VideoFrame`.
+* `lib.rs` — new `decode_jpeg_xs(buf) -> Result<JpegXsImage>`
+  standalone entry point.
+
+CI: adds an inline `ci-standalone` job running
+`cargo build/test --no-default-features --lib`.
+
 ## [0.0.1](https://github.com/OxideAV/oxideav-jpegxs/compare/v0.0.0...v0.0.1) - 2026-05-03
 
 ### Other

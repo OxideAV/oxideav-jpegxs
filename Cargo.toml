@@ -14,4 +14,12 @@ keywords = ["multimedia", "image", "jpegxs", "codec"]
 categories = ["multimedia::encoding", "multimedia::images"]
 
 [dependencies]
-oxideav-core = "0.1"
+oxideav-core = { version = "0.1", optional = true }
+
+[features]
+default = ["registry"]
+# Pulls in `oxideav-core` and exposes the `Decoder` trait surface plus
+# the `register()` entry point. Disable for an `oxideav-core`-free
+# build; the standalone `decode_jpeg_xs` API plus the underlying
+# `codestream` / `decoder` / `dwt` / etc. modules are still exposed.
+registry = ["dep:oxideav-core"]

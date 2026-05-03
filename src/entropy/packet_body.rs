@@ -46,7 +46,7 @@
 //!   round 3 (the single-component fixture has `sy = 1`). The walker
 //!   will pass real values through.
 
-use oxideav_core::{Error, Result};
+use crate::error::{JpegXsError as Error, Result};
 
 use std::collections::HashMap;
 

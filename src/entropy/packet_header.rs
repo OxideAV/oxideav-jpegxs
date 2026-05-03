@@ -19,7 +19,7 @@
 //! bits are inserted between header and body (the field widths are
 //! chosen so the header lands on a byte boundary).
 
-use oxideav_core::{Error, Result};
+use crate::error::{JpegXsError as Error, Result};
 
 use crate::entropy::bits::BitReader;
 use crate::entropy::PrecinctGeometry;

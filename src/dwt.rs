@@ -44,7 +44,7 @@
 //! parser already validated, never by an unbounded length on the
 //! wire.
 
-use oxideav_core::{Error, Result};
+use crate::error::{JpegXsError as Error, Result};
 
 /// Number of pad samples needed on each side of the working buffer
 /// for the 5/3 filter. Annex E.6 reflects two samples; the inverse

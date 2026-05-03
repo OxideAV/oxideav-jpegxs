@@ -24,7 +24,7 @@
 //! precision). Per Table A.8 this always holds — `Bw ∈ {8, 18, 20}`
 //! and `B[i] ∈ {8, ..., 16}`.
 
-use oxideav_core::{Error, Result};
+use crate::error::{JpegXsError as Error, Result};
 
 /// Decoded NLT marker segment body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

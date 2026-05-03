@@ -13,7 +13,7 @@
 //! must terminate the stream. CDT and WGT must appear before the
 //! first SLH.
 
-use oxideav_core::{Error, Result};
+use crate::error::{JpegXsError as Error, Result};
 
 use crate::capabilities::{parse_capabilities_lossy, Capabilities};
 use crate::component_table::{self, ComponentTable};

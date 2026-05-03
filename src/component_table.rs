@@ -11,7 +11,7 @@
 //! `Lcdt = 2 * Nc + 2`. `Nc` comes from the PIH (which must be parsed
 //! first).
 
-use oxideav_core::{Error, Result};
+use crate::error::{JpegXsError as Error, Result};
 
 /// Per-component description from the CDT segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -17,7 +17,7 @@
 //! (`Cf == 3`). Other `Cf` values are reserved for ISO/IEC and rejected
 //! by [`parse_cts`].
 
-use oxideav_core::{Error, Result};
+use crate::error::{JpegXsError as Error, Result};
 
 /// CTS marker `Cf` field values per Table A.20.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

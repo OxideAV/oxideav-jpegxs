@@ -33,7 +33,7 @@
 //! Allocation. RCT and Star-Tetrix both run in-place on the caller-
 //! owned per-component buffers — no heap traffic per transform call.
 
-use oxideav_core::{Error, Result};
+use crate::error::{JpegXsError as Error, Result};
 
 /// Apply the inverse reversible colour transform (Cpih == 1) to the
 /// first three component planes in place.

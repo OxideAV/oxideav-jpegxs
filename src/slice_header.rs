@@ -9,7 +9,7 @@
 //! `Lslh` is fixed at 4 (the two `Lslh` bytes plus the two `Yslh`
 //! bytes), so the body parser sees exactly 2 bytes.
 
-use oxideav_core::{Error, Result};
+use crate::error::{JpegXsError as Error, Result};
 
 /// Decoded slice header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

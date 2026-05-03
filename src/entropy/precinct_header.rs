@@ -25,7 +25,7 @@
 //! must still be present; whether the band physically participates is
 //! controlled by `b'x[b]`.)
 
-use oxideav_core::{Error, Result};
+use crate::error::{JpegXsError as Error, Result};
 
 use crate::entropy::bits::BitReader;
 use crate::entropy::{validate_packet_layout, PacketLayout, PrecinctGeometry};

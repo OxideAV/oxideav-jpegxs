@@ -57,6 +57,8 @@ pub mod decoder;
 pub mod dequant;
 pub mod dwt;
 pub mod entropy;
+pub mod error;
+pub mod image;
 pub mod markers;
 pub mod output;
 pub mod picture_header;
@@ -64,48 +66,38 @@ pub mod probe;
 pub mod slice_header;
 pub mod slice_walker;
 
+#[cfg(feature = "registry")]
+pub mod registry;
+
+#[cfg(feature = "registry")]
+pub use registry::{make_decoder, register};
+
 pub use capabilities::{parse_capabilities, parse_capabilities_lossy, Capabilities};
 pub use codestream::{Codestream, Slice};
 pub use component_table::{Component, ComponentTable};
 pub use crg::{cfa_pattern_type, parse_crg, CrgEntry, CrgMarker};
 pub use cts::{parse_cts, CtsExtent, CtsMarker};
+pub use error::{JpegXsError, Result};
+pub use image::{JpegXsImage, JpegXsPlane};
 pub use markers::Marker;
 pub use picture_header::PictureHeader;
 pub use probe::{probe, JpegXsFileInfo};
 pub use slice_header::SliceHeader;
 
-use oxideav_core::{
-    CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, Decoder, Result,
-};
-
 /// Public codec id string. Matches the aggregator feature name `jpegxs`.
 pub const CODEC_ID_STR: &str = "jpegxs";
 
-/// Register the JPEG XS decoder factory.
+/// Standalone decode entry point.
 ///
-/// Round 6 wires a working decoder for the multi-component
-/// (Nc ∈ {1, 2, 3, 4}), single-precinct-row subset of the standard
-/// with 4:4:4 / 4:2:2 / 4:2:0 sampling, multi-level inverse DWT
-/// cascade (Annex E.2 Table E.1), Annex F.3 inverse RCT and Annex F.5
-/// inverse Star-Tetrix colour transforms, and the full Annex G
-/// output path including the NLT marker. `Cw > 0` (custom precinct
-/// widths), CWD-driven `Sd > 0`, and output bit depths > 8 remain
-/// out of scope.
-pub fn register(reg: &mut CodecRegistry) {
-    let caps = CodecCapabilities::video("jpegxs_sw")
-        .with_lossy(true)
-        .with_intra_only(true);
-    reg.register(
-        CodecInfo::new(CodecId::new(CODEC_ID_STR))
-            .capabilities(caps)
-            .decoder(make_decoder),
-    );
-}
-
-/// Decoder factory — see [`decoder::make_decoder`]. The `Decoder`
-/// trait alias is re-exported from `oxideav_core`.
-pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
-    decoder::make_decoder(params)
+/// Decodes one JPEG XS codestream into a [`JpegXsImage`]. The crate's
+/// default `registry` Cargo feature additionally exposes
+/// [`registry::register`] / [`registry::make_decoder`] for the
+/// `oxideav-core` `Decoder` trait surface; with the feature off this
+/// function plus the underlying parser / decoder modules and the
+/// crate-local [`JpegXsImage`] / [`JpegXsError`] types are still
+/// available, with no `oxideav-core` dep in the dep tree.
+pub fn decode_jpeg_xs(buf: &[u8]) -> Result<JpegXsImage> {
+    decoder::decode_codestream(buf, None)
 }
 
 #[cfg(test)]
@@ -176,8 +168,10 @@ mod tests {
         assert!(probe(&buf).is_none());
     }
 
+    #[cfg(feature = "registry")]
     #[test]
     fn registration_yields_decoder() {
+        use oxideav_core::{CodecId, CodecParameters, CodecRegistry};
         let mut reg = CodecRegistry::new();
         register(&mut reg);
         let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));

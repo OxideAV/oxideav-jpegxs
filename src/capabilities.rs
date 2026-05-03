@@ -25,7 +25,7 @@
 //! must shrink `Lcap` so trailing zero bytes are not transmitted. We
 //! enforce that in [`parse_capabilities`].
 
-use oxideav_core::{Error, Result};
+use crate::error::{JpegXsError as Error, Result};
 
 /// Decoded CAP `cap[]` array.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

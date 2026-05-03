@@ -31,7 +31,7 @@
 //! the [`PrecinctGeometry`] (consumed by the entropy decoder) and the
 //! ordered list of [`PacketLayout`]s.
 
-use oxideav_core::{Error, Result};
+use crate::error::{JpegXsError as Error, Result};
 
 use crate::component_table::ComponentTable;
 use crate::entropy::{BandGeometry, PacketEntry, PacketLayout, PrecinctGeometry};

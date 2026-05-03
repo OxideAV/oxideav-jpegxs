@@ -22,12 +22,6 @@
 //!
 //! Anything outside this subset returns `Error::Unsupported`.
 
-use std::collections::VecDeque;
-
-use oxideav_core::{
-    frame::VideoPlane, CodecId, CodecParameters, Decoder, Error, Frame, Packet, Result, VideoFrame,
-};
-
 use crate::codestream;
 use crate::colour_transform::{inverse_rct, inverse_star_tetrix};
 use crate::crg::{cfa_pattern_type, parse_crg};
@@ -39,58 +33,13 @@ use crate::entropy::{
     decode_packet_body, parse_packet_header, parse_precinct_header, precinct_truncation,
     BandCoefficients, PrecinctHeader,
 };
+use crate::error::{JpegXsError as Error, Result};
+use crate::image::{JpegXsImage, JpegXsPlane as VideoPlane};
 use crate::output::{apply_output_scaling, parse_nlt};
 use crate::slice_walker::{build_plan, PicturePlan, PrecinctPlan};
 
-/// Build a JPEG XS decoder. Round 5 accepts the multi-component
-/// single-precinct-row subset.
-pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
-    let codec_id = params.codec_id.clone();
-    Ok(Box::new(JpegXsDecoder {
-        codec_id,
-        pending: VecDeque::new(),
-        eof: false,
-    }))
-}
-
-struct JpegXsDecoder {
-    codec_id: CodecId,
-    pending: VecDeque<Packet>,
-    eof: bool,
-}
-
-impl Decoder for JpegXsDecoder {
-    fn codec_id(&self) -> &CodecId {
-        &self.codec_id
-    }
-
-    fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        // JPEG XS is intra-only and one packet == one codestream. We
-        // simply queue it for `receive_frame` to pop.
-        self.pending.push_back(packet.clone());
-        Ok(())
-    }
-
-    fn receive_frame(&mut self) -> Result<Frame> {
-        let Some(pkt) = self.pending.pop_front() else {
-            return if self.eof {
-                Err(Error::Eof)
-            } else {
-                Err(Error::NeedMore)
-            };
-        };
-        let vf = decode_codestream(&pkt.data, pkt.pts)?;
-        Ok(Frame::Video(vf))
-    }
-
-    fn flush(&mut self) -> Result<()> {
-        self.eof = true;
-        Ok(())
-    }
-}
-
-/// Decode a single JPEG XS codestream into a [`VideoFrame`].
-fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
+/// Decode a single JPEG XS codestream into a [`JpegXsImage`].
+pub(crate) fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<JpegXsImage> {
     let cs = codestream::parse(buf)?;
 
     let pih = cs.pih;
@@ -270,7 +219,15 @@ fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
         });
     }
 
-    Ok(VideoFrame { pts, planes })
+    Ok(JpegXsImage {
+        width: pih.wf as u32,
+        height: pih.hf as u32,
+        num_components: pih.nc,
+        cpih: pih.cpih,
+        bit_depth: pih.bw,
+        planes,
+        pts,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -762,10 +719,14 @@ fn inverse_synth_1d(
     Ok(())
 }
 
-#[cfg(test)]
+// Integration tests live behind the `registry` feature because they
+// drive the decoder through `make_decoder` + `Packet`/`Frame`/`TimeBase`
+// which are oxideav-core types.
+#[cfg(all(test, feature = "registry"))]
 mod tests {
     use super::*;
-    use oxideav_core::{CodecId, CodecParameters, TimeBase};
+    use crate::registry::make_decoder;
+    use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, TimeBase};
 
     #[test]
     #[ignore]
