@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.0.1](https://github.com/OxideAV/oxideav-jpegxs/compare/v0.0.0...v0.0.1) - 2026-05-03
+
+### Other
+
+- Fix clippy identity_op warnings in decoder bitstream tests
+
 ## Round 6 — Star-Tetrix + multi-level DWT + CAP bits
 
 * `dwt.rs` — multi-level inverse cascade (`inverse_cascade_2d`) per
