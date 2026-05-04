@@ -95,6 +95,57 @@ pub fn inverse_rct(planes: &mut [&mut [i32]], wf: usize, hf: usize) -> Result<()
     Ok(())
 }
 
+/// Apply the **forward** reversible colour transform (Cpih == 1) — the
+/// inverse of [`inverse_rct`]. Maps three RGB component planes in place
+/// to (Y, Cb, Cr) per Annex F.4 Table F.3:
+///
+/// * `Y  = (R + 2G + B) >> 2`
+/// * `Cb = B - G`
+/// * `Cr = R - G`
+///
+/// Component layout on input (matching [`inverse_rct`]'s output): plane
+/// 0 = R, plane 1 = G, plane 2 = B. On exit: plane 0 = Y, plane 1 = Cb,
+/// plane 2 = Cr. Components ≥ 3 are untouched. The transform is exactly
+/// invertible for any signed 32-bit input and is the encoder pre-DWT
+/// step for `Cpih == 1`.
+pub fn forward_rct(planes: &mut [&mut [i32]], wf: usize, hf: usize) -> Result<()> {
+    if planes.len() < 3 {
+        return Err(Error::invalid(format!(
+            "jpegxs Cpih=1 (forward RCT) requires at least 3 component planes, got {}",
+            planes.len()
+        )));
+    }
+    let want = wf
+        .checked_mul(hf)
+        .ok_or_else(|| Error::invalid("jpegxs forward RCT: wf * hf overflow"))?;
+    for (i, p) in planes.iter().enumerate().take(3) {
+        if p.len() != want {
+            return Err(Error::invalid(format!(
+                "jpegxs forward RCT: component {i} has {} samples, expected {want}",
+                p.len()
+            )));
+        }
+    }
+    let (p0_p1, p2_rest) = planes.split_at_mut(2);
+    let (p0_slot, p1_slot) = p0_p1.split_at_mut(1);
+    let p0 = &mut **p0_slot.get_mut(0).expect("checked above");
+    let p1 = &mut **p1_slot.get_mut(0).expect("checked above");
+    let p2 = &mut **p2_rest.get_mut(0).expect("checked above");
+
+    for x in 0..want {
+        let r = p0[x];
+        let g = p1[x];
+        let b = p2[x];
+        let y = (r + 2 * g + b) >> 2;
+        let cb = b - g;
+        let cr = r - g;
+        p0[x] = y;
+        p1[x] = cb;
+        p2[x] = cr;
+    }
+    Ok(())
+}
+
 /// Inverse Star-Tetrix transform (Cpih == 3) — Annex F.5, Tables F.4 /
 /// F.5 / F.6 / F.7 / F.8 plus the [`access`] reflection from Table
 /// F.12 and the super-pixel look-up tables in Tables F.9 / F.10 /

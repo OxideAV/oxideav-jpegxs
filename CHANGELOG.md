@@ -1,6 +1,72 @@
 # Changelog
 
-## Unreleased — encoder round 1 (luma-only 32×32 self-roundtrip)
+## Unreleased — encoder round 2 (multi-component RCT + multi-decomp + odd dims)
+
+Three production-relevant axes added on top of the round-1 luma-only
+bootstrap, plus two latent decoder bugs uncovered by the new fixtures
+were fixed.
+
+* `encoder.rs` — **multi-component (`Nc ∈ {1, 3}`)**. New entry
+  points `encode_rgb_8bit(width, height, &[u8], cpih, nl)` and the
+  generalised `encode_planar(width, height, nc, cpih, nlx, nly, &[Vec<u8>])`.
+  3-component (4:4:4) inputs go through forward RCT (Annex F.4
+  Table F.3) when `cpih == 1`. 4:2:2 / 4:2:0 chroma sub-sampling is
+  still deferred to round 3.
+* `encoder.rs` — **multi-decomposition `NL,x = NL,y ∈ {1, 2}`**. NL
+  ≥ 2 routes through the new `dwt::forward_cascade_2d` cascade and
+  emits per-(β, i) picture-level band buffers; the encoder slices
+  each band into its per-precinct row range using the same
+  `pow_h = 2^(NL,y - dy)` formula the decoder uses to gather. The
+  NL=1/1 fast path keeps the round-1 per-precinct streaming forward
+  DWT.
+* `encoder.rs` — **odd dimensions**. Pictures with `Wf` or `Hf` not a
+  multiple of `2^NL,y` are accepted at any supported NL. Partial
+  bottom precincts (where `hp_real < 2^NL,y`) extend the input strip
+  via whole-sample symmetric reflection inside the encoder; the
+  decoder's per-precinct synthesis path was hardened to pad missing
+  band rows to the spec's `Hp` so `inverse_2d` always operates on a
+  consistent geometry.
+* `dwt.rs` — new `forward_cascade_2d(wc, hc, nlx, nly, &[i32])
+  -> Vec<Vec<i32>>` mirroring `inverse_cascade_2d`. Two-phase
+  decomposition (joint horizontal+vertical levels first, then pure
+  horizontal levels when `nlx > nly`); produces band buffers in the
+  same β order the inverse expects (`b = Nc * β + i` bands).
+* `colour_transform.rs` — `forward_rct` promoted from a private
+  test helper to public API. Companion of `inverse_rct` for the
+  encoder side; mirrors `Y = (R + 2G + B) >> 2`, `Cb = B - G`,
+  `Cr = R - G` per Annex F.4 Table F.3.
+* `codestream.rs` — **length-driven slice walker (BUG FIX).** The
+  legacy `FF 20`/`FF 11` byte-scan walker mis-fires on entropy bytes
+  that happen to look like a marker prefix; round-1 fixtures avoided
+  this by hand-crafting fixtures with empty entropy. Real codestreams
+  produced by the round-2 encoder hit it on every other test fixture,
+  so the slice walker now uses the picture plan's per-precinct
+  geometry to read each precinct's 24-bit `Lprc` and advance
+  `header_bytes + Lprc` per precinct. Empty-slice probe-only
+  fixtures still drop through to a fallback byte scan, which works
+  because their entropy region is empty.
+* `slice_walker.rs` — **`Wpb` formula made τx-aware (BUG FIX).** The
+  old `wp.div_ceil(sx * 2^dx)` formula matched `Wb[β,i]` from the
+  cascade only for power-of-2 widths; for odd widths it overstated
+  HL/HH band widths by one column. The corrected form mirrors the
+  cascade's `(Wc).div_ceil(2^(dx-1)) / 2` for τx = true bands. The
+  existing fixtures (all power-of-2) still pass; new odd-dim NL≥2
+  encoder fixtures now round-trip.
+* `decoder.rs` — `synthesise_precinct` pads short bands with zero
+  rows so `inverse_2d` runs at the spec's `hp_i` even when the
+  bottom precinct is partial; output rows past `Hf / sy_i` are
+  dropped (matches Annex B.6 — bands shrink, the synthesis grid
+  stays at `Hp`).
+* New encoder tests cover: RGB 32×32 with and without RCT, NL=2/2
+  for both luma and RGB+RCT, odd-dim 31×31 NL=1/1, odd-dim 33×17
+  NL=2/2, `encode_image` for 3-component inputs, rejection of
+  unsupported configs, and a generous size-bound sanity check on
+  the round-2 raw-mode encoder.
+
+Verification: 154 tests pass (was 146); standalone-feature build
+also passes 140 tests.
+
+## Round 1 — encoder bootstrap (luma-only 32×32 self-roundtrip)
 
 Bootstrap encoder mirroring the proven decoder-first pattern. Round 1
 encodes single-luma 8-bit images with `NL,x = NL,y = 1`, single

@@ -803,6 +803,222 @@ pub fn forward_2d(
     Ok(())
 }
 
+/// Multi-level 2-D forward 5/3 DWT cascade — encoder-side companion of
+/// [`inverse_cascade_2d`]. Produces a `Vec<Vec<i32>>` of band buffers
+/// indexed by the same per-component filter index `β` the inverse uses
+/// (`0 .. Nβ - 1`); each entry is sized to match the band geometry the
+/// inverse expects (`Wb[β] × Hb[β]`).
+///
+/// Pipeline mirrors the inverse two-phase decomposition in reverse:
+///
+/// 1. Joint horizontal+vertical levels `d = 1 .. min(nlx, nly)`:
+///    forward 2-D DWT splits the running LL band into
+///    `(LL_{d,d}, HL_{d,d}, LH_{d,d}, HH_{d,d})`. Output bands are
+///    written into the band buffers; LL becomes the input of the next
+///    level.
+/// 2. Pure horizontal levels `dx = min(nlx, nly) + 1 .. nlx` (only when
+///    `nlx > nly`): forward 1-D horizontal split per row turns
+///    `LL_{dx-1, nly}` into `(LL_{dx, nly}, HL_{dx, nly})`.
+///
+/// `nly > nlx` is rejected (mirrors the inverse). `nlx == 0 && nly == 0`
+/// returns one band == raw component samples.
+pub fn forward_cascade_2d(
+    wc: usize,
+    hc: usize,
+    nlx: u8,
+    nly: u8,
+    input: &[i32],
+) -> Result<Vec<Vec<i32>>> {
+    if nlx == 0 && nly == 0 {
+        if input.len() != wc * hc {
+            return Err(Error::invalid(format!(
+                "JPEG XS DWT forward cascade: input {} != wc*hc {}",
+                input.len(),
+                wc * hc
+            )));
+        }
+        return Ok(vec![input.to_vec()]);
+    }
+    if nly > nlx {
+        return Err(Error::Unsupported(format!(
+            "JPEG XS DWT forward cascade: NL,y={nly} > NL,x={nlx} not supported"
+        )));
+    }
+    if wc < 2 || hc < 2 {
+        return Err(Error::invalid(format!(
+            "JPEG XS DWT forward cascade: component dims ({wc}x{hc}) below the spec minimum of 2x2"
+        )));
+    }
+    if wc > MAX_DIM || hc > MAX_DIM {
+        return Err(Error::invalid(format!(
+            "JPEG XS DWT forward cascade: component dims ({wc}x{hc}) exceed cap {MAX_DIM}"
+        )));
+    }
+    if input.len() != wc * hc {
+        return Err(Error::invalid(format!(
+            "JPEG XS DWT forward cascade: input {} != wc*hc {}",
+            input.len(),
+            wc * hc
+        )));
+    }
+
+    let nbeta = beta_count(nlx, nly);
+    let layout: Vec<BandKey> = (0..nbeta as u32)
+        .map(|beta| beta_to_band_key(beta, nlx, nly))
+        .collect();
+    let find_band = |dx: u32, dy: u32, tx: bool, ty: bool| -> Option<usize> {
+        layout
+            .iter()
+            .position(|k| k.dx == dx && k.dy == dy && k.tau_x == tx && k.tau_y == ty)
+    };
+
+    // Same band-dim formula as the inverse cascade.
+    let band_dims = |dx: u32, dy: u32, tx: bool, ty: bool| -> (usize, usize) {
+        let w = if !tx {
+            if dx == 0 {
+                wc as u32
+            } else {
+                ((wc as u32) + (1u32 << dx) - 1) >> dx
+            }
+        } else {
+            let denom_minus1 = if dx == 0 { 1 } else { 1u32 << (dx - 1) };
+            (wc as u32).div_ceil(denom_minus1) / 2
+        };
+        let h = if !ty {
+            if dy == 0 {
+                hc as u32
+            } else {
+                ((hc as u32) + (1u32 << dy) - 1) >> dy
+            }
+        } else {
+            let denom_minus1 = if dy == 0 { 1 } else { 1u32 << (dy - 1) };
+            (hc as u32).div_ceil(denom_minus1) / 2
+        };
+        (w as usize, h as usize)
+    };
+
+    // Pre-allocate every output band buffer.
+    let mut bands_out: Vec<Vec<i32>> = (0..nbeta as u32)
+        .map(|beta| {
+            let k = layout[beta as usize];
+            let (bw, bh) = band_dims(k.dx, k.dy, k.tau_x, k.tau_y);
+            vec![0i32; bw * bh]
+        })
+        .collect();
+
+    let nlx_u = nlx as u32;
+    let nly_u = nly as u32;
+    let dxy_min = nlx_u.min(nly_u);
+
+    // The cascade band layout only carries the LL band for the deepest
+    // level (NL,x, NL,y). Intermediate LL_{d,d} values (for d < NL,x or
+    // dx < NL,x) are temporary and consumed by the next forward step.
+    //
+    // The inverse runs in reverse:
+    //   1. Pure horizontal levels (nlx > nly): synthesise LL_{nlx-1,nly}
+    //      from LL_{nlx,nly} + HL_{nlx,nly}, then LL_{nlx-2,nly} from
+    //      LL_{nlx-1,nly} + HL_{nlx-1,nly}, … down to LL_{nly,nly}.
+    //   2. Joint levels: synthesise LL_{d-1,d-1} from
+    //      (LL_{d,d}, HL_{d,d}, LH_{d,d}, HH_{d,d}), d going from
+    //      `dxy_min` down to 1.
+    //
+    // Forward direction inverts: phase 2 (joint) must split FIRST from
+    // the picture down to LL_{dxy_min, dxy_min} producing
+    // (HL/LH/HH)_{1..dxy_min}; then phase 1 (horizontal) splits LL_{dxy_min,nly}
+    // (which equals LL_{nly,nly} when dxy_min == nly) into the
+    // (LL, HL)_{nly+1..nlx} sequence.
+    //
+    // Strategy: we recursively split. Phase A walks d = 1 .. dxy_min,
+    // each step taking the *current LL* and producing 4 bands; we keep
+    // only HL/LH/HH (band slots) and feed LL forward as the next input.
+    // Phase B walks dx = dxy_min+1 .. nlx, splitting horizontally; HL
+    // gets a band slot, LL feeds forward. Final LL after both phases
+    // lands in the LL_{nlx, nly} band slot.
+    let mut current_ll = input.to_vec();
+    let mut cur_w = wc;
+    let mut cur_h = hc;
+
+    // Phase A — joint levels.
+    let mut d: u32 = 1;
+    while d <= dxy_min {
+        let hl_b = find_band(d, d, true, false).ok_or_else(|| {
+            Error::invalid(format!(
+                "JPEG XS DWT forward cascade: no HL_{{d,d}} band at d={d}"
+            ))
+        })?;
+        let lh_b = find_band(d, d, false, true).ok_or_else(|| {
+            Error::invalid(format!(
+                "JPEG XS DWT forward cascade: no LH_{{d,d}} band at d={d}"
+            ))
+        })?;
+        let hh_b = find_band(d, d, true, true).ok_or_else(|| {
+            Error::invalid(format!(
+                "JPEG XS DWT forward cascade: no HH_{{d,d}} band at d={d}"
+            ))
+        })?;
+        // The split halves cur_w/cur_h with the standard ceil/floor rule.
+        let ll_w = cur_w.div_ceil(2);
+        let hl_w_d = cur_w / 2;
+        let ll_h = cur_h.div_ceil(2);
+        let lh_h = cur_h / 2;
+
+        let mut ll_buf = vec![0i32; ll_w * ll_h];
+        let mut hl_buf = vec![0i32; hl_w_d * ll_h];
+        let mut lh_buf = vec![0i32; ll_w * lh_h];
+        let mut hh_buf = vec![0i32; hl_w_d * lh_h];
+        forward_2d(
+            cur_w,
+            cur_h,
+            &current_ll,
+            &mut ll_buf,
+            &mut hl_buf,
+            &mut lh_buf,
+            &mut hh_buf,
+        )?;
+        bands_out[hl_b] = hl_buf;
+        bands_out[lh_b] = lh_buf;
+        bands_out[hh_b] = hh_buf;
+        current_ll = ll_buf;
+        cur_w = ll_w;
+        cur_h = ll_h;
+        d += 1;
+    }
+
+    // Phase B — pure horizontal levels (only when nlx > nly).
+    let mut dx_cur = dxy_min + 1;
+    while dx_cur <= nlx_u {
+        let hl_b = find_band(dx_cur, nly_u, true, false).ok_or_else(|| {
+            Error::invalid(format!(
+                "JPEG XS DWT forward cascade: no HL_{{dx={dx_cur},dy={nly_u}}} band"
+            ))
+        })?;
+        let next_w = cur_w.div_ceil(2);
+        let hl_w_d = cur_w / 2;
+        let mut next_ll = vec![0i32; next_w * cur_h];
+        let mut hl_buf = vec![0i32; hl_w_d * cur_h];
+        for y in 0..cur_h {
+            forward_horizontal_1d(
+                &current_ll[y * cur_w..(y + 1) * cur_w],
+                &mut next_ll[y * next_w..(y + 1) * next_w],
+                &mut hl_buf[y * hl_w_d..(y + 1) * hl_w_d],
+            )?;
+        }
+        bands_out[hl_b] = hl_buf;
+        current_ll = next_ll;
+        cur_w = next_w;
+        dx_cur += 1;
+    }
+
+    // Final LL → LL_{nlx, nly} band slot.
+    let ll_b = find_band(nlx_u, nly_u, false, false).ok_or_else(|| {
+        Error::invalid(format!(
+            "JPEG XS DWT forward cascade: no LL_{{NL,x={nlx},NL,y={nly}}} band"
+        ))
+    })?;
+    bands_out[ll_b] = current_ll;
+    Ok(bands_out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

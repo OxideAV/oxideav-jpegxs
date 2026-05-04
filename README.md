@@ -12,7 +12,7 @@ framework but usable standalone.
 | Direction | Status |
 | --- | --- |
 | Decoder | working — multi-component, single-precinct-row subset (rounds 1–6) |
-| Encoder | 🚧 Round 1 — luma-only 32×32 self-roundtrip 40+ dB |
+| Encoder | Round 2 — luma + RGB (Cpih ∈ {0, 1}) 4:4:4, NL ∈ {1, 2}, odd dims, lossless 32×32 self-roundtrip ∞ dB |
 
 End-to-end decoder for the multi-component, single-precinct-row
 subset of ISO/IEC 21122-1:2022. Supports:
@@ -51,10 +51,16 @@ Public API:
   width / height / components / bit depth / profile / level / Cpih /
   lossless flag.
 * `oxideav_jpegxs::encode_luma_8bit(width, height, &[u8]) -> Result<Vec<u8>>`
-  — round-1 encoder: single-luma 8-bit, even dimensions, single
-  decomposition level. Self-roundtrips losslessly through the
-  decoder (Q = 0, deadzone, T = 0). 32×32 PSNR ≥ 40 dB (binding
-  guard); flat / synthetic inputs round-trip bit-exact.
+  — single-luma 8-bit, NL=1/1 path retained from round 1.
+* `oxideav_jpegxs::encode_rgb_8bit(width, height, &[u8], cpih, nl)
+  -> Result<Vec<u8>>` — round-2 multi-component path: 3-component
+  4:4:4, `cpih ∈ {0, 1}` (no transform / forward RCT), `nl ∈ {1, 2}`.
+  Self-roundtrips losslessly. Pixels are interleaved
+  `R, G, B, R, G, B, …`.
+* `oxideav_jpegxs::encode_planar(width, height, nc, cpih, nlx, nly,
+  &[Vec<u8>]) -> Result<Vec<u8>>` — round-2 generalised planar entry
+  point covering both Nc=1 and Nc=3, NL,x = NL,y ∈ {1, 2}, any
+  dimensions ≥ 2 (odd dims included).
 * `oxideav_jpegxs::parse_capabilities(&[u8]) -> Result<Capabilities>`
   — decode CAP body bits into individual feature flags.
 * `oxideav_jpegxs::parse_cts(&[u8]) -> Result<CtsMarker>`,
@@ -82,10 +88,13 @@ Modules:
   Star-Tetrix (Annex F.5, Tables F.4–F.8) with Table F.12 access
 * `output` — Annex G linear / quadratic / extended output scaling
   + DC level shift + clipping; NLT body parser
-* `encoder` — round-1 luma encoder: forward 5/3 DWT (Annex E.13)
-  per 2-row precinct, deadzone-quantize-equivalent identity at
-  `T = 0`, raw-mode bitplane counts (Annex C.6.4) + Fs = 0 data
-  sub-packet (Table C.8), short packet headers
+* `encoder` — rounds 1-2: forward 5/3 DWT (Annex E.13) per
+  precinct (NL=1/1) or via picture-level cascade
+  `dwt::forward_cascade_2d` (NL=2/2); forward RCT
+  (`colour_transform::forward_rct`, Annex F.4 Table F.3) when
+  `Cpih == 1`; raw-mode bitplane counts (Annex C.6.4, `Dr = 1`) +
+  Fs = 0 data sub-packet (Table C.8); short packet headers; symmetric
+  reflection for partial bottom precincts (odd heights)
 
 ## Out of scope (next round)
 
@@ -94,7 +103,9 @@ Modules:
 * `Sd > 0` (CWD-driven decomposition suppression for components 4..7).
 * Output bit depths > 8 — Annex G kernels are bit-depth agnostic but
   the pack-to-plane helper currently emits `Vec<u8>` only.
-* Encoder rounds 2+: multi-component, multi-decomp-level, odd
-  dimensions, regular (lossy) `Fq = 8` mode, NLT-aware encoder,
-  inverse colour transform on the encoder side, VLC bitplane-count
-  modes (no-prediction / vertical), significance coding.
+* Encoder rounds 3+: 4:2:2 / 4:2:0 chroma sub-sampling, NL,x ≠ NL,y
+  and NL > 2, regular (lossy) `Fq = 8` mode, NLT-aware encoder
+  (linear / quadratic / extended gamma), VLC bitplane-count modes
+  (no-prediction / vertical), significance coding, Star-Tetrix
+  (`Cpih = 3`) encoder, `Cw > 0` custom precinct widths on the
+  encoder side.

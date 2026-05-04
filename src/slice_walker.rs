@@ -525,9 +525,48 @@ fn build_precinct_plan(
             let tau_y_b = if tau_y[arr_idx] { 1u32 } else { 0u32 };
             let exists = exists_arr[arr_idx];
 
-            // Per-component precinct width: Wp / sx[i].
-            let denom = (sx[i] as u32) * (1u32 << dx_b);
-            let wpb = if denom == 0 { 0 } else { wp.div_ceil(denom) };
+            // Per-band Wpb: matches the picture-level band width Wb[β,i]
+            // when Cw == 0 (single precinct column). For τx = false
+            // (low-pass-horizontal bands LL/LH) the band has
+            // ⌈Wc / 2^dx⌉ coefficients per row; for τx = true (HL/HH)
+            // the band has ⌊LL_{dx-1}.w / 2⌋ = ⌈Wc/2^(dx-1)⌉ / 2
+            // coefficients per row. The legacy formula
+            // `Wp.div_ceil(sx * 2^dx)` matches Wb only when Wc is a
+            // power-of-2 multiple of 2^dx and breaks for odd
+            // dimensions in the τx = true bands; the corrected form
+            // mirrors the cascade band-dim formula in
+            // [`crate::dwt::inverse_cascade_2d`].
+            let wpb = {
+                let wc_p = (wp / sx[i] as u32).max(1);
+                let tx = beta != 0 && {
+                    // For β > 0 we infer τx from the position of β
+                    // among the proxy levels; this mirrors `beta_levels`.
+                    let nlx_u = nlx as u32;
+                    let nly_u = nly_per_component[i] as u32;
+                    if nly_u == 0 {
+                        true // β > 0 in NL,y == 0 path are all HL
+                    } else {
+                        let beta1 = nlx_u - nly_u + 1;
+                        if beta < beta1 {
+                            true // pure-horizontal HL series
+                        } else {
+                            let group_in = beta - beta1;
+                            let within = group_in % 3;
+                            within == 0 || within == 2 // HL or HH
+                        }
+                    }
+                };
+                if !tx {
+                    if dx_b == 0 {
+                        wc_p
+                    } else {
+                        (wc_p + (1u32 << dx_b) - 1) >> dx_b
+                    }
+                } else {
+                    let denom_minus1 = if dx_b == 0 { 1 } else { 1u32 << (dx_b - 1) };
+                    wc_p.div_ceil(denom_minus1) / 2
+                }
+            };
 
             // L0[p,b] = 2^max(NL,y - dy[i,β], 0) × τy[β]
             let nly_i = nly_per_component[i] as u32;

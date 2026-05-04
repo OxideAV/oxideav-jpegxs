@@ -198,63 +198,126 @@ pub fn parse(buf: &[u8]) -> Result<Codestream> {
     // We have just consumed the first SLH marker. Parse its body and
     // walk the rest of the codestream as alternating SLH segments and
     // entropy-coded blobs, terminated by EOC.
+    //
+    // JPEG XS does NOT byte-stuff (Part-1 §A.3 NOTE 2); a forward scan
+    // for `FF 20` / `FF 11` would mis-fire on any entropy-coded byte
+    // pair that happens to look like a marker. Instead we drive slice
+    // length from the precinct headers (Annex C.2): each precinct
+    // header carries a 24-bit `Lprc` field giving the entropy byte
+    // count after the header. Summed over the slice's `n_precincts[t]`
+    // precincts (computed by [`crate::slice_walker::build_plan`] from
+    // PIH / CDT / WGT), that yields the slice's exact entropy byte
+    // length.
+    use crate::slice_walker::build_plan;
     let mut slices: Vec<Slice> = Vec::new();
     let body = cur.read_len_segment()?;
-    let header = slice_header::parse(body)?;
-    let data_offset = cur.pos();
-    let mut current = (header, data_offset);
+    let mut current_header = slice_header::parse(body)?;
+    let mut current_data_offset = cur.pos();
+    // Try to build a picture plan from PIH/CDT/WGT. When WGT is empty
+    // (probe-only test fixtures with no entropy data) build_plan will
+    // fail; in that case fall back to the legacy `FF 20`/`FF 11` byte
+    // scan, which copes with the empty-entropy case (the very next
+    // bytes are the next marker).
+    let plan_opt = build_plan(&pih, &cdt, &wgt).ok().map(|(p, _)| p);
 
     let eoc_offset = loop {
-        // Scan forward looking for the next SLH or EOC marker. JPEG XS
-        // does NOT byte-stuff; the spec (NOTE 2 in §A.3) states that
-        // bit patterns inside the entropy-coded data can collide with
-        // marker bytes. So we cannot rely on a substring search. We
-        // instead drive entropy-data length from the codestream
-        // structure once a real bit-stream walker is available.
-        //
-        // For round 1 we use a forward scan that locates the next
-        // 0xFF byte followed by 0x10/0x11/0x20 (EOC, SOC, or SLH).
-        // This is fragile in the general case but works for hand-
-        // built fixtures whose entropy bodies are crafted to avoid
-        // those byte sequences. Round-2 work will replace this with a
-        // length-driven slice walker once the bit-stream side is
-        // implemented (the precinct/packet length fields described in
-        // Annex C.2 give the exact byte count of every slice).
-        let next = scan_next_slice_or_eoc(cur.buf, cur.pos());
-        match next {
-            Some((NextMarker::Slh, off)) => {
-                let data_len = off - current.1;
-                slices.push(Slice {
-                    header: current.0,
-                    data_offset: current.1,
-                    data_length: data_len,
-                });
-                cur.set_pos(off);
-                let m = cur.read_marker()?;
-                debug_assert_eq!(m, Marker::SLH);
+        // Determine entropy length for this slice.
+        let data_len = if let Some(plan) = plan_opt.as_ref() {
+            // Length-driven: walk precinct headers, summing
+            // `header_bytes + Lprc` per precinct. Empty-entropy slice
+            // (probe fixture) is detected by peeking at the first two
+            // bytes of the slice data area for a marker prefix.
+            let slice_idx = slices.len();
+            let slice_plan = plan.slices.get(slice_idx).ok_or_else(|| {
+                Error::invalid(format!(
+                    "jpegxs: codestream has more slices than the plan expects ({} planned)",
+                    plan.slices.len()
+                ))
+            })?;
+            let pstart_check = current_data_offset;
+            let empty_slice = pstart_check + 1 < cur.buf.len()
+                && cur.buf[pstart_check] == 0xff
+                && matches!(cur.buf[pstart_check + 1], 0x11 | 0x20);
+            let mut bytes_consumed = 0usize;
+            if !empty_slice {
+                for precinct_plan in &slice_plan.precincts {
+                    let n_existing = precinct_plan
+                        .geometry
+                        .bands
+                        .iter()
+                        .filter(|b| b.exists)
+                        .count();
+                    let header_bits = 24 + 8 + 8 + 2 * n_existing;
+                    let header_bytes = header_bits.div_ceil(8);
+                    let pstart = current_data_offset + bytes_consumed;
+                    if pstart + 3 > cur.buf.len() {
+                        return Err(Error::invalid(format!(
+                            "jpegxs: precinct header truncated at offset {pstart}"
+                        )));
+                    }
+                    let lprc = ((cur.buf[pstart] as u32) << 16)
+                        | ((cur.buf[pstart + 1] as u32) << 8)
+                        | (cur.buf[pstart + 2] as u32);
+                    bytes_consumed += header_bytes + (lprc as usize);
+                }
+            }
+            bytes_consumed
+        } else {
+            // Legacy scan path (test-only fallback): forward search for
+            // the next SLH (`FF 20`) or EOC (`FF 11`) marker. JPEG XS
+            // does not byte-stuff so this misfires on entropy bytes
+            // that happen to look like markers — only safe for hand-
+            // crafted test fixtures whose entropy region is empty.
+            let mut i = current_data_offset;
+            let mut found = None;
+            while i + 1 < cur.buf.len() {
+                if cur.buf[i] == 0xff && (cur.buf[i + 1] == 0x20 || cur.buf[i + 1] == 0x11) {
+                    found = Some(i);
+                    break;
+                }
+                i += 1;
+            }
+            match found {
+                Some(off) => off - current_data_offset,
+                None => cur.buf.len() - current_data_offset,
+            }
+        };
+        let after_slice = current_data_offset + data_len;
+        if after_slice > cur.buf.len() {
+            return Err(Error::invalid(format!(
+                "jpegxs: slice data ({data_len} bytes) exceeds codestream"
+            )));
+        }
+        slices.push(Slice {
+            header: current_header,
+            data_offset: current_data_offset,
+            data_length: data_len,
+        });
+        cur.set_pos(after_slice);
+
+        // After the slice's entropy data we expect either another SLH
+        // or the EOC marker. If the buffer is truncated mid-marker,
+        // treat it as a missing-EOC stream (matches the legacy
+        // behaviour expected by tolerant callers).
+        if cur.remaining() < 2 {
+            break None;
+        }
+        let m = cur.read_marker()?;
+        match m {
+            Marker::SLH => {
                 let body = cur.read_len_segment()?;
-                let header = slice_header::parse(body)?;
-                current = (header, cur.pos());
+                current_header = slice_header::parse(body)?;
+                current_data_offset = cur.pos();
             }
-            Some((NextMarker::Eoc, off)) => {
-                let data_len = off - current.1;
-                slices.push(Slice {
-                    header: current.0,
-                    data_offset: current.1,
-                    data_length: data_len,
-                });
-                break Some(off);
+            Marker::EOC => {
+                break Some(cur.pos() - 2);
             }
-            None => {
-                // Stream is truncated. Capture whatever entropy data
-                // remains and report `eoc_offset = None`.
-                let data_len = cur.buf.len() - current.1;
-                slices.push(Slice {
-                    header: current.0,
-                    data_offset: current.1,
-                    data_length: data_len,
-                });
-                break None;
+            other => {
+                return Err(Error::invalid(format!(
+                    "jpegxs: expected SLH or EOC after slice entropy data, got {:04X} ({})",
+                    other.0,
+                    other.name()
+                )));
             }
         }
     };
@@ -274,35 +337,11 @@ pub fn parse(buf: &[u8]) -> Result<Codestream> {
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NextMarker {
-    Slh,
-    Eoc,
-}
-
-/// Search forward from `start` for the next SLH (`FF 20`) or EOC
-/// (`FF 11`) marker pair in `buf`. Returns the marker variant and its
-/// byte offset (the offset of the leading `0xFF`) or `None` if the
-/// buffer ends first.
-///
-/// Round-1 caveat: hand-built fixtures must avoid `FF 20` / `FF 11`
-/// byte sequences inside entropy-coded slice data. Round-2 will replace
-/// this with the spec-accurate length-driven walker once the precinct
-/// header and packet header parsers (Annex C) land.
-fn scan_next_slice_or_eoc(buf: &[u8], start: usize) -> Option<(NextMarker, usize)> {
-    let mut i = start;
-    while i + 1 < buf.len() {
-        if buf[i] == 0xff {
-            match buf[i + 1] {
-                0x20 => return Some((NextMarker::Slh, i)),
-                0x11 => return Some((NextMarker::Eoc, i)),
-                _ => {}
-            }
-        }
-        i += 1;
-    }
-    None
-}
+// scan_next_slice_or_eoc removed in encoder round 2 — slice boundaries
+// are now derived from the precinct Lprc fields via the slice walker
+// plan. JPEG XS does NOT byte-stuff its entropy stream, so a
+// `FF 20`/`FF 11` byte search would mis-fire on entropy bytes that
+// happen to look like markers.
 
 struct Cursor<'a> {
     buf: &'a [u8],

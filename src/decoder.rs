@@ -642,11 +642,40 @@ fn synthesise_precinct(
                 let hl = &dequant[b_hl];
                 let lh = &dequant[b_lh];
                 let hh = &dequant[b_hh];
+                // For partial bottom precincts (e.g. odd-height
+                // pictures where the last precinct only covers 1 pixel
+                // row), some bands carry fewer rows than `hp_i`
+                // expects. Pad them with zero rows so the 2-D
+                // synthesis runs at the full precinct height; the
+                // post-DWT row-copy clips at `target_row >= Hf / sy_i`
+                // so synthesised samples beyond the picture boundary
+                // are dropped.
+                let ll_w_e = wp_i.div_ceil(2);
+                let hl_w_e = wp_i / 2;
+                let ll_h_e = hp_i.div_ceil(2);
+                let lh_h_e = hp_i / 2;
+                let pad_to = |buf: &[i32], want: usize| -> Vec<i32> {
+                    if buf.len() == want {
+                        buf.to_vec()
+                    } else {
+                        let mut v = buf.to_vec();
+                        v.resize(want, 0);
+                        v
+                    }
+                };
+                let ll_p = pad_to(ll, ll_w_e * ll_h_e);
+                let hl_p = pad_to(hl, hl_w_e * ll_h_e);
+                let lh_p = pad_to(lh, ll_w_e * lh_h_e);
+                let hh_p = pad_to(hh, hl_w_e * lh_h_e);
                 let mut out = vec![0i32; wp_i * hp_i];
-                inverse_2d(wp_i, hp_i, ll, hl, lh, hh, &mut out)?;
+                inverse_2d(wp_i, hp_i, &ll_p, &hl_p, &lh_p, &hh_p, &mut out)?;
                 let row_offset = py * hp_i;
+                let hf_rows = pih.hf as usize / sy_i;
                 for line in 0..hp_i {
                     let target_row = row_offset + line;
+                    if target_row >= hf_rows {
+                        break;
+                    }
                     if target_row >= samples_i.len() / wc_i {
                         break;
                     }
