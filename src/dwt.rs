@@ -80,24 +80,41 @@ pub fn extend_symmetric(buf: &mut [i32], z: usize) -> Result<()> {
             z + 2 * PAD
         )));
     }
-    // Left edge: X[-1] = X[1], X[-2] = X[2].
-    // PAD-relative indices: buf[PAD-1] = buf[PAD+1], buf[PAD-2] = buf[PAD+2].
-    buf[PAD - 1] = buf[PAD + 1];
-    buf[PAD - 2] = buf[PAD + 2];
-    // Right edge: X[Z] = X[Z-2], X[Z+1] = X[Z-3].
-    // PAD-relative: buf[PAD+Z] = buf[PAD+Z-2], buf[PAD+Z+1] = buf[PAD+Z-3].
+    // Right edge: X[Z+i-1] = X[Z-i-1] for i = 1, 2. PAD-relative:
+    //   buf[PAD+Z]   = buf[PAD+Z-2]    (i = 1)
+    //   buf[PAD+Z+1] = buf[PAD+Z-3]    (i = 2)
+    // For Z = 2, the i=2 step indexes buf[PAD-1] which is part of the
+    // *left* extension. The spec's reflection rules are well defined:
+    // we reflect through the left boundary using X[-1] = X[1] (already
+    // a real sample at PAD+1). The correct value at PAD-1 must
+    // therefore be known before we read it for the right pad.
+    //
+    // We compute right pad first so its source slots are still real
+    // data, then the left pad — this is safe because the left pad's
+    // sources (buf[PAD+1] and buf[PAD+2]) live inside the real-data
+    // region for Z >= 2 only when Z >= 3. For Z == 2, X[2] is out of
+    // range and reflects to X[0] = buf[PAD]: the spec's reflection
+    // chain X[-2] -> X[2] -> X[0] collapses to a single hop.
     buf[PAD + z] = buf[PAD + z - 2];
-    // For Z == 2 the second reflection step would read X[-1] which we
-    // just wrote above, and the spec's loop guard `i <= 2` covers that
-    // case identically; the `z >= 3` guard is therefore only on the
-    // index computation.
     if z >= 3 {
         buf[PAD + z + 1] = buf[PAD + z - 3];
     } else {
-        // Mirror the left-extension policy: reflect through the
-        // already-extended sample, equivalent to the spec loop running
-        // once more after the first reflection.
-        buf[PAD + z + 1] = buf[PAD - 1];
+        // Z == 2 case: PAD+Z+1 = PAD+3 which is the right pad slot
+        // beyond [PAD+Z]. The reflection chain X[Z+1] = X[Z-3] = X[-1]
+        // = X[1] gives buf[PAD+1] (a real sample).
+        buf[PAD + z + 1] = buf[PAD + 1];
+    }
+    // Left edge: X[-i] = X[i] for i = 1, 2. PAD-relative:
+    //   buf[PAD-1] = buf[PAD+1]   (real for Z >= 2)
+    //   buf[PAD-2] = buf[PAD+2]   (real for Z >= 3; reflects to PAD for Z == 2)
+    buf[PAD - 1] = buf[PAD + 1];
+    if z >= 3 {
+        buf[PAD - 2] = buf[PAD + 2];
+    } else {
+        // Z == 2 case: X[-2] = X[2] = X[0] (reflection through the
+        // right boundary collapses since X[2] = X[Z] which we just set
+        // to X[Z-2] = X[0]).
+        buf[PAD - 2] = buf[PAD];
     }
     Ok(())
 }

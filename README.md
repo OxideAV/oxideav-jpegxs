@@ -9,6 +9,11 @@ framework but usable standalone.
 
 ## Status
 
+| Direction | Status |
+| --- | --- |
+| Decoder | working — multi-component, single-precinct-row subset (rounds 1–6) |
+| Encoder | 🚧 Round 1 — luma-only 32×32 self-roundtrip 40+ dB |
+
 End-to-end decoder for the multi-component, single-precinct-row
 subset of ISO/IEC 21122-1:2022. Supports:
 
@@ -45,6 +50,11 @@ Public API:
 * `oxideav_jpegxs::probe(&[u8]) -> Option<JpegXsFileInfo>` —
   width / height / components / bit depth / profile / level / Cpih /
   lossless flag.
+* `oxideav_jpegxs::encode_luma_8bit(width, height, &[u8]) -> Result<Vec<u8>>`
+  — round-1 encoder: single-luma 8-bit, even dimensions, single
+  decomposition level. Self-roundtrips losslessly through the
+  decoder (Q = 0, deadzone, T = 0). 32×32 PSNR ≥ 40 dB (binding
+  guard); flat / synthetic inputs round-trip bit-exact.
 * `oxideav_jpegxs::parse_capabilities(&[u8]) -> Result<Capabilities>`
   — decode CAP body bits into individual feature flags.
 * `oxideav_jpegxs::parse_cts(&[u8]) -> Result<CtsMarker>`,
@@ -72,6 +82,10 @@ Modules:
   Star-Tetrix (Annex F.5, Tables F.4–F.8) with Table F.12 access
 * `output` — Annex G linear / quadratic / extended output scaling
   + DC level shift + clipping; NLT body parser
+* `encoder` — round-1 luma encoder: forward 5/3 DWT (Annex E.13)
+  per 2-row precinct, deadzone-quantize-equivalent identity at
+  `T = 0`, raw-mode bitplane counts (Annex C.6.4) + Fs = 0 data
+  sub-packet (Table C.8), short packet headers
 
 ## Out of scope (next round)
 
@@ -80,5 +94,7 @@ Modules:
 * `Sd > 0` (CWD-driven decomposition suppression for components 4..7).
 * Output bit depths > 8 — Annex G kernels are bit-depth agnostic but
   the pack-to-plane helper currently emits `Vec<u8>` only.
-* Encoder side (forward DWT, forward colour transform, entropy
-  encoder, quantization).
+* Encoder rounds 2+: multi-component, multi-decomp-level, odd
+  dimensions, regular (lossy) `Fq = 8` mode, NLT-aware encoder,
+  inverse colour transform on the encoder side, VLC bitplane-count
+  modes (no-prediction / vertical), significance coding.

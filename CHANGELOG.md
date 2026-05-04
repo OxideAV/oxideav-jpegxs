@@ -1,6 +1,42 @@
 # Changelog
 
-## Unreleased — standalone-friendly Cargo feature shape (#359)
+## Unreleased — encoder round 1 (luma-only 32×32 self-roundtrip)
+
+Bootstrap encoder mirroring the proven decoder-first pattern. Round 1
+encodes single-luma 8-bit images with `NL,x = NL,y = 1`, single
+precinct column (`Cw = 0`), single-slice (`Hsl = Np_y`), lossless
+mode (`Fq = 0`, `Bw = 8`), deadzone quantizer at `T = 0`, raw
+bitplane-count mode (`Dr = 1`), and short packet headers.
+
+* `encoder.rs` — new module exposing `encode_luma_8bit(width, height,
+  &[u8])`, `encode_image(&JpegXsImage)`, and `encode_raw_luma(width,
+  height, Vec<u8>)`. Pipeline: DC-bias subtraction → per-2-row-precinct
+  forward 2-D DWT (Annex E.13) → group-wise raw bitplane-count packing
+  (Annex C.6.4) → MSB-first sign-then-magnitude data sub-packet
+  (Annex C.4 Table C.8) → short packet header (Table C.3) + precinct
+  header (Table C.1). Codestream chain SOC | CAP | PIH | CDT | WGT |
+  SLH | <slice 0 entropy> | EOC.
+* `dwt.rs` — fix `extend_symmetric` for `z = 2`. The previous version
+  read the right-pad slot before initialising it (and used the
+  uninitialised value for the left-pad reflection). With `Hp = 2`
+  precincts the vertical 1-D pass exercises this path; the existing
+  decoder fixtures all use `h ≥ 4` or all-zero coefficients, so the
+  bug stayed hidden until the encoder fed real coefficients into a
+  2-row inverse DWT. New comment in the function explains the
+  collapsed `X[-2] = X[2] = X[0]` reflection chain.
+* `lib.rs` — `pub mod encoder;` and re-exports for `encode_image`,
+  `encode_luma_8bit`, `encode_raw_luma`.
+* New tests: `encoder::tests` covering bit-writer correctness, input
+  validation, flat-image bit-exact round-trip, 32×32 synthetic
+  lossless round-trip (PSNR = ∞ dB; the 40 dB workspace minimum is a
+  binding asserted lower bound), 2×2 minimum-size round-trip via the
+  `Wpb < Ng` short-tail-group path, and a round-trip via the
+  `JpegXsImage` convenience entry point.
+* `dwt.rs` regression: `per_precinct_dwt_round_trips_for_hp_2` pins
+  the `z = 2` symmetric-extension behaviour for the round-1 encoder
+  pipeline.
+
+Test count: 137 → 146 (+9).
 
 ## [0.0.2](https://github.com/OxideAV/oxideav-jpegxs/compare/v0.0.1...v0.0.2) - 2026-05-03
 
