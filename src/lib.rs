@@ -177,7 +177,7 @@ mod tests {
         let mut reg = CodecRegistry::new();
         register_codecs(&mut reg);
         let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
-        let dec = reg.make_decoder(&params).expect("round-4 decoder factory");
+        let dec = reg.first_decoder(&params).expect("round-4 decoder factory");
         assert_eq!(dec.codec_id().as_str(), CODEC_ID_STR);
     }
 
