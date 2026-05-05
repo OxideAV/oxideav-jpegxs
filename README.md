@@ -12,7 +12,7 @@ framework but usable standalone.
 | Direction | Status |
 | --- | --- |
 | Decoder | working — multi-component, single-precinct-row subset (rounds 1–6) |
-| Encoder | Round 4 — luma + RGB 4:4:4 / 4:2:2 / 4:2:0 + 4-component CFA Star-Tetrix, Cpih ∈ {0, 1, 3}, NL ∈ {1, 2}, odd dims, Dr ∈ {0, 1} VLC + raw picker with no-prediction (Table C.14) **and vertical-prediction (Table C.13)** sub-modes, Fq ∈ {0, 8} lossy with Q ∈ 0..=15. Self-roundtrip ∞ dB lossless; PSNR ≥ 40 dB at q=1, ≥ 25 dB at q=4 |
+| Encoder | Round 5 — luma + RGB 4:4:4 / 4:2:2 / 4:2:0 + 4-component CFA Star-Tetrix, Cpih ∈ {0, 1, 3}, **NL_x ∈ {1, 2} / NL_y ∈ {0..=NL_x}** (asymmetric decomposition), odd dims, Dr ∈ {0, 1} VLC + raw picker with no-prediction (Table C.14) **and vertical-prediction (Table C.13)** sub-modes, **significance coding (D[p,b] bit 1, Annex C.5)** gating zero significance groups, **per-band gain-weighted Q** (`T[p,b] = clamp(Q−G[b], 0, 15)`, G ∈ {0,1,2}), **NLT quadratic forward map** (Annex G.4, Tnlt=1, Bw=18) via `encode_planar_nlt_quadratic`, Fq ∈ {0, 8} lossy with Q ∈ 0..=15. Self-roundtrip ∞ dB lossless; PSNR ≥ 40 dB at q=1, ≥ 25 dB at q=4 |
 
 End-to-end decoder for the multi-component, single-precinct-row
 subset of ISO/IEC 21122-1:2022. Supports:
@@ -77,6 +77,12 @@ Public API:
   Annex F.5). Component plane order is `[R, G1, G2, B]`. Emits the
   CTS marker (`Cf`, `e1`, `e2`) and the CRG marker (Table F.9 RGGB
   layout for `Ct=0`, GRBG layout for `Ct=1`).
+* `oxideav_jpegxs::encoder::encode_planar_nlt_quadratic(width, height,
+  nc, cpih, nlx, nly, q, dco, &[Vec<u8>]) -> Result<Vec<u8>>` —
+  round-5 NLT quadratic entry point. Applies forward quadratic pre-
+  distortion (`y = sqrt(x/255) * 262143 + dco`, Annex G.4, Tnlt=1)
+  before the DWT, forces `Bw = 18`, and emits the NLT marker. `dco`
+  must fit in signed 16-bit. `q = 0` lossless; `q > 0` Fq=8 lossy.
 * `oxideav_jpegxs::parse_capabilities(&[u8]) -> Result<Capabilities>`
   — decode CAP body bits into individual feature flags.
 * `oxideav_jpegxs::parse_cts(&[u8]) -> Result<CtsMarker>`,
@@ -107,20 +113,25 @@ Modules:
   Star-Tetrix (Annex F.5, Tables F.4–F.8) with Table F.12 access
 * `output` — Annex G linear / quadratic / extended output scaling
   + DC level shift + clipping; NLT body parser
-* `encoder` — rounds 1-4: forward 5/3 DWT (Annex E.13) per
+* `encoder` — rounds 1-5: forward 5/3 DWT (Annex E.13) per
   precinct (NL=1/1) or via picture-level cascade
-  `dwt::forward_cascade_2d` (NL=2/2); forward RCT
-  (`colour_transform::forward_rct`, Annex F.4 Table F.3) when
+  `dwt::forward_cascade_2d` (NL=2/2 or asymmetric NL_x≠NL_y); forward
+  RCT (`colour_transform::forward_rct`, Annex F.4 Table F.3) when
   `Cpih == 1`; forward Star-Tetrix (`colour_transform::
   forward_star_tetrix`, Annex F.5) when `Cpih == 3`; per-packet
   picker between raw-mode bitplane counts (Annex C.6.4, `Dr = 1`),
-  Dr=0 no-prediction VLC (Annex C.6.6, Table C.14), and Dr=0
-  vertical-prediction VLC (Annex C.6.5, Table C.13) committed
-  per-band-per-precinct via `D[p,b] & 1`; Fq=8 lossy mode (Annex D.2
-  deadzone) with precinct-constant `Q[p]`; chroma sub-sampling
-  (`sx, sy ∈ {1, 2}`) via per-component effective `N'L,y[i] =
-  NL,y - log2(sy[i])` and 1-D horizontal DWT for nly_i=0 chroma;
-  Fs=0 data sub-packet (Table C.8); short packet headers; symmetric
+  Dr=0 no-prediction VLC (Annex C.6.6, Table C.14), Dr=0
+  vertical-prediction VLC (Annex C.6.5, Table C.13), and significance-
+  coded variants (`D[p,b] & 2`, Annex C.5) committed per-band-per-
+  precinct via 2-bit `D[p,b] ∈ {0,1,2,3}`; significance sub-packet
+  emitted before cnt per Annex C.4 order; Fq=8 lossy mode (Annex D.2
+  deadzone) with per-band gain-weighted truncation `T[p,b] =
+  clamp(Q−G[b], 0, 15)` (G=0 LL, G=1 HL/LH, G=2 HH); forward NLT
+  quadratic pre-distortion (Annex G.4, Tnlt=1, Bw=18) with NLT marker
+  emission; chroma sub-sampling (`sx, sy ∈ {1, 2}`) via per-component
+  effective `N'L,y[i] = NL,y - log2(sy[i])` and 1-D horizontal DWT
+  for nly_i=0 chroma; asymmetric decomposition `NL_y ≤ NL_x`; Fs=0
+  data sub-packet (Table C.8); short packet headers; symmetric
   reflection for partial bottom precincts (odd heights); CTS / CRG
   marker emission for `Cpih = 3`
 
@@ -131,9 +142,6 @@ Modules:
 * `Sd > 0` (CWD-driven decomposition suppression for components 4..7).
 * Output bit depths > 8 — Annex G kernels are bit-depth agnostic but
   the pack-to-plane helper currently emits `Vec<u8>` only.
-* Encoder rounds 5+: NL,x ≠ NL,y and NL > 2, significance coding
-  (Table C.5 / C.14 gating), NLT-aware encoder (linear / quadratic /
-  extended gamma per Annex G), `Cw > 0` custom precinct widths on the
-  encoder side, per-band per-precinct Q optimization. Round 4 already
-  covers Star-Tetrix (`Cpih = 3`) and vertical-prediction VLC
-  (Table C.13).
+* Encoder round 6+: `NL > 2`, NLT linear / extended gamma (Tnlt=2/3)
+  encoder paths, `Cw > 0` custom precinct widths, per-band per-precinct
+  Q rate-distortion optimization, `Sd > 0` decomposition suppression.

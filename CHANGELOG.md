@@ -1,5 +1,45 @@
 # Changelog
 
+## Unreleased — encoder round 5 (NL_x≠NL_y + significance coding + NLT quadratic + per-band Q)
+
+Four new encoder capabilities on top of round 4:
+
+* `encoder.rs` — **Asymmetric decomposition (`NL_x ≠ NL_y`, Annex B).**
+  Validation now accepts `NL_y ∈ {0..=NL_x}` instead of requiring
+  `NL_x == NL_y`. The cascade path routes each component through
+  `forward_cascade_2d(wc, hc, nlx, nly_i)` where `nly_i = NL_y -
+  log2(sy[i])` (chroma may reduce further). Decoder was already
+  asymmetry-capable; encoder now matches. `encode_planar(nlx=2, nly=1)`
+  self-roundtrips losslessly for both luma-only and 3-component RGB
+  (Cpih=0 and Cpih=1). `NL_y > NL_x` is still rejected.
+* `encoder.rs` — **Significance coding (`D[p,b] bit 1`, Annex C.5,
+  Table C.5).** The cascade encoder now evaluates four D combinations
+  per band per precinct: `D ∈ {0, 1, 2, 3}` (sig×pred bits). Forms
+  `no_pred_sig` and `vert_sig` are built alongside the existing
+  `no_pred` and `vert` forms. For significance-coded bands, one bit per
+  significance group (`Ns = ⌈W_pb / (Ng·Ss)⌉` groups) flags zero groups
+  which then skip bitplane-count VLC emission entirely. The significance
+  sub-packet is emitted before the cnt sub-packet per Annex C.4 order.
+  Phase 3 picks the smallest total size across all four D combinations;
+  phase 4 writes 2 D bits per band into the precinct header and selects
+  the matching packet form.
+* `encoder.rs` — **NLT quadratic forward map (Annex G.4, Tnlt=1).**
+  `encode_planar_nlt_quadratic(width, height, nc, cpih, nlx, nly, q,
+  dco, planes)` applies `y = round(sqrt(x / (2^B-1)) * (2^Bw-1)) +
+  dco` before the DWT, forcing `Bw = 18` and emitting the NLT marker
+  (`FF 16`, Tnlt=1, σ:α packed). `dco` must fit in signed 16-bit.
+  `q = 0` reduces to lossless in the 18-bit wavelet space; `q > 0`
+  sets `Fq = 8`. PSNR ≥ 40 dB (lossless path); ≥ 30 dB at q=2.
+* `encoder.rs` — **Per-band gain-weighted Q (Annex C.6.2).**
+  `build_band_gains(nc, nlx, nly, sx, sy)` computes `G[b] = tau_x +
+  tau_y` (0 for LL, 1 for HL/LH, 2 for HH) per band-in-picture-order.
+  Both the single-level and cascade encoder paths compute `T[p,b] =
+  clamp(Q - G[b], 0, 15)` so HH bands are truncated 2 steps less than
+  LL, preserving low-frequency energy at the same Q budget.
+
+Verification: 182 tests pass (was 175); `cargo fmt --check` and
+`cargo clippy -- -D warnings` clean.
+
 ## Unreleased — encoder round 4 (Star-Tetrix Cpih=3 + vertical-prediction VLC)
 
 Two production-relevant axes added on top of the round-3 lossless +
