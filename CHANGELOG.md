@@ -113,6 +113,19 @@ also passes 149 tests (was 140).
 
 ## Unreleased — encoder round 2 (multi-component RCT + multi-decomp + odd dims)
 
+## [0.0.3](https://github.com/OxideAV/oxideav-jpegxs/compare/v0.0.2...v0.0.3) - 2026-05-05
+
+### Added
+
+- *(encoder)* round 4 — Star-Tetrix Cpih=3 + vertical-prediction VLC
+- *(encoder)* round 3 — Dr=0 VLC + Fq=8 lossy + 4:2:2/4:2:0 chroma sub-sampling
+- *(encoder)* round 2 multi-component RCT, multi-decomp NL=2/2, odd dimensions
+- *(encoder)* round 1 luma-only 32x32 self-roundtrip bootstrap
+
+### Other
+
+- clippy 1.95: fix needless_range_loop + cloned_ref_to_slice_refs in round-3 tests
+
 Three production-relevant axes added on top of the round-1 luma-only
 bootstrap, plus two latent decoder bugs uncovered by the new fixtures
 were fixed.
