@@ -3046,8 +3046,9 @@ mod tests {
     #[test]
     fn round5_nlt_quadratic_high_psnr() {
         let pixels = make_synthetic_32x32();
-        let cs = encode_planar_nlt_quadratic(32, 32, 1, 0, 2, 2, 0, 0, &[pixels.clone()])
-            .expect("encode NLT quadratic lossless");
+        let cs =
+            encode_planar_nlt_quadratic(32, 32, 1, 0, 2, 2, 0, 0, std::slice::from_ref(&pixels))
+                .expect("encode NLT quadratic lossless");
         let img = decode_codestream(&cs, None).expect("decode NLT quadratic");
         let p = psnr(&pixels, &img.planes[0].data);
         assert!(
@@ -3061,11 +3062,13 @@ mod tests {
     #[test]
     fn round5_nlt_quadratic_lossy_q2_psnr() {
         let pixels = make_synthetic_32x32();
-        let lossless = encode_planar_nlt_quadratic(32, 32, 1, 0, 2, 2, 0, 0, &[pixels.clone()])
-            .expect("encode NLT lossless")
-            .len();
-        let lossy_cs = encode_planar_nlt_quadratic(32, 32, 1, 0, 2, 2, 2, 0, &[pixels.clone()])
-            .expect("encode NLT lossy q=2");
+        let lossless =
+            encode_planar_nlt_quadratic(32, 32, 1, 0, 2, 2, 0, 0, std::slice::from_ref(&pixels))
+                .expect("encode NLT lossless")
+                .len();
+        let lossy_cs =
+            encode_planar_nlt_quadratic(32, 32, 1, 0, 2, 2, 2, 0, std::slice::from_ref(&pixels))
+                .expect("encode NLT lossy q=2");
         let img = decode_codestream(&lossy_cs, None).expect("decode NLT lossy q=2");
         let p = psnr(&pixels, &img.planes[0].data);
         assert!(
