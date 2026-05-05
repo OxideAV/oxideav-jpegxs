@@ -12,7 +12,7 @@ framework but usable standalone.
 | Direction | Status |
 | --- | --- |
 | Decoder | working — multi-component, single-precinct-row subset (rounds 1–6) |
-| Encoder | Round 2 — luma + RGB (Cpih ∈ {0, 1}) 4:4:4, NL ∈ {1, 2}, odd dims, lossless 32×32 self-roundtrip ∞ dB |
+| Encoder | Round 3 — luma + RGB 4:4:4 / 4:2:2 / 4:2:0, Cpih ∈ {0, 1}, NL ∈ {1, 2}, odd dims, Dr ∈ {0, 1} VLC + raw picker, Fq ∈ {0, 8} lossy with Q ∈ 0..=15. Self-roundtrip ∞ dB lossless; PSNR ≥ 40 dB at q=1, ≥ 25 dB at q=4 |
 
 End-to-end decoder for the multi-component, single-precinct-row
 subset of ISO/IEC 21122-1:2022. Supports:
@@ -61,6 +61,16 @@ Public API:
   &[Vec<u8>]) -> Result<Vec<u8>>` — round-2 generalised planar entry
   point covering both Nc=1 and Nc=3, NL,x = NL,y ∈ {1, 2}, any
   dimensions ≥ 2 (odd dims included).
+* `oxideav_jpegxs::encoder::encode_planar_lossy(width, height, nc,
+  cpih, nlx, nly, q, &[Vec<u8>]) -> Result<Vec<u8>>` — round-3 lossy
+  4:4:4 entry point. `q ∈ 0..=15` is the precinct quantization step
+  (Annex C.2 `Q[p]`); `q = 0` reduces to lossless. Forces `Fq = 8`
+  per Table A.8 when `q > 0`.
+* `oxideav_jpegxs::encoder::encode_planar_subsampled(width, height,
+  nc, cpih, nlx, nly, q, sx, sy, &[Vec<u8>]) -> Result<Vec<u8>>` —
+  round-3 chroma-sub-sampled entry point. Each `planes[i]` has length
+  `(width / sx[i]) * (height / sy[i])`. Supports 4:4:4 / 4:2:2 / 4:2:0
+  with `(sx, sy) ∈ {1, 2}`. `q = 0` lossless / `q > 0` lossy.
 * `oxideav_jpegxs::parse_capabilities(&[u8]) -> Result<Capabilities>`
   — decode CAP body bits into individual feature flags.
 * `oxideav_jpegxs::parse_cts(&[u8]) -> Result<CtsMarker>`,
@@ -88,13 +98,18 @@ Modules:
   Star-Tetrix (Annex F.5, Tables F.4–F.8) with Table F.12 access
 * `output` — Annex G linear / quadratic / extended output scaling
   + DC level shift + clipping; NLT body parser
-* `encoder` — rounds 1-2: forward 5/3 DWT (Annex E.13) per
+* `encoder` — rounds 1-3: forward 5/3 DWT (Annex E.13) per
   precinct (NL=1/1) or via picture-level cascade
   `dwt::forward_cascade_2d` (NL=2/2); forward RCT
   (`colour_transform::forward_rct`, Annex F.4 Table F.3) when
-  `Cpih == 1`; raw-mode bitplane counts (Annex C.6.4, `Dr = 1`) +
-  Fs = 0 data sub-packet (Table C.8); short packet headers; symmetric
-  reflection for partial bottom precincts (odd heights)
+  `Cpih == 1`; per-packet picker between raw-mode bitplane counts
+  (Annex C.6.4, `Dr = 1`) and Dr=0 no-prediction VLC bitplane counts
+  (Annex C.6.6, Table C.14); Fq=8 lossy mode (Annex D.2 deadzone) with
+  precinct-constant `Q[p]`; chroma sub-sampling (`sx, sy ∈ {1, 2}`)
+  via per-component effective `N'L,y[i] = NL,y - log2(sy[i])` and 1-D
+  horizontal DWT for nly_i=0 chroma; Fs=0 data sub-packet (Table
+  C.8); short packet headers; symmetric reflection for partial bottom
+  precincts (odd heights)
 
 ## Out of scope (next round)
 
@@ -103,9 +118,9 @@ Modules:
 * `Sd > 0` (CWD-driven decomposition suppression for components 4..7).
 * Output bit depths > 8 — Annex G kernels are bit-depth agnostic but
   the pack-to-plane helper currently emits `Vec<u8>` only.
-* Encoder rounds 3+: 4:2:2 / 4:2:0 chroma sub-sampling, NL,x ≠ NL,y
-  and NL > 2, regular (lossy) `Fq = 8` mode, NLT-aware encoder
-  (linear / quadratic / extended gamma), VLC bitplane-count modes
-  (no-prediction / vertical), significance coding, Star-Tetrix
-  (`Cpih = 3`) encoder, `Cw > 0` custom precinct widths on the
-  encoder side.
+* Encoder rounds 4+: NL,x ≠ NL,y and NL > 2, vertical-prediction VLC
+  bitplane counts (Table C.13), significance coding (Table C.5 / C.14
+  gating), NLT-aware encoder (linear / quadratic / extended gamma),
+  Star-Tetrix (`Cpih = 3`) encoder, `Cw > 0` custom precinct widths
+  on the encoder side. Round 3 already covers chroma sub-sampling,
+  Fq=8 lossy, and Dr=0 VLC.

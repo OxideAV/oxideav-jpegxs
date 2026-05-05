@@ -1,5 +1,59 @@
 # Changelog
 
+## Unreleased — encoder round 3 (Dr=0 VLC + Fq=8 lossy + 4:2:2 / 4:2:0)
+
+Three production-relevant compression-feature axes added on top of the
+round-2 raw-mode-only / lossless / 4:4:4 encoder, plus a fix to the
+slice-walker's per-component band-existence path that surfaced under
+4:2:0 + NL=1/1.
+
+* `encoder.rs` — **Dr = 0 VLC bitplane-count mode (Annex C.6.6,
+  Table C.14, no prediction).** Per-precinct each packet is now built
+  in both Dr=1 raw form and Dr=0 VLC form, and the smaller (header +
+  body) is kept. New `emit_vlc_no_prediction(writer, Δm)` emits Δm
+  ones followed by a 0 comma — the inverse of the decoder's
+  `vlc(reader, mtop=T, t=T)` with θ=0. Saves ≈10–25% on the
+  bitplane-count sub-packet for sparse bands; the picker keeps Dr=1
+  for dense bands where 8 bits per group beats unary.
+* `encoder.rs` — **regular (`Fq = 8`) lossy mode with Annex D.2
+  deadzone quantizer.** New `encode_planar_lossy(width, height, nc,
+  cpih, nlx, nly, q, &[Vec<u8>]) -> Result<Vec<u8>>` entry point.
+  `q` is the precinct-level `Q[p]` (`0..=15`); `q = 0` reduces to
+  lossless. The encoder right-shifts coefficient magnitudes by
+  `T = clamp(Q - G - r, 0, 15) = q` and emits only `M - T`
+  bitplanes per code group; the decoder reconstructs with the
+  half-bucket offset `((1 << T) >> 1)`. Synthetic 32×32 RGB benchmark:
+  PSNR ≥ 40 dB at q=1, ≥ 28 dB at q=4, ≥ 25 dB at q=6, with codestream
+  shrinking from 3725 B (lossless) → 2241 B (q=4) → 1532 B (q=8) for
+  Cpih=1 NL=2/2.
+* `encoder.rs` — **4:2:2 / 4:2:0 chroma sub-sampling.** New
+  `encode_planar_subsampled(width, height, nc, cpih, nlx, nly, q,
+  sx, sy, &[Vec<u8>]) -> Result<Vec<u8>>` entry point. Each `planes[i]`
+  is `(width / sx[i]) * (height / sy[i])` bytes. Per-component
+  `N'L,y[i] = NL,y - log2(sy[i])` per Annex B.2 — sub-sampled chroma
+  at `sy = 2` & `NL,y = 1` runs only the 1-D horizontal DWT (LL/HL
+  bands), matching the decoder's `inverse_synth_1d` path. The
+  precinct-header `D[p,b]` field count and the WGT `(G[b], P[b])`
+  pair count are computed from the per-component existing-band mask.
+* `slice_walker.rs` — **per-component band-existence guard fixed.**
+  The `build_plan` per-(β, i) band geometry loop used to compute
+  `beta_levels(β, nlx, nly_i)` for every β in the picture-level
+  `Nβ`, including those exceeding the per-component `Nβ_i`. For
+  sub-sampled chroma at `sy = 2`, `nly_i = 0` and β > 1 triggered
+  `dx = nlx + 1 - β` underflow on `u32`. The fix skips the geometry
+  computation when `β >= Nβ_i` and marks the band non-existent —
+  same outcome the existing `band_exists` would have flagged later,
+  but without the underflow panic.
+* New encoder tests cover: Dr=0-vs-Dr=1 picker shrinks the codestream
+  on synthetic RGB, flat-luma compresses to ≪ raw via VLC unary
+  zeros, Fq=8 q=1 PSNR ≥ 40 dB + smaller than lossless, q=4 PSNR ≥
+  25 dB, q=0 path identical to the lossless `encode_planar`, 4:2:2
+  and 4:2:0 lossless self-roundtrip, 4:2:0 codestream smaller than
+  4:4:4 of the same picture, rejection of unsupported `(sx, sy)`.
+
+Verification: 162 tests pass (was 154); standalone-feature build
+also passes 149 tests (was 140).
+
 ## Unreleased — encoder round 2 (multi-component RCT + multi-decomp + odd dims)
 
 Three production-relevant axes added on top of the round-1 luma-only

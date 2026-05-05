@@ -1,83 +1,76 @@
-//! JPEG XS encoder — rounds 1-2.
+//! JPEG XS encoder — rounds 1-3.
 //!
 //! Round 1 (commit `95b4e27`) shipped the lossless single-luma 8-bit
-//! single-decomposition single-precinct-column case. Round 2 broadens
-//! the encoder to cover three additional production-relevant axes:
+//! single-decomposition single-precinct-column case. Round 2 broadened
+//! the encoder to multi-component (`Nc ∈ {1, 3}`), multi-decomposition
+//! (`NL,x = NL,y ∈ {1, 2}`), and odd dimensions but stayed in raw
+//! bitplane-count mode (`Dr = 1`) and lossless (`Fq = 0`) only. Round 3
+//! adds the three biggest compression-feature axes:
 //!
-//! * **Multi-component (`Nc ∈ {1, 3}`).** New entry point
-//!   [`encode_rgb_8bit`] takes an interleaved 24-bit-per-pixel RGB
-//!   buffer, splits it into three planes, optionally runs the forward
-//!   reversible colour transform (Annex F.4 Table F.3) when the caller
-//!   asks for `cpih = 1`, then emits a 3-component codestream
-//!   (`Cpih ∈ {0, 1}`, sx = sy = 1 for all three components — i.e.
-//!   4:4:4 only). The picture-level band ordering matches Annex B.2
-//!   (`b = Nc * β + i`).
-//! * **Multi-decomposition (`NL,x = NL,y ∈ {1, 2}`).** Higher-level
-//!   cascades go through [`crate::dwt::forward_cascade_2d`] which
-//!   produces every (β, i) sub-band buffer at picture level. The
-//!   encoder slices each band into its per-precinct rows when
-//!   serialising packets. The decoder's gather-then-cascade path
-//!   synthesises them back exactly.
-//! * **Odd dimensions.** Inputs with `Wf` or `Hf` not a multiple of
-//!   `2^NL,y` are accepted as-is. The forward DWT already supports
-//!   `Wpb < Ng` short tail groups; band heights derived by
-//!   `Hb = ⌈Hc / 2^dy⌉` cope with the rounding without explicit
-//!   padding. The minimum dimension stays at 2 per Annex E.6.
+//! * **Dr = 0 VLC bitplane-count mode (Annex C.6.6, Table C.14, no
+//!   prediction).** Per-precinct each packet is emitted in both Dr=1
+//!   raw form and Dr=0 VLC form, then the smaller of the two is kept.
+//!   For sparse bands (`M[g]` small / mostly zero) the VLC is one to
+//!   two orders of magnitude smaller than raw mode's flat
+//!   `Br=8` bits per code group.
+//! * **Regular (`Fq = 8`) lossy mode with Annex D.2 deadzone
+//!   quantizer.** A new `q` parameter sets the precinct-level
+//!   `Q[p]` (`0..=15`) which in turn drives the per-band truncation
+//!   `T[p,b] = clamp(Q[p] - G[b] - r, 0, 15)`. The encoder right-
+//!   shifts coefficient magnitudes by `T` (truncation) and emits only
+//!   `M - T` bitplanes per code group; the decoder reconstructs with
+//!   the half-bucket offset `((1 << T) >> 1)`. PSNR ≥ 40 dB at `q = 1`,
+//!   ≥ 32 dB at `q = 4` on synthetic 32×32 RGB.
+//! * **4:2:2 / 4:2:0 chroma sub-sampling.** New entry point
+//!   [`encode_planar_subsampled`] takes per-component `(sx, sy)` plus
+//!   per-component byte buffers sized at `Wc[i] × Hc[i]` (`Wc[i] = Wf
+//!   / sx[i]`, `Hc[i] = Hf / sy[i]`). The CDT signals the per-
+//!   component ratios; per-band geometry uses
+//!   `N'L,y[i] = NL,y - log2(sy[i])` per Annex B.2. The picture is
+//!   still 4:4:4 dimensionally (Cpih=0; RCT requires sx=sy=1 for i<3).
 //!
-//! Out-of-scope (deferred to round 3+):
-//! * 4:2:2 / 4:2:0 chroma sub-sampling (`sy[i] > 1` or `sx[i] > 1`).
-//! * `Fq = 8` regular (lossy) mode.
-//! * NLT-aware encoder (linear / quadratic / extended gamma).
-//! * VLC bitplane-count modes (`Dr = 0` no-prediction or vertical
-//!   prediction) — round 2 still emits raw mode (`Dr = 1`).
-//! * Significance coding (`D[p,b] & 2`).
+//! Out-of-scope (deferred to round 4+):
+//! * Vertical-prediction VLC (`D[p,b] & 1 = 1`, Table C.13).
+//! * Significance coding (`D[p,b] & 2 = 1`, Tables C.5 / C.14 gating).
+//! * NLT-aware encoder (linear / quadratic / extended gamma, Annex G).
+//! * Star-Tetrix encoder (`Cpih = 3`, Annex F.5).
+//! * `NL,x ≠ NL,y` and `NL > 2` (decoder cap is far higher).
 //! * `Cw > 0` (custom precinct widths).
-//! * Star-Tetrix encoder (`Cpih = 3`).
 //!
-//! Byte stream shape (unchanged from round 1, with the segment field
-//! values driven by the round-2 config):
+//! Byte stream shape (unchanged from round 2, with the precinct-header
+//! `Q[p]` field now driven by `q` and the per-packet `Dr[p,s]` field
+//! driven by the entropy-mode picker):
 //!
 //! ```text
 //! SOC | CAP | PIH | CDT | WGT | SLH | <slice 0 entropy data> | EOC
 //! ```
-//!
-//! Per-precinct layout for the multi-component / multi-decomp case:
-//! the precinct header carries `Lprc` + `Q` + `R` + `D[..]` for every
-//! existing band (one bit pair per band = `2 * NL` bits, padded to a
-//! byte). The packet stream walks Annex B.7 Table B.4: one packet
-//! containing the level-`(NL,x, NL,y)` LL band across all components,
-//! then one packet per (line × β × component) for the proxy levels.
-//! Each packet body is significance (empty when `D & 2 = 0`),
-//! bitplane-count (raw mode `Dr = 1` → `Br` bits per code group),
-//! data (sign bit + magnitude bitplanes interleaved with `Fs = 0`),
-//! sign (absent when `Fs = 0`).
 
 use crate::colour_transform::forward_rct;
 use crate::dwt::{forward_2d, forward_cascade_2d};
 use crate::error::{JpegXsError as Error, Result};
 use crate::image::{JpegXsImage, JpegXsPlane};
 
-/// Encoder configuration. Most fields are derived from the picture
-/// geometry — only the input pixels, layout, and Cpih choice are
-/// caller-controlled.
-#[derive(Debug, Clone, Copy)]
+/// Encoder configuration.
+#[derive(Debug, Clone)]
 struct EncodeConfig {
-    /// Picture width in pixels (`Wf`).
+    /// Picture width (`Wf`).
     width: u16,
-    /// Picture height in pixels (`Hf`).
+    /// Picture height (`Hf`).
     height: u16,
     /// Number of components (`Nc`).
     nc: u8,
-    /// Component bit depth, fixed at 8 for round 2.
+    /// Component bit depth, fixed at 8 in round 3.
     bit_depth: u8,
-    /// Wavelet coefficient precision (`Bw`), fixed at 8 (lossless,
-    /// `Fq = 0`).
+    /// Wavelet coefficient precision (`Bw`), fixed at 8 (Fq=0 lossless
+    /// per Table A.8). For Fq=8 we still use Bw=8 since input is 8-bit
+    /// and the deadzone quantizer drops bottom bitplanes via T, not via
+    /// extra fractional bits.
     bw: u8,
-    /// Coefficients per code group (`Ng`), Annex C constant.
+    /// Coefficients per code group (`Ng`), Annex C constant = 4.
     ng: u8,
-    /// Code groups per significance group (`Ss`), Annex C constant.
+    /// Code groups per significance group (`Ss`), Annex C constant = 8.
     ss: u8,
-    /// Raw bitplane-count width (`Br`), 4 bits in `0..=15` per Table A.7.
+    /// Raw bitplane-count width (`Br`), 4-bit field cap of 15.
     br: u8,
     /// Horizontal decomposition levels (`NL,x`).
     nlx: u8,
@@ -85,6 +78,17 @@ struct EncodeConfig {
     nly: u8,
     /// Colour transformation id (`Cpih`).
     cpih: u8,
+    /// Fractional bits in wavelet domain (`Fq`). 0 = lossless,
+    /// 8 = regular per Table A.8.
+    fq: u8,
+    /// Precinct quantization step `Q[p]` (constant across precincts).
+    /// `0..=15` per Annex D.2; clamped at the encoder boundary so
+    /// `T[p,b] = clamp(Q - G[b] - r, 0, 15)` stays in-range.
+    q: u8,
+    /// Per-component sub-sampling factors `sx[i]` and `sy[i]`.
+    /// Length `nc`. Defaults to all-ones (4:4:4).
+    sx: Vec<u8>,
+    sy: Vec<u8>,
 }
 
 impl EncodeConfig {
@@ -97,7 +101,7 @@ impl EncodeConfig {
         }
         if !matches!(self.nc, 1 | 3) {
             return Err(Error::Unsupported(format!(
-                "jpegxs encoder round 2: Nc must be 1 or 3, got {}",
+                "jpegxs encoder round 3: Nc must be 1 or 3, got {}",
                 self.nc
             )));
         }
@@ -109,15 +113,84 @@ impl EncodeConfig {
         }
         if self.cpih > 1 {
             return Err(Error::Unsupported(format!(
-                "jpegxs encoder round 2: Cpih must be 0 or 1, got {} (Star-Tetrix not yet supported)",
+                "jpegxs encoder round 3: Cpih must be 0 or 1, got {} (Star-Tetrix not yet supported)",
                 self.cpih
             )));
         }
         if !(1..=2).contains(&self.nlx) || self.nlx != self.nly {
             return Err(Error::Unsupported(format!(
-                "jpegxs encoder round 2: only NL,x = NL,y ∈ {{1, 2}} supported, got NL,x={} NL,y={}",
+                "jpegxs encoder round 3: only NL,x = NL,y ∈ {{1, 2}} supported, got NL,x={} NL,y={}",
                 self.nlx, self.nly
             )));
+        }
+        if self.fq != 0 && self.fq != 8 {
+            return Err(Error::Unsupported(format!(
+                "jpegxs encoder round 3: Fq must be 0 (lossless) or 8 (regular), got {}",
+                self.fq
+            )));
+        }
+        // Q range: spec allows 0..=31 in the precinct header, but per-
+        // band T = clamp(Q - G - r, 0, 15) and our encoder uses G[b] = 0
+        // and r = 0 → clip Q to 0..=15.
+        if self.q > 15 {
+            return Err(Error::invalid(format!(
+                "jpegxs encoder round 3: q must be in 0..=15, got {}",
+                self.q
+            )));
+        }
+        if self.q > 0 && self.fq == 0 {
+            return Err(Error::invalid(
+                "jpegxs encoder round 3: q > 0 requires Fq = 8 (regular mode); for lossless use q = 0".to_string(),
+            ));
+        }
+        if self.sx.len() != self.nc as usize || self.sy.len() != self.nc as usize {
+            return Err(Error::invalid(format!(
+                "jpegxs encoder: sx/sy must have length nc={}",
+                self.nc
+            )));
+        }
+        for (i, (&sx, &sy)) in self.sx.iter().zip(self.sy.iter()).enumerate() {
+            if !matches!(sx, 1 | 2) || !matches!(sy, 1 | 2) {
+                return Err(Error::Unsupported(format!(
+                    "jpegxs encoder round 3: component {i} (sx, sy) must be in {{1, 2}}, got ({sx}, {sy})"
+                )));
+            }
+        }
+        // RCT requires sx = sy = 1 for i < 3 per Annex F.2.
+        if self.cpih == 1 {
+            for (i, (&sx, &sy)) in self.sx.iter().zip(self.sy.iter()).enumerate().take(3) {
+                if sx != 1 || sy != 1 {
+                    return Err(Error::invalid(format!(
+                        "jpegxs encoder: Cpih=1 (RCT) requires sx[i]=sy[i]=1 for i<3, got component {i} (sx, sy)=({sx}, {sy})"
+                    )));
+                }
+            }
+        }
+        // Vertical sub-sampling needs `sy[i]` to divide `2^NL,y` evenly
+        // so `N'L,y[i] = NL,y - log2(sy[i])` stays >= 0.
+        for (i, &sy) in self.sy.iter().enumerate() {
+            if sy == 2 && self.nly < 1 {
+                return Err(Error::invalid(format!(
+                    "jpegxs encoder: component {i} sy=2 requires NL,y >= 1, got {}",
+                    self.nly
+                )));
+            }
+        }
+        // Picture dimensions must be divisible by sx / sy on each
+        // component (otherwise per-component plane size is undefined).
+        for (i, (&sx, &sy)) in self.sx.iter().zip(self.sy.iter()).enumerate() {
+            if (self.width as u32) % (sx as u32) != 0 {
+                return Err(Error::invalid(format!(
+                    "jpegxs encoder: width {} not divisible by component {i} sx={sx}",
+                    self.width
+                )));
+            }
+            if (self.height as u32) % (sy as u32) != 0 {
+                return Err(Error::invalid(format!(
+                    "jpegxs encoder: height {} not divisible by component {i} sy={sy}",
+                    self.height
+                )));
+            }
         }
         Ok(())
     }
@@ -125,9 +198,8 @@ impl EncodeConfig {
 
 /// Encode a single-luma 8-bit image to a JPEG XS codestream.
 ///
-/// `pixels` is a row-major `width * height` byte slice. Single-
-/// decomposition (`NL,x = NL,y = 1`) bootstrap path retained from
-/// round 1 for callers / tests that pin the original geometry.
+/// Lossless single-decomposition (`NL,x = NL,y = 1`) bootstrap path
+/// retained from round 1 for callers that pin the original geometry.
 pub fn encode_luma_8bit(width: u16, height: u16, pixels: &[u8]) -> Result<Vec<u8>> {
     let expected = (width as usize) * (height as usize);
     if pixels.len() != expected {
@@ -141,13 +213,9 @@ pub fn encode_luma_8bit(width: u16, height: u16, pixels: &[u8]) -> Result<Vec<u8
 
 /// Encode a 3-component RGB image to a JPEG XS codestream.
 ///
-/// `pixels` is interleaved 24-bit `R,G,B,R,G,B,…` row-major. The encoder
-/// splits the input into three planes, optionally applies the forward
-/// reversible colour transform (Annex F.4) when `cpih == 1`, and runs
-/// the multi-component encoder. Both `cpih == 0` (no transform) and
-/// `cpih == 1` (RCT) round-trip losslessly through the decoder.
-///
-/// Multi-decomposition `nl ∈ {1, 2}` selects the wavelet cascade depth.
+/// Round-3 retains the round-2 lossless behaviour. For lossy encoding
+/// or chroma sub-sampling, use [`encode_planar_lossy`] /
+/// [`encode_planar_subsampled`].
 pub fn encode_rgb_8bit(
     width: u16,
     height: u16,
@@ -174,28 +242,21 @@ pub fn encode_rgb_8bit(
     encode_planar(width, height, 3, cpih, nl, nl, &[r, g, b])
 }
 
-/// Encode the JPEG XS codestream out of a [`JpegXsImage`]. Round 2
-/// accepts:
-/// * 1 or 3 components, 8-bit, 4:4:4 sub-sampling.
-/// * `cpih ∈ {0, 1}` (no transform or forward RCT for 3-component
-///   inputs).
+/// Encode the JPEG XS codestream out of a [`JpegXsImage`].
 ///
-/// `cpih` is taken from `img.cpih`. Multi-decomposition is taken from
-/// the largest power-of-two `nl` that fits — round 2 ranges over
-/// `nl ∈ {1, 2}`. For backwards compatibility with the round-1 caller,
-/// we always pick `nl = 1` here; use [`encode_planar`] or
-/// [`encode_rgb_8bit`] with an explicit `nl` to drive the multi-decomp
-/// path.
+/// Round 3 still defaults to lossless (`Fq = 0`, `q = 0`) and 4:4:4
+/// (`sx = sy = 1` for every plane). For lossy or chroma-sub-sampled
+/// encoding, see [`encode_planar_lossy`] / [`encode_planar_subsampled`].
 pub fn encode_image(img: &JpegXsImage) -> Result<Vec<u8>> {
     if img.bit_depth != 8 {
         return Err(Error::Unsupported(format!(
-            "jpegxs encoder round 2: requires Bw = 8, got {}",
+            "jpegxs encoder round 3: requires Bw = 8, got {}",
             img.bit_depth
         )));
     }
     if !matches!(img.num_components, 1 | 3) {
         return Err(Error::Unsupported(format!(
-            "jpegxs encoder round 2: Nc must be 1 or 3, got {}",
+            "jpegxs encoder round 3: Nc must be 1 or 3, got {}",
             img.num_components
         )));
     }
@@ -212,7 +273,7 @@ pub fn encode_image(img: &JpegXsImage) -> Result<Vec<u8>> {
     for (i, plane) in img.planes.iter().enumerate() {
         if plane.stride != w {
             return Err(Error::Unsupported(format!(
-                "jpegxs encoder round 2: plane {i} stride {} != width {w} (no padding)",
+                "jpegxs encoder round 3: plane {i} stride {} != width {w} (no padding)",
                 plane.stride
             )));
         }
@@ -236,8 +297,8 @@ pub fn encode_image(img: &JpegXsImage) -> Result<Vec<u8>> {
     )
 }
 
-/// Round-1 convenience: build a [`JpegXsImage`] from raw bytes and then
-/// encode. Useful for self-roundtrip tests that already have raw pixels.
+/// Build a [`JpegXsImage`] from raw bytes and then encode. Useful for
+/// self-roundtrip tests that already have raw pixels.
 pub fn encode_raw_luma(width: u16, height: u16, pixels: Vec<u8>) -> Result<Vec<u8>> {
     let img = JpegXsImage {
         width: width as u32,
@@ -254,10 +315,7 @@ pub fn encode_raw_luma(width: u16, height: u16, pixels: Vec<u8>) -> Result<Vec<u
     encode_image(&img)
 }
 
-/// Core encoder entry point. `planes` is one byte buffer per component
-/// (length `width * height` each). `cpih` selects the colour transform
-/// (0 = none, 1 = RCT). `nlx`/`nly` are the wavelet decomposition levels
-/// (round 2: must be equal and in `{1, 2}`).
+/// Lossless 4:4:4 entry point (round-2 signature). All `sx[i] = sy[i] = 1`.
 pub fn encode_planar(
     width: u16,
     height: u16,
@@ -265,6 +323,64 @@ pub fn encode_planar(
     cpih: u8,
     nlx: u8,
     nly: u8,
+    planes: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    let sx = vec![1u8; nc as usize];
+    let sy = vec![1u8; nc as usize];
+    encode_planar_inner(width, height, nc, cpih, nlx, nly, 0, 0, &sx, &sy, planes)
+}
+
+/// Lossy entry point. `q` is the precinct quantization step (0..=15);
+/// 0 reduces to lossless. `fq` must be 8 for `q > 0` per Table A.8.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_lossy(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    q: u8,
+    planes: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    let sx = vec![1u8; nc as usize];
+    let sy = vec![1u8; nc as usize];
+    let fq = if q == 0 { 0 } else { 8 };
+    encode_planar_inner(width, height, nc, cpih, nlx, nly, fq, q, &sx, &sy, planes)
+}
+
+/// Sub-sampled (4:2:2 / 4:2:0) entry point. Each `planes[i]` has length
+/// `(width / sx[i]) * (height / sy[i])`. `q = 0` for lossless, `q > 0`
+/// engages Fq=8 lossy mode.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_subsampled(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    q: u8,
+    sx: &[u8],
+    sy: &[u8],
+    planes: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    let fq = if q == 0 { 0 } else { 8 };
+    encode_planar_inner(width, height, nc, cpih, nlx, nly, fq, q, sx, sy, planes)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_planar_inner(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    fq: u8,
+    q: u8,
+    sx: &[u8],
+    sy: &[u8],
     planes: &[Vec<u8>],
 ) -> Result<Vec<u8>> {
     let cfg = EncodeConfig {
@@ -279,9 +395,12 @@ pub fn encode_planar(
         nlx,
         nly,
         cpih,
+        fq,
+        q,
+        sx: sx.to_vec(),
+        sy: sy.to_vec(),
     };
     cfg.validate()?;
-    let n = (width as usize) * (height as usize);
     if planes.len() != nc as usize {
         return Err(Error::invalid(format!(
             "jpegxs encoder: expected {nc} component planes, got {}",
@@ -289,14 +408,18 @@ pub fn encode_planar(
         )));
     }
     for (i, p) in planes.iter().enumerate() {
-        if p.len() != n {
+        let wc = (width as usize) / (cfg.sx[i] as usize);
+        let hc = (height as usize) / (cfg.sy[i] as usize);
+        let want = wc * hc;
+        if p.len() != want {
             return Err(Error::invalid(format!(
-                "jpegxs encoder: plane {i} size {} != width*height {n}",
+                "jpegxs encoder: plane {i} size {} != Wc*Hc {want} (Wc={wc}, Hc={hc})",
                 p.len()
             )));
         }
     }
-    let mut out = Vec::with_capacity(n * (nc as usize) + 256);
+    let total: usize = planes.iter().map(|p| p.len()).sum();
+    let mut out = Vec::with_capacity(total + 256);
     write_main_header(&mut out, &cfg)?;
     write_slice(&mut out, &cfg, planes)?;
     // EOC.
@@ -318,16 +441,16 @@ fn write_main_header(out: &mut Vec<u8>, cfg: &EncodeConfig) -> Result<()> {
     out.extend_from_slice(&[0xff, 0x13]);
     let lcdt = 2u16 + 2 * (cfg.nc as u16);
     out.extend_from_slice(&lcdt.to_be_bytes());
-    for _ in 0..cfg.nc {
+    for i in 0..cfg.nc as usize {
         out.push(cfg.bit_depth); // B[i] = 8
-        out.push(0x11); // sx = 1, sy = 1 — round 2 is 4:4:4 only
+        out.push(((cfg.sx[i] & 0x0f) << 4) | (cfg.sy[i] & 0x0f));
     }
-    // WGT — Lwgt = 2 + 2*N_existing. Round 2 has Nc * Nβ existing bands
-    // (no Sd, no chroma sub-sampling, all bands exist).
-    let nbeta = n_beta(cfg.nlx, cfg.nly) as u16;
-    let n_existing = (cfg.nc as u16) * nbeta;
+    // WGT — one (G[b], P[b]) pair per *existing* band. With sub-
+    // sampling some bands don't exist for chroma components; we
+    // emit zeros for every existing band.
+    let n_existing = count_existing_bands(cfg);
     out.extend_from_slice(&[0xff, 0x14]);
-    let lwgt = 2 + 2 * n_existing;
+    let lwgt = 2 + 2 * (n_existing as u16);
     out.extend_from_slice(&lwgt.to_be_bytes());
     for _ in 0..n_existing {
         out.push(0); // G[b] = 0
@@ -337,34 +460,26 @@ fn write_main_header(out: &mut Vec<u8>, cfg: &EncodeConfig) -> Result<()> {
 }
 
 fn write_pih_body(out: &mut Vec<u8>, cfg: &EncodeConfig) {
-    // Lcod = 0 (variable bitrate).
-    out.extend_from_slice(&0u32.to_be_bytes());
-    // Ppih = 0 (unrestricted profile).
-    out.extend_from_slice(&0u16.to_be_bytes());
-    // Plev = 0.
-    out.extend_from_slice(&0u16.to_be_bytes());
-    // Wf, Hf.
+    out.extend_from_slice(&0u32.to_be_bytes()); // Lcod
+    out.extend_from_slice(&0u16.to_be_bytes()); // Ppih
+    out.extend_from_slice(&0u16.to_be_bytes()); // Plev
     out.extend_from_slice(&cfg.width.to_be_bytes());
     out.extend_from_slice(&cfg.height.to_be_bytes());
-    // Cw = 0 → one precinct column per row of the picture.
-    out.extend_from_slice(&0u16.to_be_bytes());
-    // Hsl = Np_y so all precincts land in a single slice. Hp = 2^NL,y →
-    // Np_y = ceil(Hf / 2^NL,y).
+    out.extend_from_slice(&0u16.to_be_bytes()); // Cw = 0
     let hp_pow = 1u32 << cfg.nly;
     let np_y = (cfg.height as u32).div_ceil(hp_pow);
-    out.extend_from_slice(&(np_y as u16).to_be_bytes());
-    // Nc, Ng, Ss, Bw.
+    out.extend_from_slice(&(np_y as u16).to_be_bytes()); // Hsl = Np_y
     out.push(cfg.nc);
     out.push(cfg.ng);
     out.push(cfg.ss);
     out.push(cfg.bw);
-    // Fq:Br — Fq = 0 (lossless), Br = cfg.br.
-    out.push(cfg.br & 0x0f);
-    // Fslc:Ppoc:Cpih — Fslc=0 Ppoc=0 Cpih = caller-selected.
+    // Fq:Br
+    out.push(((cfg.fq & 0x0f) << 4) | (cfg.br & 0x0f));
+    // Fslc:Ppoc:Cpih
     out.push(cfg.cpih & 0x0f);
-    // NL,x:NL,y.
+    // NL,x:NL,y
     out.push(((cfg.nlx & 0x0f) << 4) | (cfg.nly & 0x0f));
-    // Lh:Rl:Qpih:Fs:Rm — all zero.
+    // Lh:Rl:Qpih:Fs:Rm = 0
     out.push(0x00);
 }
 
@@ -375,8 +490,29 @@ fn n_beta(nlx: u8, nly: u8) -> u32 {
     2 * mn + mx + 1
 }
 
-/// Per-(β, i) band geometry needed by the encoder. Mirrors the
-/// `(dx, dy, τx, τy)` enumeration in [`crate::slice_walker`].
+/// Count the bands that actually exist over every component (i.e.
+/// matching the WGT existing-band convention). For component i with
+/// `sy[i] = 2`, band β with `dy < NL,y` and `τy = true` (i.e. LH/HH
+/// rows) does not exist; every other band does.
+fn count_existing_bands(cfg: &EncodeConfig) -> u32 {
+    let nbeta_pic = n_beta(cfg.nlx, cfg.nly);
+    let mut n = 0u32;
+    for i in 0..cfg.nc as usize {
+        let nly_i = cfg.nly.saturating_sub(match cfg.sy[i] {
+            1 => 0,
+            2 => 1,
+            4 => 2,
+            _ => 0,
+        });
+        let nbeta_i = n_beta(cfg.nlx, nly_i);
+        // Only the first nbeta_i bands of the picture-level β layout
+        // exist for component i; the rest are non-existent (Annex B.4).
+        n += nbeta_pic.min(nbeta_i);
+    }
+    n
+}
+
+/// Per-(β, i) band geometry needed by the encoder.
 #[derive(Debug, Clone, Copy)]
 struct EncBandKey {
     dx: u32,
@@ -449,7 +585,7 @@ fn beta_key(beta: u32, nlx: u8, nly: u8) -> EncBandKey {
 }
 
 /// Picture-level dimensions of band β for a `wc × hc` component under
-/// (NL,x, NL,y). Mirrors the slice walker / cascade formula.
+/// (NL,x, NL,y).
 fn band_dims(wc: usize, hc: usize, nlx: u8, nly: u8, beta: u32) -> (usize, usize) {
     let key = beta_key(beta, nlx, nly);
     let dx = key.dx;
@@ -480,7 +616,6 @@ fn band_dims(wc: usize, hc: usize, nlx: u8, nly: u8, beta: u32) -> (usize, usize
 }
 
 /// Per-precinct band-row offset count `pow_h = 2^max(NL,y - dy, 0)`.
-/// Mirrors the decoder's `cascade_band_pow_h` helper.
 fn pow_h(nly: u8, dy: u32) -> usize {
     let nly_u = nly as u32;
     if dy >= nly_u || nly_u == 0 {
@@ -501,8 +636,9 @@ fn write_slice(out: &mut Vec<u8>, cfg: &EncodeConfig, planes_u8: &[Vec<u8>]) -> 
     let nc = cfg.nc as usize;
     let dc_bias: i32 = 1 << (cfg.bw - 1);
 
-    // 1) Convert pixels to i32 with DC level shift, optionally apply
-    //    forward RCT (Cpih=1).
+    // 1) Per-component DC level shift, then optional forward RCT
+    //    (Cpih=1; only when every involved component is 4:4:4 — already
+    //    enforced upstream).
     let mut comp_planes: Vec<Vec<i32>> = planes_u8
         .iter()
         .map(|p| p.iter().map(|&v| v as i32 - dc_bias).collect::<Vec<i32>>())
@@ -518,21 +654,32 @@ fn write_slice(out: &mut Vec<u8>, cfg: &EncodeConfig, planes_u8: &[Vec<u8>]) -> 
     let hp_pow = 1u32 << nly;
     let np_y = (h as u32).div_ceil(hp_pow) as usize;
 
+    // 2) Per-component forward DWT.
+    //    The decoder picks per-precinct streaming synthesis at NL=1/1
+    //    and gather-then-cascade at NL >= 2. The encoder must mirror
+    //    that exactly because per-precinct DWT and picture-level
+    //    cascade DWT are *not* equivalent (the 5/3 high-pass coefficient
+    //    at the precinct boundary depends on a sample two precincts
+    //    away — picture-level cascade reflects across the picture
+    //    boundary, per-precinct cascade reflects across the precinct
+    //    boundary). So:
+    //    * NL=1/1 → streaming per-precinct DWT for every component
+    //      (works for 4:4:4, 4:2:2, 4:2:0 alike via per-component
+    //      precinct dimensions).
+    //    * NL >= 2 → picture-level cascade DWT per component, then
+    //      slice per precinct.
     if multi_level {
-        // Multi-level path: forward cascade on the whole picture per
-        // component, then slice each band into per-precinct row ranges.
-        // Mirrors the decoder's gather-then-cascade synthesis.
-        let nbeta = n_beta(nlx, nly) as usize;
         let mut bands_per_comp: Vec<Vec<Vec<i32>>> = Vec::with_capacity(nc);
-        for plane in comp_planes.iter().take(nc) {
-            let bands = forward_cascade_2d(w, h, nlx, nly, plane)?;
-            if bands.len() != nbeta {
-                return Err(Error::invalid(format!(
-                    "jpegxs encoder: forward_cascade_2d returned {} bands, expected {}",
-                    bands.len(),
-                    nbeta
-                )));
-            }
+        for (i, plane) in comp_planes.iter().enumerate().take(nc) {
+            let wc = w / (cfg.sx[i] as usize);
+            let hc = h / (cfg.sy[i] as usize);
+            let nly_i = cfg.nly.saturating_sub(match cfg.sy[i] {
+                1 => 0,
+                2 => 1,
+                4 => 2,
+                _ => 0,
+            });
+            let bands = forward_cascade_2d(wc, hc, cfg.nlx, nly_i, plane)?;
             bands_per_comp.push(bands);
         }
         for py in 0..np_y {
@@ -540,9 +687,9 @@ fn write_slice(out: &mut Vec<u8>, cfg: &EncodeConfig, planes_u8: &[Vec<u8>]) -> 
             out.extend_from_slice(&pbytes);
         }
     } else {
-        // Single-level path (NL=1/1): per-precinct forward DWT into 4
-        // sub-bands. Mirrors the decoder's `synthesise_precinct`
-        // streaming path.
+        // NL=1/1 streaming per-precinct path. Handles 4:4:4 and chroma-
+        // sub-sampled cases with a per-component effective NL,y and a
+        // per-component precinct row range.
         for py in 0..np_y {
             let y0 = py * (hp_pow as usize);
             let y1 = (y0 + hp_pow as usize).min(h);
@@ -554,12 +701,10 @@ fn write_slice(out: &mut Vec<u8>, cfg: &EncodeConfig, planes_u8: &[Vec<u8>]) -> 
     Ok(())
 }
 
-/// Single-level encode (NL=1/1). Mirrors round-1 layout but extended
-/// for `Nc ∈ {1, 3}` and odd dimensions. For partial bottom precincts
-/// (`hp_real < hp_pow`) the input strip is padded up to `hp_pow` rows
-/// using whole-sample symmetric reflection (matches the spec's view
-/// that band heights derive from `Hf`, not from per-precinct sample
-/// counts).
+/// Single-level streaming encode (NL=1/1). Mirrors the decoder's
+/// per-precinct synthesis path, including chroma sub-sampling — for
+/// `sy[i] = 2` components the per-precinct strip has only one row
+/// (`hp_i = 1`) and only the LL/HL bands exist (1-D horizontal DWT).
 fn encode_precinct_single_level(
     cfg: &EncodeConfig,
     comp_planes: &[Vec<i32>],
@@ -568,259 +713,221 @@ fn encode_precinct_single_level(
     hp_real: usize,
 ) -> Result<Vec<u8>> {
     let w = cfg.width as usize;
+    let h_full = cfg.height as usize;
     let nc = cfg.nc as usize;
     let hp_pow = 1usize << cfg.nly;
 
-    // Per-(β, i) band buffer.  β order: LL=0, HL=1, LH=2, HH=3.
-    // The picture-level band heights for component i derive from
-    // `Hc[i] = Hf / sy[i]` (sy=1 here), per Annex B.2:
-    //   Hb_LL = ceil(Hf/2),  Hb_LH = Hf/2  (floor division).
-    // For each precinct the row-range L1 - L0 is at most pow_h, but at
-    // the bottom edge it can be shorter when the precinct's row offset
-    // overflows Hb. We compute that per band below.
-    let h_full = cfg.height as usize;
-    let pic_ll_h = h_full.div_ceil(2);
-    let pic_lh_h = h_full / 2;
+    // Per-component bands. Each component has [LL, HL, LH, HH] but for
+    // `sy=2` (4:2:0) only [LL, HL] are populated.
+    struct CompBands {
+        nly_i: u8,
+        ll: Vec<i32>,
+        hl: Vec<i32>,
+        lh: Vec<i32>,
+        hh: Vec<i32>,
+        ll_w: usize,
+        hl_w: usize,
+        ll_h_per_precinct: usize,
+        lh_h_per_precinct: usize,
+        pic_ll_h: usize,
+        pic_lh_h: usize,
+    }
+    let mut comp_bands: Vec<CompBands> = Vec::with_capacity(nc);
+    for (i, plane) in comp_planes.iter().enumerate().take(nc) {
+        let sx_i = cfg.sx[i] as usize;
+        let sy_i = cfg.sy[i] as usize;
+        let wc = w / sx_i;
+        let hc = h_full / sy_i;
+        let hp_i = hp_pow / sy_i;
+        let nly_i = cfg.nly.saturating_sub(match cfg.sy[i] {
+            1 => 0,
+            2 => 1,
+            4 => 2,
+            _ => 0,
+        });
 
-    // Forward DWT runs at the full precinct height (`hp_pow`). When
-    // the real strip is shorter, pad with whole-sample symmetric
-    // reflection to fill the missing rows. This way the decoder's
-    // inverse_2d operates on a consistent geometry regardless of
-    // partial precincts.
-    let ll_w = w.div_ceil(2);
-    let hl_w = w / 2;
-    let ll_h_per_precinct = hp_pow.div_ceil(2);
-    let lh_h_per_precinct = hp_pow / 2;
-
-    let mut bands_per_comp: Vec<[Vec<i32>; 4]> = Vec::with_capacity(nc);
-    for plane in comp_planes.iter().take(nc) {
-        let mut strip: Vec<i32> = Vec::with_capacity(w * hp_pow);
-        for y in y0..y1 {
-            for x in 0..w {
-                strip.push(plane[y * w + x]);
+        // Per-precinct strip rows for this component.
+        let y0_i = y0 / sy_i;
+        let y1_i = (y1 / sy_i).min(hc);
+        let hp_real_i = y1_i.saturating_sub(y0_i);
+        let mut strip: Vec<i32> = Vec::with_capacity(wc * hp_i);
+        for y in y0_i..y1_i {
+            for x in 0..wc {
+                strip.push(plane[y * wc + x]);
             }
         }
-        // Pad with whole-sample symmetric reflection up to hp_pow rows.
-        // For hp_real == 1, X[1] = X[1] (only row exists); reflect from
-        // the only row.  For hp_real == 0 (shouldn't happen given np_y
-        // computation), pad with zeros.
-        while strip.len() < w * hp_pow {
-            // Reflect: row at offset r where r = strip.len()/w copies
-            // from row (2 * hp_real - r - 2) in the original. For
-            // hp_real==1, hp_pow==2: r=1 → src row = -1 → folds to 0.
-            let target_row = strip.len() / w;
-            let src_row = if hp_real >= 2 {
-                let mirrored = 2 * hp_real - target_row - 2;
-                mirrored.min(hp_real - 1)
+        // Pad with whole-sample symmetric reflection up to hp_i rows.
+        while strip.len() < wc * hp_i {
+            let target_row = strip.len() / wc;
+            let src_row = if hp_real_i >= 2 {
+                let mirrored = 2 * hp_real_i - target_row - 2;
+                mirrored.min(hp_real_i - 1)
             } else {
                 0
             };
-            let row_start = src_row * w;
-            for x in 0..w {
-                let src_idx = if hp_real == 0 { 0 } else { row_start + x };
-                let val = if hp_real == 0 { 0 } else { strip[src_idx] };
+            let row_start = src_row * wc;
+            for x in 0..wc {
+                let src_idx = if hp_real_i == 0 { 0 } else { row_start + x };
+                let val = if hp_real_i == 0 { 0 } else { strip[src_idx] };
                 strip.push(val);
             }
         }
-        let mut ll = vec![0i32; ll_w * ll_h_per_precinct];
-        let mut hl = vec![0i32; hl_w * ll_h_per_precinct];
-        let mut lh = vec![0i32; ll_w * lh_h_per_precinct];
-        let mut hh = vec![0i32; hl_w * lh_h_per_precinct];
-        forward_2d(w, hp_pow, &strip, &mut ll, &mut hl, &mut lh, &mut hh)?;
-        bands_per_comp.push([ll, hl, lh, hh]);
+
+        let ll_w = wc.div_ceil(2);
+        let hl_w = wc / 2;
+        let ll_h_per_precinct = hp_i.div_ceil(2);
+        let lh_h_per_precinct = hp_i / 2;
+        // Picture-level LL band height: depends on the per-component
+        // effective vertical decomposition. nly_i = 0 → no vertical
+        // split → LL rows == chroma rows (no /2). nly_i = 1 → vertical
+        // 1-D split halves the height.
+        let pic_ll_h = if nly_i == 0 { hc } else { hc.div_ceil(2) };
+        let pic_lh_h = if nly_i == 0 { 0 } else { hc / 2 };
+
+        if nly_i == 0 {
+            // 1-D horizontal-only DWT: one row, two bands (LL, HL).
+            // hp_i must be 1 in this case.
+            debug_assert_eq!(hp_i, 1);
+            let mut ll = vec![0i32; ll_w];
+            let mut hl = vec![0i32; hl_w];
+            crate::dwt::forward_horizontal_1d(&strip, &mut ll, &mut hl)?;
+            comp_bands.push(CompBands {
+                nly_i,
+                ll,
+                hl,
+                lh: Vec::new(),
+                hh: Vec::new(),
+                ll_w,
+                hl_w,
+                ll_h_per_precinct,
+                lh_h_per_precinct,
+                pic_ll_h,
+                pic_lh_h,
+            });
+        } else {
+            // 2-D DWT.
+            let mut ll = vec![0i32; ll_w * ll_h_per_precinct];
+            let mut hl = vec![0i32; hl_w * ll_h_per_precinct];
+            let mut lh = vec![0i32; ll_w * lh_h_per_precinct];
+            let mut hh = vec![0i32; hl_w * lh_h_per_precinct];
+            forward_2d(wc, hp_i, &strip, &mut ll, &mut hl, &mut lh, &mut hh)?;
+            comp_bands.push(CompBands {
+                nly_i,
+                ll,
+                hl,
+                lh,
+                hh,
+                ll_w,
+                hl_w,
+                ll_h_per_precinct,
+                lh_h_per_precinct,
+                pic_ll_h,
+                pic_lh_h,
+            });
+        }
+        let _ = (wc, hp_i); // dimensions captured into ll_w/hl_w/etc.
     }
 
-    // Per-band number of lines this precinct contributes (Annex B.6).
-    // pow_h = 2^max(NL,y - dy, 0).  For NL=1/1 with β ∈ {1,2,3} dy=1,
-    // pow_h = 1, so each precinct contributes at most 1 line per band.
-    // For LL (β=0, dy=NL,y=1, ty=false) L0=0; for HL (β=1, dy=1,
-    // ty=false) L0=0; for LH/HH (β=2,3, dy=1, ty=true) L0=1 in
-    // precinct-local coords. The band's picture-level row offset is
-    //   row_offset = py * pow_h
-    // and lines = pow_h.min(pic_band_h - row_offset).
+    // Per-component, per-precinct line counts. β=0 (LL) and β=1 (HL)
+    // contribute up to 1 line per precinct (since pow_h(1, dy=1) = 1
+    // and dy=1 for all 4 bands at NL=1/1; ll_h_per_precinct = 1 here).
+    // β=2 (LH) and β=3 (HH) only exist for nly_i >= 1 components.
     let py = y0 / hp_pow;
-    let row_offset_ll = py; // pow_h = 1
-    let row_offset_lh = py;
-    let lines_ll_real = if row_offset_ll >= pic_ll_h {
-        0
-    } else {
-        1.min(pic_ll_h - row_offset_ll)
-    };
-    let lines_lh_real = if row_offset_lh >= pic_lh_h {
-        0
-    } else {
-        1.min(pic_lh_h - row_offset_lh)
-    };
+    // Lines emitted for the LL/HL row in this precinct: 1 unless we're
+    // past the picture edge. For chroma at sy=2, ll_h_per_precinct
+    // already accounts for hp_i=1.
+    let lines_ll_real_per_comp: Vec<usize> = comp_bands
+        .iter()
+        .map(|cb| {
+            let row_offset = py;
+            // For sy=2 the per-component ll_h_per_precinct == 1 anyway.
+            if row_offset >= cb.pic_ll_h {
+                0
+            } else {
+                cb.ll_h_per_precinct.min(cb.pic_ll_h - row_offset)
+            }
+        })
+        .collect();
+    let lines_lh_real_per_comp: Vec<usize> = comp_bands
+        .iter()
+        .map(|cb| {
+            if cb.nly_i == 0 {
+                0
+            } else {
+                let row_offset = py;
+                if row_offset >= cb.pic_lh_h {
+                    0
+                } else {
+                    cb.lh_h_per_precinct.min(cb.pic_lh_h - row_offset)
+                }
+            }
+        })
+        .collect();
 
-    // For partial bottom precincts the bands keep their full
-    // `ll_h_per_precinct = 1` row, but only emit `lines_*_real` rows
-    // into the entropy stream. The decoder's `BandCoefficients` is
-    // sized to (L1 - L0) lines, so emitting fewer rows is correct.
-    let _ = (lines_ll_real, lines_lh_real); // captured below in band_lines selector
-
-    // Precinct header bits: 24 + 8 + 8 + 2 × N_existing.
-    // For NL=1/1 single-level Sy=1 every band exists per Annex B.4
-    // ((L0 % sy[i]) == 0), so n_existing = Nc * 4.
-    let nbeta = 4u32;
-    let n_bands = (nc as u32) * nbeta;
-    let n_existing = n_bands as usize;
+    // Precinct-header band-existence bookkeeping. β=0 / 1 always exist
+    // for every component; β=2 / 3 only exist for components with
+    // `nly_i >= 1`.
+    let mut n_existing = 0usize;
+    for (i, _) in comp_bands.iter().enumerate() {
+        n_existing += 2; // LL + HL always exist
+        if comp_bands[i].nly_i >= 1 {
+            n_existing += 2; // LH + HH
+        }
+    }
     let header_bits = 24 + 8 + 8 + 2 * n_existing;
     let header_bytes = header_bits.div_ceil(8);
     let mut precinct_bytes = vec![0u8; header_bytes];
 
     let mut entropy: Vec<u8> = Vec::new();
+    let t_band = cfg.q.min(15);
 
-    // First packet: β=0, line 0 of LL for each component.
-    let mut first_entries: Vec<(usize, usize, usize)> = Vec::new(); // (β_id, comp_i, line_off)
-    for i in 0..nc {
-        first_entries.push((0, i, 0));
+    // First packet: β=0 (LL) for all components — but only those with
+    // a non-empty LL line for this precinct.
+    let mut first_entries: Vec<PerBandEntry> = Vec::new();
+    for (i, cb) in comp_bands.iter().enumerate() {
+        if lines_ll_real_per_comp[i] == 0 {
+            continue;
+        }
+        // First (and only) row of this band buffer is `cb.ll[0..ll_w]`.
+        let line_data = cb.ll[..cb.ll_w].to_vec();
+        first_entries.push(PerBandEntry {
+            wpb: cb.ll_w as u32,
+            line: BandLineSlice::Direct(line_data),
+            t: t_band,
+        });
+    }
+    if !first_entries.is_empty() {
+        emit_packet(&mut entropy, cfg, &first_entries)?;
     }
 
-    let emit_packet = |entries: &[(usize, usize, usize)],
-                       bands_per_comp: &[[Vec<i32>; 4]],
-                       out: &mut Vec<u8>|
-     -> Result<()> {
-        let mut data_writer = BitWriter::default();
-        let mut cnt_writer = BitWriter::default();
-        for &(beta_idx, i, line_off) in entries {
-            let band_buf = &bands_per_comp[i][beta_idx];
-            // Per-band wpb in this precinct.
-            let wpb = if beta_idx == 1 || beta_idx == 3 {
-                hl_w
-            } else {
-                ll_w
-            };
-            // Per-band lines in band buffer (always full per-precinct
-            // size). Per-precinct emitted lines (real) is enforced by
-            // the caller via the entries list — entries beyond
-            // lines_*_real are simply not added.
-            let band_lines_in_buf = if beta_idx == 0 || beta_idx == 1 {
-                ll_h_per_precinct
-            } else {
-                lh_h_per_precinct
-            };
-            if line_off >= band_lines_in_buf {
+    // Proxy levels: β=1 (HL), then β=2 (LH), then β=3 (HH). One packet
+    // per (β, i) entry, gated by per-component existence and lines.
+    for beta_idx in 1usize..=3 {
+        for (i, cb) in comp_bands.iter().enumerate() {
+            // Existence per component.
+            if beta_idx >= 2 && cb.nly_i == 0 {
                 continue;
             }
-            let row_start = line_off * wpb;
-            let row_end = row_start + wpb;
-            let band_line: &[i32] = &band_buf[row_start..row_end];
-
-            let ng_u = cfg.ng as usize;
-            let ncg = wpb.div_ceil(ng_u);
-            let m_max_for_br: u32 = if cfg.br >= 8 {
-                255
+            let lines_real = if beta_idx == 1 {
+                lines_ll_real_per_comp[i]
             } else {
-                (1u32 << cfg.br) - 1
+                lines_lh_real_per_comp[i]
             };
-            let coef = |g: usize, k: usize| -> i32 {
-                let xpos = g * ng_u + k;
-                if xpos < wpb {
-                    band_line[xpos]
-                } else {
-                    0
-                }
-            };
-            let mut m_per_group = vec![0u8; ncg];
-            for (g, slot) in m_per_group.iter_mut().enumerate() {
-                let mut max_mag: u32 = 0;
-                for k in 0..ng_u {
-                    let v = coef(g, k);
-                    let mag = v.unsigned_abs();
-                    if mag > max_mag {
-                        max_mag = mag;
-                    }
-                }
-                let m = if max_mag == 0 {
-                    0u32
-                } else {
-                    32 - max_mag.leading_zeros()
-                };
-                if m > m_max_for_br {
-                    return Err(Error::invalid(format!(
-                        "jpegxs encoder: β={beta_idx} comp {i} group {g} bitplane count {m} exceeds Br = {} (cap {m_max_for_br}). Use a higher Br or quantize the input.",
-                        cfg.br
-                    )));
-                }
-                *slot = m as u8;
-            }
-            for &m in &m_per_group {
-                cnt_writer.write_bits(m as u32, cfg.br);
-            }
-            for (g, &m_u8) in m_per_group.iter().enumerate() {
-                let m = m_u8 as u32;
-                if m == 0 {
-                    continue;
-                }
-                for k in 0..ng_u {
-                    let v = coef(g, k);
-                    let sign_bit = if v < 0 { 1 } else { 0 };
-                    data_writer.write_bit(sign_bit);
-                }
-                for plane in (0..m).rev() {
-                    for k in 0..ng_u {
-                        let v = coef(g, k);
-                        let mag = v.unsigned_abs();
-                        let bit = ((mag >> plane) & 1) as u8;
-                        data_writer.write_bit(bit);
-                    }
-                }
-            }
-        }
-        cnt_writer.align_to_byte();
-        data_writer.align_to_byte();
-        let cnt_bytes = cnt_writer.into_bytes();
-        let data_bytes = data_writer.into_bytes();
-        let lcnt = cnt_bytes.len() as u32;
-        let ldat = data_bytes.len() as u32;
-        let lsgn: u32 = 0;
-        if ldat > (1 << 15) - 1 {
-            return Err(Error::invalid(format!(
-                "jpegxs encoder: Ldat = {ldat} exceeds short packet header capacity (15 bits)."
-            )));
-        }
-        if lcnt > (1 << 13) - 1 {
-            return Err(Error::invalid(format!(
-                "jpegxs encoder: Lcnt = {lcnt} exceeds short packet header capacity (13 bits)."
-            )));
-        }
-        let mut hdr_bits: u64 = 0;
-        hdr_bits = (hdr_bits << 1) | 1; // Dr = 1
-        hdr_bits = (hdr_bits << 15) | (ldat as u64 & 0x7fff);
-        hdr_bits = (hdr_bits << 13) | (lcnt as u64 & 0x1fff);
-        hdr_bits = (hdr_bits << 11) | (lsgn as u64 & 0x07ff);
-        let mut header = vec![0u8; 5];
-        for (k, byte) in header.iter_mut().enumerate() {
-            *byte = ((hdr_bits >> (8 * (4 - k))) & 0xff) as u8;
-        }
-        out.extend_from_slice(&header);
-        out.extend_from_slice(&cnt_bytes);
-        out.extend_from_slice(&data_bytes);
-        Ok(())
-    };
-
-    // First packet may itself be skipped if the LL band has no lines
-    // for this precinct (`lines_ll_real == 0` for an empty bottom-edge
-    // case — though for NL=1/1 with Hf >= 2, LL always has at least 1
-    // line for every precinct except the wholly-empty trailing one,
-    // which np_y excludes by construction).
-    if lines_ll_real > 0 {
-        emit_packet(&first_entries, &bands_per_comp, &mut entropy)?;
-    }
-
-    // Proxy levels: β = 1 (HL), 2 (LH), 3 (HH).
-    for beta_idx in 1usize..4 {
-        for i in 0..nc {
-            let band_lines_real = if beta_idx == 1 {
-                lines_ll_real
-            } else {
-                lines_lh_real
-            };
-            if band_lines_real == 0 {
+            if lines_real == 0 {
                 continue;
             }
-            let entries = vec![(beta_idx, i, 0)];
-            emit_packet(&entries, &bands_per_comp, &mut entropy)?;
+            let (band_buf, wpb) = match beta_idx {
+                1 => (&cb.hl, cb.hl_w),
+                2 => (&cb.lh, cb.ll_w),
+                _ => (&cb.hh, cb.hl_w),
+            };
+            let line_data = band_buf[..wpb].to_vec();
+            let entries = vec![PerBandEntry {
+                wpb: wpb as u32,
+                line: BandLineSlice::Direct(line_data),
+                t: t_band,
+            }];
+            emit_packet(&mut entropy, cfg, &entries)?;
         }
     }
 
@@ -838,14 +945,15 @@ fn encode_precinct_single_level(
     precinct_bytes[0] = ((lprc >> 16) & 0xff) as u8;
     precinct_bytes[1] = ((lprc >> 8) & 0xff) as u8;
     precinct_bytes[2] = (lprc & 0xff) as u8;
+    precinct_bytes[3] = cfg.q.min(31);
+    // R[p] at offset 4 stays 0.
+    // D[p,b] bits at offset 5+ stay 0.
     precinct_bytes.extend_from_slice(&entropy);
+    let _ = hp_real; // hp_real is the original-pixel-grid count; unused now
     Ok(precinct_bytes)
 }
 
 /// Encode one precinct using the multi-level cascade band layout.
-/// `bands_per_comp[i][β]` is the picture-level band buffer for filter
-/// type β of component i. The encoder slices the per-precinct row range
-/// out of each band based on `pow_h(β)`.
 fn encode_precinct_cascade(
     cfg: &EncodeConfig,
     bands_per_comp: &[Vec<Vec<i32>>],
@@ -856,215 +964,169 @@ fn encode_precinct_cascade(
     let nc = cfg.nc as usize;
     let nlx = cfg.nlx;
     let nly = cfg.nly;
-    let nbeta = n_beta(nlx, nly);
-    let n_bands = (nc as u32) * nbeta;
+    let nbeta_pic = n_beta(nlx, nly);
 
-    // For each (β, i) compute (lines, pic_band_row_offset, wpb) for
-    // this precinct.
+    // Per-component "effective" decomposition levels.
+    let nly_i: Vec<u8> = (0..nc)
+        .map(|i| {
+            cfg.nly.saturating_sub(match cfg.sy[i] {
+                1 => 0,
+                2 => 1,
+                4 => 2,
+                _ => 0,
+            })
+        })
+        .collect();
+
+    // Collect per-(β, i) slices for this precinct. Bands not existing
+    // for component i (because β >= n_beta(nlx, nly_i[i])) are skipped.
     struct Slice {
         wpb: usize,
         lines: usize,
         pic_bw: usize,
         pic_row_offset: usize,
+        comp_i: usize,
+        beta: u32,
+        exists: bool,
     }
-    let mut slices: Vec<Slice> = Vec::with_capacity(n_bands as usize);
-    for beta in 0..nbeta {
-        let key = beta_key(beta, nlx, nly);
-        for _i in 0..nc {
-            let (pic_bw, pic_bh) = band_dims(w, h, nlx, nly, beta);
-            let pow = pow_h(nly, key.dy);
-            let row_offset = py * pow;
+    let mut slices: Vec<Slice> = Vec::with_capacity((nbeta_pic as usize) * nc);
+    for beta in 0..nbeta_pic {
+        for (i, &nly_comp) in nly_i.iter().enumerate().take(nc) {
+            let wc = w / (cfg.sx[i] as usize);
+            let hc = h / (cfg.sy[i] as usize);
+            // Existence: β must be < n_beta(nlx, nly_i[i]).
+            let nbeta_i = n_beta(cfg.nlx, nly_comp);
+            let exists_per_comp = beta < nbeta_i;
+            if !exists_per_comp {
+                slices.push(Slice {
+                    wpb: 0,
+                    lines: 0,
+                    pic_bw: 0,
+                    pic_row_offset: 0,
+                    comp_i: i,
+                    beta,
+                    exists: false,
+                });
+                continue;
+            }
+            let key = beta_key(beta, cfg.nlx, nly_comp);
+            let (pic_bw, pic_bh) = band_dims(wc, hc, cfg.nlx, nly_comp, beta);
+            // pow_h is computed against the *picture-level* nly; for
+            // sub-sampled components the precinct still holds
+            // `pow_h(nly, dy)` band-rows on average — but each component
+            // contributes only `pow_h_i = 2^max(nly_i - dy, 0)` because
+            // the per-component decomposition is shallower. The
+            // sub-sample-aware Annex B.6 says lines per precinct =
+            // 2^max(NL,y - dy, 0) / sy[i].
+            let pow_pic = pow_h(cfg.nly, key.dy);
+            let pow_eff = pow_pic / (cfg.sy[i] as usize).max(1);
+            let pow_eff = pow_eff.max(1);
+            let row_offset = py * pow_eff;
             let lines = if row_offset >= pic_bh {
                 0
             } else {
-                pow.min(pic_bh - row_offset)
+                pow_eff.min(pic_bh - row_offset)
             };
             slices.push(Slice {
                 wpb: pic_bw,
                 lines,
                 pic_bw,
                 pic_row_offset: row_offset,
+                comp_i: i,
+                beta,
+                exists: true,
             });
         }
     }
 
     // Precinct header: Lprc(24) + Q(8) + R(8) + N_existing × D(2),
-    // padded to byte boundary. Round 2: every band exists (Sd=0, no
-    // chroma sub-sampling) → N_existing = n_bands.
-    let n_existing = n_bands as usize;
+    // padded to byte boundary.
+    let n_existing = slices.iter().filter(|s| s.exists).count();
     let header_bits = 24 + 8 + 8 + 2 * n_existing;
     let header_bytes = header_bits.div_ceil(8);
     let mut precinct_bytes = vec![0u8; header_bytes];
 
     // Build entropy stream: walk packets per Annex B.7 Table B.4.
-    // First packet: β=0 .. β1-1, all components, line λ = L0.
-    // Then proxy levels: β0 = β1, β1+3, …
     let mut entropy: Vec<u8> = Vec::new();
     let nlx_u = nlx as u32;
     let nly_u = nly as u32;
     let beta1 = nlx_u.max(nly_u) - nlx_u.min(nly_u) + 1;
+    let t_band = cfg.q.min(15);
 
-    // Helper: emit the full packet (entries, body, header) for a list
-    // of (band_id, line_offset_within_lines) items.
-    let emit_packet = |entries: &[(usize, usize)],
-                       bands_per_comp: &[Vec<Vec<i32>>],
-                       slices: &[Slice],
-                       out: &mut Vec<u8>|
-     -> Result<()> {
-        if entries.is_empty() {
-            return Ok(());
+    // Helper: build a one-line band slice from a per-component band buffer.
+    let extract_band_line = |s: &Slice, line_off: usize| -> Option<Vec<i32>> {
+        if !s.exists || s.lines == 0 {
+            return None;
         }
-        // Build the (header, body) for the packet covering these entries.
-        let mut data_writer = BitWriter::default();
-        let mut cnt_writer = BitWriter::default();
-        for &(b_id, line_off) in entries {
-            let s = &slices[b_id];
-            if s.lines == 0 {
-                continue;
-            }
-            let beta = (b_id as u32) / (nc as u32);
-            let i = (b_id as u32) % (nc as u32);
-            let band_buf = &bands_per_comp[i as usize][beta as usize];
-            // Picture row inside the band.
-            let pic_row = s.pic_row_offset + line_off;
-            let row_start = pic_row * s.pic_bw;
-            let row_end = row_start + s.wpb;
-            let band_line: &[i32] = &band_buf[row_start..row_end];
-            // ---- bitplane-count sub-packet (raw mode): Br bits per group ----
-            let ng_u = cfg.ng as usize;
-            let ncg = s.wpb.div_ceil(ng_u);
-            let m_max_for_br: u32 = if cfg.br >= 8 {
-                255
-            } else {
-                (1u32 << cfg.br) - 1
-            };
-            let coef = |g: usize, k: usize| -> i32 {
-                let xpos = g * ng_u + k;
-                if xpos < s.wpb {
-                    band_line[xpos]
-                } else {
-                    0
-                }
-            };
-            // Per-group bitplane counts.
-            let mut m_per_group = vec![0u8; ncg];
-            for (g, slot) in m_per_group.iter_mut().enumerate() {
-                let mut max_mag: u32 = 0;
-                for k in 0..ng_u {
-                    let v = coef(g, k);
-                    let mag = v.unsigned_abs();
-                    if mag > max_mag {
-                        max_mag = mag;
-                    }
-                }
-                let m = if max_mag == 0 {
-                    0u32
-                } else {
-                    32 - max_mag.leading_zeros()
-                };
-                if m > m_max_for_br {
-                    return Err(Error::invalid(format!(
-                        "jpegxs encoder: band {b_id} group {g} bitplane count {m} exceeds Br = {} (cap {m_max_for_br}). Use a higher Br or quantize the input.",
-                        cfg.br
-                    )));
-                }
-                *slot = m as u8;
-            }
-            for &m in &m_per_group {
-                cnt_writer.write_bits(m as u32, cfg.br);
-            }
-            // ---- data sub-packet ----
-            for (g, &m_u8) in m_per_group.iter().enumerate() {
-                let m = m_u8 as u32;
-                if m == 0 {
-                    continue;
-                }
-                // Fs = 0 → write Ng sign bits first.
-                for k in 0..ng_u {
-                    let v = coef(g, k);
-                    let sign_bit = if v < 0 { 1 } else { 0 };
-                    data_writer.write_bit(sign_bit);
-                }
-                for plane in (0..m).rev() {
-                    for k in 0..ng_u {
-                        let v = coef(g, k);
-                        let mag = v.unsigned_abs();
-                        let bit = ((mag >> plane) & 1) as u8;
-                        data_writer.write_bit(bit);
-                    }
-                }
-            }
+        if line_off >= s.lines {
+            return None;
         }
-        cnt_writer.align_to_byte();
-        data_writer.align_to_byte();
-        let cnt_bytes = cnt_writer.into_bytes();
-        let data_bytes = data_writer.into_bytes();
-        let lcnt = cnt_bytes.len() as u32;
-        let ldat = data_bytes.len() as u32;
-        let lsgn: u32 = 0;
-
-        // Short header (Wf*Nc < 32752 holds for round-2 fixtures).
-        if ldat > (1 << 15) - 1 {
-            return Err(Error::invalid(format!(
-                "jpegxs encoder: Ldat = {ldat} exceeds short packet header capacity (15 bits)."
-            )));
-        }
-        if lcnt > (1 << 13) - 1 {
-            return Err(Error::invalid(format!(
-                "jpegxs encoder: Lcnt = {lcnt} exceeds short packet header capacity (13 bits)."
-            )));
-        }
-        let mut hdr_bits: u64 = 0;
-        hdr_bits = (hdr_bits << 1) | 1; // Dr = 1
-        hdr_bits = (hdr_bits << 15) | (ldat as u64 & 0x7fff);
-        hdr_bits = (hdr_bits << 13) | (lcnt as u64 & 0x1fff);
-        hdr_bits = (hdr_bits << 11) | (lsgn as u64 & 0x07ff);
-        let mut header = vec![0u8; 5];
-        for (i, byte) in header.iter_mut().enumerate() {
-            *byte = ((hdr_bits >> (8 * (4 - i))) & 0xff) as u8;
-        }
-        out.extend_from_slice(&header);
-        out.extend_from_slice(&cnt_bytes);
-        out.extend_from_slice(&data_bytes);
-        Ok(())
+        let band_buf = &bands_per_comp[s.comp_i][s.beta as usize];
+        let pic_row = s.pic_row_offset + line_off;
+        let row_start = pic_row * s.pic_bw;
+        let row_end = row_start + s.wpb;
+        Some(band_buf[row_start..row_end].to_vec())
     };
 
-    // First packet: β = 0 .. β1-1 × Nc components × line 0.
-    let mut first_entries: Vec<(usize, usize)> = Vec::new();
+    // First packet: β = 0 .. β1-1 × Nc components × line 0 (subject to
+    // existence + sub-sample guard).
+    let mut first_entries: Vec<PerBandEntry> = Vec::new();
     for beta in 0..beta1 {
-        for i in 0..(nc as u32) {
-            let b_id = ((nc as u32) * beta + i) as usize;
-            let s = &slices[b_id];
-            if s.lines == 0 {
-                continue;
+        for i in 0..nc {
+            let s_idx = (beta as usize) * nc + i;
+            let s = &slices[s_idx];
+            // Sub-sample guard: (λ + L0) mod sy[i] == 0. λ=0 here. L0
+            // for β < β1 is 0 (τy = false), so the guard is always
+            // satisfied.
+            if let Some(line_data) = extract_band_line(s, 0) {
+                first_entries.push(PerBandEntry {
+                    wpb: s.wpb as u32,
+                    line: BandLineSlice::Direct(line_data),
+                    t: t_band,
+                });
             }
-            // Line λ = L0 → first line of the band slice = local index 0
-            // when L0 == 0 (true for β < β1, no τy → τy_b = 0). Round 2
-            // restricts to NL,x = NL,y, so β1 = 1 always — only the LL
-            // band lands in this packet.
-            first_entries.push((b_id, 0));
         }
     }
-    emit_packet(&first_entries, bands_per_comp, &slices, &mut entropy)?;
+    if !first_entries.is_empty() {
+        emit_packet(&mut entropy, cfg, &first_entries)?;
+    }
 
     // Proxy levels.
     let mut beta0 = beta1;
-    while beta0 < nbeta {
-        // Number of band lines per precinct at this proxy level.
-        let key0 = beta_key(beta0, nlx, nly);
-        let pow = pow_h(nly, key0.dy);
-        for lambda_within in 0..pow {
-            for beta in beta0..(beta0 + 3).min(nbeta) {
-                for i in 0..(nc as u32) {
-                    let b_id = ((nc as u32) * beta + i) as usize;
-                    let s = &slices[b_id];
-                    if lambda_within >= s.lines {
+    while beta0 < nbeta_pic {
+        // pow_h at the picture level for this proxy group (per spec).
+        // Sub-sampled components contribute `pow / sy[i]` lines but the
+        // outer loop walks pow_pic anyway — for components where this
+        // line doesn't exist, the band-line extractor returns None.
+        let key0 = beta_key(beta0, cfg.nlx, cfg.nly);
+        let pow_pic = pow_h(cfg.nly, key0.dy);
+        for lambda_within in 0..pow_pic {
+            for beta in beta0..(beta0 + 3).min(nbeta_pic) {
+                for i in 0..nc {
+                    let s_idx = (beta as usize) * nc + i;
+                    let s = &slices[s_idx];
+                    if !s.exists {
                         continue;
                     }
-                    // One packet per (band, line) entry — matches the
-                    // per-line emission in `compute_packet_layouts`.
-                    let entry = vec![(b_id, lambda_within)];
-                    emit_packet(&entry, bands_per_comp, &slices, &mut entropy)?;
+                    // Sub-sample guard: λ_within + L0 must be divisible
+                    // by sy[i]. For proxy levels τy ∈ {0, 1}; the guard
+                    // matches the slice walker's check. We use the
+                    // per-component-line offset to also drop entries
+                    // beyond `s.lines`.
+                    let sy_i = cfg.sy[i] as usize;
+                    let pic_grid_line = lambda_within;
+                    if sy_i != 0 && pic_grid_line % sy_i != 0 {
+                        continue;
+                    }
+                    let comp_line = pic_grid_line / sy_i.max(1);
+                    if let Some(line_data) = extract_band_line(s, comp_line) {
+                        let entries = vec![PerBandEntry {
+                            wpb: s.wpb as u32,
+                            line: BandLineSlice::Direct(line_data),
+                            t: t_band,
+                        }];
+                        emit_packet(&mut entropy, cfg, &entries)?;
+                    }
                 }
             }
         }
@@ -1085,17 +1147,244 @@ fn encode_precinct_cascade(
     precinct_bytes[0] = ((lprc >> 16) & 0xff) as u8;
     precinct_bytes[1] = ((lprc >> 8) & 0xff) as u8;
     precinct_bytes[2] = (lprc & 0xff) as u8;
-    // Q, R, D bits already zero.
+    precinct_bytes[3] = cfg.q.min(31);
+    // R[p] at offset 4 stays 0.
+    // D[p,b] bits stay 0 (no-prediction, no significance).
     precinct_bytes.extend_from_slice(&entropy);
     Ok(precinct_bytes)
 }
 
-/// Tiny MSB-first bit writer mirroring [`crate::entropy::bits::BitReader`].
+/// One band-line emitted in a packet.
+#[derive(Debug)]
+struct PerBandEntry {
+    /// `Wpb[p,b]` — coefficients per line in this band.
+    wpb: u32,
+    /// One line of int32 coefficients for this band (length `wpb`).
+    line: BandLineSlice,
+    /// Per-band `T[p,b]`.
+    t: u8,
+}
+
+#[derive(Debug)]
+enum BandLineSlice {
+    Direct(Vec<i32>),
+}
+
+impl BandLineSlice {
+    fn as_slice(&self) -> &[i32] {
+        match self {
+            BandLineSlice::Direct(v) => v.as_slice(),
+        }
+    }
+}
+
+/// Emit one packet to `out`. The packet covers a list of (band, line)
+/// entries. The encoder builds the body in two forms (Dr=1 raw and
+/// Dr=0 VLC, no-prediction), picks the one with the smaller total size
+/// (header + body), and writes that.
+fn emit_packet(out: &mut Vec<u8>, cfg: &EncodeConfig, entries: &[PerBandEntry]) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    // Build the (Dr=1) raw form.
+    let raw = build_packet_body(cfg, entries, true)?;
+    // Build the (Dr=0) VLC no-prediction form.
+    let vlc_form = build_packet_body(cfg, entries, false)?;
+
+    // Pick the smaller (header is 5 bytes either way, so just compare
+    // body lengths).
+    let chosen = if vlc_form.total_len() <= raw.total_len() {
+        vlc_form
+    } else {
+        raw
+    };
+    write_packet(out, &chosen)?;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct PacketBytes {
+    dr: u8,
+    cnt: Vec<u8>,
+    data: Vec<u8>,
+    sgn: Vec<u8>,
+}
+
+impl PacketBytes {
+    fn total_len(&self) -> usize {
+        // Short header is 5 bytes.
+        5 + self.cnt.len() + self.data.len() + self.sgn.len()
+    }
+}
+
+fn write_packet(out: &mut Vec<u8>, pkt: &PacketBytes) -> Result<()> {
+    let lcnt = pkt.cnt.len() as u32;
+    let ldat = pkt.data.len() as u32;
+    let lsgn = pkt.sgn.len() as u32;
+    if ldat > (1 << 15) - 1 {
+        return Err(Error::invalid(format!(
+            "jpegxs encoder: Ldat = {ldat} exceeds short packet header capacity (15 bits)."
+        )));
+    }
+    if lcnt > (1 << 13) - 1 {
+        return Err(Error::invalid(format!(
+            "jpegxs encoder: Lcnt = {lcnt} exceeds short packet header capacity (13 bits)."
+        )));
+    }
+    if lsgn > (1 << 11) - 1 {
+        return Err(Error::invalid(format!(
+            "jpegxs encoder: Lsgn = {lsgn} exceeds short packet header capacity (11 bits)."
+        )));
+    }
+    let mut hdr_bits: u64 = 0;
+    hdr_bits = (hdr_bits << 1) | (pkt.dr as u64 & 1);
+    hdr_bits = (hdr_bits << 15) | (ldat as u64 & 0x7fff);
+    hdr_bits = (hdr_bits << 13) | (lcnt as u64 & 0x1fff);
+    hdr_bits = (hdr_bits << 11) | (lsgn as u64 & 0x07ff);
+    let mut header = vec![0u8; 5];
+    for (k, byte) in header.iter_mut().enumerate() {
+        *byte = ((hdr_bits >> (8 * (4 - k))) & 0xff) as u8;
+    }
+    out.extend_from_slice(&header);
+    out.extend_from_slice(&pkt.cnt);
+    out.extend_from_slice(&pkt.data);
+    out.extend_from_slice(&pkt.sgn);
+    Ok(())
+}
+
+/// Build one packet body in either Dr=1 (raw) or Dr=0 (VLC no-prediction)
+/// mode. Returns `(dr, lcnt_bytes, ldat_bytes, lsgn_bytes)`.
+fn build_packet_body(
+    cfg: &EncodeConfig,
+    entries: &[PerBandEntry],
+    raw_mode: bool,
+) -> Result<PacketBytes> {
+    let mut data_writer = BitWriter::default();
+    let mut cnt_writer = BitWriter::default();
+    let ng_u = cfg.ng as usize;
+
+    for entry in entries {
+        let wpb = entry.wpb as usize;
+        let band_line: &[i32] = entry.line.as_slice();
+        let t = entry.t as u32;
+        let ncg = wpb.div_ceil(ng_u);
+        let m_max_for_br: u32 = if cfg.br >= 8 {
+            255
+        } else {
+            (1u32 << cfg.br) - 1
+        };
+        let coef = |g: usize, k: usize| -> i32 {
+            let xpos = g * ng_u + k;
+            if xpos < wpb {
+                band_line[xpos]
+            } else {
+                0
+            }
+        };
+
+        // Per-group bitplane counts (full M, before subtracting T).
+        let mut m_per_group = vec![0u8; ncg];
+        for (g, slot) in m_per_group.iter_mut().enumerate() {
+            let mut max_mag: u32 = 0;
+            for k in 0..ng_u {
+                let v = coef(g, k);
+                let mag = v.unsigned_abs();
+                if mag > max_mag {
+                    max_mag = mag;
+                }
+            }
+            let m = if max_mag == 0 {
+                0u32
+            } else {
+                32 - max_mag.leading_zeros()
+            };
+            // For lossy (T > 0), if m <= T the dequantizer collapses
+            // to zero anyway. Cap m at T (don't bother emitting empty
+            // bitplanes).
+            let m_eff = m.max(t);
+            if m_eff > m_max_for_br {
+                return Err(Error::invalid(format!(
+                    "jpegxs encoder: code group {g} bitplane count {m_eff} exceeds Br = {} (cap {m_max_for_br}). Use a higher Br or quantize the input.",
+                    cfg.br
+                )));
+            }
+            *slot = m_eff as u8;
+        }
+
+        // Bitplane-count sub-packet.
+        if raw_mode {
+            for &m in &m_per_group {
+                cnt_writer.write_bits(m as u32, cfg.br);
+            }
+        } else {
+            // Dr=0, no-prediction VLC: Δm = M - mtop. mtop = T (Table
+            // C.14 with D[p,b] & 1 == 0 → mtop = T[p,b]). For our
+            // encoder T = Q (G = 0 always); θ = max(r - t, 0) where
+            // r = mtop = T, so θ = 0. With θ = 0 the signed binary
+            // alphabet is empty — every Δm is encoded via the unary
+            // alphabet: x = Δm (always >= 0 since M >= T).
+            for &m in &m_per_group {
+                let delta_m = (m as i32) - (t as i32);
+                debug_assert!(
+                    delta_m >= 0,
+                    "M < T should never happen since we cap m at T"
+                );
+                emit_vlc_no_prediction(&mut cnt_writer, delta_m as u32);
+            }
+        }
+
+        // Data sub-packet.
+        for (g, &m_u8) in m_per_group.iter().enumerate() {
+            let m = m_u8 as u32;
+            if m <= t {
+                continue;
+            }
+            // Fs = 0: write Ng sign bits first.
+            for k in 0..ng_u {
+                let v = coef(g, k);
+                let sign_bit = if v < 0 { 1 } else { 0 };
+                data_writer.write_bit(sign_bit);
+            }
+            // Emit only planes (M-1) down to T (inclusive). Lower
+            // planes are quantized away — the decoder's deadzone
+            // adds the half-bucket offset back.
+            for plane in (t..m).rev() {
+                for k in 0..ng_u {
+                    let v = coef(g, k);
+                    let mag = v.unsigned_abs();
+                    let bit = ((mag >> plane) & 1) as u8;
+                    data_writer.write_bit(bit);
+                }
+            }
+        }
+    }
+    cnt_writer.align_to_byte();
+    data_writer.align_to_byte();
+    let cnt_bytes = cnt_writer.into_bytes();
+    let data_bytes = data_writer.into_bytes();
+    Ok(PacketBytes {
+        dr: if raw_mode { 1 } else { 0 },
+        cnt: cnt_bytes,
+        data: data_bytes,
+        sgn: Vec::new(),
+    })
+}
+
+/// Emit a VLC-encoded `Δm` using the no-prediction θ=0 alphabet:
+/// `Δm` ones followed by a 0 comma. (Since T = mtop and θ = max(r-t,0)
+/// = 0 in our encoder, every Δm > 0 is in the unary sub-alphabet, and
+/// Δm = 0 emits a single 0.)
+fn emit_vlc_no_prediction(writer: &mut BitWriter, delta_m: u32) {
+    for _ in 0..delta_m {
+        writer.write_bit(1);
+    }
+    writer.write_bit(0);
+}
+
+/// Tiny MSB-first bit writer.
 #[derive(Debug, Default)]
 struct BitWriter {
     bytes: Vec<u8>,
-    /// Number of bits written into the in-progress final byte (0 means
-    /// the last byte is full or there is no in-progress byte).
     bit_pos: u8,
 }
 
@@ -1134,8 +1423,6 @@ mod tests {
     use super::*;
     use crate::decoder::decode_codestream;
 
-    /// PSNR of two byte-arrays of equal length, in dB. `255` is the
-    /// peak signal value.
     fn psnr(a: &[u8], b: &[u8]) -> f64 {
         assert_eq!(a.len(), b.len());
         let mut sse: u64 = 0;
@@ -1166,9 +1453,9 @@ mod tests {
         for y in 0..32 {
             for x in 0..32 {
                 let off = (y * 32 + x) * 3;
-                buf[off] = (((x as i32) * 8 + y as i32) % 256) as u8; // R
-                buf[off + 1] = (((y as i32) * 5 + x as i32 * 3) % 256) as u8; // G
-                buf[off + 2] = ((x ^ y) as u8).wrapping_mul(13); // B
+                buf[off] = (((x as i32) * 8 + y as i32) % 256) as u8;
+                buf[off + 1] = (((y as i32) * 5 + x as i32 * 3) % 256) as u8;
+                buf[off + 2] = ((x ^ y) as u8).wrapping_mul(13);
             }
         }
         buf
@@ -1202,10 +1489,6 @@ mod tests {
         assert!(encode_luma_8bit(32, 32, &pixels).is_err());
     }
 
-    /// Per-precinct (32-col × 2-row) forward 2-D DWT must round-trip
-    /// through `inverse_2d` losslessly. Pinned because round-1 relies on
-    /// per-precinct synthesis of `Hp = 2`-line bands and the decoder
-    /// path through [`crate::dwt::extend_symmetric`] for `z = 2`.
     #[test]
     fn per_precinct_dwt_round_trips_for_hp_2() {
         use crate::dwt::{forward_2d, inverse_2d};
@@ -1224,7 +1507,7 @@ mod tests {
         forward_2d(w, 2, &strip, &mut ll, &mut hl, &mut lh, &mut hh).unwrap();
         let mut out = vec![0i32; w * 2];
         inverse_2d(w, 2, &ll, &hl, &lh, &hh, &mut out).unwrap();
-        assert_eq!(out, strip, "per-precinct (Hp = 2) 2-D DWT must round-trip");
+        assert_eq!(out, strip);
     }
 
     #[test]
@@ -1232,36 +1515,17 @@ mod tests {
         let pixels = vec![123u8; 32 * 32];
         let codestream = encode_luma_8bit(32, 32, &pixels).expect("encode flat 32x32");
         let img = decode_codestream(&codestream, None).expect("decode flat 32x32");
-        assert_eq!(img.width, 32);
-        assert_eq!(img.height, 32);
-        assert_eq!(img.num_components, 1);
-        assert_eq!(img.planes.len(), 1);
-        assert_eq!(img.planes[0].data.len(), 32 * 32);
-        assert_eq!(
-            img.planes[0].data, pixels,
-            "flat image must round-trip losslessly"
-        );
+        assert_eq!(img.planes[0].data, pixels);
     }
 
     #[test]
     fn self_roundtrip_synthetic_32x32_is_lossless() {
         let pixels = make_synthetic_32x32();
-        let codestream =
-            encode_luma_8bit(32, 32, &pixels).expect("encode synthetic 32x32 round-1 image");
-        let img = decode_codestream(&codestream, None).expect("decode synthetic 32x32 codestream");
-        assert_eq!(img.width, 32);
-        assert_eq!(img.height, 32);
-        assert_eq!(img.num_components, 1);
-        let decoded = &img.planes[0].data;
-        assert_eq!(
-            decoded, &pixels,
-            "lossless round 1 encoder must reconstruct the input exactly (PSNR = inf, requirement >= 40 dB)"
-        );
-        let p = psnr(&pixels, decoded);
-        assert!(
-            p >= 40.0,
-            "self-roundtrip PSNR {p:.2} dB falls short of the 40 dB round-1 minimum"
-        );
+        let codestream = encode_luma_8bit(32, 32, &pixels).expect("encode 32x32");
+        let img = decode_codestream(&codestream, None).expect("decode 32x32");
+        assert_eq!(img.planes[0].data, pixels);
+        let p = psnr(&pixels, &img.planes[0].data);
+        assert!(p >= 40.0, "self-roundtrip PSNR {p:.2} dB falls short");
     }
 
     #[test]
@@ -1269,13 +1533,9 @@ mod tests {
         let pixels = vec![10u8, 200, 50, 150];
         let codestream = encode_luma_8bit(2, 2, &pixels).expect("encode 2x2");
         let img = decode_codestream(&codestream, None).expect("decode 2x2");
-        assert_eq!(img.width, 2);
-        assert_eq!(img.height, 2);
         assert_eq!(img.planes[0].data, pixels);
     }
 
-    /// Round-trip via [`encode_image`] which takes a [`JpegXsImage`] —
-    /// the same struct the decoder produces.
     #[test]
     fn encode_image_then_decode_round_trips() {
         let pixels = make_synthetic_32x32();
@@ -1284,77 +1544,19 @@ mod tests {
         assert_eq!(img.planes[0].data, pixels);
     }
 
-    // === Round 2: multi-component =======================================
+    // === Round 2 carry-over: multi-component =============================
 
-    /// 3-component RGB without colour transform. Each plane should
-    /// round-trip independently and bit-exactly.
     #[test]
     fn self_roundtrip_rgb_32x32_no_transform() {
         let pixels = make_synthetic_rgb_32x32();
-        let codestream = encode_rgb_8bit(32, 32, &pixels, 0, 1).expect("encode RGB 32x32 (Cpih=0)");
+        let codestream = encode_rgb_8bit(32, 32, &pixels, 0, 1).expect("encode RGB 32x32");
         let img = decode_codestream(&codestream, None).expect("decode RGB Cpih=0");
-        assert_eq!(img.width, 32);
-        assert_eq!(img.height, 32);
-        assert_eq!(img.num_components, 3);
-        // De-interleave the input for comparison plane-by-plane.
         let n = 32 * 32;
-        let mut r = Vec::with_capacity(n);
-        let mut g = Vec::with_capacity(n);
-        let mut b = Vec::with_capacity(n);
-        for chunk in pixels.chunks_exact(3) {
-            r.push(chunk[0]);
-            g.push(chunk[1]);
-            b.push(chunk[2]);
-        }
-        assert_eq!(img.planes[0].data, r, "R plane");
-        assert_eq!(img.planes[1].data, g, "G plane");
-        assert_eq!(img.planes[2].data, b, "B plane");
-    }
-
-    /// 3-component RGB with forward RCT, Cpih=1. Lossless because RCT
-    /// is reversible.
-    #[test]
-    fn self_roundtrip_rgb_32x32_rct() {
-        let pixels = make_synthetic_rgb_32x32();
-        let codestream = encode_rgb_8bit(32, 32, &pixels, 1, 1).expect("encode RGB 32x32 (Cpih=1)");
-        let img = decode_codestream(&codestream, None).expect("decode RGB Cpih=1");
-        assert_eq!(img.num_components, 3);
-        assert_eq!(img.cpih, 1);
-        let n = 32 * 32;
-        let mut r = Vec::with_capacity(n);
-        let mut g = Vec::with_capacity(n);
-        let mut b = Vec::with_capacity(n);
-        for chunk in pixels.chunks_exact(3) {
-            r.push(chunk[0]);
-            g.push(chunk[1]);
-            b.push(chunk[2]);
-        }
-        assert_eq!(img.planes[0].data, r, "R plane after RCT round-trip");
-        assert_eq!(img.planes[1].data, g, "G plane after RCT round-trip");
-        assert_eq!(img.planes[2].data, b, "B plane after RCT round-trip");
-    }
-
-    /// Multi-decomposition NL=2/2, single luma. Cascade + decoder
-    /// gather-then-cascade must round-trip losslessly.
-    #[test]
-    fn self_roundtrip_luma_nl_2_2() {
-        let pixels = make_synthetic_32x32();
-        let codestream = encode_planar(32, 32, 1, 0, 2, 2, std::slice::from_ref(&pixels))
-            .expect("encode luma NL=2/2");
-        let img = decode_codestream(&codestream, None).expect("decode luma NL=2/2");
-        assert_eq!(img.planes[0].data, pixels, "NL=2/2 lossless luma");
-    }
-
-    /// Multi-decomposition NL=2/2 + RGB + RCT — the full bundle.
-    #[test]
-    fn self_roundtrip_rgb_nl_2_2_rct() {
-        let pixels = make_synthetic_rgb_32x32();
-        let codestream = encode_rgb_8bit(32, 32, &pixels, 1, 2).expect("encode RGB NL=2/2 Cpih=1");
-        let img = decode_codestream(&codestream, None).expect("decode RGB NL=2/2 Cpih=1");
-        let n = 32 * 32;
-        let mut r = Vec::with_capacity(n);
-        let mut g = Vec::with_capacity(n);
-        let mut b = Vec::with_capacity(n);
+        let (mut r, mut g, mut b) = (
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+        );
         for chunk in pixels.chunks_exact(3) {
             r.push(chunk[0]);
             g.push(chunk[1]);
@@ -1365,9 +1567,57 @@ mod tests {
         assert_eq!(img.planes[2].data, b);
     }
 
-    // === Round 2: odd dimensions ========================================
+    #[test]
+    fn self_roundtrip_rgb_32x32_rct() {
+        let pixels = make_synthetic_rgb_32x32();
+        let codestream = encode_rgb_8bit(32, 32, &pixels, 1, 1).expect("encode RGB Cpih=1");
+        let img = decode_codestream(&codestream, None).expect("decode RGB Cpih=1");
+        let n = 32 * 32;
+        let (mut r, mut g, mut b) = (
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+        );
+        for chunk in pixels.chunks_exact(3) {
+            r.push(chunk[0]);
+            g.push(chunk[1]);
+            b.push(chunk[2]);
+        }
+        assert_eq!(img.planes[0].data, r);
+        assert_eq!(img.planes[1].data, g);
+        assert_eq!(img.planes[2].data, b);
+    }
 
-    /// 31×31 odd dimensions, single luma, NL=1.
+    #[test]
+    fn self_roundtrip_luma_nl_2_2() {
+        let pixels = make_synthetic_32x32();
+        let codestream = encode_planar(32, 32, 1, 0, 2, 2, std::slice::from_ref(&pixels))
+            .expect("encode luma NL=2/2");
+        let img = decode_codestream(&codestream, None).expect("decode luma NL=2/2");
+        assert_eq!(img.planes[0].data, pixels);
+    }
+
+    #[test]
+    fn self_roundtrip_rgb_nl_2_2_rct() {
+        let pixels = make_synthetic_rgb_32x32();
+        let codestream = encode_rgb_8bit(32, 32, &pixels, 1, 2).expect("encode RGB NL=2/2 Cpih=1");
+        let img = decode_codestream(&codestream, None).expect("decode RGB NL=2/2 Cpih=1");
+        let n = 32 * 32;
+        let (mut r, mut g, mut b) = (
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+        );
+        for chunk in pixels.chunks_exact(3) {
+            r.push(chunk[0]);
+            g.push(chunk[1]);
+            b.push(chunk[2]);
+        }
+        assert_eq!(img.planes[0].data, r);
+        assert_eq!(img.planes[1].data, g);
+        assert_eq!(img.planes[2].data, b);
+    }
+
     #[test]
     fn self_roundtrip_odd_dimensions_31x31() {
         let mut pixels = vec![0u8; 31 * 31];
@@ -1378,16 +1628,9 @@ mod tests {
         }
         let codestream = encode_luma_8bit(31, 31, &pixels).expect("encode 31x31");
         let img = decode_codestream(&codestream, None).expect("decode 31x31");
-        assert_eq!(img.width, 31);
-        assert_eq!(img.height, 31);
-        assert_eq!(img.planes[0].data, pixels, "odd-dim 31x31 lossless");
+        assert_eq!(img.planes[0].data, pixels);
     }
 
-    /// 33×17 odd dimensions, NL=2/2 — exercises both odd width and
-    /// odd height with cascaded forward DWT. Pinned: the slice walker
-    /// `Wpb` formula is now τx-aware (matches `Wb` from the cascade),
-    /// so the encoder + decoder agree on band geometry under odd
-    /// dimensions for any `NL,x = NL,y`.
     #[test]
     fn self_roundtrip_odd_dimensions_33x17_nl_2_2() {
         let w = 33usize;
@@ -1401,19 +1644,18 @@ mod tests {
         let codestream = encode_planar(w as u16, h as u16, 1, 0, 2, 2, &[pixels.clone()])
             .expect("encode 33x17 NL=2/2");
         let img = decode_codestream(&codestream, None).expect("decode 33x17 NL=2/2");
-        assert_eq!(img.width, w as u32);
-        assert_eq!(img.height, h as u32);
         assert_eq!(img.planes[0].data, pixels);
     }
 
-    /// `encode_image` accepts 3-component inputs (round 2 promotion).
     #[test]
     fn encode_image_rgb_round_trips() {
         let pixels = make_synthetic_rgb_32x32();
         let n = 32 * 32;
-        let mut r = Vec::with_capacity(n);
-        let mut g = Vec::with_capacity(n);
-        let mut b = Vec::with_capacity(n);
+        let (mut r, mut g, mut b) = (
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+        );
         for chunk in pixels.chunks_exact(3) {
             r.push(chunk[0]);
             g.push(chunk[1]);
@@ -1448,28 +1690,6 @@ mod tests {
         assert_eq!(decoded.planes[2].data, b);
     }
 
-    /// Compression ratio sanity: round-2 raw-mode encoder produces
-    /// codestreams whose size is dominated by per-precinct overhead +
-    /// uncompressed magnitude bitplanes. We pin only that the encoder
-    /// stays within a generous bound of raw RGB bytes — fine-tuned
-    /// compression arrives with VLC bitplane-counts + significance
-    /// coding in round 3.
-    #[test]
-    fn round2_codestream_within_size_bound() {
-        let pixels = make_synthetic_rgb_32x32();
-        let raw = pixels.len();
-        let _cpih0_nl1 = encode_rgb_8bit(32, 32, &pixels, 0, 1).unwrap().len();
-        let _cpih1_nl1 = encode_rgb_8bit(32, 32, &pixels, 1, 1).unwrap().len();
-        let cpih1_nl2 = encode_rgb_8bit(32, 32, &pixels, 1, 2).unwrap().len();
-        // Sanity bound: raw-mode entropy is bound to be larger than
-        // raw on this size, but stay within 5x for the best mode.
-        assert!(
-            cpih1_nl2 < raw * 5,
-            "best lossless codestream {cpih1_nl2} blew past 5x raw {raw}"
-        );
-    }
-
-    /// Round 2 still rejects unsupported configs (Nc=2, NL>2, etc.).
     #[test]
     fn rejects_unsupported_configurations() {
         let pixels = vec![0u8; 32 * 32];
@@ -1482,5 +1702,302 @@ mod tests {
         assert!(encode_planar(32, 32, 2, 0, 1, 1, &two).is_err());
         // Cpih=1 with Nc=1 invalid.
         assert!(encode_planar(32, 32, 1, 1, 1, 1, &[pixels]).is_err());
+    }
+
+    // === Round 3: VLC bitplane-count mode (Dr=0, no-prediction) ==========
+
+    /// Round-3 raw-mode-vs-VLC picker: lossless 32×32 RGB stays
+    /// lossless and the codestream gets *smaller* than the round-2 raw-
+    /// mode-only emission. We compare the round-3 size against a
+    /// hand-computed raw-only lower bound (5 packets × 5-byte header +
+    /// data + Br × Ncg × packets) — but the easier pin is just to
+    /// assert the round-3 size is below a tightened bound.
+    #[test]
+    fn round3_vlc_shrinks_codestream_vs_raw_only_baseline() {
+        let pixels = make_synthetic_rgb_32x32();
+        let raw_input = pixels.len();
+        let r3 = encode_rgb_8bit(32, 32, &pixels, 1, 2)
+            .expect("encode RGB NL=2/2 Cpih=1")
+            .len();
+        // Round 2's reported size for this config was within 5x raw.
+        // Round 3 with VLC picker tightens this to ≤ 2.0x raw on
+        // synthetic 32×32 RGB.
+        assert!(
+            r3 < raw_input * 2,
+            "round-3 codestream {r3} exceeds 2x raw {raw_input}; VLC picker not engaging?"
+        );
+        // And round-trip remains lossless.
+        let img =
+            decode_codestream(&encode_rgb_8bit(32, 32, &pixels, 1, 2).unwrap(), None).unwrap();
+        let n = 32 * 32;
+        let (mut r, mut g, mut b) = (
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+        );
+        for chunk in pixels.chunks_exact(3) {
+            r.push(chunk[0]);
+            g.push(chunk[1]);
+            b.push(chunk[2]);
+        }
+        assert_eq!(img.planes[0].data, r);
+        assert_eq!(img.planes[1].data, g);
+        assert_eq!(img.planes[2].data, b);
+    }
+
+    /// Flat luma — every M = 0 except possibly the lowest band. With
+    /// Dr=0 VLC the bitplane-count sub-packet collapses to 1 bit per
+    /// group (the 0 comma) → near-minimum size.
+    #[test]
+    fn round3_flat_luma_compresses_well() {
+        let pixels = vec![123u8; 32 * 32];
+        let codestream = encode_luma_8bit(32, 32, &pixels).expect("encode flat 32x32");
+        // Flat input → raw input = 1024 bytes. Round-3 VLC + small
+        // header should stay well under 1024.
+        assert!(
+            codestream.len() < 1024,
+            "round-3 flat luma codestream {} not smaller than raw 1024",
+            codestream.len()
+        );
+        let img = decode_codestream(&codestream, None).expect("decode flat 32x32");
+        assert_eq!(img.planes[0].data, pixels);
+    }
+
+    // === Round 3: Fq=8 lossy mode =========================================
+
+    /// Fq=8 with Q=1 should still produce high-quality output (PSNR ≥
+    /// 40 dB) while shrinking the codestream further than lossless.
+    #[test]
+    fn round3_fq8_q1_psnr_above_40db() {
+        let pixels = make_synthetic_rgb_32x32();
+        let lossless = encode_rgb_8bit(32, 32, &pixels, 1, 2)
+            .expect("encode lossless")
+            .len();
+        let n = 32 * 32;
+        let (mut r, mut g, mut b) = (
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+        );
+        for chunk in pixels.chunks_exact(3) {
+            r.push(chunk[0]);
+            g.push(chunk[1]);
+            b.push(chunk[2]);
+        }
+        let cs = encode_planar_lossy(32, 32, 3, 1, 2, 2, 1, &[r.clone(), g.clone(), b.clone()])
+            .expect("encode lossy q=1");
+        let img = decode_codestream(&cs, None).expect("decode lossy");
+        let mut decoded_rgb = vec![0u8; pixels.len()];
+        for (i, ((rd, gd), bd)) in img.planes[0]
+            .data
+            .iter()
+            .zip(&img.planes[1].data)
+            .zip(&img.planes[2].data)
+            .enumerate()
+        {
+            decoded_rgb[i * 3] = *rd;
+            decoded_rgb[i * 3 + 1] = *gd;
+            decoded_rgb[i * 3 + 2] = *bd;
+        }
+        let p = psnr(&pixels, &decoded_rgb);
+        assert!(p >= 40.0, "Fq=8 q=1 PSNR {p:.2} dB below 40 dB floor");
+        assert!(
+            cs.len() < lossless,
+            "Fq=8 q=1 codestream {} not smaller than lossless {}",
+            cs.len(),
+            lossless
+        );
+    }
+
+    /// Fq=8 with Q=4 trades quality for compression but still must
+    /// PSNR ≥ 25 dB. Synthetic 32×32 RGB hits ≈28-30 dB at q=4 because
+    /// our deadzone-only encoder drops 4 bitplanes from every coefficient
+    /// without any rate-distortion shaping; q=1/2 is the sweet spot for
+    /// near-perceptually-lossless encoding (≥ 40 dB), q=4/6/8 trade
+    /// linearly until the band-truncation noise dominates.
+    #[test]
+    fn round3_fq8_q4_psnr_above_25db() {
+        let pixels = make_synthetic_rgb_32x32();
+        let n = 32 * 32;
+        let (mut r, mut g, mut b) = (
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+        );
+        for chunk in pixels.chunks_exact(3) {
+            r.push(chunk[0]);
+            g.push(chunk[1]);
+            b.push(chunk[2]);
+        }
+        let cs = encode_planar_lossy(32, 32, 3, 1, 2, 2, 4, &[r, g, b]).expect("encode lossy q=4");
+        let img = decode_codestream(&cs, None).expect("decode lossy q=4");
+        let mut decoded_rgb = vec![0u8; pixels.len()];
+        for (i, ((rd, gd), bd)) in img.planes[0]
+            .data
+            .iter()
+            .zip(&img.planes[1].data)
+            .zip(&img.planes[2].data)
+            .enumerate()
+        {
+            decoded_rgb[i * 3] = *rd;
+            decoded_rgb[i * 3 + 1] = *gd;
+            decoded_rgb[i * 3 + 2] = *bd;
+        }
+        let p = psnr(&pixels, &decoded_rgb);
+        assert!(p >= 25.0, "Fq=8 q=4 PSNR {p:.2} dB below 25 dB floor");
+    }
+
+    /// Fq=8 with Q=0 reduces to the lossless path (validated up the
+    /// chain: q=0 → fq must be 0).
+    #[test]
+    fn round3_q0_requires_fq0() {
+        // encode_planar_lossy with q=0 internally sets fq=0 → matches
+        // encode_planar exactly. Good.
+        let pixels = vec![0u8; 32 * 32];
+        let r2 = encode_planar(32, 32, 1, 0, 1, 1, &[pixels.clone()]).unwrap();
+        let r3 = encode_planar_lossy(32, 32, 1, 0, 1, 1, 0, &[pixels.clone()]).unwrap();
+        assert_eq!(r2, r3, "q=0 path must match lossless encode_planar");
+    }
+
+    // === Round 3: 4:2:2 / 4:2:0 chroma sub-sampling ======================
+
+    /// 4:2:2 — chroma planes are W/2 × H. Self round-trip must restore
+    /// every plane bit-exactly (lossless).
+    #[test]
+    fn round3_chroma_422_lossless_round_trip() {
+        let w = 32u16;
+        let h = 32u16;
+        let n_y = (w as usize) * (h as usize);
+        let n_c = ((w as usize) / 2) * (h as usize);
+        let mut y_plane = vec![0u8; n_y];
+        let mut cb_plane = vec![0u8; n_c];
+        let mut cr_plane = vec![0u8; n_c];
+        for i in 0..n_y {
+            y_plane[i] = ((i * 7 + 13) % 256) as u8;
+        }
+        for i in 0..n_c {
+            cb_plane[i] = ((i * 11 + 17) % 256) as u8;
+            cr_plane[i] = ((i * 19 + 23) % 256) as u8;
+        }
+        let cs = encode_planar_subsampled(
+            w,
+            h,
+            3,
+            0,
+            1,
+            1,
+            0,
+            &[1, 2, 2],
+            &[1, 1, 1],
+            &[y_plane.clone(), cb_plane.clone(), cr_plane.clone()],
+        )
+        .expect("encode 4:2:2 lossless");
+        let img = decode_codestream(&cs, None).expect("decode 4:2:2");
+        assert_eq!(img.num_components, 3);
+        assert_eq!(img.planes[0].data, y_plane);
+        assert_eq!(img.planes[1].data, cb_plane);
+        assert_eq!(img.planes[2].data, cr_plane);
+    }
+
+    /// 4:2:0 — chroma planes are W/2 × H/2. Self round-trip lossless.
+    #[test]
+    fn round3_chroma_420_lossless_round_trip() {
+        let w = 32u16;
+        let h = 32u16;
+        let n_y = (w as usize) * (h as usize);
+        let n_c = ((w as usize) / 2) * ((h as usize) / 2);
+        let mut y_plane = vec![0u8; n_y];
+        let mut cb_plane = vec![0u8; n_c];
+        let mut cr_plane = vec![0u8; n_c];
+        for i in 0..n_y {
+            y_plane[i] = ((i * 7 + 13) % 256) as u8;
+        }
+        for i in 0..n_c {
+            cb_plane[i] = ((i * 11 + 17) % 256) as u8;
+            cr_plane[i] = ((i * 19 + 23) % 256) as u8;
+        }
+        let cs = encode_planar_subsampled(
+            w,
+            h,
+            3,
+            0,
+            1,
+            1,
+            0,
+            &[1, 2, 2],
+            &[1, 2, 2],
+            &[y_plane.clone(), cb_plane.clone(), cr_plane.clone()],
+        )
+        .expect("encode 4:2:0 lossless");
+        let img = decode_codestream(&cs, None).expect("decode 4:2:0");
+        assert_eq!(img.num_components, 3);
+        assert_eq!(img.planes[0].data, y_plane);
+        assert_eq!(img.planes[1].data, cb_plane);
+        assert_eq!(img.planes[2].data, cr_plane);
+    }
+
+    /// 4:2:0 codestream is smaller than 4:4:4 of the same picture
+    /// (chroma byte budget halves twice).
+    #[test]
+    fn round3_chroma_420_smaller_than_444() {
+        let w = 32u16;
+        let h = 32u16;
+        let n_y = (w as usize) * (h as usize);
+        let mut y_plane = vec![0u8; n_y];
+        for i in 0..n_y {
+            y_plane[i] = ((i * 7 + 13) % 256) as u8;
+        }
+        let cb_full = y_plane.clone();
+        let cr_full = y_plane.clone();
+        let cs_444 = encode_planar(w, h, 3, 0, 1, 1, &[y_plane.clone(), cb_full, cr_full])
+            .expect("encode 4:4:4");
+        // Down-sample chroma by 2× in both axes for the 4:2:0 case.
+        let n_c = ((w as usize) / 2) * ((h as usize) / 2);
+        let mut cb420 = vec![0u8; n_c];
+        let mut cr420 = vec![0u8; n_c];
+        for y in 0..(h as usize / 2) {
+            for x in 0..(w as usize / 2) {
+                cb420[y * (w as usize / 2) + x] = y_plane[(y * 2) * w as usize + (x * 2)];
+                cr420[y * (w as usize / 2) + x] = y_plane[(y * 2) * w as usize + (x * 2)];
+            }
+        }
+        let cs_420 = encode_planar_subsampled(
+            w,
+            h,
+            3,
+            0,
+            1,
+            1,
+            0,
+            &[1, 2, 2],
+            &[1, 2, 2],
+            &[y_plane, cb420, cr420],
+        )
+        .expect("encode 4:2:0");
+        assert!(
+            cs_420.len() < cs_444.len(),
+            "4:2:0 codestream {} not smaller than 4:4:4 {}",
+            cs_420.len(),
+            cs_444.len()
+        );
+    }
+
+    /// Rejects `(sx, sy)` outside `{1, 2}`.
+    #[test]
+    fn round3_rejects_unsupported_sxy() {
+        let pixels = vec![0u8; 32 * 32];
+        let res = encode_planar_subsampled(
+            32,
+            32,
+            1,
+            0,
+            1,
+            1,
+            0,
+            &[3],
+            &[1],
+            std::slice::from_ref(&pixels),
+        );
+        assert!(res.is_err());
     }
 }

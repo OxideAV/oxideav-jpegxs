@@ -314,19 +314,23 @@ pub fn build_plan(
         let hc = hf / (comp.sy as u32);
         let nlx_i = nlx; // Annex B.2: N'L,x[i] = NL,x for i < Nc - Sd
         let nly_i = nly_per_component[i];
+        let nbeta_i = n_beta(nlx_i, nly_i);
         for beta in 0..nbeta {
-            let (dx, dy, tx, ty) = beta_levels(beta, nlx_i, nly_i);
             let idx = i * (nbeta as usize) + beta as usize;
+            // Cap β by the per-component number of filter types: if a
+            // β is not defined for component i (because nly_i < nly),
+            // skip the geometry computation (which would underflow on
+            // `dx = nlx + 1 - beta` for β > nlx + 1) and mark the band
+            // non-existent.
+            if beta >= nbeta_i {
+                exists_arr[idx] = false;
+                continue;
+            }
+            let (dx, dy, tx, ty) = beta_levels(beta, nlx_i, nly_i);
             dx_arr[idx] = dx;
             dy_arr[idx] = dy;
             tau_x[idx] = tx;
             tau_y[idx] = ty;
-            // Cap β by the per-component number of filter types: if a
-            // β is not defined for component i (because nly_i < nly),
-            // mark the band non-existent. n_beta(nlx_i, nly_i) gives the
-            // per-component count.
-            let nbeta_i = n_beta(nlx_i, nly_i);
-            let exists_per_comp = beta < nbeta_i;
             // Band geometry per Annex B.2.
             let wb_b = if !tx {
                 if dx == 0 {
@@ -350,7 +354,7 @@ pub fn build_plan(
             };
             wb[idx] = wb_b;
             hb[idx] = hb_b;
-            exists_arr[idx] = exists_per_comp && band_exists(beta, i, nly, dy, comp.sy, ty);
+            exists_arr[idx] = band_exists(beta, i, nly, dy, comp.sy, ty);
         }
     }
 
