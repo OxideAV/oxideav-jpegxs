@@ -71,7 +71,7 @@ pub mod slice_walker;
 pub mod registry;
 
 #[cfg(feature = "registry")]
-pub use registry::{make_decoder, register};
+pub use registry::{make_decoder, register, register_containers};
 
 pub use capabilities::{parse_capabilities, parse_capabilities_lossy, Capabilities};
 pub use codestream::{Codestream, Slice};
@@ -179,5 +179,20 @@ mod tests {
         let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
         let dec = reg.make_decoder(&params).expect("round-4 decoder factory");
         assert_eq!(dec.codec_id().as_str(), CODEC_ID_STR);
+    }
+
+    #[cfg(feature = "registry")]
+    #[test]
+    fn jxs_extension_resolves_to_jpegxs() {
+        use oxideav_core::ContainerRegistry;
+        let mut reg = ContainerRegistry::new();
+        register_containers(&mut reg);
+        // Canonical lower-case lookup.
+        assert_eq!(reg.container_for_extension("jxs"), Some(CODEC_ID_STR));
+        // Case-insensitive (the registry lower-cases both sides).
+        assert_eq!(reg.container_for_extension("JXS"), Some(CODEC_ID_STR));
+        assert_eq!(reg.container_for_extension("Jxs"), Some(CODEC_ID_STR));
+        // Unrelated extensions do not collide.
+        assert_eq!(reg.container_for_extension("jpg"), None);
     }
 }

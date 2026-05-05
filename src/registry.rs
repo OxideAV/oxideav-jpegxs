@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 
 use oxideav_core::{
     frame::VideoPlane, CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry,
-    Decoder, Error, Frame, Packet, Result, VideoFrame,
+    ContainerRegistry, Decoder, Error, Frame, Packet, Result, VideoFrame,
 };
 
 use crate::decoder::decode_codestream;
@@ -56,6 +56,20 @@ pub fn register(reg: &mut CodecRegistry) {
             .capabilities(caps)
             .decoder(make_decoder),
     );
+}
+
+/// Register JPEG XS file extensions into the supplied [`ContainerRegistry`].
+///
+/// JPEG XS has no separate container layer of its own — a `.jxs` file is
+/// the bare ISO/IEC 21122 codestream (SOC marker first), so no demuxer
+/// or probe is registered. We *do* register the canonical `.jxs`
+/// extension against the codec id `"jpegxs"` so a caller resolving a
+/// path hint via [`ContainerRegistry::container_for_extension`] still
+/// gets a useful answer. Lookups are case-insensitive (handled by
+/// [`ContainerRegistry::register_extension`] / `container_for_extension`,
+/// which lowercase both sides).
+pub fn register_containers(reg: &mut ContainerRegistry) {
+    reg.register_extension("jxs", CODEC_ID_STR);
 }
 
 /// Decoder factory. Round 6 accepts the multi-component
