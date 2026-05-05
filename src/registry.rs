@@ -1,5 +1,6 @@
 //! `oxideav-core` integration: `Decoder` trait impl, `Frame` / `Error`
-//! conversions, and the [`register`] entry point.
+//! conversions, and the [`register`] / [`register_codecs`] /
+//! [`register_containers`] entry points.
 //!
 //! Gated behind the default-on `registry` Cargo feature. With the
 //! feature off the rest of the crate still exposes the standalone
@@ -12,7 +13,7 @@ use std::collections::VecDeque;
 
 use oxideav_core::{
     frame::VideoPlane, CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry,
-    ContainerRegistry, Decoder, Error, Frame, Packet, Result, VideoFrame,
+    ContainerRegistry, Decoder, Error, Frame, Packet, Result, RuntimeContext, VideoFrame,
 };
 
 use crate::decoder::decode_codestream;
@@ -47,7 +48,7 @@ impl From<JpegXsImage> for Frame {
 }
 
 /// Register the JPEG XS decoder factory.
-pub fn register(reg: &mut CodecRegistry) {
+pub fn register_codecs(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::video("jpegxs_sw")
         .with_lossy(true)
         .with_intra_only(true);
@@ -70,6 +71,13 @@ pub fn register(reg: &mut CodecRegistry) {
 /// which lowercase both sides).
 pub fn register_containers(reg: &mut ContainerRegistry) {
     reg.register_extension("jxs", CODEC_ID_STR);
+}
+
+/// Unified entry point: install every codec and container provided by
+/// `oxideav-jpegxs` into a [`RuntimeContext`].
+pub fn register(ctx: &mut RuntimeContext) {
+    register_codecs(&mut ctx.codecs);
+    register_containers(&mut ctx.containers);
 }
 
 /// Decoder factory. Round 6 accepts the multi-component

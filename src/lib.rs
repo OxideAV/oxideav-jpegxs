@@ -71,7 +71,7 @@ pub mod slice_walker;
 pub mod registry;
 
 #[cfg(feature = "registry")]
-pub use registry::{make_decoder, register, register_containers};
+pub use registry::{make_decoder, register, register_codecs, register_containers};
 
 pub use capabilities::{parse_capabilities, parse_capabilities_lossy, Capabilities};
 pub use codestream::{Codestream, Slice};
@@ -175,7 +175,7 @@ mod tests {
     fn registration_yields_decoder() {
         use oxideav_core::{CodecId, CodecParameters, CodecRegistry};
         let mut reg = CodecRegistry::new();
-        register(&mut reg);
+        register_codecs(&mut reg);
         let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
         let dec = reg.make_decoder(&params).expect("round-4 decoder factory");
         assert_eq!(dec.codec_id().as_str(), CODEC_ID_STR);
@@ -194,5 +194,22 @@ mod tests {
         assert_eq!(reg.container_for_extension("Jxs"), Some(CODEC_ID_STR));
         // Unrelated extensions do not collide.
         assert_eq!(reg.container_for_extension("jpg"), None);
+    }
+
+    #[cfg(feature = "registry")]
+    #[test]
+    fn register_via_runtime_context_installs_factories() {
+        use oxideav_core::RuntimeContext;
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        assert!(
+            ctx.codecs.decoder_ids().next().is_some(),
+            "register(ctx) should install codec decoder factories"
+        );
+        assert_eq!(
+            ctx.containers.container_for_extension("jxs"),
+            Some(CODEC_ID_STR),
+            "register(ctx) should install .jxs extension hint"
+        );
     }
 }

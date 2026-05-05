@@ -83,9 +83,12 @@ Public API:
   `parse_crg(&[u8], nc) -> Result<CrgMarker>`,
   `cfa_pattern_type(&CrgMarker) -> Option<u8>` — CTS / CRG marker
   parsers and Table F.9 lookup.
-* `oxideav_jpegxs::register(&mut CodecRegistry)` — registers the
-  codec under id `"jpegxs"`. The decoder factory returns a
-  working `Decoder` that produces multi-plane `VideoFrame`s.
+* `oxideav_jpegxs::register(&mut RuntimeContext)` — unified entry point
+  that installs the codec under id `"jpegxs"` plus the `.jxs` extension
+  hint into a `RuntimeContext`. Use `register_codecs(&mut CodecRegistry)`
+  and `register_containers(&mut ContainerRegistry)` for the split form.
+  The decoder factory returns a working `Decoder` that produces
+  multi-plane `VideoFrame`s.
 
 Modules:
 
