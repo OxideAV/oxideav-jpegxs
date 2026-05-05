@@ -80,6 +80,8 @@ pub fn register(ctx: &mut RuntimeContext) {
     register_containers(&mut ctx.containers);
 }
 
+oxideav_core::register!("jpegxs", register);
+
 /// Decoder factory. Round 6 accepts the multi-component
 /// single-precinct-row subset.
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
