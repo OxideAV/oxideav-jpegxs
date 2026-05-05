@@ -1,5 +1,62 @@
 # Changelog
 
+## Unreleased — encoder round 4 (Star-Tetrix Cpih=3 + vertical-prediction VLC)
+
+Two production-relevant axes added on top of the round-3 lossless +
+Fq=8-lossy + 4:2:2 / 4:2:0 + Dr=0-no-prediction-VLC encoder:
+
+* `colour_transform.rs` — **forward Star-Tetrix transform (`Cpih == 3`,
+  Annex F.5).** New `forward_star_tetrix(planes, wf, hf, e1, e2, ct, cf)`
+  inverts the four lifting steps (Tables F.5 / F.6 / F.7 / F.8) in
+  reverse order with sign flip, sharing the `access()` reflection
+  (Table F.12) and the per-CFA-pattern displacement vector (Table
+  F.10) with the existing inverse path. Bit-exact with `floor_div`
+  (spec floor semantics, not C-truncation toward zero).
+* `encoder.rs` — **`encode_planar_star_tetrix(width, height, nlx, nly,
+  q, e1, e2, cf, ct, planes)` entry point.** Takes 4 component planes
+  in input order `(R, G1, G2, B)` matching the decoder's output
+  convention; emits the CTS marker (`Cf`, `e1`, `e2`) and the CRG
+  marker (Table F.9 RGGB row for `Ct=0`, GRBG row for `Ct=1`). Self-
+  roundtrips losslessly across `Ct ∈ {0, 1}`, `Cf ∈ {0, 3}`,
+  `e1, e2 ∈ {0, 2, 3}`, and `NL ∈ {1, 2}`.
+* `encoder.rs` — **vertical-prediction VLC (`D[p,b] & 1 = 1`, Annex
+  C.6.5, Table C.13).** The cascade encoder now runs a four-phase
+  per-precinct selector:
+  1. Phase 1 collects every packet job in slice-walker emission
+     order, marking the first-in-precinct line per `(comp, beta)`
+     band.
+  2. Phase 2 builds three forms per packet: Dr=1 raw, Dr=0 no-pred
+     VLC (`mtop = T`, θ=0), and Dr=0 vert-pred VLC (`mtop = max
+     (M_above, T)`, `θ = max(M_above - T, 0)`) — using a per-band
+     `Mtop` cache populated from earlier packets in the same precinct.
+  3. Phase 3 sums per-band `min(raw, no_pred)` vs `min(raw, vert_pred)`
+     bytes and commits `D[p,b] = 0` or `1` per band.
+  4. Phase 4 emits packets in original order using the band's chosen
+     `D[p,b]` and the smaller of `(raw, in-band-mode-VLC)`.
+  The picker beats round 3's no-pred-only path on smooth content
+  with `>= 2` lines per precinct in some band (NL >= 2 cascade,
+  proxy levels with `pow_h(NL,y, dy) > 1`).
+* `encoder.rs` — `Nc = 4` and `Cpih = 3` accepted by `EncodeConfig`
+  validation; `write_main_header` emits the CTS (`Lcts = 4`) and CRG
+  (`Lcrg = 2 + 4*Nc`) markers when `cpih == 3`.
+* `colour_transform.rs` tests cover forward + inverse Star-Tetrix
+  round-trip on flat-zero, non-trivial 8×8 four-component data,
+  non-default `(e1, e2) = (2, 3)`, alternate CFA pattern `Ct=1`, and
+  in-line `Cf=3` access mode. Encoder tests: 4-component CFA round-
+  trip via `encode_planar_star_tetrix` for `Ct ∈ {0, 1}`,
+  `Cf ∈ {0, 3}`, `NL ∈ {1, 2}`; vertical-prediction picker round-
+  trips synthetic 32×32 RGB at NL=2/2; vertical-gradient 64×64
+  compresses below 4 KB raw; rejection of `Cpih = 3` with `Nc != 4`.
+
+Encoder %-delta of synthetic RGB 32×32 (Cpih=1 NL=2/2): lossless 121.3%
+→ 120.1% (-1.2 pp from picker engaging on a few cascade bands).
+Smooth 64×64 RGB gradient lossless: 68.3% of raw (= 8397 / 12288 B).
+4-component CFA Star-Tetrix round-trip: bit-exact across all tested
+parameter combinations.
+
+Verification: 173 tests pass (was 162); standalone-feature build also
+passes; `cargo fmt --check` and `cargo clippy -- -D warnings` clean.
+
 ## Unreleased — encoder round 3 (Dr=0 VLC + Fq=8 lossy + 4:2:2 / 4:2:0)
 
 Three production-relevant compression-feature axes added on top of the

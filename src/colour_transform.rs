@@ -339,6 +339,195 @@ pub fn inverse_star_tetrix(
     Ok(())
 }
 
+/// Apply the **forward** Star-Tetrix transform (Cpih == 3) — the
+/// inverse of [`inverse_star_tetrix`]. Maps four CFA-layout component
+/// planes in place: input order is `Ω = [R, G1, G2, B]` (matching the
+/// inverse's output convention from Annex F.4 Table F.4); on exit, each
+/// plane holds `O[c, x, y]` (the pre-DWT band-domain coefficients) per
+/// the band-order `[ω1[0]=Ya, ω1[1]=Cb, ω1[2]=Cr, ω1[3]=Δ]` after the
+/// four forward lifting steps.
+///
+/// The forward cascade reverses the order and sign of each lift step:
+///
+/// 1. Re-order input to band-position layout
+///    `w4 = [G2, B, R, G1]` (matches the inverse's `w4` snapshot at the
+///    end of inverse step 4).
+/// 2. Forward inverse-of-CbCr-step (Table F.8 inverted): subtract the
+///    green-neighbour average from blue (band 1) and red (band 2).
+/// 3. Forward inverse-of-Y-step (Table F.7 inverted): add the chroma
+///    weighted neighbour sum back into G2 (band 0) and G1 (band 3).
+/// 4. Forward inverse-of-delta-step (Table F.6 inverted): subtract the Y
+///    corner-neighbour average from the delta band (band 3).
+/// 5. Forward inverse-of-average-step (Table F.5 inverted): add the Δ
+///    corner-neighbour average back into the average luma band (band 0).
+///
+/// `e1`, `e2`, `ct`, `cf` come from CTS / CRG markers (see
+/// [`inverse_star_tetrix`] for the parameter semantics).
+///
+/// Round-4: lossless self-roundtrip with the inverse on flat-zero,
+/// flat-luma, and synthetic 8×8 four-component fixtures.
+pub fn forward_star_tetrix(
+    planes: &mut [&mut [i32]],
+    wf: usize,
+    hf: usize,
+    e1: u8,
+    e2: u8,
+    ct: u8,
+    cf: u8,
+) -> Result<()> {
+    if planes.len() != 4 {
+        return Err(Error::invalid(format!(
+            "jpegxs Cpih=3 (forward Star-Tetrix) requires exactly 4 component planes, got {}",
+            planes.len()
+        )));
+    }
+    if ct > 1 {
+        return Err(Error::invalid(format!(
+            "jpegxs forward Star-Tetrix: Ct={ct} reserved for ISO/IEC use (Table F.9)"
+        )));
+    }
+    if cf != 0 && cf != 3 {
+        return Err(Error::invalid(format!(
+            "jpegxs forward Star-Tetrix: Cf={cf} reserved for ISO/IEC use (Table A.20)"
+        )));
+    }
+    let want = wf
+        .checked_mul(hf)
+        .ok_or_else(|| Error::invalid("jpegxs forward Star-Tetrix: wf * hf overflow"))?;
+    for (i, p) in planes.iter().enumerate() {
+        if p.len() != want {
+            return Err(Error::invalid(format!(
+                "jpegxs forward Star-Tetrix: component {i} has {} samples, expected {want}",
+                p.len()
+            )));
+        }
+    }
+
+    // Per-component (δx, δy) from Table F.10 (matches the inverse).
+    let mut delta = [(0u8, 0u8); 4];
+    for (c, slot) in delta.iter_mut().enumerate() {
+        *slot = crate::crg::displacement(ct, c).ok_or_else(|| {
+            Error::invalid(format!(
+                "jpegxs forward Star-Tetrix: no displacement for c={c}, Ct={ct}"
+            ))
+        })?;
+    }
+    let st = StarTetrix {
+        wf,
+        hf,
+        cf,
+        ct,
+        delta,
+        e1,
+        e2,
+    };
+
+    // 1) Re-order input planes [R, G1, G2, B] into band-position layout
+    //    [G2, B, R, G1] (this is `w4` at the end of the inverse cascade).
+    let r_in = planes[0].to_vec();
+    let g1_in = planes[1].to_vec();
+    let g2_in = planes[2].to_vec();
+    let b_in = planes[3].to_vec();
+    let w4_0 = g2_in;
+    let w4_1 = b_in;
+    let w4_2 = r_in;
+    let w4_3 = g1_in;
+    let w4 = [
+        w4_0.as_slice(),
+        w4_1.as_slice(),
+        w4_2.as_slice(),
+        w4_3.as_slice(),
+    ];
+
+    // 2) Forward inverse-of-CbCr-step: subtract green-neighbour averages
+    //    from blue (band 1) and red (band 2).
+    let mut w3_1 = vec![0i32; want];
+    let mut w3_2 = vec![0i32; want];
+    for y in 0..hf {
+        for x in 0..wf {
+            let gl = read(&w4, &st, 1, x, y, -1, 0);
+            let gr = read(&w4, &st, 1, x, y, 1, 0);
+            let gt = read(&w4, &st, 1, x, y, 0, -1);
+            let gb = read(&w4, &st, 1, x, y, 0, 1);
+            w3_1[y * wf + x] = w4[1][y * wf + x] - floor_div(gl + gr + gt + gb, 4);
+
+            let gl = read(&w4, &st, 2, x, y, -1, 0);
+            let gr = read(&w4, &st, 2, x, y, 1, 0);
+            let gt = read(&w4, &st, 2, x, y, 0, -1);
+            let gb = read(&w4, &st, 2, x, y, 0, 1);
+            w3_2[y * wf + x] = w4[2][y * wf + x] - floor_div(gl + gr + gt + gb, 4);
+        }
+    }
+    // After step 2, the bands are:
+    //   w3 = [G2 (band 0), Cb (band 1), Cr (band 2), G1 (band 3)].
+    let w3 = [w4[0], w3_1.as_slice(), w3_2.as_slice(), w4[3]];
+
+    // 3) Forward inverse-of-Y-step: add the chroma weighted neighbour
+    //    sum back into G2 (band 0) and G1 (band 3).
+    let mut w2_0 = vec![0i32; want];
+    let mut w2_3 = vec![0i32; want];
+    let two_e1 = 1i32 << e1;
+    let two_e2 = 1i32 << e2;
+    for y in 0..hf {
+        for x in 0..wf {
+            let bl = read(&w3, &st, 0, x, y, -1, 0);
+            let br = read(&w3, &st, 0, x, y, 1, 0);
+            let rt = read(&w3, &st, 0, x, y, 0, -1);
+            let rb = read(&w3, &st, 0, x, y, 0, 1);
+            let num = two_e2 * (bl + br) + two_e1 * (rt + rb);
+            w2_0[y * wf + x] = w3[0][y * wf + x] + floor_div(num, 8);
+
+            let bt = read(&w3, &st, 3, x, y, 0, -1);
+            let bb = read(&w3, &st, 3, x, y, 0, 1);
+            let rl = read(&w3, &st, 3, x, y, -1, 0);
+            let rr = read(&w3, &st, 3, x, y, 1, 0);
+            let num = two_e2 * (bt + bb) + two_e1 * (rl + rr);
+            w2_3[y * wf + x] = w3[3][y * wf + x] + floor_div(num, 8);
+        }
+    }
+    // After step 3, w2 = [Ya-pre-step1 (band 0), Cb, Cr, Δ-pre-step2 (band 3)].
+    let w2 = [w2_0.as_slice(), w3[1], w3[2], w2_3.as_slice()];
+
+    // 4) Forward inverse-of-delta-step: subtract Y corner-neighbour
+    //    average from the delta band (band 3).
+    let mut w1_3 = vec![0i32; want];
+    for y in 0..hf {
+        for x in 0..wf {
+            let ylt = read(&w2, &st, 3, x, y, -1, -1);
+            let yrt = read(&w2, &st, 3, x, y, 1, -1);
+            let ylb = read(&w2, &st, 3, x, y, -1, 1);
+            let yrb = read(&w2, &st, 3, x, y, 1, 1);
+            w1_3[y * wf + x] = w2[3][y * wf + x] - floor_div(ylt + yrt + ylb + yrb, 4);
+        }
+    }
+    // After step 4, w1 = [Ya, Cb, Cr, Δ (final)].
+    let w1 = [w2[0], w2[1], w2[2], w1_3.as_slice()];
+
+    // 5) Forward inverse-of-average-step: add the Δ corner-neighbour
+    //    average back into the average luma band (band 0). Reads of Δ
+    //    come from `w1` (band index 3 lookup via access).
+    let mut o0 = vec![0i32; want];
+    for y in 0..hf {
+        for x in 0..wf {
+            let dlt = read(&w1, &st, 0, x, y, -1, -1);
+            let drt = read(&w1, &st, 0, x, y, 1, -1);
+            let dlb = read(&w1, &st, 0, x, y, -1, 1);
+            let drb = read(&w1, &st, 0, x, y, 1, 1);
+            o0[y * wf + x] = w1[0][y * wf + x] + floor_div(dlt + drt + dlb + drb, 8);
+        }
+    }
+
+    // O[0] = Ya (the average-luma band — input to the DWT).
+    // O[1] = Cb (band 1, untouched after steps 1/2).
+    // O[2] = Cr (band 2, untouched after steps 1/2).
+    // O[3] = Δ (the differential luma band — input to the DWT).
+    planes[0].copy_from_slice(&o0);
+    planes[1].copy_from_slice(w1[1]);
+    planes[2].copy_from_slice(w1[2]);
+    planes[3].copy_from_slice(&w1_3);
+    Ok(())
+}
+
 /// Per-image Star-Tetrix configuration cached for the inner `access`
 /// helper so the lifting kernels only have to thread one struct.
 struct StarTetrix {
@@ -601,6 +790,128 @@ mod tests {
         for v in &p3 {
             assert_eq!(*v, 50, "blue plane should be 50");
         }
+    }
+
+    /// Forward Star-Tetrix followed by inverse must round-trip
+    /// every (R, G1, G2, B) plane bit-exactly under flat-zero input.
+    #[test]
+    fn star_tetrix_forward_inverse_round_trip_zero() {
+        let n = 8 * 8;
+        let mut p0 = vec![0i32; n];
+        let mut p1 = vec![0i32; n];
+        let mut p2 = vec![0i32; n];
+        let mut p3 = vec![0i32; n];
+        let mut planes: [&mut [i32]; 4] = [&mut p0, &mut p1, &mut p2, &mut p3];
+        forward_star_tetrix(&mut planes, 8, 8, 0, 0, 0, 0).unwrap();
+        inverse_star_tetrix(&mut planes, 8, 8, 0, 0, 0, 0).unwrap();
+        for &v in p0.iter().chain(&p1).chain(&p2).chain(&p3) {
+            assert_eq!(v, 0);
+        }
+    }
+
+    /// Forward → inverse over a non-trivial CFA-ish input: 4 components,
+    /// 8×8 each, with distinct per-plane patterns. Bit-exact recovery.
+    #[test]
+    fn star_tetrix_forward_inverse_round_trip_nontrivial() {
+        let n = 8 * 8;
+        let mk = |seed: i32| -> Vec<i32> {
+            (0..n)
+                .map(|i| {
+                    let x = i % 8;
+                    let y = i / 8;
+                    (x * seed + y * (seed + 1) + 50) % 240 - 120
+                })
+                .collect()
+        };
+        let r0 = mk(7);
+        let g1_0 = mk(11);
+        let g2_0 = mk(13);
+        let b0 = mk(17);
+        let mut p0 = r0.clone();
+        let mut p1 = g1_0.clone();
+        let mut p2 = g2_0.clone();
+        let mut p3 = b0.clone();
+        let mut planes: [&mut [i32]; 4] = [&mut p0, &mut p1, &mut p2, &mut p3];
+        forward_star_tetrix(&mut planes, 8, 8, 0, 0, 0, 0).unwrap();
+        // Apply inverse — must recover (R, G1, G2, B) exactly.
+        inverse_star_tetrix(&mut planes, 8, 8, 0, 0, 0, 0).unwrap();
+        assert_eq!(p0, r0, "red plane must round-trip");
+        assert_eq!(p1, g1_0, "G1 plane must round-trip");
+        assert_eq!(p2, g2_0, "G2 plane must round-trip");
+        assert_eq!(p3, b0, "blue plane must round-trip");
+    }
+
+    /// Same nontrivial round-trip with `e1=2`, `e2=3` (non-default
+    /// chroma weights from the CTS marker).
+    #[test]
+    fn star_tetrix_round_trip_nondefault_e1_e2() {
+        let n = 8 * 8;
+        let mk = |seed: i32| -> Vec<i32> {
+            (0..n)
+                .map(|i| {
+                    let x = i % 8;
+                    let y = i / 8;
+                    (x * seed - y * (seed + 1) + 80) % 200 - 100
+                })
+                .collect()
+        };
+        let r0 = mk(3);
+        let g1_0 = mk(5);
+        let g2_0 = mk(2);
+        let b0 = mk(9);
+        let mut p0 = r0.clone();
+        let mut p1 = g1_0.clone();
+        let mut p2 = g2_0.clone();
+        let mut p3 = b0.clone();
+        let mut planes: [&mut [i32]; 4] = [&mut p0, &mut p1, &mut p2, &mut p3];
+        forward_star_tetrix(&mut planes, 8, 8, 2, 3, 0, 0).unwrap();
+        inverse_star_tetrix(&mut planes, 8, 8, 2, 3, 0, 0).unwrap();
+        assert_eq!(p0, r0);
+        assert_eq!(p1, g1_0);
+        assert_eq!(p2, g2_0);
+        assert_eq!(p3, b0);
+    }
+
+    /// Round-trip with the alternate CFA pattern type (Ct=1) and
+    /// in-line access mode (Cf=3).
+    #[test]
+    fn star_tetrix_round_trip_ct1_cf3() {
+        let n = 8 * 8;
+        let mk = |seed: i32| -> Vec<i32> {
+            (0..n)
+                .map(|i| {
+                    let x = i % 8;
+                    let y = i / 8;
+                    (x * seed + y + 30) % 200 - 100
+                })
+                .collect()
+        };
+        let r0 = mk(7);
+        let g1_0 = mk(11);
+        let g2_0 = mk(13);
+        let b0 = mk(17);
+        let mut p0 = r0.clone();
+        let mut p1 = g1_0.clone();
+        let mut p2 = g2_0.clone();
+        let mut p3 = b0.clone();
+        let mut planes: [&mut [i32]; 4] = [&mut p0, &mut p1, &mut p2, &mut p3];
+        forward_star_tetrix(&mut planes, 8, 8, 0, 0, 1, 3).unwrap();
+        inverse_star_tetrix(&mut planes, 8, 8, 0, 0, 1, 3).unwrap();
+        assert_eq!(p0, r0);
+        assert_eq!(p1, g1_0);
+        assert_eq!(p2, g2_0);
+        assert_eq!(p3, b0);
+    }
+
+    /// Forward Star-Tetrix rejects wrong component count.
+    #[test]
+    fn forward_star_tetrix_rejects_wrong_component_count() {
+        let mut p0 = vec![0i32; 4];
+        let mut p1 = vec![0i32; 4];
+        let mut p2 = vec![0i32; 4];
+        let mut planes: [&mut [i32]; 3] = [&mut p0, &mut p1, &mut p2];
+        let err = forward_star_tetrix(&mut planes, 2, 2, 0, 0, 0, 0).unwrap_err();
+        assert!(format!("{err}").contains("4 component"));
     }
 
     /// Direct check of the `floor_div` helper — the spec's lifting

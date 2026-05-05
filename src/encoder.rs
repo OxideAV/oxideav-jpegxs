@@ -45,7 +45,7 @@
 //! SOC | CAP | PIH | CDT | WGT | SLH | <slice 0 entropy data> | EOC
 //! ```
 
-use crate::colour_transform::forward_rct;
+use crate::colour_transform::{forward_rct, forward_star_tetrix};
 use crate::dwt::{forward_2d, forward_cascade_2d};
 use crate::error::{JpegXsError as Error, Result};
 use crate::image::{JpegXsImage, JpegXsPlane};
@@ -89,6 +89,16 @@ struct EncodeConfig {
     /// Length `nc`. Defaults to all-ones (4:4:4).
     sx: Vec<u8>,
     sy: Vec<u8>,
+    /// Star-Tetrix `e1` (CTS field, 0..=3). Only meaningful when
+    /// `cpih == 3`; ignored otherwise.
+    cts_e1: u8,
+    /// Star-Tetrix `e2` (CTS field, 0..=3).
+    cts_e2: u8,
+    /// Star-Tetrix `Cf` (CTS field, 0 = full or 3 = in-line).
+    cts_cf: u8,
+    /// Star-Tetrix CFA pattern type `Ct` (Table F.9, 0 or 1). Drives the
+    /// CRG marker emission and the inverse `access()` reflection.
+    st_ct: u8,
 }
 
 impl EncodeConfig {
@@ -99,9 +109,9 @@ impl EncodeConfig {
                 self.width, self.height
             )));
         }
-        if !matches!(self.nc, 1 | 3) {
+        if !matches!(self.nc, 1 | 3 | 4) {
             return Err(Error::Unsupported(format!(
-                "jpegxs encoder round 3: Nc must be 1 or 3, got {}",
+                "jpegxs encoder round 4: Nc must be 1, 3, or 4, got {}",
                 self.nc
             )));
         }
@@ -111,11 +121,52 @@ impl EncodeConfig {
                 self.nc
             )));
         }
-        if self.cpih > 1 {
+        if self.cpih == 3 && self.nc != 4 {
+            return Err(Error::invalid(format!(
+                "jpegxs encoder: Cpih=3 (Star-Tetrix) requires Nc=4, got {}",
+                self.nc
+            )));
+        }
+        if !matches!(self.cpih, 0 | 1 | 3) {
             return Err(Error::Unsupported(format!(
-                "jpegxs encoder round 3: Cpih must be 0 or 1, got {} (Star-Tetrix not yet supported)",
+                "jpegxs encoder round 4: Cpih must be 0, 1, or 3, got {}",
                 self.cpih
             )));
+        }
+        if self.cpih == 3 {
+            // Star-Tetrix requires sx[i] = sy[i] = 1 on every component
+            // (the CFA grid is fully populated).
+            for (i, (&sx, &sy)) in self.sx.iter().zip(self.sy.iter()).enumerate() {
+                if sx != 1 || sy != 1 {
+                    return Err(Error::invalid(format!(
+                        "jpegxs encoder: Cpih=3 (Star-Tetrix) requires sx[i]=sy[i]=1, got component {i} (sx, sy)=({sx}, {sy})"
+                    )));
+                }
+            }
+            if self.cts_e1 > 3 {
+                return Err(Error::invalid(format!(
+                    "jpegxs encoder: Star-Tetrix e1 must be 0..=3, got {}",
+                    self.cts_e1
+                )));
+            }
+            if self.cts_e2 > 3 {
+                return Err(Error::invalid(format!(
+                    "jpegxs encoder: Star-Tetrix e2 must be 0..=3, got {}",
+                    self.cts_e2
+                )));
+            }
+            if !matches!(self.cts_cf, 0 | 3) {
+                return Err(Error::invalid(format!(
+                    "jpegxs encoder: Star-Tetrix Cf must be 0 (full) or 3 (in-line), got {}",
+                    self.cts_cf
+                )));
+            }
+            if self.st_ct > 1 {
+                return Err(Error::invalid(format!(
+                    "jpegxs encoder: Star-Tetrix Ct must be 0 or 1, got {}",
+                    self.st_ct
+                )));
+            }
         }
         if !(1..=2).contains(&self.nlx) || self.nlx != self.nly {
             return Err(Error::Unsupported(format!(
@@ -327,7 +378,41 @@ pub fn encode_planar(
 ) -> Result<Vec<u8>> {
     let sx = vec![1u8; nc as usize];
     let sy = vec![1u8; nc as usize];
-    encode_planar_inner(width, height, nc, cpih, nlx, nly, 0, 0, &sx, &sy, planes)
+    encode_planar_inner(
+        width, height, nc, cpih, nlx, nly, 0, 0, &sx, &sy, 0, 0, 0, 0, planes,
+    )
+}
+
+/// Star-Tetrix (Cpih=3) entry point — round 4. Takes 4 component planes
+/// in input order `(R, G1, G2, B)` matching [`crate::colour_transform::
+/// inverse_star_tetrix`]'s output convention. Self-roundtrips losslessly
+/// for `q == 0`. Emits the CTS marker (`Cf`, `e1`, `e2`) and the CRG
+/// marker (driving the inverse `access()` reflection via Ct).
+///
+/// `e1` and `e2` are the CTS chroma-weighting exponents (0..=3); `cf`
+/// is the CTS extent (0 = full, 3 = in-line). `ct` is the CFA pattern
+/// type per Table F.9 (0 = RGGB or BGGR, 1 = GRBG or GBRG); the CRG
+/// marker emitted carries the canonical RGGB or GRBG arrangement
+/// depending on `ct`.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_star_tetrix(
+    width: u16,
+    height: u16,
+    nlx: u8,
+    nly: u8,
+    q: u8,
+    e1: u8,
+    e2: u8,
+    cf: u8,
+    ct: u8,
+    planes: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    let sx = vec![1u8; 4];
+    let sy = vec![1u8; 4];
+    let fq = if q == 0 { 0 } else { 8 };
+    encode_planar_inner(
+        width, height, 4, 3, nlx, nly, fq, q, &sx, &sy, e1, e2, cf, ct, planes,
+    )
 }
 
 /// Lossy entry point. `q` is the precinct quantization step (0..=15);
@@ -346,7 +431,9 @@ pub fn encode_planar_lossy(
     let sx = vec![1u8; nc as usize];
     let sy = vec![1u8; nc as usize];
     let fq = if q == 0 { 0 } else { 8 };
-    encode_planar_inner(width, height, nc, cpih, nlx, nly, fq, q, &sx, &sy, planes)
+    encode_planar_inner(
+        width, height, nc, cpih, nlx, nly, fq, q, &sx, &sy, 0, 0, 0, 0, planes,
+    )
 }
 
 /// Sub-sampled (4:2:2 / 4:2:0) entry point. Each `planes[i]` has length
@@ -366,7 +453,9 @@ pub fn encode_planar_subsampled(
     planes: &[Vec<u8>],
 ) -> Result<Vec<u8>> {
     let fq = if q == 0 { 0 } else { 8 };
-    encode_planar_inner(width, height, nc, cpih, nlx, nly, fq, q, sx, sy, planes)
+    encode_planar_inner(
+        width, height, nc, cpih, nlx, nly, fq, q, sx, sy, 0, 0, 0, 0, planes,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -381,6 +470,10 @@ fn encode_planar_inner(
     q: u8,
     sx: &[u8],
     sy: &[u8],
+    cts_e1: u8,
+    cts_e2: u8,
+    cts_cf: u8,
+    st_ct: u8,
     planes: &[Vec<u8>],
 ) -> Result<Vec<u8>> {
     let cfg = EncodeConfig {
@@ -399,6 +492,10 @@ fn encode_planar_inner(
         q,
         sx: sx.to_vec(),
         sy: sy.to_vec(),
+        cts_e1,
+        cts_e2,
+        cts_cf,
+        st_ct,
     };
     cfg.validate()?;
     if planes.len() != nc as usize {
@@ -455,6 +552,39 @@ fn write_main_header(out: &mut Vec<u8>, cfg: &EncodeConfig) -> Result<()> {
     for _ in 0..n_existing {
         out.push(0); // G[b] = 0
         out.push(0); // P[b] = 0
+    }
+    // CTS + CRG — required when Cpih=3 (Star-Tetrix) per A.4.8 / A.4.9.
+    if cfg.cpih == 3 {
+        // CTS — Lcts = 4, body = 2 bytes (Reserved/Cf, e1/e2).
+        out.extend_from_slice(&[0xff, 0x18]);
+        out.extend_from_slice(&4u16.to_be_bytes());
+        out.push(cfg.cts_cf & 0x0f); // Reserved=0, Cf
+        out.push(((cfg.cts_e1 & 0x0f) << 4) | (cfg.cts_e2 & 0x0f));
+        // CRG — Lcrg = 2 + 4*Nc, body = 4 * Nc bytes.
+        out.extend_from_slice(&[0xff, 0x19]);
+        let lcrg = 2u16 + 4 * (cfg.nc as u16);
+        out.extend_from_slice(&lcrg.to_be_bytes());
+        // Emit the canonical CRG entries that map back to the chosen Ct
+        // via Table F.9 (RGGB for Ct=0, GRBG for Ct=1).
+        let entries: [(u16, u16); 4] = if cfg.st_ct == 0 {
+            // RGGB layout per Table F.9 row 1:
+            //   c=0 (R)  : (0,        0)
+            //   c=1 (G1) : (32768,    0)
+            //   c=2 (G2) : (0,    32768)
+            //   c=3 (B)  : (32768,32768)
+            [(0, 0), (32768, 0), (0, 32768), (32768, 32768)]
+        } else {
+            // GRBG layout per Table F.9 row 3:
+            //   c=0 (G1) : (32768,    0)
+            //   c=1 (R)  : (0,        0)
+            //   c=2 (B)  : (32768,32768)
+            //   c=3 (G2) : (0,    32768)
+            [(32768, 0), (0, 0), (32768, 32768), (0, 32768)]
+        };
+        for (xc, yc) in entries.iter() {
+            out.extend_from_slice(&xc.to_be_bytes());
+            out.extend_from_slice(&yc.to_be_bytes());
+        }
     }
     Ok(())
 }
@@ -646,6 +776,11 @@ fn write_slice(out: &mut Vec<u8>, cfg: &EncodeConfig, planes_u8: &[Vec<u8>]) -> 
     if cfg.cpih == 1 {
         let mut refs: Vec<&mut [i32]> = comp_planes.iter_mut().map(|p| p.as_mut_slice()).collect();
         forward_rct(&mut refs, w, h)?;
+    } else if cfg.cpih == 3 {
+        let mut refs: Vec<&mut [i32]> = comp_planes.iter_mut().map(|p| p.as_mut_slice()).collect();
+        forward_star_tetrix(
+            &mut refs, w, h, cfg.cts_e1, cfg.cts_e2, cfg.st_ct, cfg.cts_cf,
+        )?;
     }
 
     let nlx = cfg.nlx;
@@ -1046,8 +1181,11 @@ fn encode_precinct_cascade(
     let header_bytes = header_bits.div_ceil(8);
     let mut precinct_bytes = vec![0u8; header_bytes];
 
-    // Build entropy stream: walk packets per Annex B.7 Table B.4.
-    let mut entropy: Vec<u8> = Vec::new();
+    // Build entropy stream: walk packets per Annex B.7 Table B.4. Round 4
+    // adds vertical-prediction VLC: per-band per-precinct, the encoder
+    // evaluates D[p,b] = 0 (no-prediction VLC) vs D[p,b] = 1 (vertical-
+    // prediction VLC, Table C.13) and commits the smaller. Per-packet,
+    // the encoder still picks min(Dr=1 raw, Dr=0 in-band-VLC-mode).
     let nlx_u = nlx as u32;
     let nly_u = nly as u32;
     let beta1 = nlx_u.max(nly_u) - nlx_u.min(nly_u) + 1;
@@ -1068,69 +1206,211 @@ fn encode_precinct_cascade(
         Some(band_buf[row_start..row_end].to_vec())
     };
 
+    // Phase 1 — collect every packet job in slice-walker emission order.
+    // Each job carries the entries it covers + the (comp, beta) coordinate
+    // of each entry (needed for per-band D decision and Mtop tracking).
+    let mut jobs: Vec<PacketJob> = Vec::new();
+
     // First packet: β = 0 .. β1-1 × Nc components × line 0 (subject to
     // existence + sub-sample guard).
-    let mut first_entries: Vec<PerBandEntry> = Vec::new();
-    for beta in 0..beta1 {
-        for i in 0..nc {
-            let s_idx = (beta as usize) * nc + i;
-            let s = &slices[s_idx];
-            // Sub-sample guard: (λ + L0) mod sy[i] == 0. λ=0 here. L0
-            // for β < β1 is 0 (τy = false), so the guard is always
-            // satisfied.
-            if let Some(line_data) = extract_band_line(s, 0) {
-                first_entries.push(PerBandEntry {
-                    wpb: s.wpb as u32,
-                    line: BandLineSlice::Direct(line_data),
-                    t: t_band,
-                });
-            }
-        }
-    }
-    if !first_entries.is_empty() {
-        emit_packet(&mut entropy, cfg, &first_entries)?;
-    }
-
-    // Proxy levels.
-    let mut beta0 = beta1;
-    while beta0 < nbeta_pic {
-        // pow_h at the picture level for this proxy group (per spec).
-        // Sub-sampled components contribute `pow / sy[i]` lines but the
-        // outer loop walks pow_pic anyway — for components where this
-        // line doesn't exist, the band-line extractor returns None.
-        let key0 = beta_key(beta0, cfg.nlx, cfg.nly);
-        let pow_pic = pow_h(cfg.nly, key0.dy);
-        for lambda_within in 0..pow_pic {
-            for beta in beta0..(beta0 + 3).min(nbeta_pic) {
-                for i in 0..nc {
-                    let s_idx = (beta as usize) * nc + i;
-                    let s = &slices[s_idx];
-                    if !s.exists {
-                        continue;
-                    }
-                    // Sub-sample guard: λ_within + L0 must be divisible
-                    // by sy[i]. For proxy levels τy ∈ {0, 1}; the guard
-                    // matches the slice walker's check. We use the
-                    // per-component-line offset to also drop entries
-                    // beyond `s.lines`.
-                    let sy_i = cfg.sy[i] as usize;
-                    let pic_grid_line = lambda_within;
-                    if sy_i != 0 && pic_grid_line % sy_i != 0 {
-                        continue;
-                    }
-                    let comp_line = pic_grid_line / sy_i.max(1);
-                    if let Some(line_data) = extract_band_line(s, comp_line) {
-                        let entries = vec![PerBandEntry {
-                            wpb: s.wpb as u32,
-                            line: BandLineSlice::Direct(line_data),
-                            t: t_band,
-                        }];
-                        emit_packet(&mut entropy, cfg, &entries)?;
-                    }
+    {
+        let mut entries: Vec<PerBandEntry> = Vec::new();
+        let mut coords: Vec<(usize, u32)> = Vec::new();
+        for beta in 0..beta1 {
+            for i in 0..nc {
+                let s_idx = (beta as usize) * nc + i;
+                let s = &slices[s_idx];
+                if let Some(line_data) = extract_band_line(s, 0) {
+                    entries.push(PerBandEntry {
+                        wpb: s.wpb as u32,
+                        line: BandLineSlice::Direct(line_data),
+                        t: t_band,
+                    });
+                    coords.push((i, beta));
                 }
             }
         }
-        beta0 += 3;
+        if !entries.is_empty() {
+            jobs.push(PacketJob {
+                entries,
+                coords,
+                first_line_in_precinct: true,
+            });
+        }
+    }
+    // Proxy levels.
+    {
+        let mut beta0 = beta1;
+        // Track per-(comp, beta) whether we've already seen a packet for
+        // that band in this precinct (to mark first-line packets, which
+        // can never use vertical prediction).
+        let mut first_seen: std::collections::HashSet<(usize, u32)> =
+            std::collections::HashSet::new();
+        while beta0 < nbeta_pic {
+            let key0 = beta_key(beta0, cfg.nlx, cfg.nly);
+            let pow_pic = pow_h(cfg.nly, key0.dy);
+            for lambda_within in 0..pow_pic {
+                for beta in beta0..(beta0 + 3).min(nbeta_pic) {
+                    for i in 0..nc {
+                        let s_idx = (beta as usize) * nc + i;
+                        let s = &slices[s_idx];
+                        if !s.exists {
+                            continue;
+                        }
+                        let sy_i = cfg.sy[i] as usize;
+                        let pic_grid_line = lambda_within;
+                        if sy_i != 0 && pic_grid_line % sy_i != 0 {
+                            continue;
+                        }
+                        let comp_line = pic_grid_line / sy_i.max(1);
+                        if let Some(line_data) = extract_band_line(s, comp_line) {
+                            let key = (i, beta);
+                            let is_first = first_seen.insert(key);
+                            jobs.push(PacketJob {
+                                entries: vec![PerBandEntry {
+                                    wpb: s.wpb as u32,
+                                    line: BandLineSlice::Direct(line_data),
+                                    t: t_band,
+                                }],
+                                coords: vec![key],
+                                first_line_in_precinct: is_first,
+                            });
+                        }
+                    }
+                }
+            }
+            beta0 += 3;
+        }
+    }
+
+    // Phase 2 — for every job, evaluate the candidate forms in both D modes:
+    //   D=0: pick min(Dr=1 raw, Dr=0 no-pred VLC) per packet.
+    //   D=1: pick min(Dr=1 raw, Dr=0 vert-pred VLC) per packet — but the
+    //        first-line-in-precinct packet of a band has no in-precinct
+    //        predecessor under D=1 and MUST fall back to Dr=1 raw.
+    //
+    // Vertical-prediction needs the per-band Mtop cache (last-line M for
+    // each (comp, beta)). The cache is populated as we visit jobs.
+    let mut sizes_d0: std::collections::HashMap<(usize, u32), usize> =
+        std::collections::HashMap::new();
+    let mut sizes_d1: std::collections::HashMap<(usize, u32), usize> =
+        std::collections::HashMap::new();
+    let mut m_top_cache: std::collections::HashMap<(usize, u32), Vec<u8>> =
+        std::collections::HashMap::new();
+    let mut precomputed: Vec<JobForms> = Vec::with_capacity(jobs.len());
+
+    for job in &jobs {
+        // Compute M arrays for every entry once (shared across forms).
+        let m_per_entry: Vec<Vec<u8>> = job
+            .entries
+            .iter()
+            .map(|e| compute_m_per_group(cfg, e))
+            .collect::<Result<Vec<_>>>()?;
+
+        let raw = build_packet_body_with_m(cfg, &job.entries, &m_per_entry, BitplaneMode::Raw)?;
+        let no_pred = build_packet_body_with_m(
+            cfg,
+            &job.entries,
+            &m_per_entry,
+            BitplaneMode::Vlc(VlcKind::NoPred),
+        )?;
+
+        // Vertical-prediction is only attempted when EVERY entry of the
+        // packet has a predecessor-line M cached for its (comp, beta).
+        // For the cascade encoder this happens to be all-or-nothing per
+        // packet (proxy-level packets carry one entry; first packet
+        // carries one entry per (β<β1, i) — none have predecessors).
+        let mut vert_predecessor_per_entry: Vec<Vec<u8>> = Vec::with_capacity(job.entries.len());
+        let mut have_all_predecessors = !job.first_line_in_precinct;
+        if have_all_predecessors {
+            for coord in &job.coords {
+                if let Some(prev_m) = m_top_cache.get(coord) {
+                    vert_predecessor_per_entry.push(prev_m.clone());
+                } else {
+                    have_all_predecessors = false;
+                    break;
+                }
+            }
+        }
+        let vert = if have_all_predecessors {
+            Some(build_packet_body_with_m(
+                cfg,
+                &job.entries,
+                &m_per_entry,
+                BitplaneMode::Vlc(VlcKind::VertPred {
+                    predecessor: vert_predecessor_per_entry.clone(),
+                }),
+            )?)
+        } else {
+            None
+        };
+
+        // Update the cache for downstream packets — store the last entry's
+        // M-array per (comp, beta). For packets with multiple entries (the
+        // first packet) each entry's coord is unique, so we record them all.
+        for (entry_idx, coord) in job.coords.iter().enumerate() {
+            m_top_cache.insert(*coord, m_per_entry[entry_idx].clone());
+        }
+
+        // Per-packet picks:
+        let pick_d0 = raw.total_len().min(no_pred.total_len());
+        let pick_d1 = match &vert {
+            Some(v) => raw.total_len().min(v.total_len()),
+            None => raw.total_len(),
+        };
+        for coord in &job.coords {
+            *sizes_d0.entry(*coord).or_insert(0) += pick_d0;
+            *sizes_d1.entry(*coord).or_insert(0) += pick_d1;
+        }
+        precomputed.push(JobForms { raw, no_pred, vert });
+    }
+
+    // Phase 3 — per band, commit D[p,b] = 0 or 1 by total bytes. A band
+    // with only one line in the precinct (no predecessor-bearing packet)
+    // sees identical D=0 / D=1 totals for the raw fallback only; pick D=0
+    // so the no-pred VLC is available for the line.
+    let mut d_per_band: std::collections::HashMap<(usize, u32), u8> =
+        std::collections::HashMap::new();
+    for coord in sizes_d0.keys() {
+        let s0 = sizes_d0[coord];
+        let s1 = sizes_d1.get(coord).copied().unwrap_or(usize::MAX);
+        let d = if s1 < s0 { 1 } else { 0 };
+        d_per_band.insert(*coord, d);
+    }
+
+    // Phase 4 — emit packets in order, picking per-packet form according
+    // to the band's chosen D[p,b].
+    let mut entropy: Vec<u8> = Vec::new();
+    for (job, forms) in jobs.iter().zip(precomputed) {
+        // For multi-entry packets (first packet) every entry's band
+        // matters, but they all follow the same rule: D=0 → no-pred,
+        // D=1 → vert-pred (or raw fallback when predecessor unavailable).
+        // The first packet always uses the D=0 path because it carries
+        // no predecessors.
+        let d_any_one = job
+            .coords
+            .iter()
+            .map(|c| d_per_band.get(c).copied().unwrap_or(0))
+            .max()
+            .unwrap_or(0);
+        let chosen = if d_any_one == 1 {
+            // D[p,b]=1 chosen for at least one band in this packet. Use
+            // vertical-prediction if available, else raw.
+            if let Some(v) = forms.vert {
+                if v.total_len() <= forms.raw.total_len() {
+                    v
+                } else {
+                    forms.raw
+                }
+            } else {
+                forms.raw
+            }
+        } else if forms.no_pred.total_len() <= forms.raw.total_len() {
+            forms.no_pred
+        } else {
+            forms.raw
+        };
+        write_packet(&mut entropy, &chosen)?;
     }
 
     let lprc = entropy.len() as u32;
@@ -1149,9 +1429,73 @@ fn encode_precinct_cascade(
     precinct_bytes[2] = (lprc & 0xff) as u8;
     precinct_bytes[3] = cfg.q.min(31);
     // R[p] at offset 4 stays 0.
-    // D[p,b] bits stay 0 (no-prediction, no significance).
+    // D[p,b] bits at offset 5+: pack 2 bits per existing band (Sig|Pred),
+    // big-endian bit order matching the decoder. Round 4 emits bit 0
+    // (vert-pred) per band; bit 1 (significance) stays 0.
+    let mut bit_cursor: usize = (24 + 8 + 8) as usize; // skip Lprc/Q/R bits
+    for s in &slices {
+        if !s.exists {
+            continue;
+        }
+        let d = d_per_band.get(&(s.comp_i, s.beta)).copied().unwrap_or(0);
+        // 2 bits per band: (sig_bit << 1) | pred_bit. Round 4 uses sig=0.
+        let dbits = d & 1;
+        // Significance bit (msb of pair).
+        write_d_bit(&mut precinct_bytes, bit_cursor, 0);
+        bit_cursor += 1;
+        write_d_bit(&mut precinct_bytes, bit_cursor, dbits);
+        bit_cursor += 1;
+    }
     precinct_bytes.extend_from_slice(&entropy);
     Ok(precinct_bytes)
+}
+
+/// Write one bit at `bit_pos` (counted MSB-first) into `bytes`. Used for
+/// the precinct header `D[p,b]` field.
+fn write_d_bit(bytes: &mut [u8], bit_pos: usize, value: u8) {
+    let byte = bit_pos / 8;
+    let off = 7 - (bit_pos % 8);
+    if byte < bytes.len() {
+        bytes[byte] |= (value & 1) << off;
+    }
+}
+
+/// One packet's data plus its band coordinates — phase-1 output of the
+/// per-precinct encoder.
+struct PacketJob {
+    entries: Vec<PerBandEntry>,
+    /// `(comp_idx, beta)` per entry.
+    coords: Vec<(usize, u32)>,
+    /// True iff at least one entry of this packet belongs to a band that
+    /// has not yet been seen in the current precinct (i.e. no in-precinct
+    /// vertical-prediction predecessor exists for that entry).
+    first_line_in_precinct: bool,
+}
+
+/// Three forms of one packet, computed by phase 2 of the per-precinct
+/// encoder.
+struct JobForms {
+    raw: PacketBytes,
+    no_pred: PacketBytes,
+    vert: Option<PacketBytes>,
+}
+
+/// Bitplane-count sub-packet coding mode (Table C.7 / C.12 / C.13 / C.14).
+#[derive(Debug)]
+enum BitplaneMode {
+    /// Dr = 1: raw, Br bits per code group.
+    Raw,
+    /// Dr = 0: VLC, with the spec's prediction sub-mode.
+    Vlc(VlcKind),
+}
+
+#[derive(Debug)]
+enum VlcKind {
+    /// Table C.14 — no prediction. `mtop = T[p,b]`, `θ = 0`.
+    NoPred,
+    /// Table C.13 — vertical prediction. `mtop = max(M_above, T)`,
+    /// `θ = max(M_above - T, 0)`. Per-entry predecessor M-array.
+    VertPred { predecessor: Vec<Vec<u8>> },
 }
 
 /// One band-line emitted in a packet.
@@ -1179,22 +1523,27 @@ impl BandLineSlice {
 }
 
 /// Emit one packet to `out`. The packet covers a list of (band, line)
-/// entries. The encoder builds the body in two forms (Dr=1 raw and
-/// Dr=0 VLC, no-prediction), picks the one with the smaller total size
-/// (header + body), and writes that.
+/// entries. Single-level (NL=1/1) callers use this — every packet has
+/// at most one line per band per precinct, so vertical prediction is
+/// never available. The cascade encoder uses the multi-form pipeline
+/// (`PacketJob` / `JobForms`) which adds vertical prediction.
 fn emit_packet(out: &mut Vec<u8>, cfg: &EncodeConfig, entries: &[PerBandEntry]) -> Result<()> {
     if entries.is_empty() {
         return Ok(());
     }
-    // Build the (Dr=1) raw form.
-    let raw = build_packet_body(cfg, entries, true)?;
-    // Build the (Dr=0) VLC no-prediction form.
-    let vlc_form = build_packet_body(cfg, entries, false)?;
-
-    // Pick the smaller (header is 5 bytes either way, so just compare
-    // body lengths).
-    let chosen = if vlc_form.total_len() <= raw.total_len() {
-        vlc_form
+    let m_per_entry: Vec<Vec<u8>> = entries
+        .iter()
+        .map(|e| compute_m_per_group(cfg, e))
+        .collect::<Result<Vec<_>>>()?;
+    let raw = build_packet_body_with_m(cfg, entries, &m_per_entry, BitplaneMode::Raw)?;
+    let no_pred = build_packet_body_with_m(
+        cfg,
+        entries,
+        &m_per_entry,
+        BitplaneMode::Vlc(VlcKind::NoPred),
+    )?;
+    let chosen = if no_pred.total_len() <= raw.total_len() {
+        no_pred
     } else {
         raw
     };
@@ -1252,27 +1601,67 @@ fn write_packet(out: &mut Vec<u8>, pkt: &PacketBytes) -> Result<()> {
     Ok(())
 }
 
-/// Build one packet body in either Dr=1 (raw) or Dr=0 (VLC no-prediction)
-/// mode. Returns `(dr, lcnt_bytes, ldat_bytes, lsgn_bytes)`.
-fn build_packet_body(
+/// Compute the per-code-group bitplane counts `M[g]` for one entry,
+/// applying the lossy lower-bound `M >= T` so dequantized magnitudes
+/// don't exceed the bitstream's M cap.
+fn compute_m_per_group(cfg: &EncodeConfig, entry: &PerBandEntry) -> Result<Vec<u8>> {
+    let wpb = entry.wpb as usize;
+    let band_line: &[i32] = entry.line.as_slice();
+    let t = entry.t as u32;
+    let ng_u = cfg.ng as usize;
+    let ncg = wpb.div_ceil(ng_u);
+    let m_max_for_br: u32 = if cfg.br >= 8 {
+        255
+    } else {
+        (1u32 << cfg.br) - 1
+    };
+    let mut m_per_group = vec![0u8; ncg];
+    for (g, slot) in m_per_group.iter_mut().enumerate() {
+        let mut max_mag: u32 = 0;
+        for k in 0..ng_u {
+            let xpos = g * ng_u + k;
+            let v = if xpos < wpb { band_line[xpos] } else { 0 };
+            let mag = v.unsigned_abs();
+            if mag > max_mag {
+                max_mag = mag;
+            }
+        }
+        let m = if max_mag == 0 {
+            0u32
+        } else {
+            32 - max_mag.leading_zeros()
+        };
+        let m_eff = m.max(t);
+        if m_eff > m_max_for_br {
+            return Err(Error::invalid(format!(
+                "jpegxs encoder: code group {g} bitplane count {m_eff} exceeds Br = {} (cap {m_max_for_br}). Use a higher Br or quantize the input.",
+                cfg.br
+            )));
+        }
+        *slot = m_eff as u8;
+    }
+    Ok(m_per_group)
+}
+
+/// Build one packet body for the given bitplane-count coding mode,
+/// using pre-computed per-entry M arrays. The data sub-packet is
+/// independent of the bitplane-count mode (only the `cnt` sub-packet
+/// changes per Tables C.7 / C.12 / C.13 / C.14).
+fn build_packet_body_with_m(
     cfg: &EncodeConfig,
     entries: &[PerBandEntry],
-    raw_mode: bool,
+    m_per_entry: &[Vec<u8>],
+    mode: BitplaneMode,
 ) -> Result<PacketBytes> {
     let mut data_writer = BitWriter::default();
     let mut cnt_writer = BitWriter::default();
     let ng_u = cfg.ng as usize;
 
-    for entry in entries {
+    for (entry_idx, entry) in entries.iter().enumerate() {
         let wpb = entry.wpb as usize;
         let band_line: &[i32] = entry.line.as_slice();
         let t = entry.t as u32;
-        let ncg = wpb.div_ceil(ng_u);
-        let m_max_for_br: u32 = if cfg.br >= 8 {
-            255
-        } else {
-            (1u32 << cfg.br) - 1
-        };
+        let m_per_group = &m_per_entry[entry_idx];
         let coef = |g: usize, k: usize| -> i32 {
             let xpos = g * ng_u + k;
             if xpos < wpb {
@@ -1282,58 +1671,47 @@ fn build_packet_body(
             }
         };
 
-        // Per-group bitplane counts (full M, before subtracting T).
-        let mut m_per_group = vec![0u8; ncg];
-        for (g, slot) in m_per_group.iter_mut().enumerate() {
-            let mut max_mag: u32 = 0;
-            for k in 0..ng_u {
-                let v = coef(g, k);
-                let mag = v.unsigned_abs();
-                if mag > max_mag {
-                    max_mag = mag;
+        // Bitplane-count sub-packet.
+        match &mode {
+            BitplaneMode::Raw => {
+                for &m in m_per_group {
+                    cnt_writer.write_bits(m as u32, cfg.br);
                 }
             }
-            let m = if max_mag == 0 {
-                0u32
-            } else {
-                32 - max_mag.leading_zeros()
-            };
-            // For lossy (T > 0), if m <= T the dequantizer collapses
-            // to zero anyway. Cap m at T (don't bother emitting empty
-            // bitplanes).
-            let m_eff = m.max(t);
-            if m_eff > m_max_for_br {
-                return Err(Error::invalid(format!(
-                    "jpegxs encoder: code group {g} bitplane count {m_eff} exceeds Br = {} (cap {m_max_for_br}). Use a higher Br or quantize the input.",
-                    cfg.br
-                )));
+            BitplaneMode::Vlc(VlcKind::NoPred) => {
+                // mtop = T[p,b]; θ = max(mtop - T, 0) = 0. Δm = M - mtop
+                // is always >= 0 (since we cap M at T) → unary
+                // sub-alphabet → x = Δm → "Δm ones + 0".
+                for &m in m_per_group {
+                    let delta_m = (m as i32) - (t as i32);
+                    debug_assert!(delta_m >= 0);
+                    emit_vlc_signed(&mut cnt_writer, delta_m, 0);
+                }
             }
-            *slot = m_eff as u8;
-        }
-
-        // Bitplane-count sub-packet.
-        if raw_mode {
-            for &m in &m_per_group {
-                cnt_writer.write_bits(m as u32, cfg.br);
-            }
-        } else {
-            // Dr=0, no-prediction VLC: Δm = M - mtop. mtop = T (Table
-            // C.14 with D[p,b] & 1 == 0 → mtop = T[p,b]). For our
-            // encoder T = Q (G = 0 always); θ = max(r - t, 0) where
-            // r = mtop = T, so θ = 0. With θ = 0 the signed binary
-            // alphabet is empty — every Δm is encoded via the unary
-            // alphabet: x = Δm (always >= 0 since M >= T).
-            for &m in &m_per_group {
-                let delta_m = (m as i32) - (t as i32);
-                debug_assert!(
-                    delta_m >= 0,
-                    "M < T should never happen since we cap m at T"
-                );
-                emit_vlc_no_prediction(&mut cnt_writer, delta_m as u32);
+            BitplaneMode::Vlc(VlcKind::VertPred { predecessor }) => {
+                // Table C.13: mtop = max(M_above, max(T, Ttop)). With
+                // Ttop = T (in-precinct predecessor) → mtop = max(
+                // M_above, T). θ = max(mtop - T, 0). Δm = M - mtop is
+                // signed (can go negative when M < mtop).
+                let pred_m = &predecessor[entry_idx];
+                if pred_m.len() != m_per_group.len() {
+                    return Err(Error::invalid(format!(
+                        "jpegxs encoder: vertical predictor M length {} != current {}",
+                        pred_m.len(),
+                        m_per_group.len()
+                    )));
+                }
+                for (g, &m) in m_per_group.iter().enumerate() {
+                    let m_above = pred_m[g] as i32;
+                    let mtop = m_above.max(t as i32);
+                    let theta = (mtop - t as i32).max(0);
+                    let delta_m = (m as i32) - mtop;
+                    emit_vlc_signed(&mut cnt_writer, delta_m, theta);
+                }
             }
         }
 
-        // Data sub-packet.
+        // Data sub-packet — independent of bitplane-count mode.
         for (g, &m_u8) in m_per_group.iter().enumerate() {
             let m = m_u8 as u32;
             if m <= t {
@@ -1345,9 +1723,6 @@ fn build_packet_body(
                 let sign_bit = if v < 0 { 1 } else { 0 };
                 data_writer.write_bit(sign_bit);
             }
-            // Emit only planes (M-1) down to T (inclusive). Lower
-            // planes are quantized away — the decoder's deadzone
-            // adds the half-bucket offset back.
             for plane in (t..m).rev() {
                 for k in 0..ng_u {
                     let v = coef(g, k);
@@ -1362,20 +1737,47 @@ fn build_packet_body(
     data_writer.align_to_byte();
     let cnt_bytes = cnt_writer.into_bytes();
     let data_bytes = data_writer.into_bytes();
+    let dr = match mode {
+        BitplaneMode::Raw => 1,
+        BitplaneMode::Vlc(_) => 0,
+    };
     Ok(PacketBytes {
-        dr: if raw_mode { 1 } else { 0 },
+        dr,
         cnt: cnt_bytes,
         data: data_bytes,
         sgn: Vec::new(),
     })
 }
 
-/// Emit a VLC-encoded `Δm` using the no-prediction θ=0 alphabet:
-/// `Δm` ones followed by a 0 comma. (Since T = mtop and θ = max(r-t,0)
-/// = 0 in our encoder, every Δm > 0 is in the unary sub-alphabet, and
-/// Δm = 0 emits a single 0.)
-fn emit_vlc_no_prediction(writer: &mut BitWriter, delta_m: u32) {
-    for _ in 0..delta_m {
+/// Emit a VLC-encoded signed `value` for the predictor parameter `theta`
+/// (Annex C.7.1, Table C.15). Inverse of [`crate::entropy::bits::vlc`]:
+///
+/// * `value > theta` → unary sub-alphabet, `x = value + theta`.
+/// * `0 < value <= theta` → signed-binary even codeword, `x = 2 * value`.
+/// * `-theta <= value < 0` → signed-binary odd codeword, `x = 2 * (-value) - 1`.
+/// * `value == 0` → `x = 0` (single 0 bit).
+///
+/// Then `x` ones are emitted MSB-first followed by a single 0 comma.
+/// `value` must satisfy `-theta <= value` (caller's responsibility — for
+/// our encoder `value = M - mtop` and `M >= T` ensures
+/// `value >= -theta = T - mtop`).
+fn emit_vlc_signed(writer: &mut BitWriter, value: i32, theta: i32) {
+    debug_assert!(theta >= 0);
+    debug_assert!(
+        value >= -theta,
+        "VLC signed value {value} below -theta {theta}"
+    );
+    let x: u32 = if value > theta {
+        (value + theta) as u32
+    } else if value > 0 {
+        (2 * value) as u32
+    } else if value == 0 {
+        0
+    } else {
+        (2 * (-value) - 1) as u32
+    };
+    debug_assert!(x <= 32, "VLC codeword length {x} exceeds 32-bit cap");
+    for _ in 0..x {
         writer.write_bit(1);
     }
     writer.write_bit(0);
@@ -1980,6 +2382,163 @@ mod tests {
             cs_420.len(),
             cs_444.len()
         );
+    }
+
+    // === Round 4: Star-Tetrix (Cpih=3) =====================================
+
+    fn make_cfa_8x8() -> [Vec<u8>; 4] {
+        // Synthesise four 8x8 CFA-like component planes with distinct
+        // patterns — emulates a Bayer mosaic decomposed into 4 separate
+        // sub-grid components.
+        let n = 8 * 8;
+        let mut r = vec![0u8; n];
+        let mut g1 = vec![0u8; n];
+        let mut g2 = vec![0u8; n];
+        let mut b = vec![0u8; n];
+        for y in 0..8 {
+            for x in 0..8 {
+                let idx = y * 8 + x;
+                r[idx] = ((x as i32 * 11 + y as i32 * 5) % 240).unsigned_abs() as u8;
+                g1[idx] = ((x as i32 * 7 + y as i32 * 13) % 240).unsigned_abs() as u8;
+                g2[idx] = ((x as i32 * 13 + y as i32 * 7) % 240).unsigned_abs() as u8;
+                b[idx] = ((x as i32 * 5 + y as i32 * 11) % 240).unsigned_abs() as u8;
+            }
+        }
+        [r, g1, g2, b]
+    }
+
+    /// Self-roundtrip: encode 4-component CFA via Star-Tetrix, decode,
+    /// recover every plane bit-exactly.
+    #[test]
+    fn round4_star_tetrix_lossless_round_trip() {
+        let [r, g1, g2, b] = make_cfa_8x8();
+        let cs = encode_planar_star_tetrix(
+            8,
+            8,
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            &[r.clone(), g1.clone(), g2.clone(), b.clone()],
+        )
+        .expect("encode Cpih=3 lossless");
+        let img = decode_codestream(&cs, None).expect("decode Cpih=3");
+        assert_eq!(img.num_components, 4);
+        assert_eq!(img.planes[0].data, r, "red plane must round-trip");
+        assert_eq!(img.planes[1].data, g1, "G1 plane must round-trip");
+        assert_eq!(img.planes[2].data, g2, "G2 plane must round-trip");
+        assert_eq!(img.planes[3].data, b, "blue plane must round-trip");
+    }
+
+    /// Star-Tetrix with Ct=1 (GRBG layout) and non-default e1/e2 also
+    /// round-trips losslessly.
+    #[test]
+    fn round4_star_tetrix_ct1_e1_2_e2_3_round_trip() {
+        let [r, g1, g2, b] = make_cfa_8x8();
+        let cs = encode_planar_star_tetrix(
+            8,
+            8,
+            1,
+            1,
+            0,
+            2,
+            3,
+            0,
+            1,
+            &[r.clone(), g1.clone(), g2.clone(), b.clone()],
+        )
+        .expect("encode Cpih=3 Ct=1 e1=2 e2=3");
+        let img = decode_codestream(&cs, None).expect("decode Cpih=3 Ct=1");
+        assert_eq!(img.planes[0].data, r);
+        assert_eq!(img.planes[1].data, g1);
+        assert_eq!(img.planes[2].data, g2);
+        assert_eq!(img.planes[3].data, b);
+    }
+
+    /// Star-Tetrix with NL=2/2 and Cf=3 (in-line access) round-trips.
+    #[test]
+    fn round4_star_tetrix_nl_2_cf3_round_trip() {
+        let [r, g1, g2, b] = make_cfa_8x8();
+        let cs = encode_planar_star_tetrix(
+            8,
+            8,
+            2,
+            2,
+            0,
+            1,
+            1,
+            3,
+            0,
+            &[r.clone(), g1.clone(), g2.clone(), b.clone()],
+        )
+        .expect("encode Cpih=3 NL=2/2 Cf=3");
+        let img = decode_codestream(&cs, None).expect("decode Cpih=3 NL=2/2 Cf=3");
+        assert_eq!(img.planes[0].data, r);
+        assert_eq!(img.planes[1].data, g1);
+        assert_eq!(img.planes[2].data, g2);
+        assert_eq!(img.planes[3].data, b);
+    }
+
+    // === Round 4: vertical-prediction VLC (Dr=0, D[p,b] & 1 = 1) =========
+
+    /// Vertical-prediction picker self-roundtrips losslessly on the
+    /// synthetic 32×32 RGB cascade fixture. Picker compares D=0 (no-pred)
+    /// vs D=1 (vert-pred) per band per precinct and emits the smaller.
+    #[test]
+    fn round4_vertical_prediction_lossless_round_trip() {
+        let pixels = make_synthetic_rgb_32x32();
+        let codestream = encode_rgb_8bit(32, 32, &pixels, 1, 2).expect("encode RGB NL=2/2 Cpih=1");
+        let img = decode_codestream(&codestream, None).expect("decode round 4 vertpred");
+        let n = 32 * 32;
+        let (mut r, mut g, mut b) = (
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+        );
+        for chunk in pixels.chunks_exact(3) {
+            r.push(chunk[0]);
+            g.push(chunk[1]);
+            b.push(chunk[2]);
+        }
+        assert_eq!(img.planes[0].data, r, "red plane");
+        assert_eq!(img.planes[1].data, g, "green plane");
+        assert_eq!(img.planes[2].data, b, "blue plane");
+    }
+
+    /// Smooth vertical gradient — vertical-prediction picker should
+    /// engage on the LH/HH bands and beat round-3 no-pred-only baseline.
+    /// We assert round-trip + the codestream stays under 4 KB on a
+    /// 64×64 vertical gradient.
+    #[test]
+    fn round4_vertical_gradient_compresses_well() {
+        let w = 64u16;
+        let h = 64u16;
+        let mut pixels = vec![0u8; (w as usize) * (h as usize)];
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                pixels[y * w as usize + x] = ((x * 2 + y * 4) % 256) as u8;
+            }
+        }
+        let cs = encode_planar(w, h, 1, 0, 2, 2, &[pixels.clone()])
+            .expect("encode 64x64 vertical gradient");
+        let img = decode_codestream(&cs, None).expect("decode 64x64 vertical gradient");
+        assert_eq!(img.planes[0].data, pixels, "round-trip lossless");
+        assert!(
+            cs.len() < 4096,
+            "vertical-gradient codestream {} bytes >= 4 KB raw",
+            cs.len()
+        );
+    }
+
+    /// Cpih=3 must fail when Nc != 4.
+    #[test]
+    fn round4_star_tetrix_rejects_wrong_nc() {
+        let pixels = vec![0u8; 8 * 8];
+        let res = encode_planar(8, 8, 3, 3, 1, 1, &[pixels.clone(), pixels.clone(), pixels]);
+        assert!(res.is_err(), "Cpih=3 with Nc=3 must be rejected");
     }
 
     /// Rejects `(sx, sy)` outside `{1, 2}`.
