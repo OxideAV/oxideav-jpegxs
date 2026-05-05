@@ -1854,8 +1854,8 @@ mod tests {
         // encode_planar_lossy with q=0 internally sets fq=0 → matches
         // encode_planar exactly. Good.
         let pixels = vec![0u8; 32 * 32];
-        let r2 = encode_planar(32, 32, 1, 0, 1, 1, &[pixels.clone()]).unwrap();
-        let r3 = encode_planar_lossy(32, 32, 1, 0, 1, 1, 0, &[pixels.clone()]).unwrap();
+        let r2 = encode_planar(32, 32, 1, 0, 1, 1, std::slice::from_ref(&pixels)).unwrap();
+        let r3 = encode_planar_lossy(32, 32, 1, 0, 1, 1, 0, std::slice::from_ref(&pixels)).unwrap();
         assert_eq!(r2, r3, "q=0 path must match lossless encode_planar");
     }
 
@@ -1872,8 +1872,8 @@ mod tests {
         let mut y_plane = vec![0u8; n_y];
         let mut cb_plane = vec![0u8; n_c];
         let mut cr_plane = vec![0u8; n_c];
-        for i in 0..n_y {
-            y_plane[i] = ((i * 7 + 13) % 256) as u8;
+        for (i, slot) in y_plane.iter_mut().enumerate() {
+            *slot = ((i * 7 + 13) % 256) as u8;
         }
         for i in 0..n_c {
             cb_plane[i] = ((i * 11 + 17) % 256) as u8;
@@ -1909,8 +1909,8 @@ mod tests {
         let mut y_plane = vec![0u8; n_y];
         let mut cb_plane = vec![0u8; n_c];
         let mut cr_plane = vec![0u8; n_c];
-        for i in 0..n_y {
-            y_plane[i] = ((i * 7 + 13) % 256) as u8;
+        for (i, slot) in y_plane.iter_mut().enumerate() {
+            *slot = ((i * 7 + 13) % 256) as u8;
         }
         for i in 0..n_c {
             cb_plane[i] = ((i * 11 + 17) % 256) as u8;
@@ -1944,8 +1944,8 @@ mod tests {
         let h = 32u16;
         let n_y = (w as usize) * (h as usize);
         let mut y_plane = vec![0u8; n_y];
-        for i in 0..n_y {
-            y_plane[i] = ((i * 7 + 13) % 256) as u8;
+        for (i, slot) in y_plane.iter_mut().enumerate() {
+            *slot = ((i * 7 + 13) % 256) as u8;
         }
         let cb_full = y_plane.clone();
         let cr_full = y_plane.clone();
