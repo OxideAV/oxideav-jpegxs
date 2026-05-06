@@ -15,12 +15,6 @@ categories = ["multimedia::encoding", "multimedia::images"]
 
 [dependencies]
 oxideav-core = { version = "0.1", optional = true }
-# Distributed-slice auto-registration into `oxideav_core::REGISTRARS`
-# via the `oxideav_core::register!` macro. Tiny crate, no transitive
-# deps; works on every target including wasm. Optional + gated behind
-# the `registry` feature so standalone image-library callers don't pull
-# it in.
-linkme = { version = "0.3", optional = true }
 
 [features]
 default = ["registry"]
@@ -28,4 +22,4 @@ default = ["registry"]
 # the `register()` entry point. Disable for an `oxideav-core`-free
 # build; the standalone `decode_jpeg_xs` API plus the underlying
 # `codestream` / `decoder` / `dwt` / etc. modules are still exposed.
-registry = ["dep:oxideav-core", "dep:linkme"]
+registry = ["dep:oxideav-core"]
