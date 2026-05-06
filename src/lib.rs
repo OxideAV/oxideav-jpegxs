@@ -71,7 +71,7 @@ pub mod slice_walker;
 pub mod registry;
 
 #[cfg(feature = "registry")]
-pub use registry::{make_decoder, register, register_codecs, register_containers};
+pub use registry::{__oxideav_entry, make_decoder, register, register_codecs, register_containers};
 
 pub use capabilities::{parse_capabilities, parse_capabilities_lossy, Capabilities};
 pub use codestream::{Codestream, Slice};
