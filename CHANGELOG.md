@@ -183,6 +183,21 @@ also passes 149 tests (was 140).
 
 ## Unreleased — encoder round 2 (multi-component RCT + multi-decomp + odd dims)
 
+## [0.0.4](https://github.com/OxideAV/oxideav-jpegxs/compare/v0.0.3...v0.0.4) - 2026-05-08
+
+### Other
+
+- encoder round 6: relax NL,x cap from 2 to 5 (deeper wavelet cascade)
+- drop dead `linkme` dep
+- re-export __oxideav_entry from registry sub-module
+- encoder round 5: silence clippy 1.95 cloned_ref_to_slice_refs in tests
+- encoder round 5: NL_x≠NL_y + significance coding + NLT quadratic + per-band Q
+- registry calls: rename make_decoder/make_encoder → first_decoder/first_encoder
+- auto-register via oxideav_core::register! macro (linkme distributed slice)
+- unify entry point on register(&mut RuntimeContext) ([#502](https://github.com/OxideAV/oxideav-jpegxs/pull/502))
+- add register_containers for .jxs extension lookup
+- release v0.0.3
+
 ## [0.0.3](https://github.com/OxideAV/oxideav-jpegxs/compare/v0.0.2...v0.0.3) - 2026-05-05
 
 ### Added
