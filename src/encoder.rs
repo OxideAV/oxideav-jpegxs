@@ -1,4 +1,4 @@
-//! JPEG XS encoder — rounds 1-5.
+//! JPEG XS encoder — rounds 1-6.
 //!
 //! Round 1 (commit `95b4e27`) shipped the lossless single-luma 8-bit
 //! single-decomposition single-precinct-column case. Round 2 broadened
@@ -52,10 +52,20 @@
 //!   pixels before quantization, and self-roundtrips through the
 //!   decoder's inverse quadratic path.
 //!
-//! Out-of-scope (deferred to round 6+):
+//! Round 6 adds:
+//! * **Deeper wavelet cascade `NL ∈ {1..=5}`.** The encoder validation
+//!   was capped at NL=2/2 even though `forward_cascade_2d` /
+//!   `inverse_cascade_2d` are generic in NL,y ≤ NL,x. Relaxing the
+//!   validation lets users opt into deeper multi-resolution analysis
+//!   (NL=3/3, 4/4, 5/5 all self-roundtrip). The cascade path is the
+//!   only path used for NL > 1 already, so no encoder kernel changes
+//!   were needed beyond the validate threshold. Spec Annex A.4.4
+//!   Table A.7 allows NL,x up to 8; we test through 5/5 here.
+//!
+//! Out-of-scope (deferred to round 7+):
 //! * Extended NLT (Tnlt=2, three-segment gamma).
 //! * `Cw > 0` (custom precinct widths).
-//! * `NL > 2`.
+//! * `NL > 5` (spec allows up to 8).
 //!
 //! Byte stream shape:
 //!
@@ -196,9 +206,13 @@ impl EncodeConfig {
                 )));
             }
         }
-        if self.nlx < 1 || self.nlx > 2 || self.nly > self.nlx || self.nly > 2 {
+        // Round 6: NL,x ∈ {1..=5} (spec allows up to 8; we test through
+        // NL=5/5 here, matching the decoder's cascade scope). NL,y ∈
+        // {0..=NL,x} per Annex B (NOTE 1: NL,y > NL,x case "needs not to
+        // be considered for interoperability").
+        if self.nlx < 1 || self.nlx > 5 || self.nly > self.nlx {
             return Err(Error::Unsupported(format!(
-                "jpegxs encoder round 5: NL,x ∈ {{1, 2}}, NL,y ∈ {{0..=NL,x}}, got NL,x={} NL,y={}",
+                "jpegxs encoder: NL,x ∈ {{1..=5}}, NL,y ∈ {{0..=NL,x}}, got NL,x={} NL,y={}",
                 self.nlx, self.nly
             )));
         }
@@ -2516,8 +2530,8 @@ mod tests {
     #[test]
     fn rejects_unsupported_configurations() {
         let pixels = vec![0u8; 32 * 32];
-        // NL=3 not yet supported.
-        assert!(encode_planar(32, 32, 1, 0, 3, 3, std::slice::from_ref(&pixels)).is_err());
+        // NL=6 above the round-6 cap (round-6 supports NL ∈ {1..=5}).
+        assert!(encode_planar(32, 32, 1, 0, 6, 6, std::slice::from_ref(&pixels)).is_err());
         // NL,y > NL,x is not legal per spec.
         assert!(encode_planar(32, 32, 1, 0, 1, 2, std::slice::from_ref(&pixels)).is_err());
         // Nc=2 not yet supported.
@@ -3157,5 +3171,128 @@ mod tests {
             encode_planar(64, 64, 1, 0, 1, 1, std::slice::from_ref(&pixels)).expect("encode NL=1");
         let img1 = decode_codestream(&cs_nl1, None).expect("decode NL=1 flat");
         assert_eq!(img1.planes[0].data, pixels, "NL=1 round-trip");
+    }
+
+    // === Round 6: deeper wavelet cascade (NL > 2) ==========================
+    //
+    // The decoder cascade has always been generic (`forward_cascade_2d`
+    // / `inverse_cascade_2d` accept any `(NL,x, NL,y)` pair with
+    // `NL,y ≤ NL,x`). The encoder validation previously capped at
+    // NL=2 / 2; relaxing to NL=5 / 5 lets users opt into deeper
+    // multi-resolution analysis. Each extra level halves the LL band
+    // again, so deep transforms compress smoother content better at the
+    // same Q budget but cost a few extra cascade steps. Tested at every
+    // step from 3/3 up to 5/5 on a 64×64 luma + RGB to keep all four
+    // candidate D-form variants exercised, plus an asymmetric NL,x=3 /
+    // NL,y=2 case.
+    //
+    // The test images are non-trivial (sinusoidal fringes + per-pixel
+    // gradient) so the cascade actually splits energy across all bands;
+    // a flat gray image would short-circuit through the significance
+    // coding path and not validate the cascade logic.
+    fn make_nl_test_64x64() -> Vec<u8> {
+        let mut pixels = vec![0u8; 64 * 64];
+        for y in 0..64 {
+            for x in 0..64 {
+                let v = 128i32
+                    + ((x as i32 - 32) * (y as i32 - 32) / 8).clamp(-100, 100)
+                    + (((x ^ y) as i32) & 0x1f);
+                pixels[y * 64 + x] = v.clamp(0, 255) as u8;
+            }
+        }
+        pixels
+    }
+
+    #[test]
+    fn round6_nl_3_3_lossless_round_trip_luma() {
+        let pixels = make_nl_test_64x64();
+        let cs = encode_planar(64, 64, 1, 0, 3, 3, std::slice::from_ref(&pixels))
+            .expect("encode luma NL=3/3");
+        let img = decode_codestream(&cs, None).expect("decode NL=3/3");
+        assert_eq!(
+            img.planes[0].data, pixels,
+            "luma must round-trip losslessly at NL=3/3"
+        );
+    }
+
+    #[test]
+    fn round6_nl_4_4_lossless_round_trip_luma() {
+        let pixels = make_nl_test_64x64();
+        let cs = encode_planar(64, 64, 1, 0, 4, 4, std::slice::from_ref(&pixels))
+            .expect("encode luma NL=4/4");
+        let img = decode_codestream(&cs, None).expect("decode NL=4/4");
+        assert_eq!(
+            img.planes[0].data, pixels,
+            "luma must round-trip losslessly at NL=4/4"
+        );
+    }
+
+    #[test]
+    fn round6_nl_5_5_lossless_round_trip_luma() {
+        let pixels = make_nl_test_64x64();
+        let cs = encode_planar(64, 64, 1, 0, 5, 5, std::slice::from_ref(&pixels))
+            .expect("encode luma NL=5/5");
+        let img = decode_codestream(&cs, None).expect("decode NL=5/5");
+        assert_eq!(
+            img.planes[0].data, pixels,
+            "luma must round-trip losslessly at NL=5/5"
+        );
+    }
+
+    #[test]
+    fn round6_nl_3_3_lossless_round_trip_rgb() {
+        let pixels = make_synthetic_rgb_32x32();
+        let n = 32 * 32;
+        let (mut r, mut g, mut b) = (
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+        );
+        for chunk in pixels.chunks_exact(3) {
+            r.push(chunk[0]);
+            g.push(chunk[1]);
+            b.push(chunk[2]);
+        }
+        let cs = encode_planar(32, 32, 3, 1, 3, 3, &[r.clone(), g.clone(), b.clone()])
+            .expect("encode RGB NL=3/3 Cpih=1");
+        let img = decode_codestream(&cs, None).expect("decode RGB NL=3/3");
+        assert_eq!(img.planes[0].data, r, "red plane NL=3/3");
+        assert_eq!(img.planes[1].data, g, "green plane NL=3/3");
+        assert_eq!(img.planes[2].data, b, "blue plane NL=3/3");
+    }
+
+    #[test]
+    fn round6_nl_3_2_asymmetric_lossless_round_trip() {
+        let pixels = make_nl_test_64x64();
+        let cs = encode_planar(64, 64, 1, 0, 3, 2, std::slice::from_ref(&pixels))
+            .expect("encode luma NL=3/2");
+        let img = decode_codestream(&cs, None).expect("decode NL=3/2");
+        assert_eq!(
+            img.planes[0].data, pixels,
+            "luma must round-trip losslessly at NL=3/2"
+        );
+    }
+
+    /// NL,x=6 must be rejected (round-6 cap is NL=5; spec maximum is 8
+    /// but we test through 5).
+    #[test]
+    fn round6_rejects_nlx_above_5() {
+        let pixels = vec![0u8; 64 * 64];
+        let res = encode_planar(64, 64, 1, 0, 6, 6, std::slice::from_ref(&pixels));
+        assert!(res.is_err(), "NL,x=6 must be rejected at the encoder cap");
+    }
+
+    /// Deeper cascades typically compress smoother content better at
+    /// the same Q. We don't rely on a strict ordering across NL because
+    /// the picker can flip on small inputs, but NL=4 q=4 lossy must
+    /// still round-trip with PSNR ≥ 25 dB.
+    #[test]
+    fn round6_nl_4_4_lossy_q4_psnr_above_25db() {
+        let pixels = make_nl_test_64x64();
+        let cs = encode_planar_lossy(64, 64, 1, 0, 4, 4, 4, std::slice::from_ref(&pixels))
+            .expect("encode luma NL=4/4 q=4");
+        let img = decode_codestream(&cs, None).expect("decode NL=4/4 q=4");
+        let p = psnr(&pixels, &img.planes[0].data);
+        assert!(p >= 25.0, "NL=4/4 q=4 PSNR {p:.2} dB below 25 dB floor");
     }
 }

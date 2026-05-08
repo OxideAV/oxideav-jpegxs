@@ -12,7 +12,7 @@ framework but usable standalone.
 | Direction | Status |
 | --- | --- |
 | Decoder | working — multi-component, single-precinct-row subset (rounds 1–6) |
-| Encoder | Round 5 — luma + RGB 4:4:4 / 4:2:2 / 4:2:0 + 4-component CFA Star-Tetrix, Cpih ∈ {0, 1, 3}, **NL_x ∈ {1, 2} / NL_y ∈ {0..=NL_x}** (asymmetric decomposition), odd dims, Dr ∈ {0, 1} VLC + raw picker with no-prediction (Table C.14) **and vertical-prediction (Table C.13)** sub-modes, **significance coding (D[p,b] bit 1, Annex C.5)** gating zero significance groups, **per-band gain-weighted Q** (`T[p,b] = clamp(Q−G[b], 0, 15)`, G ∈ {0,1,2}), **NLT quadratic forward map** (Annex G.4, Tnlt=1, Bw=18) via `encode_planar_nlt_quadratic`, Fq ∈ {0, 8} lossy with Q ∈ 0..=15. Self-roundtrip ∞ dB lossless; PSNR ≥ 40 dB at q=1, ≥ 25 dB at q=4 |
+| Encoder | Round 6 — luma + RGB 4:4:4 / 4:2:2 / 4:2:0 + 4-component CFA Star-Tetrix, Cpih ∈ {0, 1, 3}, **NL_x ∈ {1..=5} / NL_y ∈ {0..=NL_x}** (deeper multi-resolution cascade + asymmetric decomposition), odd dims, Dr ∈ {0, 1} VLC + raw picker with no-prediction (Table C.14) **and vertical-prediction (Table C.13)** sub-modes, **significance coding (D[p,b] bit 1, Annex C.5)** gating zero significance groups, **per-band gain-weighted Q** (`T[p,b] = clamp(Q−G[b], 0, 15)`, G ∈ {0,1,2}), **NLT quadratic forward map** (Annex G.4, Tnlt=1, Bw=18) via `encode_planar_nlt_quadratic`, Fq ∈ {0, 8} lossy with Q ∈ 0..=15. Self-roundtrip ∞ dB lossless at NL=3/3, 4/4, 5/5; PSNR ≥ 40 dB at q=1, ≥ 25 dB at q=4 |
 
 End-to-end decoder for the multi-component, single-precinct-row
 subset of ISO/IEC 21122-1:2022. Supports:
@@ -142,6 +142,7 @@ Modules:
 * `Sd > 0` (CWD-driven decomposition suppression for components 4..7).
 * Output bit depths > 8 — Annex G kernels are bit-depth agnostic but
   the pack-to-plane helper currently emits `Vec<u8>` only.
-* Encoder round 6+: `NL > 2`, NLT linear / extended gamma (Tnlt=2/3)
-  encoder paths, `Cw > 0` custom precinct widths, per-band per-precinct
-  Q rate-distortion optimization, `Sd > 0` decomposition suppression.
+* Encoder round 7+: NLT linear / extended gamma (Tnlt=2/3) encoder
+  paths, `Cw > 0` custom precinct widths, per-band per-precinct Q rate-
+  distortion optimization, `Sd > 0` decomposition suppression. (NL > 5
+  is allowed by the spec up to 8; round 6 caps at NL=5.)

@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased — encoder round 6 (deeper wavelet cascade NL ∈ {1..=5})
+
+The encoder validation previously capped at NL,x = 2 / NL,y = 2 even
+though `forward_cascade_2d` and `inverse_cascade_2d` are generic across
+any `NL,y ≤ NL,x` pair (decoder cascade tested at NL = 3/3 since round
+6 of the decoder).
+
+* `encoder.rs` — **Relaxed `EncodeConfig::validate` to accept
+  `NL,x ∈ {1..=5}` (was `{1, 2}`).** `NL,y ∈ {0..=NL,x}` constraint
+  unchanged. Spec Annex A.4.4 Table A.7 allows NL,x ∈ {1..=8}; we test
+  through 5/5 here with both luma and 3-component RGB self-roundtrips.
+  All four entry points (`encode_planar`, `encode_planar_lossy`,
+  `encode_planar_subsampled`, `encode_planar_star_tetrix`,
+  `encode_planar_nlt_quadratic`) inherit the deeper-NL ceiling because
+  they all route through `encode_planar_inner` → `validate`.
+* Self-roundtrip tests at NL = 3/3, 4/4, 5/5 for 64×64 luma and at
+  NL = 3/3 for 32×32 RGB (Cpih=1); asymmetric NL = 3/2 round-trip;
+  rejection at NL = 6.
+* `round6_nl_4_4_lossy_q4_psnr_above_25db` confirms the lossy path
+  still meets the 25 dB floor at deeper cascades.
+
+The cascade band geometry / `n_beta` / `beta_key` / `band_dims` /
+`pow_h` helpers were already generic in NL — relaxing the validation
+threshold is the only encoder-side change. The decoder needed no
+changes (it has always supported NL > 2 cascades).
+
+Verification: 189 tests pass (was 182, +7); standalone-feature build
+also passes; `cargo fmt --check` and `cargo clippy -- -D warnings`
+clean.
+
 ## Unreleased — encoder round 5 (NL_x≠NL_y + significance coding + NLT quadratic + per-band Q)
 
 Four new encoder capabilities on top of round 4:
