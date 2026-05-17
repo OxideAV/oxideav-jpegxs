@@ -1373,8 +1373,8 @@ mod tests {
     ///
     /// This is the minimum-viable multi-level fixture: 1 slice, 1
     /// precinct, 7 bands (Nβ = 7 for NL,x = NL,y = 2), 10 packets
-    /// matching the layout the slice walker emits (verified via the
-    /// `debug_multilevel_layout` test).
+    /// matching the layout the slice walker emits (Nβ = 7 invariant
+    /// also asserted by `multilevel_plan_shape_nl_2_2_4x4_luma`).
     fn build_zero_codestream_4x4_nl22() -> Vec<u8> {
         let mut v = Vec::new();
         v.extend_from_slice(&[0xff, 0x10]);
