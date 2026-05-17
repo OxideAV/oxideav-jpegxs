@@ -12,7 +12,7 @@ framework but usable standalone.
 | Direction | Status |
 | --- | --- |
 | Decoder | working — multi-component, single-precinct-row subset (rounds 1–6) |
-| Encoder | Round 6 — luma + RGB 4:4:4 / 4:2:2 / 4:2:0 + 4-component CFA Star-Tetrix, Cpih ∈ {0, 1, 3}, **NL_x ∈ {1..=5} / NL_y ∈ {0..=NL_x}** (deeper multi-resolution cascade + asymmetric decomposition), odd dims, Dr ∈ {0, 1} VLC + raw picker with no-prediction (Table C.14) **and vertical-prediction (Table C.13)** sub-modes, **significance coding (D[p,b] bit 1, Annex C.5)** gating zero significance groups, **per-band gain-weighted Q** (`T[p,b] = clamp(Q−G[b], 0, 15)`, G ∈ {0,1,2}), **NLT quadratic forward map** (Annex G.4, Tnlt=1, Bw=18) via `encode_planar_nlt_quadratic`, Fq ∈ {0, 8} lossy with Q ∈ 0..=15. Self-roundtrip ∞ dB lossless at NL=3/3, 4/4, 5/5; PSNR ≥ 40 dB at q=1, ≥ 25 dB at q=4 |
+| Encoder | Round 7 — luma + RGB 4:4:4 / 4:2:2 / 4:2:0 + 4-component CFA Star-Tetrix, Cpih ∈ {0, 1, 3}, **NL_x ∈ {1..=8} / NL_y ∈ {0..=NL_x}** (spec Annex A.4.4 Table A.7 hard max), odd dims, Dr ∈ {0, 1} VLC + raw picker with no-prediction (Table C.14) **and vertical-prediction (Table C.13)** sub-modes, **significance coding (D[p,b] bit 1, Annex C.5)** gating zero significance groups, **per-band gain-weighted Q** (`T[p,b] = clamp(Q−G[b], 0, 15)`, G ∈ {0,1,2}), **NLT quadratic forward map** (Annex G.4, Tnlt=1, Bw=18) via `encode_planar_nlt_quadratic`, **NLT extended forward map** (Annex G.5, Tnlt=2, three-segment gamma, Bw=18) via `encode_planar_nlt_extended` with reverse LUT inverter, Fq ∈ {0, 8} lossy with Q ∈ 0..=15. Self-roundtrip ∞ dB lossless at NL=3/3, 4/4, 5/5, 6/6; PSNR ≥ 40 dB at q=1, ≥ 25 dB at q=4; NLT extended PSNR ≥ 30 dB at q=0, ≥ 25 dB at q=2 |
 
 End-to-end decoder for the multi-component, single-precinct-row
 subset of ISO/IEC 21122-1:2022. Supports:
@@ -83,6 +83,15 @@ Public API:
   distortion (`y = sqrt(x/255) * 262143 + dco`, Annex G.4, Tnlt=1)
   before the DWT, forces `Bw = 18`, and emits the NLT marker. `dco`
   must fit in signed 16-bit. `q = 0` lossless; `q > 0` Fq=8 lossy.
+* `oxideav_jpegxs::encoder::encode_planar_nlt_extended(width, height,
+  nc, cpih, nlx, nly, q, t1, t2, e, &[Vec<u8>]) -> Result<Vec<u8>>` —
+  round-7 NLT extended entry point. Applies a forward extended-gamma
+  pre-distortion (Annex G.5, Tnlt=2, three-segment kernel with
+  thresholds `0 < T1 < T2 ≤ 2^Bw - 1` and slope exponent `E ∈ 1..=4`)
+  built from a `2^Bw`-entry reverse LUT inverting the decoder's
+  `extended_path`. Forces `Bw = 18` and emits the NLT marker with
+  `(T1, T2, E)`. `q = 0` lossless within LUT resolution; `q > 0` Fq=8
+  lossy.
 * `oxideav_jpegxs::parse_capabilities(&[u8]) -> Result<Capabilities>`
   — decode CAP body bits into individual feature flags.
 * `oxideav_jpegxs::parse_cts(&[u8]) -> Result<CtsMarker>`,
@@ -113,11 +122,11 @@ Modules:
   Star-Tetrix (Annex F.5, Tables F.4–F.8) with Table F.12 access
 * `output` — Annex G linear / quadratic / extended output scaling
   + DC level shift + clipping; NLT body parser
-* `encoder` — rounds 1-5: forward 5/3 DWT (Annex E.13) per
+* `encoder` — rounds 1-7: forward 5/3 DWT (Annex E.13) per
   precinct (NL=1/1) or via picture-level cascade
-  `dwt::forward_cascade_2d` (NL=2/2 or asymmetric NL_x≠NL_y); forward
-  RCT (`colour_transform::forward_rct`, Annex F.4 Table F.3) when
-  `Cpih == 1`; forward Star-Tetrix (`colour_transform::
+  `dwt::forward_cascade_2d` (NL ∈ {1..=8} or asymmetric NL_x≠NL_y);
+  forward RCT (`colour_transform::forward_rct`, Annex F.4 Table F.3)
+  when `Cpih == 1`; forward Star-Tetrix (`colour_transform::
   forward_star_tetrix`, Annex F.5) when `Cpih == 3`; per-packet
   picker between raw-mode bitplane counts (Annex C.6.4, `Dr = 1`),
   Dr=0 no-prediction VLC (Annex C.6.6, Table C.14), Dr=0
@@ -127,13 +136,14 @@ Modules:
   emitted before cnt per Annex C.4 order; Fq=8 lossy mode (Annex D.2
   deadzone) with per-band gain-weighted truncation `T[p,b] =
   clamp(Q−G[b], 0, 15)` (G=0 LL, G=1 HL/LH, G=2 HH); forward NLT
-  quadratic pre-distortion (Annex G.4, Tnlt=1, Bw=18) with NLT marker
-  emission; chroma sub-sampling (`sx, sy ∈ {1, 2}`) via per-component
-  effective `N'L,y[i] = NL,y - log2(sy[i])` and 1-D horizontal DWT
-  for nly_i=0 chroma; asymmetric decomposition `NL_y ≤ NL_x`; Fs=0
-  data sub-packet (Table C.8); short packet headers; symmetric
-  reflection for partial bottom precincts (odd heights); CTS / CRG
-  marker emission for `Cpih = 3`
+  quadratic pre-distortion (Annex G.4, Tnlt=1, Bw=18) and forward NLT
+  extended pre-distortion (Annex G.5, Tnlt=2, Bw=18, reverse-LUT
+  inverter) with NLT marker emission; chroma sub-sampling (`sx, sy ∈
+  {1, 2}`) via per-component effective `N'L,y[i] = NL,y - log2(sy[i])`
+  and 1-D horizontal DWT for nly_i=0 chroma; asymmetric decomposition
+  `NL_y ≤ NL_x`; Fs=0 data sub-packet (Table C.8); short packet
+  headers; symmetric reflection for partial bottom precincts (odd
+  heights); CTS / CRG marker emission for `Cpih = 3`
 
 ## Out of scope (next round)
 
@@ -142,7 +152,7 @@ Modules:
 * `Sd > 0` (CWD-driven decomposition suppression for components 4..7).
 * Output bit depths > 8 — Annex G kernels are bit-depth agnostic but
   the pack-to-plane helper currently emits `Vec<u8>` only.
-* Encoder round 7+: NLT linear / extended gamma (Tnlt=2/3) encoder
-  paths, `Cw > 0` custom precinct widths, per-band per-precinct Q rate-
-  distortion optimization, `Sd > 0` decomposition suppression. (NL > 5
-  is allowed by the spec up to 8; round 6 caps at NL=5.)
+* Encoder round 8+: `Cw > 0` custom precinct widths, per-band per-
+  precinct Q rate-distortion optimization, `Sd > 0` decomposition
+  suppression. (Round 7 adds extended NLT Tnlt=2 + raises the NL cap
+  from 5 to 8.)

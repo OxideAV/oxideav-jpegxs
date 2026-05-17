@@ -758,9 +758,12 @@ mod tests {
     use crate::registry::make_decoder;
     use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, TimeBase};
 
+    /// Multi-level plan-shape sanity check: 4×4 luma, NL=2/2 → 7 bands
+    /// (LL2 + HL2 + LH2 + HH2 + HL1 + LH1 + HH1), single component,
+    /// one slice covering the whole picture, every precinct's band
+    /// geometry must exist and have non-zero width.
     #[test]
-    #[ignore]
-    fn debug_multilevel_layout() {
+    fn multilevel_plan_shape_nl_2_2_4x4_luma() {
         use crate::component_table::{Component, ComponentTable};
         use crate::picture_header::PictureHeader;
         use crate::slice_walker::build_plan;
@@ -798,23 +801,17 @@ mod tests {
         };
         let wgt = vec![0u8; 14];
         let (plan, _) = build_plan(&pih, &cdt, &wgt).unwrap();
-        eprintln!("nbeta={} nbands={}", plan.n_beta, plan.n_bands);
+        // Annex B.3: Nβ = 2*min(NL,x,NL,y) + max(NL,x,NL,y) + 1.
+        // For NL,x = NL,y = 2 → Nβ = 7.
+        assert_eq!(plan.n_beta, 7, "NL=2/2 must give Nβ=7");
+        assert_eq!(plan.slices.len(), 1, "Hsl=1 single-slice plan");
         for s in &plan.slices {
+            assert!(!s.precincts.is_empty(), "slice must contain >= 1 precinct");
             for p in &s.precincts {
-                eprintln!("Precinct p={} packets={}", p.p, p.packets.len());
-                for (i, b) in p.geometry.bands.iter().enumerate() {
-                    eprintln!(
-                        "  band[{i}] wpb={} l0={} l1={} exists={}",
-                        b.wpb, b.l0, b.l1, b.exists
-                    );
-                }
-                for (i, pkt) in p.packets.iter().enumerate() {
-                    let entries: Vec<_> = pkt
-                        .entries
-                        .iter()
-                        .map(|e| format!("(b={} l={})", e.band, e.line))
-                        .collect();
-                    eprintln!("  packet[{i}] {}", entries.join(","));
+                for b in &p.geometry.bands {
+                    if b.exists {
+                        assert!(b.wpb > 0, "existing band has non-zero width");
+                    }
                 }
             }
         }

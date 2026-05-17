@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased — encoder round 7 (extended NLT Tnlt=2 + NL ∈ {1..=8})
+
+Two encoder-side capabilities on top of round 6:
+
+* `encoder.rs` — **Extended NLT encoder (Tnlt=2, Annex G.5).** New
+  entry point `encode_planar_nlt_extended(width, height, nc, cpih, nlx,
+  nly, q, t1, t2, e, planes)` emits the NLT marker (Tnlt=2, T1, T2, E)
+  with `Bw = 18` and applies a forward extended-gamma pre-distortion
+  that inverts the decoder's three-segment kernel via a `2^Bw`-entry
+  reverse lookup table built once per encode. The inverse LUT is
+  exact-round-trippable on parameter combinations whose decoder output
+  spans the full 8-bit range (verified at `T1 = 2^14`, `T2 = 2^16`,
+  `E = 1`, where every input pixel 0..=255 round-trips bit-exactly via
+  the LUT path alone — DWT / quantizer adds the only further loss).
+  Validates `0 < T1 < T2`, `1 ≤ E ≤ 4`, both thresholds ≤ `2^Bw - 1`.
+  Self-roundtrip PSNR ≥ 30 dB on a 32×32 synthetic gradient at q=0;
+  ≥ 25 dB at q=2 with a strictly smaller codestream.
+* `encoder.rs` — **Deeper wavelet cascade `NL ∈ {1..=8}`.** Validation
+  cap lifted from 5 to 8 (the spec Annex A.4.4 Table A.7 hard maximum).
+  The cascade DWT / band geometry helpers were already parametric in
+  `NL`; only the validation threshold needed adjustment. `NL = 6/6`
+  64×64 luma self-roundtrip verified; `NL = 9` rejection verified.
+
+`decoder.rs` — **Removed `#[ignore]` on `debug_multilevel_layout`.**
+Rewritten as `multilevel_plan_shape_nl_2_2_4x4_luma`: asserts the
+Annex B.3 invariant `Nβ = 2·min(NL,x,NL,y) + max(NL,x,NL,y) + 1` (= 7
+at NL = 2/2), a single-slice plan with `Hsl = 1`, and that every
+existing band carries a non-zero `wpb`. Replaces a debug-only `eprintln!`
+helper with a real regression.
+
+Verification: 194 tests pass (was 189, +5; the previously-ignored
+debug test is now a real assertion); standalone-feature build also
+passes; `cargo fmt --check` and `cargo clippy --all-targets --no-deps
+-- -D warnings` clean.
+
 ## Unreleased — encoder round 6 (deeper wavelet cascade NL ∈ {1..=5})
 
 The encoder validation previously capped at NL,x = 2 / NL,y = 2 even

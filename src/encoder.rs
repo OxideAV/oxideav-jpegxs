@@ -62,10 +62,24 @@
 //!   were needed beyond the validate threshold. Spec Annex A.4.4
 //!   Table A.7 allows NL,x up to 8; we test through 5/5 here.
 //!
-//! Out-of-scope (deferred to round 7+):
-//! * Extended NLT (Tnlt=2, three-segment gamma).
+//! Round 7 adds:
+//! * **Extended NLT encoder (Tnlt=2, Annex G.5).** New entry point
+//!   [`encode_planar_nlt_extended`] emits the NLT marker (Tnlt=2, T1,
+//!   T2, E) with `Bw = 18`, then applies a forward extended-gamma
+//!   pre-distortion that inverts the decoder's three-segment kernel via
+//!   a `2^Bw`-entry reverse lookup table. Self-roundtrip PSNR ≥ 30 dB on
+//!   a synthetic 32×32 gradient at q=0 (lossless intent within the LUT
+//!   resolution), ≥ 25 dB at q=2.
+//! * **Deeper wavelet cascade `NL ∈ {1..=8}`.** Validation cap lifted
+//!   from 5 to 8 (the spec Annex A.4.4 Table A.7 hard maximum). The
+//!   cascade DWT / band geometry helpers were already parametric in
+//!   `NL` — only the validation threshold needed adjustment. NL=6/6
+//!   self-roundtrip verified.
+//!
+//! Out-of-scope (deferred to round 8+):
 //! * `Cw > 0` (custom precinct widths).
-//! * `NL > 5` (spec allows up to 8).
+//! * Per-band per-precinct Q rate-distortion optimization.
+//! * `Sd > 0` decomposition suppression (CWD).
 //!
 //! Byte stream shape:
 //!
@@ -206,13 +220,12 @@ impl EncodeConfig {
                 )));
             }
         }
-        // Round 6: NL,x ∈ {1..=5} (spec allows up to 8; we test through
-        // NL=5/5 here, matching the decoder's cascade scope). NL,y ∈
-        // {0..=NL,x} per Annex B (NOTE 1: NL,y > NL,x case "needs not to
-        // be considered for interoperability").
-        if self.nlx < 1 || self.nlx > 5 || self.nly > self.nlx {
+        // Round 7: NL,x ∈ {1..=8} (spec Annex A.4.4 Table A.7 hard max).
+        // NL,y ∈ {0..=NL,x} per Annex B (NOTE 1: NL,y > NL,x case "needs
+        // not to be considered for interoperability").
+        if self.nlx < 1 || self.nlx > 8 || self.nly > self.nlx {
             return Err(Error::Unsupported(format!(
-                "jpegxs encoder: NL,x ∈ {{1..=5}}, NL,y ∈ {{0..=NL,x}}, got NL,x={} NL,y={}",
+                "jpegxs encoder: NL,x ∈ {{1..=8}}, NL,y ∈ {{0..=NL,x}}, got NL,x={} NL,y={}",
                 self.nlx, self.nly
             )));
         }
@@ -551,6 +564,77 @@ pub fn encode_planar_nlt_quadratic(
     )
 }
 
+/// Round-7 NLT extended encoder (Tnlt=2, Annex G.5).
+///
+/// Applies a forward extended-gamma pre-distortion to 8-bit input pixels
+/// before the DWT and emits an NLT marker so the decoder applies the
+/// inverse three-segment kernel. Requires `Bw = 18` per Table A.8.
+/// `q = 0` reduces to the "lossless within LUT resolution" case; `q > 0`
+/// engages Fq=8 lossy mode.
+///
+/// `t1`, `t2`, `e` are the extended-NLT parameters embedded in the NLT
+/// marker (Annex G.5 thresholds and linear-slope exponent). Constraints
+/// validated by [`crate::output::parse_nlt`] also apply here:
+/// `0 < t1 < t2`, `1 ≤ e ≤ 4`, both `t1` and `t2` in `1..=2^Bw - 1`.
+///
+/// The forward pre-distortion is built by walking the decoder's
+/// `extended_path` once across `v_wave ∈ [0, 2^Bw - 1]` and recording the
+/// first wavelet-domain code that reconstructs each 8-bit pixel value.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_nlt_extended(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    q: u8,
+    t1: u32,
+    t2: u32,
+    e: u8,
+    planes: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    if t1 == 0 || t2 == 0 || t2 <= t1 {
+        return Err(Error::invalid(format!(
+            "jpegxs NLT extended: require 0 < T1 < T2, got T1={t1} T2={t2}"
+        )));
+    }
+    if !(1..=4).contains(&e) {
+        return Err(Error::invalid(format!(
+            "jpegxs NLT extended: E must be in 1..=4, got {e}"
+        )));
+    }
+    // Bw is forced to 18 by encode_planar_inner_nlt when nlt.is_some().
+    let bw_max = (1u32 << 18) - 1;
+    if t1 > bw_max || t2 > bw_max {
+        return Err(Error::invalid(format!(
+            "jpegxs NLT extended: T1={t1} or T2={t2} exceeds 2^Bw-1={bw_max}"
+        )));
+    }
+    let sx = vec![1u8; nc as usize];
+    let sy = vec![1u8; nc as usize];
+    let fq = if q == 0 { 0 } else { 8 };
+    encode_planar_inner_nlt(
+        width,
+        height,
+        nc,
+        cpih,
+        nlx,
+        nly,
+        fq,
+        q,
+        &sx,
+        &sy,
+        0,
+        0,
+        0,
+        0,
+        Some(NltParams::Extended { t1, t2, e }),
+        Vec::new(),
+        planes,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_planar_inner(
     width: u16,
@@ -798,6 +882,76 @@ fn n_beta(nlx: u8, nly: u8) -> u32 {
     2 * mn + mx + 1
 }
 
+/// Build a 256-entry "forward extended-NLT" lookup table mapping each
+/// 8-bit input pixel value to a wavelet-domain code in `[0, 2^Bw - 1]`.
+///
+/// The lookup is built by walking the decoder's extended-gamma kernel
+/// (Annex G.5, Table G.4) across every `v_wave ∈ [0, 2^Bw - 1]`,
+/// computing the 8-bit output, and recording the first wavelet code that
+/// reconstructs each output level. This is O(2^Bw) and runs once per
+/// encode; for Bw=18 that's ~262k iterations and ~256 bytes of state.
+///
+/// The output 8-bit value walks monotonically (modulo the rounding /
+/// segment-boundary discretization) so a single pass suffices. Levels
+/// that never appear in the decoder output (e.g. unreachable due to
+/// segment-boundary skips) are filled with the nearest neighbour from
+/// the left.
+fn build_extended_forward_lut(bw: u8, bc: u8, t1: u32, t2: u32, e: u8) -> Vec<u32> {
+    let bw_i = bw as i64;
+    let m = (1i64 << bc) - 1;
+    let two_pow_bw_minus_one = (1i64 << bw) - 1;
+    let t1 = t1 as i64;
+    let t2 = t2 as i64;
+    let e_i = e as i64;
+    let b2 = t1 * t1;
+    let shift_a13 = 2 * bw_i - 2 - 2 * e_i;
+    let a1 = b2 + (t1 << (bw_i - e_i)) + (1i64 << shift_a13);
+    let b1 = t1 + (1i64 << (bw_i - e_i - 1));
+    let a3 = b2 + (t2 << (bw_i - e_i)) - (1i64 << shift_a13);
+    let b3 = t2 - (1i64 << (bw_i - e_i - 1));
+    let zeta = 2 * bw_i - (bc as i64);
+    let zeta_u = zeta.max(0) as u32;
+    let half: i64 = if zeta_u == 0 { 0 } else { 1i64 << (zeta_u - 1) };
+
+    let n_levels = (1usize << bc).min(257);
+    let mut lut: Vec<Option<u32>> = vec![None; n_levels];
+
+    let max_wave = 1u64 << bw;
+    for v_wave in 0..max_wave {
+        let v0 = v_wave as i64;
+        let v = if v0 < t1 {
+            let v = b1 - v0;
+            let v = v.clamp(0, two_pow_bw_minus_one);
+            a1 - v * v
+        } else if v0 < t2 {
+            (v0 << (bw_i - e_i)) + b2
+        } else {
+            let v = v0 - b3;
+            let v = v.clamp(0, two_pow_bw_minus_one);
+            a3 + v * v
+        };
+        let v = if zeta_u == 0 { v } else { (v + half) >> zeta_u };
+        let out = v.clamp(0, m) as usize;
+        if out < lut.len() && lut[out].is_none() {
+            lut[out] = Some(v_wave as u32);
+        }
+    }
+
+    // Fill any unreachable levels with the nearest filled neighbour.
+    let mut filled: Vec<u32> = Vec::with_capacity(n_levels);
+    let mut last: u32 = 0;
+    for slot in lut.iter() {
+        match slot {
+            Some(v) => {
+                last = *v;
+                filled.push(*v);
+            }
+            None => filled.push(last),
+        }
+    }
+    filled
+}
+
 /// Count the bands that actually exist over every component (i.e.
 /// matching the WGT existing-band convention). For component i with
 /// `sy[i] = 2`, band β with `dy < NL,y` and `τy = true` (i.e. LH/HH
@@ -977,43 +1131,68 @@ fn write_slice(out: &mut Vec<u8>, cfg: &EncodeConfig, planes_u8: &[Vec<u8>]) -> 
     let nc = cfg.nc as usize;
     let dc_bias: i32 = 1 << (cfg.bw - 1);
 
-    // 1) Optional forward NLT pre-distortion (quadratic encoder side).
-    //    The forward map for Tnlt=1 is the square root of the normalised
-    //    input:  v_encoded = round(sqrt(v_linear / (2^B - 1)) * (2^Bw - 1)).
-    //    We apply this before DC level shift (input is 0..=255 u8) and
-    //    store as i32 in the wavelet domain.
-    let mut comp_planes: Vec<Vec<i32>> = if let Some(NltParams::Quadratic { dco }) = cfg.nlt {
-        // Forward quadratic: map u8 input → Bw-bit domain.
-        // Spec Annex G.4 forward: y = round(sqrt(x / (2^B-1)) * (2^Bw-1)).
-        // The DC level shift for Bw=18 is 2^17.
-        let bw_max = (1i64 << cfg.bw) - 1;
-        let b_max = (1i64 << 8) - 1; // B[i] = 8 always
-        planes_u8
-            .iter()
-            .map(|p| {
-                p.iter()
-                    .map(|&v| {
-                        let x = (v as i64).clamp(0, b_max);
-                        // y = round(sqrt(x / b_max) * bw_max)
-                        let y = if x == 0 {
-                            0i64
-                        } else {
-                            let ratio = (x as f64) / (b_max as f64);
-                            (ratio.sqrt() * (bw_max as f64)).round() as i64
-                        };
-                        let y = (y + (dco as i64)).clamp(0, bw_max);
-                        // Subtract DC bias (for Bw=18 that's 2^17=131072).
-                        (y as i32) - dc_bias
-                    })
-                    .collect()
-            })
-            .collect()
-    } else {
-        // Normal linear path: u8 input shifted to i32 wavelet domain.
-        planes_u8
-            .iter()
-            .map(|p| p.iter().map(|&v| v as i32 - dc_bias).collect::<Vec<i32>>())
-            .collect()
+    // 1) Optional forward NLT pre-distortion.
+    //    Tnlt=1 (quadratic, Annex G.4 forward):
+    //      y = round(sqrt(v_linear / (2^B - 1)) * (2^Bw - 1)) + dco.
+    //    Tnlt=2 (extended, Annex G.5): no closed-form algebraic inverse
+    //      across the three-segment kernel, so we build a reverse LUT
+    //      from the decoder's `extended_path` and pick the first wavelet
+    //      code per 8-bit output value.
+    //    Both paths produce a wavelet-domain value in [0, 2^Bw-1] which
+    //    is then shifted by `-dc_bias` to land in [-2^(Bw-1), 2^(Bw-1)-1].
+    let mut comp_planes: Vec<Vec<i32>> = match cfg.nlt {
+        Some(NltParams::Quadratic { dco }) => {
+            // Forward quadratic: map u8 input → Bw-bit domain.
+            // Spec Annex G.4 forward: y = round(sqrt(x / (2^B-1)) * (2^Bw-1)).
+            // The DC level shift for Bw=18 is 2^17.
+            let bw_max = (1i64 << cfg.bw) - 1;
+            let b_max = (1i64 << 8) - 1; // B[i] = 8 always
+            planes_u8
+                .iter()
+                .map(|p| {
+                    p.iter()
+                        .map(|&v| {
+                            let x = (v as i64).clamp(0, b_max);
+                            // y = round(sqrt(x / b_max) * bw_max)
+                            let y = if x == 0 {
+                                0i64
+                            } else {
+                                let ratio = (x as f64) / (b_max as f64);
+                                (ratio.sqrt() * (bw_max as f64)).round() as i64
+                            };
+                            let y = (y + (dco as i64)).clamp(0, bw_max);
+                            // Subtract DC bias (for Bw=18 that's 2^17=131072).
+                            (y as i32) - dc_bias
+                        })
+                        .collect()
+                })
+                .collect()
+        }
+        Some(NltParams::Extended { t1, t2, e }) => {
+            // Build the reverse LUT (output u8 → first wavelet code that
+            // reconstructs it under `extended_path`). This is O(2^Bw) per
+            // encode, independent of picture size. Bw is always 18 here.
+            let fwd = build_extended_forward_lut(cfg.bw, 8, t1, t2, e);
+            planes_u8
+                .iter()
+                .map(|p| {
+                    p.iter()
+                        .map(|&v| {
+                            let y = fwd[v as usize] as i64;
+                            // Subtract DC bias.
+                            (y as i32) - dc_bias
+                        })
+                        .collect()
+                })
+                .collect()
+        }
+        None => {
+            // Normal linear path: u8 input shifted to i32 wavelet domain.
+            planes_u8
+                .iter()
+                .map(|p| p.iter().map(|&v| v as i32 - dc_bias).collect::<Vec<i32>>())
+                .collect()
+        }
     };
 
     // 2) Per-component colour transform.
@@ -3273,13 +3452,13 @@ mod tests {
         );
     }
 
-    /// NL,x=6 must be rejected (round-6 cap is NL=5; spec maximum is 8
-    /// but we test through 5).
+    /// NL,x=9 must be rejected (round-7 cap is NL=8; spec Annex A.4.4
+    /// Table A.7 hard maximum is 8).
     #[test]
-    fn round6_rejects_nlx_above_5() {
+    fn round7_rejects_nlx_above_8() {
         let pixels = vec![0u8; 64 * 64];
-        let res = encode_planar(64, 64, 1, 0, 6, 6, std::slice::from_ref(&pixels));
-        assert!(res.is_err(), "NL,x=6 must be rejected at the encoder cap");
+        let res = encode_planar(64, 64, 1, 0, 9, 9, std::slice::from_ref(&pixels));
+        assert!(res.is_err(), "NL,x=9 must be rejected at the encoder cap");
     }
 
     /// Deeper cascades typically compress smoother content better at
@@ -3294,5 +3473,183 @@ mod tests {
         let img = decode_codestream(&cs, None).expect("decode NL=4/4 q=4");
         let p = psnr(&pixels, &img.planes[0].data);
         assert!(p >= 25.0, "NL=4/4 q=4 PSNR {p:.2} dB below 25 dB floor");
+    }
+
+    // === Round 7: extended NLT encoder (Annex G.5) =========================
+
+    /// Extended NLT encode + decode round-trip on a 32×32 synthetic
+    /// gradient. The forward LUT inverts the decoder's three-segment
+    /// kernel within rounding, so PSNR must be ≥ 30 dB on a smooth ramp
+    /// (the per-band Q and DWT rounding contribute additional loss on
+    /// top of the LUT quantization).
+    #[test]
+    fn round7_nlt_extended_high_psnr() {
+        let pixels = make_synthetic_32x32();
+        let cs = encode_planar_nlt_extended(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            0,
+            1 << 14,
+            1 << 16,
+            1,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("encode NLT extended lossless");
+        let img = decode_codestream(&cs, None).expect("decode NLT extended");
+        let p = psnr(&pixels, &img.planes[0].data);
+        assert!(
+            p >= 30.0,
+            "NLT extended round-trip PSNR {p:.2} dB below 30 dB floor"
+        );
+    }
+
+    /// Extended NLT with q=2 (lossy) still meets the 25 dB floor and
+    /// produces a codestream no larger than the lossless variant.
+    #[test]
+    fn round7_nlt_extended_lossy_q2_psnr() {
+        let pixels = make_synthetic_32x32();
+        let lossless = encode_planar_nlt_extended(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            0,
+            1 << 14,
+            1 << 16,
+            1,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("encode NLT extended lossless")
+        .len();
+        let lossy_cs = encode_planar_nlt_extended(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            2,
+            1 << 14,
+            1 << 16,
+            1,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("encode NLT extended lossy q=2");
+        let img = decode_codestream(&lossy_cs, None).expect("decode NLT extended lossy q=2");
+        let p = psnr(&pixels, &img.planes[0].data);
+        assert!(
+            p >= 25.0,
+            "NLT extended lossy q=2 PSNR {p:.2} dB below 25 dB floor"
+        );
+        assert!(
+            lossy_cs.len() <= lossless,
+            "NLT extended lossy q=2 size {} not ≤ lossless {}",
+            lossy_cs.len(),
+            lossless
+        );
+    }
+
+    /// Extended NLT rejects bad parameters (T2 ≤ T1, E out of range,
+    /// thresholds exceeding 2^Bw-1).
+    #[test]
+    fn round7_nlt_extended_rejects_bad_params() {
+        let pixels = vec![0u8; 32 * 32];
+        // T2 ≤ T1.
+        assert!(encode_planar_nlt_extended(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            0,
+            200,
+            100,
+            3,
+            std::slice::from_ref(&pixels)
+        )
+        .is_err());
+        // T1 = 0.
+        assert!(encode_planar_nlt_extended(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            0,
+            0,
+            100,
+            3,
+            std::slice::from_ref(&pixels)
+        )
+        .is_err());
+        // E = 0.
+        assert!(encode_planar_nlt_extended(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            0,
+            100,
+            200,
+            0,
+            std::slice::from_ref(&pixels)
+        )
+        .is_err());
+        // E = 5.
+        assert!(encode_planar_nlt_extended(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            0,
+            100,
+            200,
+            5,
+            std::slice::from_ref(&pixels)
+        )
+        .is_err());
+        // T exceeds 2^Bw-1.
+        assert!(encode_planar_nlt_extended(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            0,
+            (1 << 18) + 1,
+            (1 << 18) + 2,
+            3,
+            std::slice::from_ref(&pixels)
+        )
+        .is_err());
+    }
+
+    // === Round 7: deeper wavelet cascade NL ∈ {6, 7, 8} ====================
+
+    /// NL=6/6 self-roundtrip on a 64×64 luma image. Verifies the encoder
+    /// validate cap was correctly lifted from 5 to 8.
+    #[test]
+    fn round7_nl_6_6_lossless_round_trip() {
+        let pixels = make_nl_test_64x64();
+        let cs = encode_planar(64, 64, 1, 0, 6, 6, std::slice::from_ref(&pixels))
+            .expect("encode luma NL=6/6");
+        let img = decode_codestream(&cs, None).expect("decode NL=6/6");
+        assert_eq!(
+            img.planes[0].data, pixels,
+            "luma must round-trip losslessly at NL=6/6"
+        );
     }
 }
