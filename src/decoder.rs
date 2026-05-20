@@ -82,7 +82,11 @@ pub(crate) fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<JpegXsIm
 
     let (plan, _weights) = build_plan(&pih, &cdt, &wgt)?;
 
-    let multi_level = pih.nlx > 1 || pih.nly > 1;
+    // Cw > 0 (Np_x > 1) forces the picture-level gather/cascade path
+    // because per-precinct DWT is not equivalent to a multi-precinct-per-
+    // row layout (precinct boundaries reflect at the band level, not the
+    // sample level — only the picture-level cascade DWT is correct).
+    let multi_level = pih.nlx > 1 || pih.nly > 1 || plan.np_x > 1;
 
     // Allocate per-component sample buffers sized at Wc[i] × Hc[i].
     let wf = pih.wf as usize;
@@ -335,7 +339,9 @@ fn gather_precinct(
 
     let nc = plan.nc as u32;
     let nbeta = plan.n_beta;
-    let py = precinct_plan.p as usize; // np_x == 1 → p = py.
+    let np_x = plan.np_x as usize;
+    let py = (precinct_plan.p as usize) / np_x.max(1);
+    let px = (precinct_plan.p as usize) % np_x.max(1);
     let nly_pic = pih.nly;
 
     for (i, c) in cdt.components.iter().enumerate().take(nc as usize) {
@@ -362,6 +368,27 @@ fn gather_precinct(
             let wc = (pih.wf as usize) / (c.sx as usize);
             let hc = (pih.hf as usize) / (sy_i as usize);
             let (pic_bw, pic_bh) = band_dims(wc, hc, pih.nlx, nly_i, beta);
+            // Column offset of this precinct (px) in the picture-level
+            // band. For a uniform-Cs precinct grid all precincts before
+            // the rightmost have the same Wpb value computed from Cs;
+            // the rightmost picks up the remainder. Cs is the per-row
+            // band step in image-grid units; converting it to band-grid
+            // units gives the column stride per precinct.
+            let band_cols_per_uniform_precinct: usize = {
+                let cs = plan.cs as usize;
+                let sx_i = c.sx as usize;
+                let key = beta_key_for(beta, pih.nlx, nly_i);
+                let dx = key.dx as usize;
+                let tx = key.tau_x;
+                let denom_low = sx_i * (1usize << dx);
+                if !tx {
+                    cs.div_ceil(denom_low)
+                } else {
+                    let denom_high = sx_i * (1usize << dx.saturating_sub(1));
+                    cs.div_ceil(denom_high) / 2
+                }
+            };
+            let band_col_offset = px * band_cols_per_uniform_precinct;
             // Map this precinct's band-line slice [0..lines) into the
             // picture-level band rows. The first picture-band-line for
             // precinct py is `py * (pow)`, where pow = 2^max(NL,y - dy, 0).
@@ -408,8 +435,14 @@ fn gather_precinct(
                 if pic_row >= pic_bh {
                     break;
                 }
-                let dst = &mut band_buf[pic_row * pic_bw..pic_row * pic_bw + wpb.min(pic_bw)];
-                let src = &dequant[b][line * wpb..line * wpb + wpb.min(pic_bw)];
+                // Bound the copy width to the available picture columns.
+                let copy_w = wpb.min(pic_bw.saturating_sub(band_col_offset));
+                if copy_w == 0 {
+                    break;
+                }
+                let dst_start = pic_row * pic_bw + band_col_offset;
+                let dst = &mut band_buf[dst_start..dst_start + copy_w];
+                let src = &dequant[b][line * wpb..line * wpb + copy_w];
                 dst.copy_from_slice(src);
             }
         }

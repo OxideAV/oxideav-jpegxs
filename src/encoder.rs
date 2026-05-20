@@ -151,6 +151,13 @@ struct EncodeConfig {
     /// must equal `count_existing_bands(cfg)` or be empty (→ all-zero
     /// gains, backward-compatible with rounds 1–4).
     band_gains: Vec<u8>,
+    /// Precinct-width parameter (`Cw`, PIH §A.4.4). `0` means a single
+    /// precinct column spans the full picture width (`Cs = Wf`, the
+    /// only mode supported up through round 7). For `Cw > 0` the
+    /// per-row column width becomes `Cs = 8 × Cw × max(sx) × 2^NL,x`
+    /// (Annex B.5), and the encoder emits `Np,x = ⌈Wf / Cs⌉` precincts
+    /// per row in raster order.
+    cw: u16,
 }
 
 impl EncodeConfig {
@@ -297,6 +304,29 @@ impl EncodeConfig {
                     self.height
                 )));
             }
+        }
+        // Cw > 0 — validate the derived Cs makes sense per Annex B.5.
+        if self.cw != 0 {
+            let max_sx = self.sx.iter().copied().max().unwrap_or(1) as u32;
+            let pow_nlx = 1u32 << self.nlx;
+            let cs = 8u32 * (self.cw as u32) * max_sx * pow_nlx;
+            if cs == 0 {
+                return Err(Error::invalid(
+                    "jpegxs encoder: derived Cs = 0 (check Cw / NL,x / sx)".to_string(),
+                ));
+            }
+            if cs > self.width as u32 {
+                return Err(Error::Unsupported(format!(
+                    "jpegxs encoder: derived Cs={cs} exceeds picture width {} (Cw={} too large for NL,x={} and max sx={max_sx})",
+                    self.width, self.cw, self.nlx
+                )));
+            }
+            // Spec Note 1 in §B.5: all but the rightmost precincts must
+            // contain at least 8 samples of the LL band, which is the
+            // motivation for the 8× factor in Cs.  The encoder cannot
+            // do better than the formula gives; the user is responsible
+            // for picking Cw such that the rightmost precinct also has
+            // reasonable width.
         }
         Ok(())
     }
@@ -491,6 +521,60 @@ pub fn encode_planar_lossy(
     )
 }
 
+/// Round-8 multi-precinct-per-row entry point (`Cw > 0`).
+///
+/// Same shape as [`encode_planar_lossy`] but takes the precinct-width
+/// parameter `cw` from the picture header (`Cw`, Annex A.4.4). With
+/// `cw > 0` the encoder splits each precinct row into
+/// `Np,x = ⌈Wf / Cs⌉` precincts where `Cs = 8 × cw × max(sx) × 2^NL,x`
+/// (Annex B.5).  `cw = 0` reduces to a single precinct column spanning
+/// the full picture width (equivalent to [`encode_planar_lossy`]).
+///
+/// The decoder side has been updated in parallel to walk
+/// `Np,x × Np,y` precincts in raster order and gather them into the
+/// picture-level band buffers before running the inverse cascade DWT,
+/// so any encoder output with `cw > 0` round-trips through
+/// [`crate::decode_jpeg_xs`].
+///
+/// Validation: `Cs` must not exceed the picture width; `Cs == 0` is
+/// rejected.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_cw(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    q: u8,
+    cw: u16,
+    planes: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    let sx = vec![1u8; nc as usize];
+    let sy = vec![1u8; nc as usize];
+    let fq = if q == 0 { 0 } else { 8 };
+    encode_planar_inner_nlt(
+        width,
+        height,
+        nc,
+        cpih,
+        nlx,
+        nly,
+        fq,
+        q,
+        &sx,
+        &sy,
+        0,
+        0,
+        0,
+        0,
+        None,
+        Vec::new(),
+        cw,
+        planes,
+    )
+}
+
 /// Sub-sampled (4:2:2 / 4:2:0) entry point. Each `planes[i]` has length
 /// `(width / sx[i]) * (height / sy[i])`. `q = 0` for lossless, `q > 0`
 /// engages Fq=8 lossy mode.
@@ -560,6 +644,7 @@ pub fn encode_planar_nlt_quadratic(
         0,
         Some(NltParams::Quadratic { dco }),
         Vec::new(), // band_gains built inside after validation
+        0,
         planes,
     )
 }
@@ -631,6 +716,7 @@ pub fn encode_planar_nlt_extended(
         0,
         Some(NltParams::Extended { t1, t2, e }),
         Vec::new(),
+        0,
         planes,
     )
 }
@@ -670,6 +756,7 @@ fn encode_planar_inner(
         st_ct,
         None,
         Vec::new(),
+        0,
         planes,
     )
 }
@@ -693,6 +780,7 @@ fn encode_planar_inner_nlt(
     st_ct: u8,
     nlt: Option<NltParams>,
     band_gains: Vec<u8>,
+    cw: u16,
     planes: &[Vec<u8>],
 ) -> Result<Vec<u8>> {
     let bw = if nlt.is_some() { 18 } else { 8 };
@@ -718,6 +806,7 @@ fn encode_planar_inner_nlt(
         st_ct,
         nlt,
         band_gains,
+        cw,
     };
     cfg.validate()?;
     // Build per-band gains after validation so beta_key is called with
@@ -857,7 +946,7 @@ fn write_pih_body(out: &mut Vec<u8>, cfg: &EncodeConfig) {
     out.extend_from_slice(&0u16.to_be_bytes()); // Plev
     out.extend_from_slice(&cfg.width.to_be_bytes());
     out.extend_from_slice(&cfg.height.to_be_bytes());
-    out.extend_from_slice(&0u16.to_be_bytes()); // Cw = 0
+    out.extend_from_slice(&cfg.cw.to_be_bytes()); // Cw (0 = full-width precincts)
     let hp_pow = 1u32 << cfg.nly;
     let np_y = (cfg.height as u32).div_ceil(hp_pow);
     out.extend_from_slice(&(np_y as u16).to_be_bytes()); // Hsl = Np_y
@@ -1208,26 +1297,32 @@ fn write_slice(out: &mut Vec<u8>, cfg: &EncodeConfig, planes_u8: &[Vec<u8>]) -> 
 
     let nlx = cfg.nlx;
     let nly = cfg.nly;
+    // Compute Cs / Np,x per Annex B.5.
+    let max_sx = cfg.sx.iter().copied().max().unwrap_or(1) as u32;
+    let cs: u32 = if cfg.cw == 0 {
+        w as u32
+    } else {
+        8u32 * (cfg.cw as u32) * max_sx * (1u32 << nlx)
+    };
+    let np_x: usize = ((w as u32).div_ceil(cs)) as usize;
     // Route everything with nlx > 1 or nly > 1 through the cascade path,
-    // including asymmetric (nlx != nly) configurations.
-    let multi_level = nlx > 1 || nly > 1;
+    // including asymmetric (nlx != nly) configurations. Cw > 0 (Np,x > 1)
+    // also forces the cascade path because per-precinct DWT does not
+    // commute with multi-precinct-per-row layout (precinct boundaries
+    // reflect at the band level, not the sample level).
+    let multi_level = nlx > 1 || nly > 1 || np_x > 1;
     let hp_pow = 1u32 << nly;
     let np_y = (h as u32).div_ceil(hp_pow) as usize;
 
     // 3) Per-component forward DWT.
     //    The decoder picks per-precinct streaming synthesis at NL=1/1
-    //    and gather-then-cascade at NL >= 2. The encoder must mirror
-    //    that exactly because per-precinct DWT and picture-level
-    //    cascade DWT are *not* equivalent (the 5/3 high-pass coefficient
-    //    at the precinct boundary depends on a sample two precincts
-    //    away — picture-level cascade reflects across the picture
-    //    boundary, per-precinct cascade reflects across the precinct
-    //    boundary). So:
-    //    * NL=1/1 → streaming per-precinct DWT for every component
-    //      (works for 4:4:4, 4:2:2, 4:2:0 alike via per-component
-    //      precinct dimensions).
-    //    * NL >= 2 (or NL,x != NL,y) → picture-level cascade DWT per
-    //      component, then slice per precinct.
+    //    single-column and gather-then-cascade otherwise. The encoder
+    //    must mirror that exactly because per-precinct DWT and
+    //    picture-level cascade DWT are *not* equivalent (the 5/3
+    //    high-pass coefficient at the precinct boundary depends on a
+    //    sample two precincts away — picture-level cascade reflects
+    //    across the picture boundary, per-precinct cascade reflects
+    //    across the precinct boundary).
     if multi_level {
         let mut bands_per_comp: Vec<Vec<Vec<i32>>> = Vec::with_capacity(nc);
         for (i, plane) in comp_planes.iter().enumerate().take(nc) {
@@ -1243,8 +1338,10 @@ fn write_slice(out: &mut Vec<u8>, cfg: &EncodeConfig, planes_u8: &[Vec<u8>]) -> 
             bands_per_comp.push(bands);
         }
         for py in 0..np_y {
-            let pbytes = encode_precinct_cascade(cfg, &bands_per_comp, py)?;
-            out.extend_from_slice(&pbytes);
+            for px in 0..np_x {
+                let pbytes = encode_precinct_cascade(cfg, &bands_per_comp, py, px, cs)?;
+                out.extend_from_slice(&pbytes);
+            }
         }
     } else {
         // NL=1/1 streaming per-precinct path. Handles 4:4:4 and chroma-
@@ -1522,6 +1619,8 @@ fn encode_precinct_cascade(
     cfg: &EncodeConfig,
     bands_per_comp: &[Vec<Vec<i32>>],
     py: usize,
+    px: usize,
+    cs: u32,
 ) -> Result<Vec<u8>> {
     let w = cfg.width as usize;
     let h = cfg.height as usize;
@@ -1529,6 +1628,14 @@ fn encode_precinct_cascade(
     let nlx = cfg.nlx;
     let nly = cfg.nly;
     let nbeta_pic = n_beta(nlx, nly);
+    // Width Wp[p] in image-grid columns for precinct (px, py). All but
+    // the rightmost are Cs wide; the rightmost picks up Wf mod Cs.
+    let np_x = ((w as u32).div_ceil(cs)) as usize;
+    let _wp_this = if px + 1 < np_x {
+        cs as usize
+    } else {
+        ((w as u32 - 1) % cs + 1) as usize
+    };
 
     // Per-component "effective" decomposition levels.
     let nly_i: Vec<u8> = (0..nc)
@@ -1549,6 +1656,12 @@ fn encode_precinct_cascade(
         lines: usize,
         pic_bw: usize,
         pic_row_offset: usize,
+        /// Column offset into the picture-level band buffer for this
+        /// precinct column (`px * Cs / (sx[i] * 2^dx)` for low-pass,
+        /// or `px * Cs / (sx[i] * 2^(dx-1)) / 2` for high-pass; both
+        /// reduce to `px * Cs / (sx[i] * 2^dx)` because `Cs` is a
+        /// multiple of `8 * max(sx) * 2^NL,x`).
+        pic_col_offset: usize,
         comp_i: usize,
         beta: u32,
         exists: bool,
@@ -1567,6 +1680,7 @@ fn encode_precinct_cascade(
                     lines: 0,
                     pic_bw: 0,
                     pic_row_offset: 0,
+                    pic_col_offset: 0,
                     comp_i: i,
                     beta,
                     exists: false,
@@ -1591,11 +1705,28 @@ fn encode_precinct_cascade(
             } else {
                 pow_eff.min(pic_bh - row_offset)
             };
+            // Per-precinct Wpb[p,b]. For Cw == 0 every precinct equals
+            // pic_bw (the picture-level band width). For Cw > 0 the
+            // band-cols-per-precinct equals `Cs / (sx[i] * 2^dx)` for
+            // both low- and high-pass, since `Cs = 8 × Cw × max(sx) ×
+            // 2^NL,x` is an exact multiple of `sx[i] * 2^dx` for any
+            // dx ∈ {0..=NL,x}.
+            let sx_i = cfg.sx[i] as usize;
+            let dx = key.dx as usize;
+            let cols_per_uniform = (cs as usize) / (sx_i * (1usize << dx)).max(1);
+            let pic_col_offset = px * cols_per_uniform;
+            let remaining_cols = pic_bw.saturating_sub(pic_col_offset);
+            let wpb_this = if px + 1 < np_x {
+                cols_per_uniform.min(remaining_cols)
+            } else {
+                remaining_cols
+            };
             slices.push(Slice {
-                wpb: pic_bw,
+                wpb: wpb_this,
                 lines,
                 pic_bw,
                 pic_row_offset: row_offset,
+                pic_col_offset,
                 comp_i: i,
                 beta,
                 exists: true,
@@ -1636,9 +1767,12 @@ fn encode_precinct_cascade(
         if line_off >= s.lines {
             return None;
         }
+        if s.wpb == 0 {
+            return None;
+        }
         let band_buf = &bands_per_comp[s.comp_i][s.beta as usize];
         let pic_row = s.pic_row_offset + line_off;
-        let row_start = pic_row * s.pic_bw;
+        let row_start = pic_row * s.pic_bw + s.pic_col_offset;
         let row_end = row_start + s.wpb;
         Some(band_buf[row_start..row_end].to_vec())
     };
@@ -3651,5 +3785,193 @@ mod tests {
             img.planes[0].data, pixels,
             "luma must round-trip losslessly at NL=6/6"
         );
+    }
+
+    // === Round 8: multi-precinct-per-row (Cw > 0) ==========================
+
+    /// 64×16 luma at NL=1/1 with Cw=1 → Cs = 8 × 1 × 1 × 2 = 16 →
+    /// Np,x = 4 precincts per row. Self-roundtrips losslessly.
+    #[test]
+    fn round8_cw1_64x16_luma_nl_1_1_lossless() {
+        let w = 64usize;
+        let h = 16usize;
+        let mut pixels = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                pixels[y * w + x] = ((x * 7 + y * 11) % 256) as u8;
+            }
+        }
+        let cs = encode_planar_cw(w as u16, h as u16, 1, 0, 1, 1, 0, 1, &[pixels.clone()])
+            .expect("encode 64x16 Cw=1 NL=1/1");
+        let img = decode_codestream(&cs, None).expect("decode 64x16 Cw=1");
+        assert_eq!(
+            img.planes[0].data, pixels,
+            "luma must round-trip losslessly with Cw=1 NL=1/1"
+        );
+    }
+
+    /// 64×16 luma at NL=2/2 with Cw=1 → Cs = 8 × 1 × 1 × 4 = 32 →
+    /// Np,x = 2 precincts per row. Verifies the gather path's per-precinct
+    /// column offset is correct under a deeper cascade.
+    #[test]
+    fn round8_cw1_64x16_luma_nl_2_2_lossless() {
+        let w = 64usize;
+        let h = 16usize;
+        let mut pixels = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                pixels[y * w + x] = ((x * 13 + y * 5 + 3) % 256) as u8;
+            }
+        }
+        let cs = encode_planar_cw(w as u16, h as u16, 1, 0, 2, 2, 0, 1, &[pixels.clone()])
+            .expect("encode 64x16 Cw=1 NL=2/2");
+        let img = decode_codestream(&cs, None).expect("decode 64x16 Cw=1 NL=2/2");
+        assert_eq!(
+            img.planes[0].data, pixels,
+            "luma must round-trip losslessly with Cw=1 NL=2/2"
+        );
+    }
+
+    /// 128×32 RGB at NL=2/2 with Cw=2 (Cs = 8 × 2 × 1 × 4 = 64 → Np,x = 2)
+    /// and Cpih=1 (RCT). The full multi-component + multi-precinct path.
+    #[test]
+    fn round8_cw2_128x32_rgb_rct_nl_2_2_lossless() {
+        let w = 128usize;
+        let h = 32usize;
+        let mut r = vec![0u8; w * h];
+        let mut g = vec![0u8; w * h];
+        let mut b = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                r[y * w + x] = ((x * 3 + y * 5) % 256) as u8;
+                g[y * w + x] = ((x * 7 + y * 11 + 17) % 256) as u8;
+                b[y * w + x] = ((x * 13 + y * 17 + 29) % 256) as u8;
+            }
+        }
+        let cs = encode_planar_cw(
+            w as u16,
+            h as u16,
+            3,
+            1,
+            2,
+            2,
+            0,
+            2,
+            &[r.clone(), g.clone(), b.clone()],
+        )
+        .expect("encode 128x32 Cw=2 RCT NL=2/2");
+        let img = decode_codestream(&cs, None).expect("decode 128x32 Cw=2 RCT NL=2/2");
+        assert_eq!(img.planes[0].data, r);
+        assert_eq!(img.planes[1].data, g);
+        assert_eq!(img.planes[2].data, b);
+    }
+
+    /// Cw > 0 with q > 0 (lossy mode) — still round-trips within the
+    /// PSNR floor the cascade lossy path holds at q=2.
+    #[test]
+    fn round8_cw1_64x16_luma_lossy_q2_psnr() {
+        let w = 64usize;
+        let h = 16usize;
+        let mut pixels = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                pixels[y * w + x] = ((x * 7 + y * 11) % 256) as u8;
+            }
+        }
+        let cs = encode_planar_cw(w as u16, h as u16, 1, 0, 2, 2, 2, 1, &[pixels.clone()])
+            .expect("encode 64x16 Cw=1 q=2");
+        let img = decode_codestream(&cs, None).expect("decode 64x16 Cw=1 q=2");
+        let p = psnr(&pixels, &img.planes[0].data);
+        assert!(p >= 25.0, "Cw=1 lossy q=2 PSNR {p:.2} dB below 25 dB floor");
+    }
+
+    /// Encoder rejects Cs > Wf (Cw too large for the picture).
+    #[test]
+    fn round8_rejects_cw_exceeding_picture() {
+        let pixels = vec![0u8; 32 * 32];
+        // Cw=4 at NL,x=2 → Cs = 8 × 4 × 1 × 4 = 128 > 32.
+        let result = encode_planar_cw(32, 32, 1, 0, 2, 2, 0, 4, std::slice::from_ref(&pixels));
+        assert!(result.is_err());
+    }
+
+    /// Cw > 0 with chroma sub-sampling. 64×8 YUV 4:2:2 at NL=1/1 Cw=1
+    /// with max(sx)=2 → Cs = 8 × 1 × 2 × 2 = 32, Np,x = ⌈64/32⌉ = 2.
+    /// Routes through `encode_planar_inner_nlt` via a custom call site
+    /// because `encode_planar_cw` only handles 4:4:4.
+    #[test]
+    fn round8_cw1_64x8_yuv_422_lossless() {
+        let w = 64usize;
+        let h = 8usize;
+        let mut y_plane = vec![0u8; w * h];
+        let mut u_plane = vec![0u8; (w / 2) * h];
+        let mut v_plane = vec![0u8; (w / 2) * h];
+        for y in 0..h {
+            for x in 0..w {
+                y_plane[y * w + x] = ((x * 3 + y * 5) % 256) as u8;
+            }
+            for x in 0..(w / 2) {
+                u_plane[y * (w / 2) + x] = ((x * 7 + y * 11 + 17) % 256) as u8;
+                v_plane[y * (w / 2) + x] = ((x * 13 + y * 17 + 29) % 256) as u8;
+            }
+        }
+        // Inline call to encode_planar_inner_nlt with sx=[1,2,2], sy=[1,1,1].
+        let sx = vec![1u8, 2, 2];
+        let sy = vec![1u8, 1, 1];
+        let cs = encode_planar_inner_nlt(
+            w as u16,
+            h as u16,
+            3,
+            0,
+            1,
+            1,
+            0,
+            0,
+            &sx,
+            &sy,
+            0,
+            0,
+            0,
+            0,
+            None,
+            Vec::new(),
+            1, // cw
+            &[y_plane.clone(), u_plane.clone(), v_plane.clone()],
+        )
+        .expect("encode 64x8 4:2:2 Cw=1 NL=1/1");
+        let img = decode_codestream(&cs, None).expect("decode 64x8 4:2:2 Cw=1");
+        assert_eq!(img.planes[0].data, y_plane);
+        assert_eq!(img.planes[1].data, u_plane);
+        assert_eq!(img.planes[2].data, v_plane);
+    }
+
+    /// Odd-width picture with Cw > 0: rightmost precinct picks up the
+    /// remainder. 96×16 luma at NL=1/1 Cw=1 → Cs=16, Np,x=⌈96/16⌉=6,
+    /// every precinct is 16 wide (no remainder).
+    #[test]
+    fn round8_cw1_96x16_luma_six_precincts_lossless() {
+        let w = 96usize;
+        let h = 16usize;
+        let mut pixels = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                pixels[y * w + x] = ((x.wrapping_mul(19) + y.wrapping_mul(31)) % 256) as u8;
+            }
+        }
+        let cs = encode_planar_cw(w as u16, h as u16, 1, 0, 1, 1, 0, 1, &[pixels.clone()])
+            .expect("encode 96x16 Cw=1 NL=1/1");
+        let img = decode_codestream(&cs, None).expect("decode 96x16 Cw=1");
+        assert_eq!(img.planes[0].data, pixels);
+    }
+
+    /// Cw=0 reduces to single-precinct-per-row behaviour (bit-equivalent
+    /// to encode_planar).
+    #[test]
+    fn round8_cw0_matches_encode_planar() {
+        let pixels = make_synthetic_32x32();
+        let cs_a = encode_planar_cw(32, 32, 1, 0, 2, 2, 0, 0, std::slice::from_ref(&pixels))
+            .expect("encode_planar_cw cw=0");
+        let cs_b = encode_planar(32, 32, 1, 0, 2, 2, std::slice::from_ref(&pixels))
+            .expect("encode_planar");
+        assert_eq!(cs_a, cs_b, "Cw=0 must match encode_planar bit-for-bit");
     }
 }

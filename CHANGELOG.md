@@ -1,5 +1,54 @@
 # Changelog
 
+## Unreleased — round 8 (multi-precinct-per-row `Cw > 0`)
+
+End-to-end `Cw > 0` support on both decoder and encoder sides — the
+multi-precinct-per-row case spec §B.5 defines with
+`Cs = 8 × Cw × max(sx) × 2^NL,x` and `Np,x = ⌈Wf / Cs⌉` precincts per
+row.
+
+* `slice_walker.rs` — **precinct grid computation for `Cw > 0`**. The
+  `Cw != 0` `Unsupported` rejection lifts; `build_plan` now computes
+  `Cs` per Annex B.5 and walks `Np,x × Np,y` precincts in raster
+  order. `PicturePlan` carries new `np_x` / `np_y` / `cs` fields so
+  downstream callers can recover the per-row layout without
+  recomputing it. The per-precinct `Wp[p]` / `Wpb[p,b]` formulas were
+  already parametric in the precinct grid; only the grid stride and
+  the rightmost-precinct remainder needed adjusting.
+* `decoder.rs` — **gather path generalised to `Np,x > 1`**. The
+  picture-level band-buffer copy now uses
+  `py = p / Np,x, px = p % Np,x` and offsets each precinct into the
+  picture band at `band_col_offset = px × (Cs / (sx[i] × 2^dx))`.
+  `Cw > 0` codestreams are forced through the gather-then-cascade
+  path (the legacy NL=1/1 streaming-per-precinct fast path runs a
+  per-precinct DWT that does not commute with multi-precinct-per-row
+  layout, since precinct boundaries reflect at the band level not
+  the sample level).
+* `encoder.rs` — **new `encode_planar_cw` entry point** taking the
+  `Cw` parameter and routing everything through the picture-level
+  cascade forward DWT. `EncodeConfig` gains a `cw` field; the PIH
+  body now emits the configured `Cw` value instead of hard-coding
+  zero. `encode_precinct_cascade` takes `(py, px, Cs)` and slices
+  each picture-level band buffer at the per-precinct column range,
+  computing per-precinct `Wpb` from `Cs / (sx[i] × 2^dx)` (a clean
+  divisor because `Cs` is built as `8 × Cw × max(sx) × 2^NL,x`).
+  `Cw = 0` reduces to the prior single-precinct-per-row codestream
+  bit-for-bit.
+* `encoder.rs` — **`EncodeConfig::validate`** rejects `Cs > Wf` and
+  `Cs == 0`, the two corruption modes the spec implicitly excludes.
+
+Verification: 203 tests pass (was 194, +9). New tests cover:
+`Cw=1 64×16 luma NL=1/1` lossless, `Cw=1 64×16 luma NL=2/2`
+lossless, `Cw=2 128×32 RGB+RCT NL=2/2` lossless, `Cw=1 64×8 YUV 4:2:2
+NL=1/1` lossless, `Cw=1 64×16 luma q=2` PSNR ≥ 25 dB, `Cw=1 96×16
+luma` (Np,x=6) lossless, `Cw=0` bit-equivalence to `encode_planar`,
+`Cs > Wf` rejection, plus a slice-walker plan-shape test for
+`Cw=1 32×4 luma NL=1/1` (Np,x=2, Cs=16, Wpb[β=0]=8). The
+standalone-feature build passes too (187 tests).
+
+`cargo fmt --check` clean; `cargo clippy --all-targets --no-deps --
+-D warnings` clean.
+
 ## Unreleased — encoder round 7 (extended NLT Tnlt=2 + NL ∈ {1..=8})
 
 Two encoder-side capabilities on top of round 6:

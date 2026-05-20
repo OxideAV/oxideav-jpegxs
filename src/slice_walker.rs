@@ -116,6 +116,15 @@ pub struct PicturePlan {
     /// the component table.
     pub sx: Vec<u8>,
     pub sy: Vec<u8>,
+    /// Number of precinct columns per row (`Np,x`, Annex B.5). For
+    /// `Cw == 0` this is 1; for `Cw > 0` it is `Wf / Cs`.
+    pub np_x: u32,
+    /// Number of precinct rows (`Np,y`, Annex B.5).
+    pub np_y: u32,
+    /// Column width `Cs` of all but the rightmost precinct, in sample-
+    /// grid columns. `Cs = Wf` when `Cw == 0`; otherwise
+    /// `Cs = 8 × Cw × max(sx) × 2^NL,x`.
+    pub cs: u32,
 }
 
 /// Parse the WGT body into `(gain, priority)` pairs, one per existing
@@ -223,11 +232,6 @@ pub fn build_plan(
     cdt: &ComponentTable,
     wgt_body: &[u8],
 ) -> Result<(PicturePlan, Vec<BandWeight>)> {
-    if pih.cw != 0 {
-        return Err(Error::Unsupported(
-            "jpegxs walker: Cw != 0 (custom precinct width) is round-6".into(),
-        ));
-    }
     if cdt.components.len() != pih.nc as usize {
         return Err(Error::invalid(format!(
             "jpegxs walker: CDT has {} components but PIH says Nc={}",
@@ -358,9 +362,26 @@ pub fn build_plan(
         }
     }
 
-    // Precinct grid (Annex B.5). Cw == 0 → Cs = Wf, Np_x = 1.
-    let cs = wf;
-    let np_x: u32 = 1;
+    // Precinct grid (Annex B.5):
+    //   Cs = 8 × Cw × max(sx[i]) × 2^NL,x        if Cw > 0
+    //      = Wf                                   otherwise
+    //   Np_x = ⌈Wf / Cs⌉, Np_y = ⌈Hf / 2^NL,y⌉
+    let cs: u32 = if pih.cw == 0 {
+        wf
+    } else {
+        let max_sx = sx.iter().copied().max().unwrap_or(1) as u32;
+        let pow = 1u32 << nlx;
+        8u32 * (pih.cw as u32) * max_sx * pow
+    };
+    if cs == 0 {
+        return Err(Error::invalid(
+            "jpegxs walker: derived Cs == 0 (check Cw / NL,x / sx)".to_string(),
+        ));
+    }
+    // Spec Note 1: all but the rightmost precincts must contain at least
+    // 8 samples of the LL band — i.e. Wf umod Cs <= Wf is automatic, but
+    // we still require the rightmost Wp[p] > 0.
+    let np_x: u32 = wf.div_ceil(cs);
     // Hp = 2^NL,y. NL,y == 0 is a degenerate case where every component
     // line forms its own precinct. The spec writes Np_y = ⌈Hf / 2^NL,y⌉.
     let hp_pow = if nly == 0 { 1u32 } else { 1u32 << nly };
@@ -478,6 +499,9 @@ pub fn build_plan(
             nc: pih.nc,
             sx,
             sy,
+            np_x,
+            np_y,
+            cs,
         },
         weights_existing,
     ))
@@ -877,6 +901,30 @@ mod tests {
         assert_eq!(p0.geometry.bands[0].wpb, 2);
         assert_eq!(p0.geometry.bands[1].wpb, 2);
         assert_eq!(p0.geometry.bands[2].wpb, 4);
+    }
+
+    /// Round-8: Cw > 0 split a 32-wide picture into 2 precincts per row.
+    /// Cw=1, NL,x=1, max(sx)=1 → Cs = 8 × 1 × 1 × 2 = 16, Np,x = 2.
+    #[test]
+    fn build_plan_cw_gt_zero_64x4_luma_nl_1_1() {
+        let mut pih = pih_min(1, 1, 32, 4);
+        pih.cw = 1;
+        let cdt = cdt_one(8);
+        // n_existing = 4 bands × 1 component = 4 → WGT 8 bytes.
+        let wgt = vec![0u8; 8];
+        let (plan, _) = build_plan(&pih, &cdt, &wgt).expect("Cw=1 plan");
+        assert_eq!(plan.np_x, 2);
+        assert_eq!(plan.cs, 16);
+        // Np,y = ⌈4 / 2⌉ = 2 → total 4 precincts.
+        assert_eq!(plan.np_y, 2);
+        assert_eq!(
+            plan.slices.iter().map(|s| s.precincts.len()).sum::<usize>(),
+            4
+        );
+        // First precinct band 0 (LL): wpb = ⌈(Cs/sx) / 2^dx⌉ = ⌈16/2⌉ = 8.
+        let p0 = &plan.slices[0].precincts[0];
+        assert_eq!(p0.geometry.bands[0].wpb, 8);
+        assert_eq!(p0.wp, 16);
     }
 
     #[test]

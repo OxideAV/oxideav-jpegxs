@@ -78,7 +78,7 @@ pub use codestream::{Codestream, Slice};
 pub use component_table::{Component, ComponentTable};
 pub use crg::{cfa_pattern_type, parse_crg, CrgEntry, CrgMarker};
 pub use cts::{parse_cts, CtsExtent, CtsMarker};
-pub use encoder::{encode_image, encode_luma_8bit, encode_raw_luma};
+pub use encoder::{encode_image, encode_luma_8bit, encode_planar_cw, encode_raw_luma};
 pub use error::{JpegXsError, Result};
 pub use image::{JpegXsImage, JpegXsPlane};
 pub use markers::Marker;
