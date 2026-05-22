@@ -4,15 +4,25 @@
 //! Round-5 scope (#129): build the per-precinct geometry the entropy
 //! decoder needs from the picture header / component table / weights
 //! table for the multi-component (`Nc ≥ 1`), 4:4:4 / 4:2:2 / 4:2:0
-//! sub-sampled cases. `Sd == 0` only — `Sd > 0` (CWD-driven
-//! decomposition suppression) is still deferred.
+//! sub-sampled cases.
+//!
+//! Round-9 (r91) adds `Sd > 0` (CWD-driven decomposition suppression
+//! per Annex A.4.7 Table A.18). For `i ≥ Nc - Sd` the wavelet
+//! decomposition is suppressed: only filter type β = 0 carries data
+//! and the band index becomes `b = (Nc - Sd) × Nβ + i`. Each such
+//! component contributes one packet per picture line (per Table B.4
+//! tail loop) and Annex A.4.7 mandates `sx[c] = sy[c] = 1` for
+//! suppressed components.
 //!
 //! Spec band-index layout (Annex B.2): for `i < Nc - Sd`, the band id
 //! is `b = (Nc - Sd) * β + i`. So bands are *interleaved* by component
 //! within each β level — for 3 components and 4 βs the order is
 //! (β=0, i=0), (β=0, i=1), (β=0, i=2), (β=1, i=0), … (β=3, i=2).
 //! Annex B.7 Table B.4 also walks them in that order, which is why
-//! the first packet in 5/0 / 4:4:4 contains all 18 bands.
+//! the first packet in 5/0 / 4:4:4 contains all 18 bands. The Sd
+//! suppressed bands live at the tail starting at
+//! `(Nc - Sd) × Nβ` and run for `Sd` slots, one per suppressed
+//! component (always β = 0).
 //!
 //! Derived quantities:
 //!
@@ -125,6 +135,12 @@ pub struct PicturePlan {
     /// grid columns. `Cs = Wf` when `Cw == 0`; otherwise
     /// `Cs = 8 × Cw × max(sx) × 2^NL,x`.
     pub cs: u32,
+    /// Number of components whose wavelet decomposition is suppressed
+    /// (Annex A.4.7 Table A.18 `Sd`). Zero unless the codestream
+    /// carried a CWD marker. The last `sd` components (indices
+    /// `[Nc-Sd, Nc)`) are raw-coded; their band id is
+    /// `b = (Nc - Sd) × Nβ + i` and only β = 0 carries data.
+    pub sd: u8,
 }
 
 /// Parse the WGT body into `(gain, priority)` pairs, one per existing
@@ -225,12 +241,30 @@ fn band_exists(beta: u32, _i_in_decomposed: usize, nly: u8, dy: u32, sy: u8, tau
 }
 
 /// Build a [`PicturePlan`] from the picture header / component table /
-/// WGT body. Returns an error if the configuration is outside the
-/// round-5 supported subset.
+/// WGT body. Sd == 0 (no decomposition suppression). Equivalent to
+/// [`build_plan_sd(pih, cdt, wgt_body, 0)`].
 pub fn build_plan(
     pih: &PictureHeader,
     cdt: &ComponentTable,
     wgt_body: &[u8],
+) -> Result<(PicturePlan, Vec<BandWeight>)> {
+    build_plan_sd(pih, cdt, wgt_body, 0)
+}
+
+/// Build a [`PicturePlan`] from the picture header / component table /
+/// WGT body with an explicit Sd (CWD, Annex A.4.7).
+///
+/// `sd` is the number of trailing components whose wavelet decomposition
+/// is suppressed. Per Annex A.4.7 Table A.18, `sd ∈ 1..=Nc-1` when
+/// present (and the spec further requires `Nc > 3`), and every
+/// suppressed component must have `sx[c] = sy[c] = 1`. `sd = 0` reduces
+/// to the original round-5 path. Returns an error if the configuration
+/// is outside the supported subset.
+pub fn build_plan_sd(
+    pih: &PictureHeader,
+    cdt: &ComponentTable,
+    wgt_body: &[u8],
+    sd: u8,
 ) -> Result<(PicturePlan, Vec<BandWeight>)> {
     if cdt.components.len() != pih.nc as usize {
         return Err(Error::invalid(format!(
@@ -238,6 +272,30 @@ pub fn build_plan(
             cdt.components.len(),
             pih.nc
         )));
+    }
+    if sd > 0 {
+        if pih.nc <= 3 {
+            return Err(Error::invalid(format!(
+                "jpegxs walker: Sd>0 requires Nc>3 per Annex A.4.7, got Nc={}",
+                pih.nc
+            )));
+        }
+        if (sd as u16) >= pih.nc as u16 {
+            return Err(Error::invalid(format!(
+                "jpegxs walker: Sd={sd} must be < Nc={} per Table A.18",
+                pih.nc
+            )));
+        }
+        // Suppressed components (i >= Nc - Sd) must have sx[i]=sy[i]=1.
+        let n_decomposed_u = (pih.nc - sd) as usize;
+        for (i, c) in cdt.components.iter().enumerate().skip(n_decomposed_u) {
+            if c.sx != 1 || c.sy != 1 {
+                return Err(Error::invalid(format!(
+                    "jpegxs walker: suppressed component i={i} (Sd) must have sx=sy=1, got sx={} sy={} (Annex A.4.7)",
+                    c.sx, c.sy
+                )));
+            }
+        }
     }
     let nlx = pih.nlx;
     let nly = pih.nly;
@@ -266,8 +324,11 @@ pub fn build_plan(
 
     let nbeta = n_beta(nlx, nly);
     let nc = pih.nc as u32;
-    let n_decomposed = nc; // Sd == 0 always for round 5.
-    let n_bands = n_decomposed * nbeta; // Sd == 0 → no tail term.
+    let sd_u = sd as u32;
+    let n_decomposed = nc.saturating_sub(sd_u);
+    // Annex B.3 NL = (Nc - Sd) × Nβ + Sd. The Sd tail bands all live at
+    // β = 0 and carry the suppressed components' raw samples.
+    let n_bands = n_decomposed * nbeta + sd_u;
 
     // Per-component sampling factors.
     let sx: Vec<u8> = cdt.components.iter().map(|c| c.sx).collect();
@@ -314,6 +375,12 @@ pub fn build_plan(
     let mut tau_y = vec![false; arr_size];
     let mut exists_arr = vec![false; arr_size];
     for (i, comp) in cdt.components.iter().enumerate() {
+        // Suppressed components (Sd): the picture-level wavelet array is
+        // skipped entirely. Their data lives in the Sd tail bands of the
+        // weights_by_band / per-precinct band layout instead.
+        if (i as u32) >= n_decomposed {
+            continue;
+        }
         let wc = wf / (comp.sx as u32);
         let hc = hf / (comp.sy as u32);
         let nlx_i = nlx; // Annex B.2: N'L,x[i] = NL,x for i < Nc - Sd
@@ -390,8 +457,11 @@ pub fn build_plan(
 
     // Per-band gain/priority from WGT. Annex A.4.11 Table A.24 lists
     // a (G[b], P[b]) pair only for existing bands (`if (b'x[b])`); we
-    // therefore feed `parse_wgt` the count of existing bands.
-    let n_existing: usize = exists_arr.iter().filter(|e| **e).count();
+    // therefore feed `parse_wgt` the count of existing bands. The Sd
+    // tail bands always exist (suppressed components carry one β=0
+    // band per component, sx[i]=sy[i]=1).
+    let n_existing_wavelet: usize = exists_arr.iter().filter(|e| **e).count();
+    let n_existing: usize = n_existing_wavelet + (sd_u as usize);
     let weights_existing = parse_wgt(wgt_body, n_existing)?;
     // Build a band-indexed weights array (size `n_bands`); non-existent
     // bands get a placeholder zero pair that the walker never reads.
@@ -405,7 +475,7 @@ pub fn build_plan(
     {
         let mut wgt_cursor = 0;
         for beta in 0..nbeta {
-            for i in 0..nc as usize {
+            for i in 0..n_decomposed as usize {
                 let idx = i * (nbeta as usize) + beta as usize;
                 if !exists_arr[idx] {
                     continue;
@@ -414,6 +484,12 @@ pub fn build_plan(
                 weights_by_band[b] = weights_existing[wgt_cursor];
                 wgt_cursor += 1;
             }
+        }
+        // Sd tail bands: one per suppressed component, β = 0.
+        for i in 0..sd_u as usize {
+            let b = (n_decomposed * nbeta + i as u32) as usize;
+            weights_by_band[b] = weights_existing[wgt_cursor];
+            wgt_cursor += 1;
         }
         debug_assert_eq!(wgt_cursor, n_existing);
     }
@@ -431,6 +507,7 @@ pub fn build_plan(
                 nly,
                 nbeta,
                 nc,
+                n_decomposed,
                 &sx,
                 &sy,
                 &nly_per_component,
@@ -502,6 +579,7 @@ pub fn build_plan(
             np_x,
             np_y,
             cs,
+            sd,
         },
         weights_existing,
     ))
@@ -516,6 +594,7 @@ fn build_precinct_plan(
     nly: u8,
     nbeta: u32,
     nc: u32,
+    n_decomposed: u32,
     sx: &[u8],
     sy: &[u8],
     nly_per_component: &[u8],
@@ -540,13 +619,15 @@ fn build_precinct_plan(
         ((pih.wf as u32 - 1) % cs) + 1
     };
 
-    let n_bands = nc * nbeta;
+    let sd_u = nc - n_decomposed;
+    let n_bands = n_decomposed * nbeta + sd_u;
     let mut bands: Vec<BandGeometry> = Vec::with_capacity(n_bands as usize);
     let mut band_component: Vec<u8> = Vec::with_capacity(n_bands as usize);
     let mut band_beta: Vec<u32> = Vec::with_capacity(n_bands as usize);
-    // Fill per-band geometry in band-id order: b = nc * β + i.
+    // Fill per-band geometry in band-id order: b = (Nc - Sd) * β + i for
+    // i ∈ [0, Nc-Sd). Sd suppressed bands are appended afterward.
     for beta in 0..nbeta {
-        for i in 0..nc as usize {
+        for i in 0..n_decomposed as usize {
             let arr_idx = i * (nbeta as usize) + beta as usize;
             let dx_b = dx[arr_idx];
             let dy_b = dy[arr_idx];
@@ -616,7 +697,7 @@ fn build_precinct_plan(
             let l1 = l0 + l1_extent;
 
             let weight = if exists {
-                let b = (nc * beta + i as u32) as usize;
+                let b = (n_decomposed * beta + i as u32) as usize;
                 weights_by_band[b]
             } else {
                 BandWeight {
@@ -637,6 +718,34 @@ fn build_precinct_plan(
         }
     }
 
+    // Sd tail bands: one per suppressed component (i ∈ [Nc-Sd, Nc)).
+    // Filter type β = 0, sx[i] = sy[i] = 1 enforced upstream. The band
+    // is the raw component samples — picture width Wf, precinct height
+    // Hp = 2^NL,y rows (clamped to Hf at the bottom). The per-precinct
+    // band width matches Wp[p] (the standard precinct width formula).
+    // L0/L1 enumerate the precinct's line range within the picture.
+    let hp_pic_rows = if nly == 0 { 1u32 } else { 1u32 << nly };
+    let row_offset_pic = py * hp_pic_rows;
+    let lines_this_precinct = hp_pic_rows.min((pih.hf as u32).saturating_sub(row_offset_pic));
+    for i in 0..sd_u {
+        let comp_idx = n_decomposed + i;
+        // Per Annex A.4.7, the suppressed component has sx=sy=1, so its
+        // per-precinct band footprint is exactly Wp[p] columns × `lines_this_precinct` rows.
+        let wpb = wp; // sx[i] = 1 implies Wpb = Wp[p].
+        let b_tail = (n_decomposed * nbeta + i) as usize;
+        let weight = weights_by_band[b_tail];
+        bands.push(BandGeometry {
+            wpb,
+            gain: weight.gain,
+            priority: weight.priority,
+            l0: 0u16,
+            l1: lines_this_precinct as u16,
+            exists: lines_this_precinct > 0,
+        });
+        band_component.push(comp_idx as u8);
+        band_beta.push(0);
+    }
+
     let geometry = PrecinctGeometry {
         bands: bands.clone(),
         ng: pih.ng,
@@ -650,7 +759,17 @@ fn build_precinct_plan(
         short_packet_header: (pih.wf as u32) * (pih.nc as u32) < 32752,
     };
 
-    let packets = compute_packet_layouts(nlx, nly, nc, &bands, dy, &band_component, sy);
+    let packets = compute_packet_layouts(
+        nlx,
+        nly,
+        nc,
+        n_decomposed,
+        &bands,
+        dy,
+        &band_component,
+        sy,
+        lines_this_precinct,
+    );
 
     // Sanity: the rightmost precinct's Wp is non-empty.
     if wp == 0 {
@@ -678,29 +797,37 @@ fn build_precinct_plan(
 ///
 /// Round-5 multi-component handling: bands are interleaved by component
 /// per the spec band-id rule `b = (Nc - Sd) × β + i`. The first packet
-/// covers β1 bands × Nc components on line 0; subsequent packets group
-/// 3 βs × Nc components on each line of the proxy level.
+/// covers β1 bands × (Nc - Sd) components on line 0; subsequent packets group
+/// 3 βs × (Nc - Sd) components on each line of the proxy level.
+///
+/// Round-9 (r91): when `Sd > 0`, the suppressed components are appended
+/// at the end (band ids `(Nc-Sd)·Nβ .. (Nc-Sd)·Nβ + Sd`). Per the
+/// "tail loop" of Table B.4, each line of each suppressed component
+/// gets its own packet, walked with the component index as the fast
+/// variable and the line as the slow variable.
 #[allow(clippy::too_many_arguments)]
 fn compute_packet_layouts(
     nlx: u8,
     nly: u8,
     nc: u32,
+    n_decomposed: u32,
     bands: &[BandGeometry],
     dy: &[u32],
     band_component: &[u8],
     sy: &[u8],
+    lines_this_precinct: u32,
 ) -> Vec<PacketLayout> {
     let mut layouts: Vec<Vec<PacketEntry>> = Vec::new();
 
     // Step 1 — first packet: β1 = max(NL,x, NL,y) − min(NL,x, NL,y) + 1
-    // bands × all components, all on line λ = 0.
+    // bands × Nc-Sd wavelet components, all on line λ = 0.
     let nlx_u = nlx as u32;
     let nly_u = nly as u32;
     let beta1 = nlx_u.max(nly_u) - nlx_u.min(nly_u) + 1;
     let mut first_pkt: Vec<PacketEntry> = Vec::new();
     for beta in 0..beta1 {
-        for i in 0..nc {
-            let b = (nc * beta + i) as usize;
+        for i in 0..n_decomposed {
+            let b = (n_decomposed * beta + i) as usize;
             if b < bands.len() && bands[b].exists {
                 let l0 = bands[b].l0 as u32;
                 // Subsampling guard from Table B.4: (λ + L0) umod sy[i] == 0.
@@ -723,10 +850,17 @@ fn compute_packet_layouts(
     //   lines_in_level = 2^(NL,y - dy[β0])    (Table B.4)
     //   for λ within level (in image-grid lines):
     //     for β = β0 .. β0+2:
-    //       for i = 0 .. Nc-1:
+    //       for i = 0 .. Nc-Sd-1:
     //         if exists && (λ + L0[p,b]) umod sy[i] == 0:
     //           start a new packet (r = 1) per band per component
-    let nbeta_u = (bands.len() as u32) / nc;
+    let nbeta_u = if n_decomposed > 0 {
+        // Wavelet bands occupy `n_decomposed * nβ` slots; the Sd tail
+        // adds `Sd` more. Deriving Nβ from the wavelet sub-array.
+        let sd_u = nc - n_decomposed;
+        ((bands.len() as u32) - sd_u) / n_decomposed
+    } else {
+        0
+    };
     let mut beta0 = beta1;
     while beta0 < nbeta_u {
         // Use β0's dy for the loop bound — should match across all
@@ -745,8 +879,8 @@ fn compute_packet_layouts(
         let lines_in_level = pow;
         for lambda_within in 0..lines_in_level {
             for beta in beta0..(beta0 + 3).min(nbeta_u) {
-                for i in 0..nc {
-                    let b = (nc * beta + i) as usize;
+                for i in 0..n_decomposed {
+                    let b = (n_decomposed * beta + i) as usize;
                     if b >= bands.len() || !bands[b].exists {
                         continue;
                     }
@@ -768,6 +902,30 @@ fn compute_packet_layouts(
             }
         }
         beta0 += 3;
+    }
+
+    // Step 3 — Sd tail: one packet per (line λ, suppressed component i),
+    // with component as the fast and line as the slow variable per Annex
+    // B.7 Table B.4 NOTE / final loop.
+    let sd_u = nc - n_decomposed;
+    if sd_u > 0 {
+        let sd_band_base = n_decomposed * nbeta_u;
+        for lambda in 0..lines_this_precinct {
+            for i in 0..sd_u {
+                let b = (sd_band_base + i) as usize;
+                if b >= bands.len() || !bands[b].exists {
+                    continue;
+                }
+                let l1 = bands[b].l1 as u32;
+                if lambda >= l1 {
+                    continue;
+                }
+                layouts.push(vec![PacketEntry {
+                    band: b as u16,
+                    line: lambda as u16,
+                }]);
+            }
+        }
     }
     let _ = band_component;
 
@@ -1011,5 +1169,92 @@ mod tests {
         let p0 = &plan.slices[0].precincts[0];
         assert_eq!(p0.packets.len(), 1, "5/0 → 1 packet");
         assert_eq!(p0.packets[0].entries.len(), 18, "all 18 bands grouped");
+    }
+
+    /// Round 9 (r91): Sd=1 with Nc=4 at NL=1/1, 4×4 picture. Annex
+    /// A.4.7: NL = (Nc-Sd) × Nβ + Sd = 3*4 + 1 = 13. The 13th band is
+    /// the suppressed component's raw single-band.
+    #[test]
+    fn build_plan_sd1_4comp_4x4_nl_1_1() {
+        let mut pih = pih_min(1, 1, 4, 4);
+        pih.nc = 4;
+        let cdt = ComponentTable {
+            components: vec![
+                Component {
+                    bit_depth: 8,
+                    sx: 1,
+                    sy: 1,
+                },
+                Component {
+                    bit_depth: 8,
+                    sx: 1,
+                    sy: 1,
+                },
+                Component {
+                    bit_depth: 8,
+                    sx: 1,
+                    sy: 1,
+                },
+                Component {
+                    bit_depth: 8,
+                    sx: 1,
+                    sy: 1,
+                },
+            ],
+        };
+        // n_existing = 3 wavelet comps × 4 bands + 1 Sd tail = 13.
+        let wgt = vec![0u8; 13 * 2];
+        let (plan, weights) = build_plan_sd(&pih, &cdt, &wgt, 1).expect("Sd=1 4-comp plan");
+        assert_eq!(plan.n_bands, 13);
+        assert_eq!(plan.n_decomposed, 3);
+        assert_eq!(plan.sd, 1);
+        assert_eq!(weights.len(), 13);
+        let p0 = &plan.slices[0].precincts[0];
+        // Wavelet bands: 12 (β = 0..3 × 3 components).
+        // Sd tail band: 1 at index 12, component 3, β=0.
+        assert_eq!(p0.geometry.bands.len(), 13);
+        assert_eq!(p0.band_component[12], 3);
+        assert_eq!(p0.band_beta[12], 0);
+        // Sd-tail band has the full per-precinct width.
+        assert_eq!(p0.geometry.bands[12].wpb, plan.cs);
+    }
+
+    /// Round 9: walker rejects suppressed components with sub-sampling.
+    #[test]
+    fn build_plan_sd_rejects_subsampled_tail() {
+        let mut pih = pih_min(1, 1, 4, 4);
+        pih.nc = 4;
+        let cdt = ComponentTable {
+            components: vec![
+                Component {
+                    bit_depth: 8,
+                    sx: 1,
+                    sy: 1,
+                },
+                Component {
+                    bit_depth: 8,
+                    sx: 1,
+                    sy: 1,
+                },
+                Component {
+                    bit_depth: 8,
+                    sx: 1,
+                    sy: 1,
+                },
+                Component {
+                    bit_depth: 8,
+                    sx: 2,
+                    sy: 1,
+                },
+            ],
+        };
+        let wgt = vec![0u8; 13 * 2];
+        let err = build_plan_sd(&pih, &cdt, &wgt, 1)
+            .expect_err("Sd suppressed component with sx=2 must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Sd") || msg.contains("sx=sy=1"),
+            "unexpected error: {msg}"
+        );
     }
 }

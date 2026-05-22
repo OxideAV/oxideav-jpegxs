@@ -1,5 +1,51 @@
 # Changelog
 
+## Unreleased — round 9 / r91 (`Sd > 0` CWD decomposition suppression)
+
+End-to-end `Sd > 0` support on both decoder and encoder sides per
+ISO/IEC 21122-1:2022 Annex A.4.7 Table A.18 (CWD marker) and Annex B.7
+Table B.4 (tail-loop packet emission).
+
+* `codestream.rs` — **CWD body parsing**. The 1-byte `Sd` field is now
+  decoded and validated against `Nc > 3` and `Sd ∈ 1..=Nc-1`; a new
+  `cwd_sd: Option<u8>` field on `Codestream` exposes the parsed value
+  without the caller having to re-touch the raw body. Slice-length
+  derivation routes through `build_plan_sd` so multi-Sd codestreams
+  derive correct precinct counts.
+* `slice_walker.rs` — **`build_plan_sd(pih, cdt, wgt, sd)` extension**.
+  Reads `n_decomposed = Nc - Sd`, allocates `n_bands = n_decomposed *
+  Nβ + Sd` per Annex B.3, builds the wavelet `(β, i)` band table only
+  for `i < n_decomposed`, and appends Sd tail bands (β=0, raw, one per
+  suppressed component) carrying the full `Wp[p] × Hp` precinct
+  footprint. Packet layout walker emits the spec's tail loop
+  ("component as fast, line as slow") after the wavelet packets, one
+  packet per (line λ, suppressed component i). `PicturePlan` gains a
+  public `sd: u8` field.
+* `decoder.rs` — **gather path bypasses DWT for Sd components**. The
+  multi-level cascade allocation skips suppressed components (empty
+  per-component band slot). During `gather_precinct`, the Sd tail
+  bands' dequantized values are copied straight into `samples[i]` at
+  the precinct's row/column offset (sx=sy=1 mandated). The cascade-DWT
+  loop also skips suppressed slots. `Sd > 0` forces the multi-level
+  path because the per-precinct streaming path doesn't know about the
+  tail bands.
+* `encoder.rs` — **new `encode_planar_sd(width, height, nc, nlx, nly,
+  q, sd, planes)` entry point**. `EncodeConfig` gains an `sd: u8`
+  field; validation accepts `Nc ∈ 4..=8` when `Sd > 0` and rejects
+  `Cpih != 0`. `write_main_header` emits the CWD marker (`FF 17`,
+  Lcwd=3) after WGT. `count_existing_bands` / `build_band_gains_sd`
+  account for the `Sd` tail (gain=0). `write_slice` forces the
+  cascade path when `Sd > 0`, skips suppressed components in the
+  per-component forward DWT loop, and `encode_precinct_cascade` adds
+  `Sd` slices at the tail (reading raw DC-biased samples from
+  `comp_planes`); phase-1 packet jobs emit the per-(line, suppressed
+  component) packets after the wavelet packets per Annex B.7.
+* **Tests** — 5 new encoder roundtrip / rejection tests (`round9_*`)
+  + 2 walker tests (`build_plan_sd1_4comp_4x4_nl_1_1`,
+  `build_plan_sd_rejects_subsampled_tail`). 7 new / 0 ignored; 210
+  total (was 203). Lossless self-roundtrips at Sd=1 Nc=4 NL=2/2 and
+  Sd=2 Nc=5 NL=1/1; Sd=1 q=2 holds per-component PSNR ≥ 30 dB.
+
 ## Unreleased — round 8 (multi-precinct-per-row `Cw > 0`)
 
 End-to-end `Cw > 0` support on both decoder and encoder sides — the

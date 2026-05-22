@@ -36,7 +36,7 @@ use crate::entropy::{
 use crate::error::{JpegXsError as Error, Result};
 use crate::image::{JpegXsImage, JpegXsPlane as VideoPlane};
 use crate::output::{apply_output_scaling, parse_nlt};
-use crate::slice_walker::{build_plan, PicturePlan, PrecinctPlan};
+use crate::slice_walker::{PicturePlan, PrecinctPlan};
 
 /// Decode a single JPEG XS codestream into a [`JpegXsImage`].
 pub(crate) fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<JpegXsImage> {
@@ -52,11 +52,9 @@ pub(crate) fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<JpegXsIm
             pih.qpih
         )));
     }
-    if cs.cwd.is_some() {
-        return Err(Error::Unsupported(
-            "jpegxs decoder: CWD (component-dependent wavelet decomposition) not supported".into(),
-        ));
-    }
+    // CWD body is validated by the codestream parser; here we just
+    // read off the Sd field (None → Sd = 0).
+    let sd: u8 = cs.cwd_sd.unwrap_or(0);
     // Annex F.2 hard requirements.
     if pih.cpih == 1 {
         if pih.nc < 3 {
@@ -80,13 +78,15 @@ pub(crate) fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<JpegXsIm
         None => None,
     };
 
-    let (plan, _weights) = build_plan(&pih, &cdt, &wgt)?;
+    let (plan, _weights) = crate::slice_walker::build_plan_sd(&pih, &cdt, &wgt, sd)?;
 
     // Cw > 0 (Np_x > 1) forces the picture-level gather/cascade path
     // because per-precinct DWT is not equivalent to a multi-precinct-per-
     // row layout (precinct boundaries reflect at the band level, not the
     // sample level — only the picture-level cascade DWT is correct).
-    let multi_level = pih.nlx > 1 || pih.nly > 1 || plan.np_x > 1;
+    // Sd > 0 also forces the gather path because the suppressed-component
+    // band data is copied directly into samples there.
+    let multi_level = pih.nlx > 1 || pih.nly > 1 || plan.np_x > 1 || sd > 0;
 
     // Allocate per-component sample buffers sized at Wc[i] × Hc[i].
     let wf = pih.wf as usize;
@@ -111,6 +111,12 @@ pub(crate) fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<JpegXsIm
     let mut gathered: Vec<Vec<Vec<i32>>> = Vec::with_capacity(plan.nc as usize);
     if multi_level {
         for (i, c) in cdt.components.iter().enumerate() {
+            // Suppressed components (Sd): no wavelet bands. Push an
+            // empty per-component slot so indexing by `i` still works.
+            if (i as u8) >= plan.nc - plan.sd {
+                gathered.push(Vec::new());
+                continue;
+            }
             let wc = wf / (c.sx as usize);
             let hc = hf / (c.sy as usize);
             let nlx_i = pih.nlx;
@@ -128,7 +134,6 @@ pub(crate) fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<JpegXsIm
                 let (bw, bh) = band_dims(wc, hc, nlx_i, nly_i, beta);
                 bands_i.push(vec![0i32; bw * bh]);
             }
-            let _ = i;
             gathered.push(bands_i);
         }
     }
@@ -162,8 +167,12 @@ pub(crate) fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<JpegXsIm
 
     if multi_level {
         // Run the inverse-DWT cascade per component now that all band
-        // coefficients have been gathered.
+        // coefficients have been gathered. Skip suppressed (Sd) components:
+        // their samples were written directly during gather_precinct.
         for (i, c) in cdt.components.iter().enumerate() {
+            if (i as u8) >= plan.nc - plan.sd {
+                continue;
+            }
             let wc = wf / (c.sx as usize);
             let hc = hf / (c.sy as usize);
             let nlx_i = pih.nlx;
@@ -305,6 +314,7 @@ fn decode_slice(
                 &state.coefficients,
                 &precinct_header,
                 g,
+                samples,
             )?;
         } else {
             synthesise_precinct(
@@ -324,6 +334,10 @@ fn decode_slice(
 /// Multi-level path — copy this precinct's dequantized band data into
 /// the picture-level gather buffers `gathered[i][β]`. The cascade runs
 /// later in [`decode_codestream`] once every precinct has contributed.
+///
+/// Sd suppressed components (i ≥ Nc - Sd) bypass `gathered`: their
+/// band data is the raw component samples and gets copied straight into
+/// `samples[i]` at the precinct's row offset.
 #[allow(clippy::too_many_arguments)]
 fn gather_precinct(
     precinct_plan: &PrecinctPlan,
@@ -333,18 +347,27 @@ fn gather_precinct(
     bands: &[BandCoefficients],
     precinct_header: &PrecinctHeader,
     gathered: &mut [Vec<Vec<i32>>],
+    samples: &mut [Vec<i32>],
 ) -> Result<()> {
     let trunc = precinct_truncation(&precinct_plan.geometry, precinct_header);
     let dequant = dequantize_precinct(pih.qpih, &precinct_plan.geometry, &trunc, bands);
 
-    let nc = plan.nc as u32;
+    let _nc = plan.nc as u32;
+    let n_decomposed = plan.n_decomposed;
+    let sd_u = (plan.sd) as u32;
     let nbeta = plan.n_beta;
     let np_x = plan.np_x as usize;
     let py = (precinct_plan.p as usize) / np_x.max(1);
     let px = (precinct_plan.p as usize) % np_x.max(1);
     let nly_pic = pih.nly;
 
-    for (i, c) in cdt.components.iter().enumerate().take(nc as usize) {
+    // Wavelet components (i < Nc - Sd).
+    for (i, c) in cdt
+        .components
+        .iter()
+        .enumerate()
+        .take(n_decomposed as usize)
+    {
         let sy_i = c.sy;
         let nly_i = nly_pic.saturating_sub(match sy_i {
             1 => 0,
@@ -354,7 +377,7 @@ fn gather_precinct(
         });
         let nb_i = beta_count(pih.nlx, nly_i) as u32;
         for beta in 0..nbeta.min(nb_i) {
-            let b = (nc * beta + i as u32) as usize;
+            let b = (n_decomposed * beta + i as u32) as usize;
             let band_geom = &precinct_plan.geometry.bands[b];
             if !band_geom.exists {
                 continue;
@@ -443,6 +466,50 @@ fn gather_precinct(
                 let dst_start = pic_row * pic_bw + band_col_offset;
                 let dst = &mut band_buf[dst_start..dst_start + copy_w];
                 let src = &dequant[b][line * wpb..line * wpb + copy_w];
+                dst.copy_from_slice(src);
+            }
+        }
+    }
+
+    // Sd tail: suppressed components have sx=sy=1 (enforced in walker)
+    // and bypass the DWT cascade. Copy their dequantized band data
+    // directly into the sample plane at this precinct's row offset.
+    if sd_u > 0 {
+        let wf = pih.wf as usize;
+        let hf = pih.hf as usize;
+        let cs = plan.cs as usize;
+        let col_offset = px * cs;
+        let wp = (wf.saturating_sub(col_offset)).min(cs);
+        let pow_pic = if pih.nly == 0 {
+            1usize
+        } else {
+            1usize << pih.nly
+        };
+        let pic_row_offset = py * pow_pic;
+        for sd_idx in 0..sd_u as usize {
+            let i = (n_decomposed as usize) + sd_idx;
+            let b = ((n_decomposed * nbeta) as usize) + sd_idx;
+            let band_geom = &precinct_plan.geometry.bands[b];
+            if !band_geom.exists {
+                continue;
+            }
+            let lines = (band_geom.l1 - band_geom.l0) as usize;
+            let wpb = band_geom.wpb as usize;
+            // Pull the dequantized values for this band.
+            let band_buf = &dequant[b];
+            for line in 0..lines {
+                let pic_row = pic_row_offset + line;
+                if pic_row >= hf {
+                    break;
+                }
+                let copy_w = wpb.min(wp);
+                if copy_w == 0 {
+                    break;
+                }
+                let dst_start = pic_row * wf + col_offset;
+                let src_start = line * wpb;
+                let dst = &mut samples[i][dst_start..dst_start + copy_w];
+                let src = &band_buf[src_start..src_start + copy_w];
                 dst.copy_from_slice(src);
             }
         }

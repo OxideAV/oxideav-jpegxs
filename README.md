@@ -11,8 +11,8 @@ framework but usable standalone.
 
 | Direction | Status |
 | --- | --- |
-| Decoder | working — multi-component, **multi-precinct-per-row (Cw ≥ 0)** subset (rounds 1–8) |
-| Encoder | Round 8 — luma + RGB 4:4:4 / 4:2:2 / 4:2:0 + 4-component CFA Star-Tetrix, Cpih ∈ {0, 1, 3}, **NL_x ∈ {1..=8} / NL_y ∈ {0..=NL_x}** (spec Annex A.4.4 Table A.7 hard max), **Cw ≥ 0** (`Cs = 8 × Cw × max(sx) × 2^NL,x` per Annex B.5, Np,x = ⌈Wf / Cs⌉ precincts per row), odd dims, Dr ∈ {0, 1} VLC + raw picker with no-prediction (Table C.14) **and vertical-prediction (Table C.13)** sub-modes, **significance coding (D[p,b] bit 1, Annex C.5)** gating zero significance groups, **per-band gain-weighted Q** (`T[p,b] = clamp(Q−G[b], 0, 15)`, G ∈ {0,1,2}), **NLT quadratic forward map** (Annex G.4, Tnlt=1, Bw=18) via `encode_planar_nlt_quadratic`, **NLT extended forward map** (Annex G.5, Tnlt=2, three-segment gamma, Bw=18) via `encode_planar_nlt_extended` with reverse LUT inverter, Fq ∈ {0, 8} lossy with Q ∈ 0..=15. Self-roundtrip ∞ dB lossless at NL=3/3, 4/4, 5/5, 6/6; PSNR ≥ 40 dB at q=1, ≥ 25 dB at q=4; NLT extended PSNR ≥ 30 dB at q=0, ≥ 25 dB at q=2; Cw=1 64×16 luma at NL=1/1 and NL=2/2 + Cw=2 128×32 RGB+RCT NL=2/2 + Cw=1 4:2:2 round-trip bit-exact |
+| Decoder | working — multi-component, **multi-precinct-per-row (Cw ≥ 0)** subset (rounds 1–8) + **Sd > 0 (CWD, Annex A.4.7)** decomposition suppression (round 9) |
+| Encoder | Round 9 — luma + RGB 4:4:4 / 4:2:2 / 4:2:0 + 4-component CFA Star-Tetrix, Cpih ∈ {0, 1, 3}, **NL_x ∈ {1..=8} / NL_y ∈ {0..=NL_x}** (spec Annex A.4.4 Table A.7 hard max), **Cw ≥ 0** (`Cs = 8 × Cw × max(sx) × 2^NL,x` per Annex B.5, Np,x = ⌈Wf / Cs⌉ precincts per row), **Sd ∈ 0..Nc-1 (CWD, Annex A.4.7) with Nc up to 8 when Sd>0**, odd dims, Dr ∈ {0, 1} VLC + raw picker with no-prediction (Table C.14) **and vertical-prediction (Table C.13)** sub-modes, **significance coding (D[p,b] bit 1, Annex C.5)** gating zero significance groups, **per-band gain-weighted Q** (`T[p,b] = clamp(Q−G[b], 0, 15)`, G ∈ {0,1,2}), **NLT quadratic forward map** (Annex G.4, Tnlt=1, Bw=18) via `encode_planar_nlt_quadratic`, **NLT extended forward map** (Annex G.5, Tnlt=2, three-segment gamma, Bw=18) via `encode_planar_nlt_extended` with reverse LUT inverter, Fq ∈ {0, 8} lossy with Q ∈ 0..=15. Self-roundtrip ∞ dB lossless at NL=3/3, 4/4, 5/5, 6/6 and Sd=1 Nc=4 / Sd=2 Nc=5 lossless; PSNR ≥ 40 dB at q=1, ≥ 30 dB at Sd=1 q=2, ≥ 25 dB at q=4; NLT extended PSNR ≥ 30 dB at q=0, ≥ 25 dB at q=2; Cw=1 64×16 luma at NL=1/1 and NL=2/2 + Cw=2 128×32 RGB+RCT NL=2/2 + Cw=1 4:2:2 round-trip bit-exact |
 
 End-to-end decoder for the multi-component, single-precinct-row
 subset of ISO/IEC 21122-1:2022. Supports:
@@ -105,6 +105,17 @@ Public API:
   with `Cs = 8 × cw × max(sx) × 2^NL,x`. Rejects `Cs > Wf`. Routes
   everything through the picture-level cascade DWT so per-precinct
   columns commute with the wavelet boundaries.
+* `oxideav_jpegxs::encoder::encode_planar_sd(width, height, nc, nlx,
+  nly, q, sd, &[Vec<u8>]) -> Result<Vec<u8>>` — round-9 (r91) `Sd > 0`
+  (CWD) entry point per Annex A.4.7 Table A.18. The leading `nc - sd`
+  components are wavelet-coded as usual; the trailing `sd` components
+  are coded raw (no DWT) and follow the wavelet packets with the
+  component as fast and line as slow variable per Annex B.7 Table B.4.
+  Emits a CWD marker (`FF 17`, Lcwd=3) carrying `Sd`. Constraints:
+  `1 ≤ sd ≤ nc-1`, `nc > 3` (spec hard requirement), every suppressed
+  component must have `sx[i] = sy[i] = 1`, `cpih = 0` only for this
+  round. Self-roundtrips losslessly at Sd=1 Nc=4 / Sd=2 Nc=5 and holds
+  ≥ 30 dB per-component PSNR at Sd=1 q=2.
 * `oxideav_jpegxs::parse_capabilities(&[u8]) -> Result<Capabilities>`
   — decode CAP body bits into individual feature flags.
 * `oxideav_jpegxs::parse_cts(&[u8]) -> Result<CtsMarker>`,
@@ -160,13 +171,11 @@ Modules:
 
 ## Out of scope (next round)
 
-* `Sd > 0` (CWD-driven decomposition suppression for components 4..7) —
-  the CWD marker parser (Annex A.4.7) needs wiring + the slice
-  walker's band-index formula needs the `b = (Nc - Sd) × Nβ + i`
-  tail term for suppressed components.
 * Output bit depths > 8 — Annex G kernels are bit-depth agnostic but
   the pack-to-plane helper currently emits `Vec<u8>` only.
-* Encoder round 9+: per-band per-precinct Q rate-distortion
-  optimization, `Sd > 0` decomposition suppression, multi-slice
-  emission with `Hsl > 1` precinct rows per slice. (Round 8 lands
-  `Cw > 0` multi-precinct-per-row on both decode and encode sides.)
+* Encoder round 10+: per-band per-precinct Q rate-distortion
+  optimization, multi-slice emission with `Hsl > 1` precinct rows per
+  slice, `Sd > 0` combined with `Cpih ≠ 0` colour transforms.
+  (Round 9 lands `Sd > 0` raw-tail decomposition suppression on both
+  decode and encode sides; round 8 lands `Cw > 0` multi-precinct-per-
+  row.)

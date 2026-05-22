@@ -158,6 +158,13 @@ struct EncodeConfig {
     /// (Annex B.5), and the encoder emits `Np,x = ⌈Wf / Cs⌉` precincts
     /// per row in raster order.
     cw: u16,
+    /// Number of trailing components whose wavelet decomposition is
+    /// suppressed (`Sd`, Annex A.4.7 Table A.18). Zero unless the
+    /// caller explicitly enables CWD via [`encode_planar_sd`]. When
+    /// non-zero, the encoder emits a CWD marker and routes the
+    /// suppressed components through raw single-band (β=0) per-line
+    /// packets after the wavelet packets.
+    sd: u8,
 }
 
 impl EncodeConfig {
@@ -168,9 +175,16 @@ impl EncodeConfig {
                 self.width, self.height
             )));
         }
-        if !matches!(self.nc, 1 | 3 | 4) {
+        // Round 9 (r91): Sd>0 enables Nc up to 8 (Annex A.4.1 hard cap).
+        // Otherwise stay on the pre-r91 supported set of {1, 3, 4}.
+        let allowed_nc = if self.sd > 0 {
+            (4..=8).contains(&self.nc)
+        } else {
+            matches!(self.nc, 1 | 3 | 4)
+        };
+        if !allowed_nc {
             return Err(Error::Unsupported(format!(
-                "jpegxs encoder round 4: Nc must be 1, 3, or 4, got {}",
+                "jpegxs encoder: Nc must be 1/3/4 (or 4..=8 with Sd>0), got {}",
                 self.nc
             )));
         }
@@ -302,6 +316,43 @@ impl EncodeConfig {
                 return Err(Error::invalid(format!(
                     "jpegxs encoder: height {} not divisible by component {i} sy={sy}",
                     self.height
+                )));
+            }
+        }
+        // Sd > 0 (CWD, Annex A.4.7 Table A.18). Requires Nc>3 and every
+        // suppressed component must have sx=sy=1.
+        if self.sd != 0 {
+            if self.nc <= 3 {
+                return Err(Error::invalid(format!(
+                    "jpegxs encoder: Sd>0 requires Nc>3 per Annex A.4.7, got Nc={}",
+                    self.nc
+                )));
+            }
+            if self.sd >= self.nc {
+                return Err(Error::invalid(format!(
+                    "jpegxs encoder: Sd={} must be < Nc={} per Table A.18",
+                    self.sd, self.nc
+                )));
+            }
+            for i in (self.nc - self.sd) as usize..self.nc as usize {
+                if self.sx[i] != 1 || self.sy[i] != 1 {
+                    return Err(Error::invalid(format!(
+                        "jpegxs encoder: suppressed component i={i} (Sd) must have sx=sy=1, got ({}, {}) (Annex A.4.7)",
+                        self.sx[i], self.sy[i]
+                    )));
+                }
+            }
+            // Sd > 0 is incompatible with colour transforms that span
+            // every component in the picture (`Cpih == 1` RCT touches
+            // components 0..3, `Cpih == 3` Star-Tetrix touches 0..4).
+            // The suppressed components are excluded by definition, so
+            // the colour transform can still legally run on i < Nc-Sd
+            // when its operand count fits; we restrict to `Cpih == 0`
+            // for the round-9 encoder to keep the implementation tight.
+            if self.cpih != 0 {
+                return Err(Error::Unsupported(format!(
+                    "jpegxs encoder round 9: Sd>0 currently requires Cpih=0, got Cpih={}",
+                    self.cpih
                 )));
             }
         }
@@ -571,6 +622,54 @@ pub fn encode_planar_cw(
         None,
         Vec::new(),
         cw,
+        0,
+        planes,
+    )
+}
+
+/// Round-9 (r91) `Sd > 0` (CWD) entry point — Annex A.4.7 Table A.18.
+///
+/// Encodes a multi-component picture where the trailing `sd` components
+/// (indices `[nc - sd, nc)`) are coded raw (no wavelet decomposition)
+/// while the leading `nc - sd` components go through the standard 5/3
+/// cascade DWT. Emits a CWD marker with the chosen `Sd`. Per the spec,
+/// `sd ∈ 1..=nc-1`, `nc > 3`, and every suppressed component must have
+/// `sx[i] = sy[i] = 1`. The encoder currently restricts `cpih` to 0
+/// (no colour transform) for the Sd path; the wavelet components still
+/// follow the regular gain-weighted Fq=8 lossy / lossless behaviour.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_sd(
+    width: u16,
+    height: u16,
+    nc: u8,
+    nlx: u8,
+    nly: u8,
+    q: u8,
+    sd: u8,
+    planes: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    let sx = vec![1u8; nc as usize];
+    let sy = vec![1u8; nc as usize];
+    let fq = if q == 0 { 0 } else { 8 };
+    encode_planar_inner_nlt(
+        width,
+        height,
+        nc,
+        0, // cpih: only 0 supported for Sd>0 in this round
+        nlx,
+        nly,
+        fq,
+        q,
+        &sx,
+        &sy,
+        0,
+        0,
+        0,
+        0,
+        None,
+        Vec::new(),
+        0, // cw
+        sd,
         planes,
     )
 }
@@ -645,6 +744,7 @@ pub fn encode_planar_nlt_quadratic(
         Some(NltParams::Quadratic { dco }),
         Vec::new(), // band_gains built inside after validation
         0,
+        0,
         planes,
     )
 }
@@ -717,6 +817,7 @@ pub fn encode_planar_nlt_extended(
         Some(NltParams::Extended { t1, t2, e }),
         Vec::new(),
         0,
+        0,
         planes,
     )
 }
@@ -757,6 +858,7 @@ fn encode_planar_inner(
         None,
         Vec::new(),
         0,
+        0,
         planes,
     )
 }
@@ -781,6 +883,7 @@ fn encode_planar_inner_nlt(
     nlt: Option<NltParams>,
     band_gains: Vec<u8>,
     cw: u16,
+    sd: u8,
     planes: &[Vec<u8>],
 ) -> Result<Vec<u8>> {
     let bw = if nlt.is_some() { 18 } else { 8 };
@@ -807,13 +910,14 @@ fn encode_planar_inner_nlt(
         nlt,
         band_gains,
         cw,
+        sd,
     };
     cfg.validate()?;
     // Build per-band gains after validation so beta_key is called with
     // known-good (nlx >= nly) parameters.
     let cfg = if cfg.band_gains.is_empty() {
         EncodeConfig {
-            band_gains: build_band_gains(nc, nlx, nly, sx, sy),
+            band_gains: build_band_gains_sd(nc, sd, nlx, nly, sx, sy),
             ..cfg
         }
     } else {
@@ -874,6 +978,14 @@ fn write_main_header(out: &mut Vec<u8>, cfg: &EncodeConfig) -> Result<()> {
         let g = cfg.band_gains.get(k).copied().unwrap_or(0);
         out.push(g); // G[b]
         out.push(0); // P[b] = 0
+    }
+    // CWD marker — Annex A.4.7 Table A.18. Emitted whenever Sd > 0
+    // (must precede the first SLH and follow PIH/CDT/WGT). Body is
+    // exactly 1 byte holding `Sd`.
+    if cfg.sd != 0 {
+        out.extend_from_slice(&[0xff, 0x17]); // CWD marker (Table A.1)
+        out.extend_from_slice(&3u16.to_be_bytes()); // Lcwd = 3
+        out.push(cfg.sd);
     }
     // NLT marker — required for quadratic / extended non-linearity
     // (Annex A.4.6). Round 5 implements Tnlt=1 (quadratic) only.
@@ -1047,8 +1159,9 @@ fn build_extended_forward_lut(bw: u8, bc: u8, t1: u32, t2: u32, e: u8) -> Vec<u3
 /// rows) does not exist; every other band does.
 fn count_existing_bands(cfg: &EncodeConfig) -> u32 {
     let nbeta_pic = n_beta(cfg.nlx, cfg.nly);
+    let n_decomposed = (cfg.nc - cfg.sd) as usize;
     let mut n = 0u32;
-    for i in 0..cfg.nc as usize {
+    for i in 0..n_decomposed {
         let nly_i = cfg.nly.saturating_sub(match cfg.sy[i] {
             1 => 0,
             2 => 1,
@@ -1060,6 +1173,8 @@ fn count_existing_bands(cfg: &EncodeConfig) -> u32 {
         // exist for component i; the rest are non-existent (Annex B.4).
         n += nbeta_pic.min(nbeta_i);
     }
+    // Sd tail bands always exist (sx=sy=1 enforced upstream).
+    n += cfg.sd as u32;
     n
 }
 
@@ -1073,11 +1188,16 @@ fn count_existing_bands(cfg: &EncodeConfig) -> u32 {
 /// This allows `T[p,b] = clamp(Q - G[b], 0, 15)` in the precinct
 /// header to allocate fewer bits (higher T) to the LL band and more
 /// bits (lower T) to the high-frequency HH band, improving PSNR/byte.
-fn build_band_gains(nc: u8, nlx: u8, nly: u8, _sx: &[u8], sy: &[u8]) -> Vec<u8> {
+/// Variant of [`build_band_gains_sd`] that accounts for Sd suppressed
+/// components by appending one gain slot per suppressed component at
+/// the tail. Suppressed-component gains are zero (LL-equivalent —
+/// the band is the raw samples, so we don't want extra truncation).
+fn build_band_gains_sd(nc: u8, sd: u8, nlx: u8, nly: u8, _sx: &[u8], sy: &[u8]) -> Vec<u8> {
     let nbeta_pic = n_beta(nlx, nly);
+    let n_decomposed = (nc - sd) as usize;
     let mut gains = Vec::new();
     for beta in 0..nbeta_pic {
-        for &sy_val in sy.iter().take(nc as usize) {
+        for &sy_val in sy.iter().take(n_decomposed) {
             let nly_i = nly.saturating_sub(match sy_val {
                 1 => 0,
                 2 => 1,
@@ -1092,6 +1212,10 @@ fn build_band_gains(nc: u8, nlx: u8, nly: u8, _sx: &[u8], sy: &[u8]) -> Vec<u8> 
             let gain = (if key.tau_x { 1u8 } else { 0 }) + (if key.tau_y { 1 } else { 0 });
             gains.push(gain);
         }
+    }
+    // Append one zero-gain slot per Sd suppressed component.
+    if sd > 0 {
+        gains.resize(gains.len() + sd as usize, 0);
     }
     gains
 }
@@ -1310,7 +1434,7 @@ fn write_slice(out: &mut Vec<u8>, cfg: &EncodeConfig, planes_u8: &[Vec<u8>]) -> 
     // also forces the cascade path because per-precinct DWT does not
     // commute with multi-precinct-per-row layout (precinct boundaries
     // reflect at the band level, not the sample level).
-    let multi_level = nlx > 1 || nly > 1 || np_x > 1;
+    let multi_level = nlx > 1 || nly > 1 || np_x > 1 || cfg.sd > 0;
     let hp_pow = 1u32 << nly;
     let np_y = (h as u32).div_ceil(hp_pow) as usize;
 
@@ -1324,8 +1448,14 @@ fn write_slice(out: &mut Vec<u8>, cfg: &EncodeConfig, planes_u8: &[Vec<u8>]) -> 
     //    across the picture boundary, per-precinct cascade reflects
     //    across the precinct boundary).
     if multi_level {
+        let n_decomposed = (cfg.nc - cfg.sd) as usize;
         let mut bands_per_comp: Vec<Vec<Vec<i32>>> = Vec::with_capacity(nc);
         for (i, plane) in comp_planes.iter().enumerate().take(nc) {
+            if i >= n_decomposed {
+                // Suppressed (Sd) — no wavelet bands; push empty slot.
+                bands_per_comp.push(Vec::new());
+                continue;
+            }
             let wc = w / (cfg.sx[i] as usize);
             let hc = h / (cfg.sy[i] as usize);
             let nly_i = cfg.nly.saturating_sub(match cfg.sy[i] {
@@ -1337,9 +1467,16 @@ fn write_slice(out: &mut Vec<u8>, cfg: &EncodeConfig, planes_u8: &[Vec<u8>]) -> 
             let bands = forward_cascade_2d(wc, hc, cfg.nlx, nly_i, plane)?;
             bands_per_comp.push(bands);
         }
+        // For suppressed (Sd) components, encode_precinct_cascade reads
+        // the wavelet-domain `comp_planes` slice for the component
+        // directly (no DWT was applied). `comp_planes` is already
+        // DC-biased so the values fed into the entropy coder match the
+        // dynamic range the decoder dequant path will produce when
+        // copying straight back into the sample plane.
         for py in 0..np_y {
             for px in 0..np_x {
-                let pbytes = encode_precinct_cascade(cfg, &bands_per_comp, py, px, cs)?;
+                let pbytes =
+                    encode_precinct_cascade(cfg, &bands_per_comp, &comp_planes, py, px, cs)?;
                 out.extend_from_slice(&pbytes);
             }
         }
@@ -1615,9 +1752,14 @@ fn encode_precinct_single_level(
 }
 
 /// Encode one precinct using the multi-level cascade band layout.
+///
+/// `comp_planes` carries the raw (DC-biased) per-component samples used
+/// only for the Sd suppressed components (`i ≥ Nc - Sd`); the wavelet
+/// components draw from `bands_per_comp` as before.
 fn encode_precinct_cascade(
     cfg: &EncodeConfig,
     bands_per_comp: &[Vec<Vec<i32>>],
+    comp_planes: &[Vec<i32>],
     py: usize,
     px: usize,
     cs: u32,
@@ -1666,9 +1808,11 @@ fn encode_precinct_cascade(
         beta: u32,
         exists: bool,
     }
-    let mut slices: Vec<Slice> = Vec::with_capacity((nbeta_pic as usize) * nc);
+    let sd_u = cfg.sd as usize;
+    let n_decomposed = nc - sd_u;
+    let mut slices: Vec<Slice> = Vec::with_capacity(((nbeta_pic as usize) * n_decomposed) + sd_u);
     for beta in 0..nbeta_pic {
-        for (i, &nly_comp) in nly_i.iter().enumerate().take(nc) {
+        for (i, &nly_comp) in nly_i.iter().enumerate().take(n_decomposed) {
             let wc = w / (cfg.sx[i] as usize);
             let hc = h / (cfg.sy[i] as usize);
             // Existence: β must be < n_beta(nlx, nly_i[i]).
@@ -1734,6 +1878,33 @@ fn encode_precinct_cascade(
         }
     }
 
+    // Sd tail slices: one per suppressed component (β = 0, no DWT). The
+    // band data lives in `comp_planes[i]` at the precinct's row offset.
+    // Per Annex A.4.7, sx[i] = sy[i] = 1 so the per-precinct band width
+    // is exactly Wp[p] and the precinct holds Hp = 2^NL,y picture lines.
+    let hp_pic = if nly == 0 { 1usize } else { 1usize << nly };
+    let pic_row_offset_sd = py * hp_pic;
+    let lines_this_precinct = hp_pic.min(h.saturating_sub(pic_row_offset_sd));
+    let wp_this = if px + 1 < np_x {
+        cs as usize
+    } else {
+        ((w as u32 - 1) % cs + 1) as usize
+    };
+    let pic_col_offset_sd = px * (cs as usize);
+    for sd_idx in 0..sd_u {
+        let i = n_decomposed + sd_idx;
+        slices.push(Slice {
+            wpb: wp_this.min(w.saturating_sub(pic_col_offset_sd)),
+            lines: lines_this_precinct,
+            pic_bw: w, // sx[i] = 1, so the picture-level band width is the full width
+            pic_row_offset: pic_row_offset_sd,
+            pic_col_offset: pic_col_offset_sd,
+            comp_i: i,
+            beta: 0,
+            exists: lines_this_precinct > 0 && wp_this > 0,
+        });
+    }
+
     // Precinct header: Lprc(24) + Q(8) + R(8) + N_existing × D(2),
     // padded to byte boundary.
     let n_existing = slices.iter().filter(|s| s.exists).count();
@@ -1760,6 +1931,9 @@ fn encode_precinct_cascade(
     };
 
     // Helper: build a one-line band slice from a per-component band buffer.
+    // Wavelet components (i < n_decomposed) read from bands_per_comp; the
+    // Sd suppressed components read directly from comp_planes (their
+    // "band" is the raw, DC-biased picture samples).
     let extract_band_line = |s: &Slice, line_off: usize| -> Option<Vec<i32>> {
         if !s.exists || s.lines == 0 {
             return None;
@@ -1769,6 +1943,14 @@ fn encode_precinct_cascade(
         }
         if s.wpb == 0 {
             return None;
+        }
+        if s.comp_i >= n_decomposed {
+            // Sd suppressed: comp_planes is sized at Wf*Hf for sx=sy=1.
+            let plane = &comp_planes[s.comp_i];
+            let pic_row = s.pic_row_offset + line_off;
+            let row_start = pic_row * s.pic_bw + s.pic_col_offset;
+            let row_end = row_start + s.wpb;
+            return Some(plane[row_start..row_end].to_vec());
         }
         let band_buf = &bands_per_comp[s.comp_i][s.beta as usize];
         let pic_row = s.pic_row_offset + line_off;
@@ -1782,14 +1964,14 @@ fn encode_precinct_cascade(
     // of each entry (needed for per-band D decision and Mtop tracking).
     let mut jobs: Vec<PacketJob> = Vec::new();
 
-    // First packet: β = 0 .. β1-1 × Nc components × line 0 (subject to
-    // existence + sub-sample guard).
+    // First packet: β = 0 .. β1-1 × (Nc - Sd) wavelet components × line 0
+    // (subject to existence + sub-sample guard).
     {
         let mut entries: Vec<PerBandEntry> = Vec::new();
         let mut coords: Vec<(usize, u32)> = Vec::new();
         for beta in 0..beta1 {
-            for i in 0..nc {
-                let s_idx = (beta as usize) * nc + i;
+            for i in 0..n_decomposed {
+                let s_idx = (beta as usize) * n_decomposed + i;
                 let s = &slices[s_idx];
                 if let Some(line_data) = extract_band_line(s, 0) {
                     entries.push(PerBandEntry {
@@ -1822,8 +2004,8 @@ fn encode_precinct_cascade(
             let pow_pic = pow_h(cfg.nly, key0.dy);
             for lambda_within in 0..pow_pic {
                 for beta in beta0..(beta0 + 3).min(nbeta_pic) {
-                    for i in 0..nc {
-                        let s_idx = (beta as usize) * nc + i;
+                    for i in 0..n_decomposed {
+                        let s_idx = (beta as usize) * n_decomposed + i;
                         let s = &slices[s_idx];
                         if !s.exists {
                             continue;
@@ -1851,6 +2033,39 @@ fn encode_precinct_cascade(
                 }
             }
             beta0 += 3;
+        }
+    }
+
+    // Sd tail: one packet per (line λ, suppressed component i), with
+    // component as the fast and line as the slow variable per Annex B.7
+    // Table B.4. The slice index for the tail is
+    // `nbeta_pic * n_decomposed + (i - n_decomposed)`.
+    if sd_u > 0 {
+        let sd_first_slice = (nbeta_pic as usize) * n_decomposed;
+        for lambda in 0..lines_this_precinct {
+            for sd_idx in 0..sd_u {
+                let s_idx = sd_first_slice + sd_idx;
+                let s = &slices[s_idx];
+                if !s.exists {
+                    continue;
+                }
+                let i = n_decomposed + sd_idx;
+                let line_off = lambda;
+                if let Some(line_data) = extract_band_line(s, line_off) {
+                    let key = (i, 0u32);
+                    let is_first = lambda == 0;
+                    jobs.push(PacketJob {
+                        entries: vec![PerBandEntry {
+                            wpb: s.wpb as u32,
+                            line: BandLineSlice::Direct(line_data),
+                            // Sd tail bands carry raw samples; T = clamp(Q - 0).
+                            t: (cfg.q as i32).clamp(0, 15) as u8,
+                        }],
+                        coords: vec![key],
+                        first_line_in_precinct: is_first,
+                    });
+                }
+            }
         }
     }
 
@@ -3935,6 +4150,7 @@ mod tests {
             None,
             Vec::new(),
             1, // cw
+            0, // sd
             &[y_plane.clone(), u_plane.clone(), v_plane.clone()],
         )
         .expect("encode 64x8 4:2:2 Cw=1 NL=1/1");
@@ -3973,5 +4189,116 @@ mod tests {
         let cs_b = encode_planar(32, 32, 1, 0, 2, 2, std::slice::from_ref(&pixels))
             .expect("encode_planar");
         assert_eq!(cs_a, cs_b, "Cw=0 must match encode_planar bit-for-bit");
+    }
+
+    /// Round 9 (r91): Sd=1 with Nc=4, NL=2/2. Components 0..3 are
+    /// wavelet-coded; component 3 is suppressed and carried raw.
+    #[test]
+    fn round9_sd1_4comp_32x16_lossless() {
+        let w = 32usize;
+        let h = 16usize;
+        let make = |seed: u32| {
+            let mut v = vec![0u8; w * h];
+            for y in 0..h {
+                for x in 0..w {
+                    v[y * w + x] = ((x as u32)
+                        .wrapping_mul(seed + 3)
+                        .wrapping_add((y as u32).wrapping_mul(seed + 7))
+                        .wrapping_add(seed)
+                        % 256) as u8;
+                }
+            }
+            v
+        };
+        let p0 = make(11);
+        let p1 = make(17);
+        let p2 = make(23);
+        let p3 = make(29);
+        let cs = encode_planar_sd(
+            w as u16,
+            h as u16,
+            4,
+            2,
+            2,
+            0,
+            1, // sd: suppress component 3 only
+            &[p0.clone(), p1.clone(), p2.clone(), p3.clone()],
+        )
+        .expect("encode 32x16 Nc=4 Sd=1 NL=2/2");
+        let img = decode_codestream(&cs, None).expect("decode Sd=1");
+        assert_eq!(img.planes[0].data, p0, "wavelet comp 0 lossless");
+        assert_eq!(img.planes[1].data, p1, "wavelet comp 1 lossless");
+        assert_eq!(img.planes[2].data, p2, "wavelet comp 2 lossless");
+        assert_eq!(img.planes[3].data, p3, "Sd-suppressed comp 3 lossless");
+    }
+
+    /// Round 9: Sd=2 with Nc=5 — two suppressed components.
+    #[test]
+    fn round9_sd2_5comp_16x8_lossless() {
+        let w = 16usize;
+        let h = 8usize;
+        let make = |seed: u32| {
+            let mut v = vec![0u8; w * h];
+            for y in 0..h {
+                for x in 0..w {
+                    v[y * w + x] = ((x as u32 + seed)
+                        .wrapping_mul((y as u32 + 1).wrapping_add(seed))
+                        % 251) as u8;
+                }
+            }
+            v
+        };
+        let p: Vec<Vec<u8>> = (0..5u32).map(make).collect();
+        let cs = encode_planar_sd(w as u16, h as u16, 5, 1, 1, 0, 2, &p)
+            .expect("encode 16x8 Nc=5 Sd=2 NL=1/1");
+        let img = decode_codestream(&cs, None).expect("decode Sd=2");
+        for (i, expected) in p.iter().enumerate().take(5) {
+            assert_eq!(&img.planes[i].data, expected, "comp {i} roundtrip");
+        }
+    }
+
+    /// Round 9: Sd=1 lossy q=2 — wavelet components are quantized, Sd
+    /// tail component is also subjected to T but at G=0 retains useful
+    /// PSNR (≥30 dB on smooth patterns).
+    #[test]
+    fn round9_sd1_4comp_lossy_q2_psnr_floor() {
+        let w = 32usize;
+        let h = 16usize;
+        let mut p = vec![vec![0u8; w * h]; 4];
+        for y in 0..h {
+            for x in 0..w {
+                let g = ((x as u32 * 8 + y as u32 * 4) % 256) as u8;
+                p[0][y * w + x] = g;
+                p[1][y * w + x] = g.wrapping_add(20);
+                p[2][y * w + x] = g.wrapping_add(40);
+                p[3][y * w + x] = g.wrapping_add(60);
+            }
+        }
+        let cs =
+            encode_planar_sd(w as u16, h as u16, 4, 2, 2, 2, 1, &p).expect("encode lossy Sd=1 q=2");
+        let img = decode_codestream(&cs, None).expect("decode lossy Sd=1");
+        for (i, expected) in p.iter().enumerate().take(4) {
+            let q = psnr(expected, &img.planes[i].data);
+            assert!(
+                q >= 30.0,
+                "Sd=1 q=2 comp {i} PSNR {q:.2} dB below 30 dB floor"
+            );
+        }
+    }
+
+    /// Round 9: encoder rejects Sd>0 when Nc<=3 (Annex A.4.7).
+    #[test]
+    fn round9_rejects_sd_with_nc_3() {
+        let p = vec![vec![0u8; 16 * 8]; 3];
+        let result = encode_planar_sd(16, 8, 3, 1, 1, 0, 1, &p);
+        assert!(result.is_err(), "Sd>0 must require Nc>3");
+    }
+
+    /// Round 9: encoder rejects Sd>=Nc (Annex A.4.7).
+    #[test]
+    fn round9_rejects_sd_eq_nc() {
+        let p = vec![vec![0u8; 16 * 8]; 4];
+        let result = encode_planar_sd(16, 8, 4, 1, 1, 0, 4, &p);
+        assert!(result.is_err(), "Sd must be < Nc");
     }
 }

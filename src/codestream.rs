@@ -47,6 +47,10 @@ pub struct Codestream {
     pub nlt: Option<Vec<u8>>,
     /// Optional CWD body if present.
     pub cwd: Option<Vec<u8>>,
+    /// Parsed value of the CWD `Sd` field per Annex A.4.7 Table A.18.
+    /// `None` when no CWD marker was present (decoder treats this as
+    /// `Sd = 0`); otherwise `Some(sd)` with `sd ∈ 1..=Nc-1`.
+    pub cwd_sd: Option<u8>,
     /// Optional CTS body if present (mandatory iff `Cpih == 3`).
     pub cts: Option<Vec<u8>>,
     /// Optional CRG body if present.
@@ -150,6 +154,28 @@ pub fn parse(buf: &[u8]) -> Result<Codestream> {
                     return Err(Error::invalid("jpegxs: duplicate CWD segment"));
                 }
                 let body = cur.read_len_segment()?;
+                // Annex A.4.7 Table A.18: CWD body is exactly 1 byte
+                // (`Sd`), and `Sd ∈ 1..=Nc-1`. The marker is forbidden
+                // unless `Nc > 3` per the same table.
+                if body.len() != 1 {
+                    return Err(Error::invalid(format!(
+                        "jpegxs: CWD body must be 1 byte (Sd), got {}",
+                        body.len()
+                    )));
+                }
+                if pih.nc <= 3 {
+                    return Err(Error::invalid(format!(
+                        "jpegxs: CWD requires Nc>3 per Annex A.4.7, got Nc={}",
+                        pih.nc
+                    )));
+                }
+                let sd_val = body[0];
+                if sd_val == 0 || (sd_val as u16) >= pih.nc as u16 {
+                    return Err(Error::invalid(format!(
+                        "jpegxs: CWD Sd must be in 1..={}, got {sd_val}",
+                        pih.nc - 1
+                    )));
+                }
                 cwd = Some(body.to_vec());
             }
             Marker::CTS => {
@@ -208,17 +234,20 @@ pub fn parse(buf: &[u8]) -> Result<Codestream> {
     // precincts (computed by [`crate::slice_walker::build_plan`] from
     // PIH / CDT / WGT), that yields the slice's exact entropy byte
     // length.
-    use crate::slice_walker::build_plan;
+    use crate::slice_walker::build_plan_sd;
     let mut slices: Vec<Slice> = Vec::new();
     let body = cur.read_len_segment()?;
     let mut current_header = slice_header::parse(body)?;
     let mut current_data_offset = cur.pos();
-    // Try to build a picture plan from PIH/CDT/WGT. When WGT is empty
-    // (probe-only test fixtures with no entropy data) build_plan will
+    // Try to build a picture plan from PIH/CDT/WGT/CWD. When WGT is empty
+    // (probe-only test fixtures with no entropy data) build_plan_sd will
     // fail; in that case fall back to the legacy `FF 20`/`FF 11` byte
     // scan, which copes with the empty-entropy case (the very next
     // bytes are the next marker).
-    let plan_opt = build_plan(&pih, &cdt, &wgt).ok().map(|(p, _)| p);
+    let sd_for_plan = cwd.as_deref().map(|b| b[0]).unwrap_or(0);
+    let plan_opt = build_plan_sd(&pih, &cdt, &wgt, sd_for_plan)
+        .ok()
+        .map(|(p, _)| p);
 
     let eoc_offset = loop {
         // Determine entropy length for this slice.
@@ -322,6 +351,7 @@ pub fn parse(buf: &[u8]) -> Result<Codestream> {
         }
     };
 
+    let cwd_sd = cwd.as_deref().map(|b| b[0]);
     Ok(Codestream {
         cap,
         pih,
@@ -329,6 +359,7 @@ pub fn parse(buf: &[u8]) -> Result<Codestream> {
         wgt,
         nlt,
         cwd,
+        cwd_sd,
         cts,
         crg,
         com,
