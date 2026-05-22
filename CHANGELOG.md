@@ -1,5 +1,48 @@
 # Changelog
 
+## Unreleased — round 95 / r93 (`Sd > 0` composes with `Cpih ≠ 0`)
+
+Lifts the round-9 (r91) blanket `Cpih = 0` restriction on `Sd > 0` per
+ISO/IEC 21122-1:2022 Annex F.2 Table F.1 + §A.5.2 + §B.2. The colour
+transform's operand window is fixed at `c < 3` (Cpih=1 / RCT) or
+`c < 4` (Cpih=3 / Star-Tetrix); when CWD's suppressed-component tail
+sits entirely beyond that window — i.e. `Nc - Sd >= 3` for RCT or
+`Nc - Sd >= 4` for Star-Tetrix — the two features compose cleanly: the
+first `Nc - Sd` components are wavelet-coded (with the colour transform
+applied to indices 0..3 / 0..4), and the trailing `Sd` components ride
+the raw CWD tail-loop unchanged.
+
+* `colour_transform.rs` — **RCT / Star-Tetrix accept ≥ 3 / ≥ 4 planes**.
+  Previously `inverse_star_tetrix` and `forward_star_tetrix` rejected
+  unless `planes.len() == 4`. The new contract accepts any plane count
+  ≥ 4 and operates only on the first 4 (per Table F.1 "Set Ω = O for
+  c ≥ 4"). `inverse_rct` / `forward_rct` already had the equivalent
+  contract on the first 3 planes; comments tightened.
+* `encoder.rs` — **new `encode_planar_sd_rct` and
+  `encode_planar_sd_star_tetrix` entry points**. The
+  `EncodeConfig.validate` block now drops the
+  "`Sd > 0` requires `Cpih = 0`" rejection and instead checks the
+  operand-window overlap constraint
+  (`Nc - Sd >= 3` for `Cpih = 1`, `Nc - Sd >= 4` for `Cpih = 3`).
+  The `Cpih = 1 → Nc = 3` and `Cpih = 3 → Nc = 4` strict-equality
+  checks become `Nc >= 3` / `Nc >= 4` per Annex F.2. Cpih=3 sx/sy=1
+  enforcement narrows from "every component" to "first 4 components"
+  so suppressed-tail components beyond the CFA window can carry their
+  own sampling factors when needed (in practice the CWD constraint
+  forces them to 1×1 anyway, but the encoder no longer cross-rejects).
+  CRG marker emission body length now scales with `Nc` and emits
+  `(0, 0)` placement for entries beyond the four CFA components.
+* `decoder.rs` — **Cpih=3 + Nc > 4 path unblocked**. The
+  `pih.nc != 4` rejection becomes `pih.nc < 4` per Annex F.2 Table F.1.
+  Defensive `Nc - Sd >= 3 / 4` overlap checks added so a malformed
+  codestream that suppresses a transform operand fails fast.
+* **Tests** — 6 new encoder roundtrip / rejection tests covering
+  Sd=1+Cpih=1 (Nc=4 lossless + lossy q=2 PSNR floor), Sd=2+Cpih=1
+  (Nc=5 lossless), Sd=1+Cpih=3 (Nc=5 lossless), and operand-window
+  overlap rejection for each colour transform; 2 colour_transform
+  module tests verifying RCT/Star-Tetrix pass extra (tail) planes
+  through unchanged. 218 total (was 210); 0 ignored.
+
 ## Unreleased — round 9 / r91 (`Sd > 0` CWD decomposition suppression)
 
 End-to-end `Sd > 0` support on both decoder and encoder sides per

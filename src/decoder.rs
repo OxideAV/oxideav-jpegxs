@@ -186,8 +186,20 @@ pub(crate) fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<JpegXsIm
         }
     }
 
-    // Annex F inverse colour transform.
+    // Annex F inverse colour transform — Table F.1 dispatches by Cpih.
+    // The transform's operand window is fixed at c < 3 (RCT) or c < 4
+    // (Star-Tetrix); when Sd > 0, the suppressed-tail components live at
+    // c ≥ Nc - Sd and must not overlap the operand window, otherwise the
+    // transform would consume samples that were never wavelet-coded
+    // (Part-1 §A.5.2 + §B.2). We re-check the constraint here so a
+    // malformed codestream fails fast instead of producing garbage.
     if pih.cpih == 1 {
+        if (pih.nc - sd) < 3 {
+            return Err(Error::invalid(format!(
+                "jpegxs Cpih=1 (RCT) + Sd>0: Nc-Sd must be >= 3 so RCT operand window c<3 is wavelet-coded, got Nc={} Sd={}",
+                pih.nc, sd
+            )));
+        }
         let mut refs: Vec<&mut [i32]> = samples.iter_mut().map(|p| p.as_mut_slice()).collect();
         inverse_rct(&mut refs, wf, hf)?;
     } else if pih.cpih == 3 {
@@ -210,10 +222,16 @@ pub(crate) fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<JpegXsIm
                 "jpegxs Cpih=3: CRG entries do not match a Table F.9 CFA pattern (RGGB/BGGR/GRBG/GBRG)",
             )
         })?;
-        if pih.nc != 4 {
+        if pih.nc < 4 {
             return Err(Error::invalid(format!(
-                "jpegxs Cpih=3: Star-Tetrix requires Nc=4, got {}",
+                "jpegxs Cpih=3: Star-Tetrix requires Nc>=4 per Annex F.2, got {}",
                 pih.nc
+            )));
+        }
+        if (pih.nc - sd) < 4 {
+            return Err(Error::invalid(format!(
+                "jpegxs Cpih=3 + Sd>0: Nc-Sd must be >= 4 so Star-Tetrix operand window c<4 is wavelet-coded, got Nc={} Sd={}",
+                pih.nc, sd
             )));
         }
         let mut refs: Vec<&mut [i32]> = samples.iter_mut().map(|p| p.as_mut_slice()).collect();

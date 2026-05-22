@@ -188,15 +188,24 @@ impl EncodeConfig {
                 self.nc
             )));
         }
-        if self.cpih == 1 && self.nc != 3 {
+        // Annex F.2 Table F.1: Cpih=1 operates on c<3; Cpih=3 on c<4.
+        // The transform's operand range is fixed regardless of Nc, so
+        // Nc>=3 (Cpih=1) and Nc>=4 (Cpih=3) are the spec's actual
+        // requirements. The trailing components (c >= 3 for RCT, c >= 4
+        // for Star-Tetrix) are passed through unchanged — that is the
+        // same path CWD's Sd-suppressed components take, which is why
+        // Cpih≠0 composes with Sd>0 as long as the colour-transform
+        // operand window does not overlap the suppressed-component tail
+        // (checked below in the Sd block).
+        if self.cpih == 1 && self.nc < 3 {
             return Err(Error::invalid(format!(
-                "jpegxs encoder: Cpih=1 (RCT) requires Nc=3, got {}",
+                "jpegxs encoder: Cpih=1 (RCT) requires Nc>=3 per Annex F.2, got {}",
                 self.nc
             )));
         }
-        if self.cpih == 3 && self.nc != 4 {
+        if self.cpih == 3 && self.nc < 4 {
             return Err(Error::invalid(format!(
-                "jpegxs encoder: Cpih=3 (Star-Tetrix) requires Nc=4, got {}",
+                "jpegxs encoder: Cpih=3 (Star-Tetrix) requires Nc>=4 per Annex F.2, got {}",
                 self.nc
             )));
         }
@@ -207,12 +216,16 @@ impl EncodeConfig {
             )));
         }
         if self.cpih == 3 {
-            // Star-Tetrix requires sx[i] = sy[i] = 1 on every component
-            // (the CFA grid is fully populated).
-            for (i, (&sx, &sy)) in self.sx.iter().zip(self.sy.iter()).enumerate() {
+            // Star-Tetrix requires sx[i] = sy[i] = 1 on the 4 CFA
+            // components it consumes (c<4). Components beyond that — Sd
+            // suppressed tail when Sd>0, or otherwise — are not touched
+            // by the transform; their sampling factors are independently
+            // governed by CDT + (if applicable) the CWD constraint
+            // sx=sy=1 on suppressed comps.
+            for (i, (&sx, &sy)) in self.sx.iter().zip(self.sy.iter()).enumerate().take(4) {
                 if sx != 1 || sy != 1 {
                     return Err(Error::invalid(format!(
-                        "jpegxs encoder: Cpih=3 (Star-Tetrix) requires sx[i]=sy[i]=1, got component {i} (sx, sy)=({sx}, {sy})"
+                        "jpegxs encoder: Cpih=3 (Star-Tetrix) requires sx[i]=sy[i]=1 for i<4, got component {i} (sx, sy)=({sx}, {sy})"
                     )));
                 }
             }
@@ -342,17 +355,23 @@ impl EncodeConfig {
                     )));
                 }
             }
-            // Sd > 0 is incompatible with colour transforms that span
-            // every component in the picture (`Cpih == 1` RCT touches
-            // components 0..3, `Cpih == 3` Star-Tetrix touches 0..4).
-            // The suppressed components are excluded by definition, so
-            // the colour transform can still legally run on i < Nc-Sd
-            // when its operand count fits; we restrict to `Cpih == 0`
-            // for the round-9 encoder to keep the implementation tight.
-            if self.cpih != 0 {
-                return Err(Error::Unsupported(format!(
-                    "jpegxs encoder round 9: Sd>0 currently requires Cpih=0, got Cpih={}",
-                    self.cpih
+            // Sd > 0 composes with Cpih ≠ 0 as long as the colour
+            // transform's operand window (c < 3 for Cpih=1, c < 4 for
+            // Cpih=3) does not overlap the CWD-suppressed tail
+            // (c ≥ Nc - Sd). Since Sd suppresses *trailing* components,
+            // the overlap constraint reduces to Nc - Sd >= operand_max.
+            // Round 95 (r93): lift the round-9 (r91) blanket Cpih=0
+            // restriction per Part-1 §A.5.2 + §B.2 — the post-transform
+            // component set is what Sd carves the tail from.
+            let operand_max = match self.cpih {
+                1 => 3u8, // RCT: c<3
+                3 => 4u8, // Star-Tetrix: c<4
+                _ => 0u8,
+            };
+            if operand_max > 0 && self.nc - self.sd < operand_max {
+                return Err(Error::invalid(format!(
+                    "jpegxs encoder: Cpih={} requires Nc-Sd >= {} so the colour transform's operand window is fully wavelet-coded (Annex F.2 Table F.1), got Nc={} Sd={}",
+                    self.cpih, operand_max, self.nc, self.sd
                 )));
             }
         }
@@ -634,9 +653,9 @@ pub fn encode_planar_cw(
 /// while the leading `nc - sd` components go through the standard 5/3
 /// cascade DWT. Emits a CWD marker with the chosen `Sd`. Per the spec,
 /// `sd ∈ 1..=nc-1`, `nc > 3`, and every suppressed component must have
-/// `sx[i] = sy[i] = 1`. The encoder currently restricts `cpih` to 0
-/// (no colour transform) for the Sd path; the wavelet components still
-/// follow the regular gain-weighted Fq=8 lossy / lossless behaviour.
+/// `sx[i] = sy[i] = 1`. Cpih is forced to 0 by this entry point; for
+/// Cpih=1 (RCT) + Sd see [`encode_planar_sd_rct`]; for Cpih=3
+/// (Star-Tetrix) + Sd see [`encode_planar_sd_star_tetrix`].
 #[allow(clippy::too_many_arguments)]
 pub fn encode_planar_sd(
     width: u16,
@@ -655,7 +674,7 @@ pub fn encode_planar_sd(
         width,
         height,
         nc,
-        0, // cpih: only 0 supported for Sd>0 in this round
+        0, // cpih: explicit Cpih=0 entry point
         nlx,
         nly,
         fq,
@@ -666,6 +685,108 @@ pub fn encode_planar_sd(
         0,
         0,
         0,
+        None,
+        Vec::new(),
+        0, // cw
+        sd,
+        planes,
+    )
+}
+
+/// Round-95 (r93) `Sd > 0` + `Cpih = 1` (RCT) entry point.
+///
+/// Per Annex F.2 Table F.1 the RCT operand window is `c < 3` — when the
+/// CWD-suppressed tail does not overlap that window (`Nc - Sd >= 3`),
+/// the colour transform composes cleanly with the suppressed-tail
+/// raw-coding path. The first three components are forward-RCT'd before
+/// the DWT cascade; components 3..Nc-Sd remain wavelet-coded without
+/// colour transform; components Nc-Sd..Nc are coded raw per the CWD
+/// tail loop (Annex B.7 Table B.4).
+///
+/// Constraints: `nc - sd >= 3`, `nc > 3` (CWD), `sd >= 1`, `sx[i] = sy[i] = 1`
+/// for every component (the encoder forces 4:4:4 here to keep the
+/// post-RCT geometry well-defined).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_sd_rct(
+    width: u16,
+    height: u16,
+    nc: u8,
+    nlx: u8,
+    nly: u8,
+    q: u8,
+    sd: u8,
+    planes: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    let sx = vec![1u8; nc as usize];
+    let sy = vec![1u8; nc as usize];
+    let fq = if q == 0 { 0 } else { 8 };
+    encode_planar_inner_nlt(
+        width,
+        height,
+        nc,
+        1, // cpih: RCT
+        nlx,
+        nly,
+        fq,
+        q,
+        &sx,
+        &sy,
+        0,
+        0,
+        0,
+        0,
+        None,
+        Vec::new(),
+        0, // cw
+        sd,
+        planes,
+    )
+}
+
+/// Round-95 (r93) `Sd > 0` + `Cpih = 3` (Star-Tetrix) entry point.
+///
+/// Per Annex F.2 Table F.1 the Star-Tetrix operand window is `c < 4`;
+/// when `Nc - Sd >= 4` the four CFA components are forward-Star-Tetrix'd
+/// before the DWT cascade and the suppressed trailing components ride
+/// through raw. Emits both the CTS marker (`Cf`, `e1`, `e2`) and the CRG
+/// marker (per Table F.9 from `ct`).
+///
+/// Constraints: `nc - sd >= 4`, `nc > 3` (CWD; in practice `nc >= 5`
+/// because `sd >= 1`), `sd >= 1`, `sx[i] = sy[i] = 1` for every
+/// component.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_sd_star_tetrix(
+    width: u16,
+    height: u16,
+    nc: u8,
+    nlx: u8,
+    nly: u8,
+    q: u8,
+    sd: u8,
+    e1: u8,
+    e2: u8,
+    cf: u8,
+    ct: u8,
+    planes: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    let sx = vec![1u8; nc as usize];
+    let sy = vec![1u8; nc as usize];
+    let fq = if q == 0 { 0 } else { 8 };
+    encode_planar_inner_nlt(
+        width,
+        height,
+        nc,
+        3, // cpih: Star-Tetrix
+        nlx,
+        nly,
+        fq,
+        q,
+        &sx,
+        &sy,
+        e1,
+        e2,
+        cf,
+        ct,
         None,
         Vec::new(),
         0, // cw
@@ -1028,8 +1149,12 @@ fn write_main_header(out: &mut Vec<u8>, cfg: &EncodeConfig) -> Result<()> {
         let lcrg = 2u16 + 4 * (cfg.nc as u16);
         out.extend_from_slice(&lcrg.to_be_bytes());
         // Emit the canonical CRG entries that map back to the chosen Ct
-        // via Table F.9 (RGGB for Ct=0, GRBG for Ct=1).
-        let entries: [(u16, u16); 4] = if cfg.st_ct == 0 {
+        // via Table F.9 (RGGB for Ct=0, GRBG for Ct=1). The first four
+        // entries are the CFA-component placements; any additional Nc-4
+        // entries (when Nc > 4, i.e. Cpih=3 + Sd>0) are emitted as
+        // (0, 0) — placement-irrelevant since Table F.1 leaves those
+        // components untouched by the transform.
+        let cfa: [(u16, u16); 4] = if cfg.st_ct == 0 {
             // RGGB layout per Table F.9 row 1:
             //   c=0 (R)  : (0,        0)
             //   c=1 (G1) : (32768,    0)
@@ -1044,7 +1169,8 @@ fn write_main_header(out: &mut Vec<u8>, cfg: &EncodeConfig) -> Result<()> {
             //   c=3 (G2) : (0,    32768)
             [(32768, 0), (0, 0), (32768, 32768), (0, 32768)]
         };
-        for (xc, yc) in entries.iter() {
+        for c in 0..cfg.nc as usize {
+            let (xc, yc) = cfa.get(c).copied().unwrap_or((0, 0));
             out.extend_from_slice(&xc.to_be_bytes());
             out.extend_from_slice(&yc.to_be_bytes());
         }
@@ -4300,5 +4426,182 @@ mod tests {
         let p = vec![vec![0u8; 16 * 8]; 4];
         let result = encode_planar_sd(16, 8, 4, 1, 1, 0, 4, &p);
         assert!(result.is_err(), "Sd must be < Nc");
+    }
+
+    /// Round 95 (r93): Sd=1 + Cpih=1 (RCT). Nc=4 picture with 4 planes,
+    /// components 0..2 ride the RCT cascade, component 3 is suppressed
+    /// (raw CWD tail). Self-roundtrips losslessly at q=0.
+    #[test]
+    fn round95_sd1_cpih1_rct_4comp_32x16_lossless() {
+        let w = 32usize;
+        let h = 16usize;
+        let make = |seed: u32| {
+            let mut v = vec![0u8; w * h];
+            for y in 0..h {
+                for x in 0..w {
+                    v[y * w + x] = ((x as u32)
+                        .wrapping_mul(seed + 5)
+                        .wrapping_add((y as u32).wrapping_mul(seed + 11))
+                        .wrapping_add(seed * 13)
+                        % 256) as u8;
+                }
+            }
+            v
+        };
+        let r = make(7);
+        let g = make(13);
+        let b = make(19);
+        let alpha = make(31);
+        let cs = encode_planar_sd_rct(
+            w as u16,
+            h as u16,
+            4,
+            2,
+            2,
+            0,
+            1,
+            &[r.clone(), g.clone(), b.clone(), alpha.clone()],
+        )
+        .expect("encode 32x16 Nc=4 Sd=1 Cpih=1 NL=2/2");
+        let img = decode_codestream(&cs, None).expect("decode Sd=1 Cpih=1");
+        assert_eq!(img.num_components, 4);
+        assert_eq!(img.cpih, 1, "PIH should report Cpih=1");
+        assert_eq!(img.planes[0].data, r, "R lossless via RCT");
+        assert_eq!(img.planes[1].data, g, "G lossless via RCT");
+        assert_eq!(img.planes[2].data, b, "B lossless via RCT");
+        assert_eq!(img.planes[3].data, alpha, "Sd-suppressed alpha lossless");
+    }
+
+    /// Round 95 (r93): Sd=1 + Cpih=1 lossy q=2 PSNR floor.
+    #[test]
+    fn round95_sd1_cpih1_rct_lossy_q2_psnr_floor() {
+        let w = 32usize;
+        let h = 16usize;
+        let mut p = vec![vec![0u8; w * h]; 4];
+        for y in 0..h {
+            for x in 0..w {
+                let g = ((x as u32 * 6 + y as u32 * 9) % 256) as u8;
+                p[0][y * w + x] = g;
+                p[1][y * w + x] = g.wrapping_add(15);
+                p[2][y * w + x] = g.wrapping_add(30);
+                p[3][y * w + x] = g.wrapping_add(45);
+            }
+        }
+        let cs = encode_planar_sd_rct(w as u16, h as u16, 4, 2, 2, 2, 1, &p)
+            .expect("encode lossy Sd=1 Cpih=1 q=2");
+        let img = decode_codestream(&cs, None).expect("decode lossy Sd=1 Cpih=1");
+        assert_eq!(img.cpih, 1);
+        for (i, expected) in p.iter().enumerate().take(4) {
+            let q = psnr(expected, &img.planes[i].data);
+            assert!(
+                q >= 25.0,
+                "Sd=1 Cpih=1 q=2 comp {i} PSNR {q:.2} dB below 25 dB floor"
+            );
+        }
+    }
+
+    /// Round 95 (r93): Sd=2 + Cpih=1 (RCT). Nc=5; components 0..2 ride
+    /// RCT cascade, components 3..4 are suppressed (raw CWD tail).
+    #[test]
+    fn round95_sd2_cpih1_rct_5comp_lossless() {
+        let w = 16usize;
+        let h = 8usize;
+        let make = |seed: u32| {
+            let mut v = vec![0u8; w * h];
+            for y in 0..h {
+                for x in 0..w {
+                    v[y * w + x] = ((x as u32 + seed)
+                        .wrapping_mul((y as u32 + 1).wrapping_add(seed))
+                        % 251) as u8;
+                }
+            }
+            v
+        };
+        let p: Vec<Vec<u8>> = (0..5u32).map(make).collect();
+        let cs = encode_planar_sd_rct(w as u16, h as u16, 5, 1, 1, 0, 2, &p)
+            .expect("encode 16x8 Nc=5 Sd=2 Cpih=1 NL=1/1");
+        let img = decode_codestream(&cs, None).expect("decode Sd=2 Cpih=1");
+        assert_eq!(img.cpih, 1);
+        for (i, expected) in p.iter().enumerate().take(5) {
+            assert_eq!(&img.planes[i].data, expected, "comp {i} roundtrip");
+        }
+    }
+
+    /// Round 95 (r93): Sd=1 + Cpih=3 (Star-Tetrix). Nc=5 picture; the 4
+    /// CFA components ride the Star-Tetrix cascade, component 4 is the
+    /// suppressed CWD tail.
+    #[test]
+    fn round95_sd1_cpih3_star_tetrix_5comp_lossless() {
+        let w = 16usize;
+        let h = 8usize;
+        let make = |seed: u32| {
+            let mut v = vec![0u8; w * h];
+            for y in 0..h {
+                for x in 0..w {
+                    v[y * w + x] = ((x as u32)
+                        .wrapping_mul(seed + 2)
+                        .wrapping_add((y as u32).wrapping_mul(seed + 3))
+                        .wrapping_add(seed)
+                        % 256) as u8;
+                }
+            }
+            v
+        };
+        let r = make(11);
+        let g1 = make(17);
+        let g2 = make(23);
+        let b = make(29);
+        let ir = make(41);
+        let cs = encode_planar_sd_star_tetrix(
+            w as u16,
+            h as u16,
+            5,
+            1,
+            1,
+            0,
+            1, // sd: suppress component 4 (IR / NIR tail)
+            0, // e1
+            0, // e2
+            0, // cf=full
+            0, // ct=RGGB
+            &[r.clone(), g1.clone(), g2.clone(), b.clone(), ir.clone()],
+        )
+        .expect("encode 16x8 Nc=5 Sd=1 Cpih=3");
+        let img = decode_codestream(&cs, None).expect("decode Sd=1 Cpih=3");
+        assert_eq!(img.num_components, 5);
+        assert_eq!(img.cpih, 3, "PIH should report Cpih=3");
+        assert_eq!(img.planes[0].data, r, "R lossless via Star-Tetrix");
+        assert_eq!(img.planes[1].data, g1, "G1 lossless via Star-Tetrix");
+        assert_eq!(img.planes[2].data, g2, "G2 lossless via Star-Tetrix");
+        assert_eq!(img.planes[3].data, b, "B lossless via Star-Tetrix");
+        assert_eq!(img.planes[4].data, ir, "Sd-suppressed IR lossless");
+    }
+
+    /// Round 95 (r93): encoder rejects Sd that suppresses an RCT operand
+    /// component (Nc-Sd < 3).
+    #[test]
+    fn round95_rejects_sd_overlapping_rct_operand_window() {
+        // Nc=4, Sd=2 means Nc-Sd=2 → suppresses index 2 (Cr operand of
+        // RCT). Must reject.
+        let p = vec![vec![0u8; 16 * 8]; 4];
+        let result = encode_planar_sd_rct(16, 8, 4, 1, 1, 0, 2, &p);
+        assert!(
+            result.is_err(),
+            "Cpih=1 + Sd=2 with Nc=4 must reject (RCT operand overlap)"
+        );
+    }
+
+    /// Round 95 (r93): encoder rejects Sd that suppresses a Star-Tetrix
+    /// operand component (Nc-Sd < 4).
+    #[test]
+    fn round95_rejects_sd_overlapping_star_tetrix_operand_window() {
+        // Nc=5, Sd=2 means Nc-Sd=3 → suppresses component 3 (B operand
+        // of Star-Tetrix). Must reject.
+        let p = vec![vec![0u8; 16 * 8]; 5];
+        let result = encode_planar_sd_star_tetrix(16, 8, 5, 1, 1, 0, 2, 0, 0, 0, 0, &p);
+        assert!(
+            result.is_err(),
+            "Cpih=3 + Sd=2 with Nc=5 must reject (Star-Tetrix operand overlap)"
+        );
     }
 }

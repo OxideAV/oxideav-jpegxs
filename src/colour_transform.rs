@@ -178,9 +178,13 @@ pub fn inverse_star_tetrix(
     ct: u8,
     cf: u8,
 ) -> Result<()> {
-    if planes.len() != 4 {
+    // Per Annex F.2 Table F.1, Cpih=3 operates on components c<4 and
+    // sets Ω[c,x,y] = O[c,x,y] for c≥4. Accept any plane count ≥ 4 so
+    // CWD-suppressed trailing components (Sd>0, Annex A.4.7) ride through
+    // unchanged.
+    if planes.len() < 4 {
         return Err(Error::invalid(format!(
-            "jpegxs Cpih=3 (Star-Tetrix) requires exactly 4 component planes, got {}",
+            "jpegxs Cpih=3 (Star-Tetrix) requires at least 4 component planes, got {}",
             planes.len()
         )));
     }
@@ -197,7 +201,11 @@ pub fn inverse_star_tetrix(
     let want = wf
         .checked_mul(hf)
         .ok_or_else(|| Error::invalid("jpegxs Star-Tetrix: wf * hf overflow"))?;
-    for (i, p) in planes.iter().enumerate() {
+    // Only the first 4 component planes participate in the transform.
+    // Components ≥ 4 (e.g. CWD-suppressed tail) are left untouched by the
+    // caller; their plane size may differ in principle (though in practice
+    // CWD mandates sx=sy=1 on suppressed comps, matching the same size).
+    for (i, p) in planes.iter().enumerate().take(4) {
         if p.len() != want {
             return Err(Error::invalid(format!(
                 "jpegxs Star-Tetrix: component {i} has {} samples, expected {want}",
@@ -375,9 +383,12 @@ pub fn forward_star_tetrix(
     ct: u8,
     cf: u8,
 ) -> Result<()> {
-    if planes.len() != 4 {
+    // Accept any plane count ≥ 4 so CWD-suppressed trailing components
+    // ride through unchanged (Annex A.4.7 / Annex F.2 Table F.1 — Ω = O
+    // for c ≥ 4 when Cpih=3).
+    if planes.len() < 4 {
         return Err(Error::invalid(format!(
-            "jpegxs Cpih=3 (forward Star-Tetrix) requires exactly 4 component planes, got {}",
+            "jpegxs Cpih=3 (forward Star-Tetrix) requires at least 4 component planes, got {}",
             planes.len()
         )));
     }
@@ -394,7 +405,8 @@ pub fn forward_star_tetrix(
     let want = wf
         .checked_mul(hf)
         .ok_or_else(|| Error::invalid("jpegxs forward Star-Tetrix: wf * hf overflow"))?;
-    for (i, p) in planes.iter().enumerate() {
+    // Only the first 4 component planes participate in the transform.
+    for (i, p) in planes.iter().enumerate().take(4) {
         if p.len() != want {
             return Err(Error::invalid(format!(
                 "jpegxs forward Star-Tetrix: component {i} has {} samples, expected {want}",
@@ -912,6 +924,69 @@ mod tests {
         let mut planes: [&mut [i32]; 3] = [&mut p0, &mut p1, &mut p2];
         let err = forward_star_tetrix(&mut planes, 2, 2, 0, 0, 0, 0).unwrap_err();
         assert!(format!("{err}").contains("4 component"));
+    }
+
+    /// Round 95 (r93): Star-Tetrix accepts >=4 planes — Annex F.2
+    /// Table F.1 leaves components c≥4 untouched. Verifies the trailing
+    /// plane(s) round-trip bit-exactly when the first 4 carry the CFA
+    /// data.
+    #[test]
+    fn star_tetrix_passes_extra_components_through() {
+        // 4×4 picture, 5 components: 4 CFA + 1 suppressed tail.
+        let wf = 4usize;
+        let hf = 4usize;
+        let size = wf * hf;
+        let r0: Vec<i32> = (0..size as i32).map(|x| 100 + x * 2).collect();
+        let g1_0: Vec<i32> = (0..size as i32).map(|x| 120 + x).collect();
+        let g2_0: Vec<i32> = (0..size as i32).map(|x| 130 - x).collect();
+        let b0: Vec<i32> = (0..size as i32).map(|x| 90 + x * 3).collect();
+        let tail0: Vec<i32> = (0..size as i32).map(|x| 200 + x * 5).collect();
+        let mut p0 = r0.clone();
+        let mut p1 = g1_0.clone();
+        let mut p2 = g2_0.clone();
+        let mut p3 = b0.clone();
+        let mut p4 = tail0.clone();
+        {
+            let mut planes: [&mut [i32]; 5] = [&mut p0, &mut p1, &mut p2, &mut p3, &mut p4];
+            forward_star_tetrix(&mut planes, wf, hf, 0, 0, 0, 0).unwrap();
+            inverse_star_tetrix(&mut planes, wf, hf, 0, 0, 0, 0).unwrap();
+        }
+        assert_eq!(p0, r0, "R round-trips");
+        assert_eq!(p1, g1_0, "G1 round-trips");
+        assert_eq!(p2, g2_0, "G2 round-trips");
+        assert_eq!(p3, b0, "B round-trips");
+        // The 5th plane must not be touched by either direction.
+        assert_eq!(p4, tail0, "trailing tail plane must pass through unchanged");
+    }
+
+    /// Round 95 (r93): RCT accepts >=3 planes — Annex F.2 Table F.1
+    /// leaves components c≥3 untouched. Verifies the trailing plane(s)
+    /// round-trip bit-exactly when the first 3 carry the RGB data.
+    #[test]
+    fn rct_passes_extra_components_through() {
+        let wf = 4usize;
+        let hf = 4usize;
+        let size = wf * hf;
+        let r0: Vec<i32> = (0..size as i32).map(|x| 60 + x * 2).collect();
+        let g0: Vec<i32> = (0..size as i32).map(|x| 80 + x).collect();
+        let b0: Vec<i32> = (0..size as i32).map(|x| 50 + x * 3).collect();
+        let alpha0: Vec<i32> = (0..size as i32).map(|x| 200 - x).collect();
+        let mut p0 = r0.clone();
+        let mut p1 = g0.clone();
+        let mut p2 = b0.clone();
+        let mut p3 = alpha0.clone();
+        {
+            let mut planes: [&mut [i32]; 4] = [&mut p0, &mut p1, &mut p2, &mut p3];
+            super::forward_rct(&mut planes, wf, hf).unwrap();
+            inverse_rct(&mut planes, wf, hf).unwrap();
+        }
+        assert_eq!(p0, r0, "R round-trips");
+        assert_eq!(p1, g0, "G round-trips");
+        assert_eq!(p2, b0, "B round-trips");
+        assert_eq!(
+            p3, alpha0,
+            "trailing alpha plane must pass through unchanged"
+        );
     }
 
     /// Direct check of the `floor_div` helper — the spec's lifting
