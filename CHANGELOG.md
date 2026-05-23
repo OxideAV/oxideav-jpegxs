@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased — round 100 (encoder `Fs = 1` separate sign sub-packet)
+
+Adds encoder support for the `Fs = 1` sign-handling strategy per
+ISO/IEC 21122-1:2022 Annex A.4.4 Table A.11 + Annex C.4 + Annex C.5.5
+Table C.9. The decoder has supported `Fs = 1` end-to-end since the
+initial rounds (`pih.fs` threads slice walker → packet body, which reads
+the separate sign sub-packet); the encoder previously hard-coded
+`Fs = 0` (signs interleaved into the data sub-packet, Table C.8). This
+round closes that gap on the encode side.
+
+* `encoder.rs` — **`EncodeConfig` gains an `fs: u8` field** (default 0),
+  validated as `0` (joint signs) or `1` (separate sign sub-packet);
+  reserved values 2/3 are rejected. `write_pih_body` now emits
+  `(fs & 0x03) << 2` into the `Lh:Rl:Qpih:Fs:Rm` byte instead of a
+  hard-coded `0x00`.
+* `build_packet_body_with_m` — **emits the sign sub-packet when
+  `Fs = 1`**. The data sub-packet (Table C.8) drops its interleaved
+  `Ng`-per-significant-group sign bits and carries magnitude bitplanes
+  only; a new `sgn` bit-writer (Table C.9) walks bands → lines → groups
+  → members and emits one sign bit per coefficient whose reconstructed
+  magnitude is non-zero (gated on `(|v| >> T) != 0`, matching the
+  decoder's `coef.v != 0` test after the magnitude planes `[T, M)` are
+  laid down). The `sgn` writer is byte-aligned and routed into the
+  packet header's existing `Lsgn` field. Works with both VLC (`Dr = 0`)
+  and raw (`Dr = 1`) bitplane-count modes.
+* **New public entry point `encode_planar_fs1(width, height, nc, cpih,
+  nlx, nly, q, planes)`** — same shape as `encode_planar_lossy` but with
+  `Fs = 1`. For sparse-sign content it is strictly more compact than the
+  `Fs = 0` form (which spends `Ng = 4` sign bits on every significant
+  code group regardless of how many coefficients are non-zero).
+* **Tests** — 5 new (`round100_*`): Fs=1 luma lossless + PIH `fs == 1`
+  assertion, Fs=1 RGB+RCT (Cpih=1) lossless, Fs=1 lossy q=2 PSNR ≥ 30 dB
+  floor, Fs=1-vs-Fs=0 identical-decode + compactness on a sparse-sign
+  image, and reserved-`Fs` rejection. 223 total (was 218); 0 ignored.
+
 ## Unreleased — round 95 / r93 (`Sd > 0` composes with `Cpih ≠ 0`)
 
 Lifts the round-9 (r91) blanket `Cpih = 0` restriction on `Sd > 0` per

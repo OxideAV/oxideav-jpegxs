@@ -121,6 +121,11 @@ struct EncodeConfig {
     nly: u8,
     /// Colour transformation id (`Cpih`).
     cpih: u8,
+    /// Sign handling strategy (`Fs`, Annex A.4.4 Table A.11). `0` = signs
+    /// encoded jointly with the data sub-packet (Table C.8); `1` = signs
+    /// encoded in a separate sign sub-packet (Table C.9), one bit per
+    /// non-zero coefficient.
+    fs: u8,
     /// Fractional bits in wavelet domain (`Fq`). 0 = lossless,
     /// 8 = regular per Table A.8.
     fq: u8,
@@ -267,6 +272,14 @@ impl EncodeConfig {
             return Err(Error::Unsupported(format!(
                 "jpegxs encoder round 3: Fq must be 0 (lossless) or 8 (regular), got {}",
                 self.fq
+            )));
+        }
+        // Fs (Annex A.4.4 Table A.11): 0 = signs jointly with data, 1 =
+        // separate sign sub-packet. Values 2/3 are reserved.
+        if self.fs > 1 {
+            return Err(Error::Unsupported(format!(
+                "jpegxs encoder: Fs must be 0 (joint signs) or 1 (separate sign sub-packet), got {}",
+                self.fs
             )));
         }
         // Q range: spec allows 0..=31 in the precinct header, but per-
@@ -591,6 +604,60 @@ pub fn encode_planar_lossy(
     )
 }
 
+/// Round-100 separate-sign-sub-packet entry point (`Fs = 1`).
+///
+/// Same shape as [`encode_planar_lossy`] but sets the picture-header sign
+/// handling strategy to `Fs = 1` (Annex A.4.4 Table A.11): signs are
+/// carried in a dedicated sign sub-packet (Annex C.5.5, Table C.9) rather
+/// than interleaved into the data sub-packet (Table C.8). With `Fs = 1`
+/// only the magnitude bitplanes ride the data sub-packet, and exactly one
+/// sign bit is emitted per coefficient whose reconstructed magnitude is
+/// non-zero — strictly fewer than the `Fs = 0` form, which spends `Ng`
+/// sign bits on every significant code group regardless of how many of
+/// its coefficients are actually non-zero.
+///
+/// `q` is the precinct quantization step (`0..=15`); `q = 0` is lossless
+/// and `q > 0` forces `Fq = 8` per Table A.8. The decoder already threads
+/// `pih.fs` end-to-end (slice walker → packet body), so any output of this
+/// entry point round-trips through [`crate::decode_jpeg_xs`].
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_fs1(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    q: u8,
+    planes: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    let sx = vec![1u8; nc as usize];
+    let sy = vec![1u8; nc as usize];
+    let fq = if q == 0 { 0 } else { 8 };
+    encode_planar_inner_nlt(
+        width,
+        height,
+        nc,
+        cpih,
+        nlx,
+        nly,
+        fq,
+        q,
+        &sx,
+        &sy,
+        0,
+        0,
+        0,
+        0,
+        None,
+        Vec::new(),
+        0, // cw
+        0, // sd
+        1, // fs: separate sign sub-packet (Table C.9)
+        planes,
+    )
+}
+
 /// Round-8 multi-precinct-per-row entry point (`Cw > 0`).
 ///
 /// Same shape as [`encode_planar_lossy`] but takes the precinct-width
@@ -642,6 +709,7 @@ pub fn encode_planar_cw(
         Vec::new(),
         cw,
         0,
+        0, // fs: signs jointly with data (Fs=0)
         planes,
     )
 }
@@ -689,6 +757,7 @@ pub fn encode_planar_sd(
         Vec::new(),
         0, // cw
         sd,
+        0, // fs: signs jointly with data (Fs=0)
         planes,
     )
 }
@@ -739,6 +808,7 @@ pub fn encode_planar_sd_rct(
         Vec::new(),
         0, // cw
         sd,
+        0, // fs: signs jointly with data (Fs=0)
         planes,
     )
 }
@@ -791,6 +861,7 @@ pub fn encode_planar_sd_star_tetrix(
         Vec::new(),
         0, // cw
         sd,
+        0, // fs: signs jointly with data (Fs=0)
         planes,
     )
 }
@@ -866,6 +937,7 @@ pub fn encode_planar_nlt_quadratic(
         Vec::new(), // band_gains built inside after validation
         0,
         0,
+        0, // fs: signs jointly with data (Fs=0)
         planes,
     )
 }
@@ -939,6 +1011,7 @@ pub fn encode_planar_nlt_extended(
         Vec::new(),
         0,
         0,
+        0, // fs: signs jointly with data (Fs=0)
         planes,
     )
 }
@@ -980,6 +1053,7 @@ fn encode_planar_inner(
         Vec::new(),
         0,
         0,
+        0, // fs: signs jointly with data (Fs=0)
         planes,
     )
 }
@@ -1005,6 +1079,7 @@ fn encode_planar_inner_nlt(
     band_gains: Vec<u8>,
     cw: u16,
     sd: u8,
+    fs: u8,
     planes: &[Vec<u8>],
 ) -> Result<Vec<u8>> {
     let bw = if nlt.is_some() { 18 } else { 8 };
@@ -1020,6 +1095,7 @@ fn encode_planar_inner_nlt(
         nlx,
         nly,
         cpih,
+        fs,
         fq,
         q,
         sx: sx.to_vec(),
@@ -1198,8 +1274,10 @@ fn write_pih_body(out: &mut Vec<u8>, cfg: &EncodeConfig) {
     out.push(cfg.cpih & 0x0f);
     // NL,x:NL,y
     out.push(((cfg.nlx & 0x0f) << 4) | (cfg.nly & 0x0f));
-    // Lh:Rl:Qpih:Fs:Rm = 0
-    out.push(0x00);
+    // Lh (1) : Rl (1) : Qpih (2) : Fs (2) : Rm (2). Only Fs is non-zero
+    // here (separate sign sub-packet when cfg.fs == 1, Annex A.4.4
+    // Table A.11); Lh/Rl/Qpih/Rm stay 0.
+    out.push((cfg.fs & 0x03) << 2);
 }
 
 /// Number of wavelet filter types `Nβ` per Annex B.3.
@@ -2655,6 +2733,11 @@ fn build_packet_body_with_m(
     let mut data_writer = BitWriter::default();
     let mut cnt_writer = BitWriter::default();
     let mut sig_writer = BitWriter::default();
+    // Separate sign sub-packet (Annex C.5.5, Table C.9), only used when
+    // Fs=1. Stays empty for Fs=0 (signs interleaved in the data sub-packet
+    // per Table C.8).
+    let mut sgn_writer = BitWriter::default();
+    let fs1 = cfg.fs == 1;
     let ng_u = cfg.ng as usize;
     let ss_u = cfg.ss as usize; // code groups per significance group
 
@@ -2804,11 +2887,16 @@ fn build_packet_body_with_m(
             if m <= t {
                 continue;
             }
-            // Fs = 0: write Ng sign bits first.
-            for k in 0..ng_u {
-                let v = coef(g, k);
-                let sign_bit = if v < 0 { 1 } else { 0 };
-                data_writer.write_bit(sign_bit);
+            // Fs = 0: signs interleaved here, Ng bits per significant code
+            // group (Table C.8). Fs = 1: signs deferred to the sign
+            // sub-packet (Table C.9), so the data sub-packet carries only
+            // magnitude bitplanes.
+            if !fs1 {
+                for k in 0..ng_u {
+                    let v = coef(g, k);
+                    let sign_bit = if v < 0 { 1 } else { 0 };
+                    data_writer.write_bit(sign_bit);
+                }
             }
             for plane in (t..m).rev() {
                 for k in 0..ng_u {
@@ -2819,12 +2907,40 @@ fn build_packet_body_with_m(
                 }
             }
         }
+
+        // Sign sub-packet (Fs = 1, Table C.9). One bit per coefficient
+        // whose reconstructed magnitude is non-zero, iterating bands →
+        // lines → groups → members in the same order the decoder reads.
+        // The decoder's reconstructed magnitude keeps original bitplanes
+        // [T, M); it is non-zero exactly when (|v| >> T) != 0, so we gate
+        // the sign emission on that predicate (matching the decoder's
+        // `coef.v != 0` test).
+        if fs1 {
+            for (g, &m_u8) in m_per_group.iter().enumerate() {
+                let m = m_u8 as u32;
+                for k in 0..ng_u {
+                    let v = coef(g, k);
+                    // A coefficient only contributes a sign bit when its
+                    // kept bitplanes [T, M) hold at least one set bit. For
+                    // groups with M <= T (all magnitudes truncated away),
+                    // (|v| >> t) is still gated below; the magnitude is
+                    // effectively zero after dequant so no sign is emitted.
+                    let kept = if m > t { v.unsigned_abs() >> t } else { 0 };
+                    if kept != 0 {
+                        let sign_bit = if v < 0 { 1 } else { 0 };
+                        sgn_writer.write_bit(sign_bit);
+                    }
+                }
+            }
+        }
     }
     cnt_writer.align_to_byte();
     data_writer.align_to_byte();
+    sgn_writer.align_to_byte();
     let sig_bytes = sig_writer.into_bytes();
     let cnt_bytes = cnt_writer.into_bytes();
     let data_bytes = data_writer.into_bytes();
+    let sgn_bytes = sgn_writer.into_bytes();
     let dr = match mode {
         BitplaneMode::Raw => 1,
         BitplaneMode::Vlc(_) => 0,
@@ -2834,7 +2950,7 @@ fn build_packet_body_with_m(
         sig: sig_bytes,
         cnt: cnt_bytes,
         data: data_bytes,
-        sgn: Vec::new(),
+        sgn: sgn_bytes,
     })
 }
 
@@ -4277,6 +4393,7 @@ mod tests {
             Vec::new(),
             1, // cw
             0, // sd
+            0, // fs
             &[y_plane.clone(), u_plane.clone(), v_plane.clone()],
         )
         .expect("encode 64x8 4:2:2 Cw=1 NL=1/1");
@@ -4603,5 +4720,143 @@ mod tests {
             result.is_err(),
             "Cpih=3 + Sd=2 with Nc=5 must reject (Star-Tetrix operand overlap)"
         );
+    }
+
+    // === Round 100: Fs=1 separate sign sub-packet (Annex C.5.5) =========
+
+    /// Round 100: Fs=1 luma round-trips losslessly and the PIH carries
+    /// the sign-handling flag (`fs == 1`, Annex A.4.4 Table A.11).
+    #[test]
+    fn round100_fs1_luma_32x32_nl_2_2_lossless() {
+        let pixels = make_synthetic_32x32();
+        let cs = encode_planar_fs1(32, 32, 1, 0, 2, 2, 0, std::slice::from_ref(&pixels))
+            .expect("encode 32x32 luma Fs=1 NL=2/2");
+        let parsed = crate::codestream::parse(&cs).expect("parse codestream");
+        assert_eq!(parsed.pih.fs, 1, "PIH should report Fs=1");
+        let img = decode_codestream(&cs, None).expect("decode Fs=1 luma");
+        assert_eq!(img.planes[0].data, pixels, "Fs=1 luma lossless");
+    }
+
+    /// Round 100: Fs=1 with an RGB picture under the reversible colour
+    /// transform (Cpih=1) round-trips losslessly.
+    #[test]
+    fn round100_fs1_rgb_cpih1_nl_2_2_lossless() {
+        let rgb = make_synthetic_rgb_32x32();
+        let mut r = vec![0u8; 32 * 32];
+        let mut g = vec![0u8; 32 * 32];
+        let mut b = vec![0u8; 32 * 32];
+        for i in 0..32 * 32 {
+            r[i] = rgb[i * 3];
+            g[i] = rgb[i * 3 + 1];
+            b[i] = rgb[i * 3 + 2];
+        }
+        let cs = encode_planar_fs1(32, 32, 3, 1, 2, 2, 0, &[r.clone(), g.clone(), b.clone()])
+            .expect("encode RGB Fs=1 Cpih=1 NL=2/2");
+        let img = decode_codestream(&cs, None).expect("decode Fs=1 RGB");
+        assert_eq!(img.planes[0].data, r, "R lossless Fs=1");
+        assert_eq!(img.planes[1].data, g, "G lossless Fs=1");
+        assert_eq!(img.planes[2].data, b, "B lossless Fs=1");
+    }
+
+    /// Round 100: Fs=1 lossy q=2 holds the same PSNR floor as the Fs=0
+    /// path — the sign sub-packet is a lossless re-layout, not a quality
+    /// trade-off.
+    #[test]
+    fn round100_fs1_lossy_q2_psnr_floor() {
+        let pixels = make_synthetic_32x32();
+        let cs = encode_planar_fs1(32, 32, 1, 0, 2, 2, 2, std::slice::from_ref(&pixels))
+            .expect("encode 32x32 luma Fs=1 q=2");
+        let img = decode_codestream(&cs, None).expect("decode Fs=1 lossy");
+        let q = psnr(&pixels, &img.planes[0].data);
+        assert!(q >= 30.0, "Fs=1 q=2 luma PSNR {q:.2} dB below 30 dB floor");
+    }
+
+    /// Round 100: Fs=1 and Fs=0 decode to byte-identical pixels (the sign
+    /// sub-packet is just an alternative on-wire sign layout). Also checks
+    /// the two codestreams differ (the sign re-layout actually changes the
+    /// bytes) and that on a sparse-sign image the Fs=1 form is no larger.
+    #[test]
+    fn round100_fs1_matches_fs0_decode_and_is_compact() {
+        // Sparse-sign image: mostly flat with a few high-frequency spikes,
+        // so most significant code groups have several zero coefficients.
+        // Under Fs=0 each significant group still spends Ng=4 sign bits;
+        // under Fs=1 only the non-zero coefficients pay a sign bit.
+        let w = 32usize;
+        let h = 32usize;
+        let mut pixels = vec![128u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                if (x % 8 == 0) && (y % 8 == 0) {
+                    pixels[y * w + x] = if (x + y) % 16 == 0 { 200 } else { 60 };
+                }
+            }
+        }
+        let cs0 = encode_planar_lossy(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            0,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("encode Fs=0");
+        let cs1 = encode_planar_fs1(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            0,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("encode Fs=1");
+        let img0 = decode_codestream(&cs0, None).expect("decode Fs=0");
+        let img1 = decode_codestream(&cs1, None).expect("decode Fs=1");
+        assert_eq!(
+            img0.planes[0].data, img1.planes[0].data,
+            "Fs=0 and Fs=1 must decode to identical pixels"
+        );
+        assert_eq!(img0.planes[0].data, pixels, "Fs=0 lossless");
+        assert_eq!(img1.planes[0].data, pixels, "Fs=1 lossless");
+        assert_ne!(cs0, cs1, "Fs=1 re-layout must change the codestream bytes");
+        assert!(
+            cs1.len() <= cs0.len(),
+            "Fs=1 sparse-sign codestream {} must be <= Fs=0 {}",
+            cs1.len(),
+            cs0.len()
+        );
+    }
+
+    /// Round 100: the encoder rejects reserved Fs values (2/3) routed
+    /// through the inner builder.
+    #[test]
+    fn round100_rejects_reserved_fs() {
+        let pixels = vec![0u8; 16 * 8];
+        let result = encode_planar_inner_nlt(
+            16,
+            8,
+            1,
+            0,
+            1,
+            1,
+            0,
+            0,
+            &[1],
+            &[1],
+            0,
+            0,
+            0,
+            0,
+            None,
+            Vec::new(),
+            0, // cw
+            0, // sd
+            2, // fs: reserved → must reject
+            std::slice::from_ref(&pixels),
+        );
+        assert!(result.is_err(), "Fs=2 (reserved) must be rejected");
     }
 }
