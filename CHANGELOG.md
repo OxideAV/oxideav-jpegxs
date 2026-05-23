@@ -1,5 +1,41 @@
 # Changelog
 
+## Unreleased — round 108 (encoder `Qpih = 1` uniform inverse quantizer)
+
+Adds encoder support for the `Qpih = 1` inverse-quantizer type per
+ISO/IEC 21122-1:2022 Annex A.4.4 Table A.10 + Annex D.3 Table D.2. The
+decoder has supported `Qpih = 1` (the uniform / Neumann-series inverse
+quantizer) end-to-end since the early rounds (`pih.qpih` threads into
+`dequant::dequantize_precinct`, which dispatches `inverse_uniform`; the
+decoder rejects `Qpih > 1`); the encoder previously hard-coded
+`Qpih = 0` (the deadzone quantizer, Annex D.2). This round closes that
+gap on the encode side.
+
+* `encoder.rs` — **`EncodeConfig` gains a `qpih: u8` field** (default 0),
+  validated as `0` (deadzone) or `1` (uniform); reserved values 2/3 are
+  rejected to mirror the decoder's `Qpih > 1` rejection. `write_pih_body`
+  now emits `(qpih & 0x03) << 4` into the `Lh:Rl:Qpih:Fs:Rm` byte
+  (Qpih is bits 5:4) instead of leaving the field at 0.
+* **The data sub-packet is unchanged.** Both quantizer types read the
+  identical magnitude bitplanes off the wire — only the decoder's
+  reconstruction kernel differs (deadzone midpoint `(v << T) + r` vs the
+  uniform Neumann series). The encoder therefore only signals the bit;
+  no forward-quantization change is needed. At `q = 0` (`T = 0`) both
+  kernels reconstruct exactly (the Neumann series collapses to `v`
+  because the stored magnitude satisfies `v < 2^M`), so `Qpih = 1`
+  self-roundtrips losslessly and decodes byte-identically to the
+  `Qpih = 0` form (the two codestreams differ in exactly one byte — the
+  PIH quantizer-type byte). At `q > 0` the two kernels reconstruct
+  different (both valid) lossy magnitudes.
+* **New public entry point `encode_planar_qpih(width, height, nc, cpih,
+  nlx, nly, q, planes)`** — same shape as `encode_planar_lossy` but sets
+  `Qpih = 1`.
+* **Tests** — 5 new (`round108_*`): Qpih=1 luma lossless + PIH
+  `qpih == 1` assertion, Qpih=1 RGB+RCT (Cpih=1) lossless, Qpih=1 lossy
+  q=2 PSNR ≥ 30 dB floor, Qpih=1-vs-Qpih=0 lossless exactly-one-byte
+  diff (the PIH bit-4 toggle) + identical decode, and reserved-`Qpih`
+  rejection. 234 total (was 229); 0 ignored.
+
 ## Unreleased — round 103 (encoder multi-slice emission, `Hsl > 0`)
 
 Adds encoder support for multi-slice codestreams per ISO/IEC

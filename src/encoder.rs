@@ -121,6 +121,13 @@ struct EncodeConfig {
     nly: u8,
     /// Colour transformation id (`Cpih`).
     cpih: u8,
+    /// Inverse-quantizer type (`Qpih`, Annex A.4.4 Table A.10). `0` =
+    /// deadzone (Annex D.2); `1` = uniform / Neumann-series (Annex D.3).
+    /// The data sub-packet is byte-identical for both — only the decoder's
+    /// reconstruction kernel differs — so the encoder just signals the bit
+    /// and the decoder picks the matching inverse. Values 2/3 are reserved
+    /// (the decoder rejects `Qpih > 1`).
+    qpih: u8,
     /// Sign handling strategy (`Fs`, Annex A.4.4 Table A.11). `0` = signs
     /// encoded jointly with the data sub-packet (Table C.8); `1` = signs
     /// encoded in a separate sign sub-packet (Table C.9), one bit per
@@ -291,6 +298,16 @@ impl EncodeConfig {
             return Err(Error::Unsupported(format!(
                 "jpegxs encoder: Fs must be 0 (joint signs) or 1 (separate sign sub-packet), got {}",
                 self.fs
+            )));
+        }
+        // Qpih (Annex A.4.4 Table A.10): 0 = deadzone inverse quantizer
+        // (Annex D.2), 1 = uniform / Neumann-series inverse quantizer
+        // (Annex D.3). Values 2/3 are reserved and the decoder rejects
+        // `Qpih > 1`, so refuse them here too.
+        if self.qpih > 1 {
+            return Err(Error::Unsupported(format!(
+                "jpegxs encoder: Qpih must be 0 (deadzone) or 1 (uniform), got {}",
+                self.qpih
             )));
         }
         // Q range: spec allows 0..=31 in the precinct header, but per-
@@ -688,6 +705,71 @@ pub fn encode_planar_hsl(
         0,   // sd: no CWD suppression
         0,   // fs: signs jointly with data (Fs=0)
         hsl, // hsl: slice height in precinct rows
+        0,   // qpih: deadzone inverse quantizer (Qpih=0)
+        planes,
+    )
+}
+
+/// Round-108 uniform-inverse-quantizer entry point (`Qpih = 1`).
+///
+/// Same shape as [`encode_planar_lossy`] but sets the picture-header
+/// inverse-quantizer type to `Qpih = 1` (Annex A.4.4 Table A.10): the
+/// decoder reconstructs coefficients with the uniform / Neumann-series
+/// kernel of Annex D.3 instead of the deadzone kernel of Annex D.2
+/// (`Qpih = 0`).
+///
+/// The data sub-packet on the wire is byte-identical for both quantizer
+/// types — only the `Qpih` bit in the PIH `Lh:Rl:Qpih:Fs:Rm` byte changes,
+/// and the decoder picks the matching inverse from it. At `q = 0`
+/// (lossless, `T[p,b] = 0`) the deadzone reconstruction `(v << 0) + 0 = v`
+/// and the uniform reconstruction (`φ = v`, `ζ = M + 1`, the Neumann
+/// series collapses to `v` because the stored magnitude satisfies
+/// `v < 2^M`) are both exact, so `Qpih = 1` self-roundtrips losslessly and
+/// decodes byte-identically to the `Qpih = 0` form. At `q > 0` the two
+/// kernels reconstruct different (but both valid) lossy magnitudes; the
+/// uniform path replaces the deadzone midpoint `r = (1<<T)>>1` with the
+/// equal-bucket Neumann reconstruction.
+///
+/// `q` is the precinct quantization step (`0..=15`); `q = 0` is lossless
+/// and `q > 0` forces `Fq = 8` per Table A.8. The decoder has threaded
+/// `pih.qpih` into `dequantize_precinct` since the early rounds, so any
+/// output of this entry point round-trips through [`crate::decode_jpeg_xs`].
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_qpih(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    q: u8,
+    planes: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    let sx = vec![1u8; nc as usize];
+    let sy = vec![1u8; nc as usize];
+    let fq = if q == 0 { 0 } else { 8 };
+    encode_planar_inner_nlt(
+        width,
+        height,
+        nc,
+        cpih,
+        nlx,
+        nly,
+        fq,
+        q,
+        &sx,
+        &sy,
+        0,
+        0,
+        0,
+        0,
+        None,
+        Vec::new(),
+        0, // cw: single precinct column
+        0, // sd: no CWD suppression
+        0, // fs: signs jointly with data (Fs=0)
+        0, // hsl: single slice (Hsl = Np,y)
+        1, // qpih: uniform inverse quantizer (Qpih=1, Annex D.3)
         planes,
     )
 }
@@ -743,6 +825,7 @@ pub fn encode_planar_fs1(
         0, // sd
         1, // fs: separate sign sub-packet (Table C.9)
         0, // hsl: single slice (Hsl = Np,y)
+        0, // qpih: deadzone inverse quantizer (Qpih=0)
         planes,
     )
 }
@@ -800,6 +883,7 @@ pub fn encode_planar_cw(
         0,
         0, // fs: signs jointly with data (Fs=0)
         0, // hsl: single slice (Hsl = Np,y)
+        0, // qpih: deadzone inverse quantizer (Qpih=0)
         planes,
     )
 }
@@ -849,6 +933,7 @@ pub fn encode_planar_sd(
         sd,
         0, // fs: signs jointly with data (Fs=0)
         0, // hsl: single slice (Hsl = Np,y)
+        0, // qpih: deadzone inverse quantizer (Qpih=0)
         planes,
     )
 }
@@ -901,6 +986,7 @@ pub fn encode_planar_sd_rct(
         sd,
         0, // fs: signs jointly with data (Fs=0)
         0, // hsl: single slice (Hsl = Np,y)
+        0, // qpih: deadzone inverse quantizer (Qpih=0)
         planes,
     )
 }
@@ -955,6 +1041,7 @@ pub fn encode_planar_sd_star_tetrix(
         sd,
         0, // fs: signs jointly with data (Fs=0)
         0, // hsl: single slice (Hsl = Np,y)
+        0, // qpih: deadzone inverse quantizer (Qpih=0)
         planes,
     )
 }
@@ -1032,6 +1119,7 @@ pub fn encode_planar_nlt_quadratic(
         0,
         0, // fs: signs jointly with data (Fs=0)
         0, // hsl: single slice (Hsl = Np,y)
+        0, // qpih: deadzone inverse quantizer (Qpih=0)
         planes,
     )
 }
@@ -1107,6 +1195,7 @@ pub fn encode_planar_nlt_extended(
         0,
         0, // fs: signs jointly with data (Fs=0)
         0, // hsl: single slice (Hsl = Np,y)
+        0, // qpih: deadzone inverse quantizer (Qpih=0)
         planes,
     )
 }
@@ -1150,6 +1239,7 @@ fn encode_planar_inner(
         0,
         0, // fs: signs jointly with data (Fs=0)
         0, // hsl: single slice (Hsl = Np,y)
+        0, // qpih: deadzone inverse quantizer (Qpih=0)
         planes,
     )
 }
@@ -1177,6 +1267,7 @@ fn encode_planar_inner_nlt(
     sd: u8,
     fs: u8,
     hsl: u16,
+    qpih: u8,
     planes: &[Vec<u8>],
 ) -> Result<Vec<u8>> {
     let bw = if nlt.is_some() { 18 } else { 8 };
@@ -1192,6 +1283,7 @@ fn encode_planar_inner_nlt(
         nlx,
         nly,
         cpih,
+        qpih,
         fs,
         fq,
         q,
@@ -1375,10 +1467,11 @@ fn write_pih_body(out: &mut Vec<u8>, cfg: &EncodeConfig) {
     out.push(cfg.cpih & 0x0f);
     // NL,x:NL,y
     out.push(((cfg.nlx & 0x0f) << 4) | (cfg.nly & 0x0f));
-    // Lh (1) : Rl (1) : Qpih (2) : Fs (2) : Rm (2). Only Fs is non-zero
-    // here (separate sign sub-packet when cfg.fs == 1, Annex A.4.4
-    // Table A.11); Lh/Rl/Qpih/Rm stay 0.
-    out.push((cfg.fs & 0x03) << 2);
+    // Lh (1) : Rl (1) : Qpih (2) : Fs (2) : Rm (2). Qpih (bits 5:4,
+    // Annex A.4.4 Table A.10) selects the decoder's inverse-quantizer
+    // kernel (0 = deadzone, 1 = uniform); Fs (bits 3:2, Table A.11)
+    // selects sign handling. Lh/Rl/Rm stay 0.
+    out.push(((cfg.qpih & 0x03) << 4) | ((cfg.fs & 0x03) << 2));
 }
 
 /// Resolve the `Hsl` field (slice height in precinct rows) emitted in
@@ -4540,6 +4633,7 @@ mod tests {
             0, // sd
             0, // fs
             0, // hsl
+            0, // qpih
             &[y_plane.clone(), u_plane.clone(), v_plane.clone()],
         )
         .expect("encode 64x8 4:2:2 Cw=1 NL=1/1");
@@ -5002,6 +5096,7 @@ mod tests {
             0, // sd
             2, // fs: reserved → must reject
             0, // hsl
+            0, // qpih
             std::slice::from_ref(&pixels),
         );
         assert!(result.is_err(), "Fs=2 (reserved) must be rejected");
@@ -5205,5 +5300,143 @@ mod tests {
             std::slice::from_ref(&pixels),
         );
         assert!(result.is_err(), "Hsl > Np,y must be rejected");
+    }
+
+    // === Round 108: Qpih=1 uniform inverse quantizer (Annex D.3) ========
+
+    /// Round 108: Qpih=1 luma round-trips losslessly and the PIH carries
+    /// the inverse-quantizer type (`qpih == 1`, Annex A.4.4 Table A.10).
+    /// At q=0 (T=0) both the deadzone and uniform kernels reconstruct
+    /// exactly, so the uniform path is lossless.
+    #[test]
+    fn round108_qpih1_luma_32x32_nl_2_2_lossless() {
+        let pixels = make_synthetic_32x32();
+        let cs = encode_planar_qpih(32, 32, 1, 0, 2, 2, 0, std::slice::from_ref(&pixels))
+            .expect("encode 32x32 luma Qpih=1 NL=2/2");
+        let parsed = crate::codestream::parse(&cs).expect("parse codestream");
+        assert_eq!(parsed.pih.qpih, 1, "PIH should report Qpih=1");
+        let img = decode_codestream(&cs, None).expect("decode Qpih=1 luma");
+        assert_eq!(img.planes[0].data, pixels, "Qpih=1 luma lossless");
+    }
+
+    /// Round 108: Qpih=1 with an RGB picture under the reversible colour
+    /// transform (Cpih=1) round-trips losslessly.
+    #[test]
+    fn round108_qpih1_rgb_cpih1_nl_2_2_lossless() {
+        let rgb = make_synthetic_rgb_32x32();
+        let mut r = vec![0u8; 32 * 32];
+        let mut g = vec![0u8; 32 * 32];
+        let mut b = vec![0u8; 32 * 32];
+        for i in 0..32 * 32 {
+            r[i] = rgb[i * 3];
+            g[i] = rgb[i * 3 + 1];
+            b[i] = rgb[i * 3 + 2];
+        }
+        let cs = encode_planar_qpih(32, 32, 3, 1, 2, 2, 0, &[r.clone(), g.clone(), b.clone()])
+            .expect("encode RGB Qpih=1 Cpih=1 NL=2/2");
+        let parsed = crate::codestream::parse(&cs).expect("parse codestream");
+        assert_eq!(parsed.pih.qpih, 1, "PIH should report Qpih=1");
+        let img = decode_codestream(&cs, None).expect("decode Qpih=1 RGB");
+        assert_eq!(img.planes[0].data, r, "R lossless Qpih=1");
+        assert_eq!(img.planes[1].data, g, "G lossless Qpih=1");
+        assert_eq!(img.planes[2].data, b, "B lossless Qpih=1");
+    }
+
+    /// Round 108: Qpih=1 lossy q=2 reconstructs through the uniform /
+    /// Neumann-series kernel (Annex D.3) and holds a PSNR floor. The
+    /// uniform kernel is a valid lossy reconstruction; it does not need to
+    /// match the deadzone PSNR, only stay above a sane floor.
+    #[test]
+    fn round108_qpih1_lossy_q2_psnr_floor() {
+        let pixels = make_synthetic_32x32();
+        let cs = encode_planar_qpih(32, 32, 1, 0, 2, 2, 2, std::slice::from_ref(&pixels))
+            .expect("encode 32x32 luma Qpih=1 q=2");
+        let parsed = crate::codestream::parse(&cs).expect("parse codestream");
+        assert_eq!(parsed.pih.qpih, 1, "PIH should report Qpih=1");
+        let img = decode_codestream(&cs, None).expect("decode Qpih=1 lossy");
+        let q = psnr(&pixels, &img.planes[0].data);
+        assert!(
+            q >= 30.0,
+            "Qpih=1 q=2 luma PSNR {q:.2} dB below 30 dB floor"
+        );
+    }
+
+    /// Round 108: at q=0 (lossless) the only on-wire difference between
+    /// Qpih=1 and Qpih=0 is the PIH `Lh:Rl:Qpih:Fs:Rm` byte — the data
+    /// sub-packet is byte-identical because the same magnitude bitplanes
+    /// are emitted. So the two codestreams differ in exactly one byte (the
+    /// PIH quantizer-type byte) and decode to identical pixels.
+    #[test]
+    fn round108_qpih1_vs_qpih0_lossless_one_byte_diff() {
+        let pixels = make_synthetic_32x32();
+        let cs0 = encode_planar_lossy(32, 32, 1, 0, 2, 2, 0, std::slice::from_ref(&pixels))
+            .expect("encode Qpih=0");
+        let cs1 = encode_planar_qpih(32, 32, 1, 0, 2, 2, 0, std::slice::from_ref(&pixels))
+            .expect("encode Qpih=1");
+        assert_eq!(
+            cs0.len(),
+            cs1.len(),
+            "Qpih only flips a header bit; lengths must match"
+        );
+        let diffs: Vec<usize> = cs0
+            .iter()
+            .zip(cs1.iter())
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            diffs.len(),
+            1,
+            "Qpih=0 vs Qpih=1 lossless must differ in exactly one byte, differ at {diffs:?}"
+        );
+        // The single differing byte is the PIH quantizer-type byte: bit 4
+        // (Qpih LSB) is set in the Qpih=1 stream and clear in Qpih=0.
+        let d = diffs[0];
+        assert_eq!(
+            cs1[d] ^ cs0[d],
+            0x10,
+            "the differing byte must toggle exactly the Qpih bit (bit 4)"
+        );
+        let img0 = decode_codestream(&cs0, None).expect("decode Qpih=0");
+        let img1 = decode_codestream(&cs1, None).expect("decode Qpih=1");
+        assert_eq!(
+            img0.planes[0].data, img1.planes[0].data,
+            "Qpih=0 and Qpih=1 lossless must decode to identical pixels"
+        );
+        assert_eq!(img1.planes[0].data, pixels, "Qpih=1 lossless");
+    }
+
+    /// Round 108: the encoder rejects reserved Qpih values (2/3) routed
+    /// through the inner builder — the decoder rejects `Qpih > 1` so the
+    /// encoder must never emit them.
+    #[test]
+    fn round108_rejects_reserved_qpih() {
+        let pixels = vec![0u8; 16 * 8];
+        let result = encode_planar_inner_nlt(
+            16,
+            8,
+            1,
+            0,
+            1,
+            1,
+            0,
+            0,
+            &[1],
+            &[1],
+            0,
+            0,
+            0,
+            0,
+            None,
+            Vec::new(),
+            0, // cw
+            0, // sd
+            0, // fs
+            0, // hsl
+            2, // qpih: reserved → must reject
+            std::slice::from_ref(&pixels),
+        );
+        assert!(result.is_err(), "Qpih=2 (reserved) must be rejected");
     }
 }
