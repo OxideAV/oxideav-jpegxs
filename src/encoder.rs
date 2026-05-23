@@ -170,6 +170,17 @@ struct EncodeConfig {
     /// suppressed components through raw single-band (β=0) per-line
     /// packets after the wavelet packets.
     sd: u8,
+    /// Slice height in precinct rows (`Hsl`, PIH §A.4.4, signalled in the
+    /// picture header per Annex B.10). `0` means a single slice spanning
+    /// the whole picture (`Hsl = Np,y`), which is the only mode supported
+    /// through round 100. `hsl > 0` groups the `Np,y` precinct rows into
+    /// `⌈Np,y / Hsl⌉` slices of `Hsl` precinct rows each (the last slice
+    /// is shorter when `Np,y` is not a multiple of `Hsl`), emitting one
+    /// SLH marker per slice with `Yslh = t` (the slice's top-down order).
+    /// Vertical prediction is already precinct-scoped in this encoder, so
+    /// slice boundaries fall cleanly between precinct rows with no
+    /// cross-slice predictor state to reset (Annex B.10).
+    hsl: u16,
 }
 
 impl EncodeConfig {
@@ -411,6 +422,19 @@ impl EncodeConfig {
             // for picking Cw such that the rightmost precinct also has
             // reasonable width.
         }
+        // Hsl > 0 — slice height in precinct rows (Annex B.10). A value
+        // exceeding Np,y is meaningless: it would describe a single slice
+        // that extends past the last precinct row. Np,y = ⌈Hf / 2^NL,y⌉.
+        if self.hsl != 0 {
+            let hp_pow = 1u32 << self.nly;
+            let np_y = (self.height as u32).div_ceil(hp_pow);
+            if (self.hsl as u32) > np_y {
+                return Err(Error::invalid(format!(
+                    "jpegxs encoder: Hsl={} exceeds the {} precinct rows (Np,y) for height={} NL,y={} (Annex B.10)",
+                    self.hsl, np_y, self.height, self.nly
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -604,6 +628,70 @@ pub fn encode_planar_lossy(
     )
 }
 
+/// Round-103 multi-slice 4:4:4 entry point (`Hsl > 0`).
+///
+/// Same shape as [`encode_planar_lossy`] but takes an explicit slice
+/// height `hsl` in precinct rows (PIH `Hsl`, signalled per Annex B.10).
+/// `hsl = 0` reduces to the single-slice layout (`Hsl = Np,y`, the whole
+/// picture in one slice — bit-equivalent to [`encode_planar_lossy`]).
+/// `hsl > 0` partitions the `Np,y = ⌈Hf / 2^NL,y⌉` precinct rows into
+/// `⌈Np,y / hsl⌉` slices of `hsl` precinct rows each (the last slice is
+/// shorter when `Np,y` is not a multiple of `hsl`), emitting one SLH
+/// marker per slice (Annex A.4.12 Table A.25) with `Yslh = t` — the
+/// slice's top-down order, counting from 0 at the top of the image.
+///
+/// Slices decode independently: the decoder reconstructs the identical
+/// precinct-to-slice grouping from PIH `Hsl` + `Np,y`
+/// ([`crate::slice_walker`] Annex B.10), so any output round-trips
+/// through [`crate::decode_jpeg_xs`]. Vertical prediction is precinct-
+/// scoped in this encoder, so slice boundaries carry no predictor state
+/// across them (Annex B.10 requires vertical prediction be disabled
+/// across slice boundaries — satisfied trivially here because no
+/// predictor crosses a precinct row in the first place).
+///
+/// `hsl` must be `<= Np,y` (a larger value would describe a single slice
+/// running past the last precinct row). `q` is the precinct quantization
+/// step (`0..=15`); `q = 0` is lossless and `q > 0` forces `Fq = 8`.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_hsl(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    q: u8,
+    hsl: u16,
+    planes: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    let sx = vec![1u8; nc as usize];
+    let sy = vec![1u8; nc as usize];
+    let fq = if q == 0 { 0 } else { 8 };
+    encode_planar_inner_nlt(
+        width,
+        height,
+        nc,
+        cpih,
+        nlx,
+        nly,
+        fq,
+        q,
+        &sx,
+        &sy,
+        0,
+        0,
+        0,
+        0,
+        None,
+        Vec::new(),
+        0,   // cw: single precinct column
+        0,   // sd: no CWD suppression
+        0,   // fs: signs jointly with data (Fs=0)
+        hsl, // hsl: slice height in precinct rows
+        planes,
+    )
+}
+
 /// Round-100 separate-sign-sub-packet entry point (`Fs = 1`).
 ///
 /// Same shape as [`encode_planar_lossy`] but sets the picture-header sign
@@ -654,6 +742,7 @@ pub fn encode_planar_fs1(
         0, // cw
         0, // sd
         1, // fs: separate sign sub-packet (Table C.9)
+        0, // hsl: single slice (Hsl = Np,y)
         planes,
     )
 }
@@ -710,6 +799,7 @@ pub fn encode_planar_cw(
         cw,
         0,
         0, // fs: signs jointly with data (Fs=0)
+        0, // hsl: single slice (Hsl = Np,y)
         planes,
     )
 }
@@ -758,6 +848,7 @@ pub fn encode_planar_sd(
         0, // cw
         sd,
         0, // fs: signs jointly with data (Fs=0)
+        0, // hsl: single slice (Hsl = Np,y)
         planes,
     )
 }
@@ -809,6 +900,7 @@ pub fn encode_planar_sd_rct(
         0, // cw
         sd,
         0, // fs: signs jointly with data (Fs=0)
+        0, // hsl: single slice (Hsl = Np,y)
         planes,
     )
 }
@@ -862,6 +954,7 @@ pub fn encode_planar_sd_star_tetrix(
         0, // cw
         sd,
         0, // fs: signs jointly with data (Fs=0)
+        0, // hsl: single slice (Hsl = Np,y)
         planes,
     )
 }
@@ -938,6 +1031,7 @@ pub fn encode_planar_nlt_quadratic(
         0,
         0,
         0, // fs: signs jointly with data (Fs=0)
+        0, // hsl: single slice (Hsl = Np,y)
         planes,
     )
 }
@@ -1012,6 +1106,7 @@ pub fn encode_planar_nlt_extended(
         0,
         0,
         0, // fs: signs jointly with data (Fs=0)
+        0, // hsl: single slice (Hsl = Np,y)
         planes,
     )
 }
@@ -1054,6 +1149,7 @@ fn encode_planar_inner(
         0,
         0,
         0, // fs: signs jointly with data (Fs=0)
+        0, // hsl: single slice (Hsl = Np,y)
         planes,
     )
 }
@@ -1080,6 +1176,7 @@ fn encode_planar_inner_nlt(
     cw: u16,
     sd: u8,
     fs: u8,
+    hsl: u16,
     planes: &[Vec<u8>],
 ) -> Result<Vec<u8>> {
     let bw = if nlt.is_some() { 18 } else { 8 };
@@ -1108,6 +1205,7 @@ fn encode_planar_inner_nlt(
         band_gains,
         cw,
         sd,
+        hsl,
     };
     cfg.validate()?;
     // Build per-band gains after validation so beta_key is called with
@@ -1261,9 +1359,12 @@ fn write_pih_body(out: &mut Vec<u8>, cfg: &EncodeConfig) {
     out.extend_from_slice(&cfg.width.to_be_bytes());
     out.extend_from_slice(&cfg.height.to_be_bytes());
     out.extend_from_slice(&cfg.cw.to_be_bytes()); // Cw (0 = full-width precincts)
-    let hp_pow = 1u32 << cfg.nly;
-    let np_y = (cfg.height as u32).div_ceil(hp_pow);
-    out.extend_from_slice(&(np_y as u16).to_be_bytes()); // Hsl = Np_y
+                                                  // Hsl — slice height in precinct rows (Annex B.10). cfg.hsl == 0 is
+                                                  // the single-slice default (Hsl = Np,y, the whole picture in one
+                                                  // slice); a non-zero cfg.hsl groups the precinct rows into
+                                                  // ⌈Np,y / Hsl⌉ slices and is emitted verbatim.
+    let hsl_field = effective_hsl(cfg);
+    out.extend_from_slice(&hsl_field.to_be_bytes()); // Hsl
     out.push(cfg.nc);
     out.push(cfg.ng);
     out.push(cfg.ss);
@@ -1278,6 +1379,20 @@ fn write_pih_body(out: &mut Vec<u8>, cfg: &EncodeConfig) {
     // here (separate sign sub-packet when cfg.fs == 1, Annex A.4.4
     // Table A.11); Lh/Rl/Qpih/Rm stay 0.
     out.push((cfg.fs & 0x03) << 2);
+}
+
+/// Resolve the `Hsl` field (slice height in precinct rows) emitted in
+/// the PIH. `cfg.hsl == 0` means "single slice covering the whole
+/// picture", which on the wire is `Hsl = Np,y`. Otherwise the caller's
+/// value is used verbatim (validated `<= Np,y` in [`EncodeConfig::validate`]).
+fn effective_hsl(cfg: &EncodeConfig) -> u16 {
+    let hp_pow = 1u32 << cfg.nly;
+    let np_y = (cfg.height as u32).div_ceil(hp_pow) as u16;
+    if cfg.hsl == 0 {
+        np_y
+    } else {
+        cfg.hsl
+    }
 }
 
 /// Number of wavelet filter types `Nβ` per Annex B.3.
@@ -1538,11 +1653,6 @@ fn pow_h(nly: u8, dy: u32) -> usize {
 }
 
 fn write_slice(out: &mut Vec<u8>, cfg: &EncodeConfig, planes_u8: &[Vec<u8>]) -> Result<()> {
-    // SLH — Lslh = 4, Yslh = 0 (single slice covers the whole picture).
-    out.extend_from_slice(&[0xff, 0x20]);
-    out.extend_from_slice(&4u16.to_be_bytes());
-    out.extend_from_slice(&0u16.to_be_bytes());
-
     let w = cfg.width as usize;
     let h = cfg.height as usize;
     let nc = cfg.nc as usize;
@@ -1642,6 +1752,25 @@ fn write_slice(out: &mut Vec<u8>, cfg: &EncodeConfig, planes_u8: &[Vec<u8>]) -> 
     let hp_pow = 1u32 << nly;
     let np_y = (h as u32).div_ceil(hp_pow) as usize;
 
+    // Slice grouping per Annex B.10: precinct rows are partitioned into
+    // ⌈Np,y / Hsl⌉ slices of `hsl_rows` rows each (the last slice is
+    // shorter when Np,y is not a multiple of Hsl). Each slice gets its
+    // own SLH marker (Yslh = t, the top-down slice order). cfg.hsl == 0
+    // is the legacy single-slice mode (hsl_rows = Np,y → one slice). The
+    // decoder reconstructs the identical grouping from PIH Hsl + Np,y
+    // (slice_walker::build_plan), so the encoder only has to emit the
+    // markers at the matching precinct-row boundaries. Vertical
+    // prediction is precinct-scoped in this encoder (the M-top cache in
+    // encode_precinct_cascade is local to one precinct), so no cross-
+    // slice predictor state needs resetting at the boundaries.
+    let hsl_rows: usize = if cfg.hsl == 0 { np_y } else { cfg.hsl as usize };
+    // SLH writer: Lslh = 4, body = Yslh (u16). Annex A.4.12 Table A.25.
+    let write_slh = |out: &mut Vec<u8>, t: u16| {
+        out.extend_from_slice(&[0xff, 0x20]);
+        out.extend_from_slice(&4u16.to_be_bytes());
+        out.extend_from_slice(&t.to_be_bytes());
+    };
+
     // 3) Per-component forward DWT.
     //    The decoder picks per-precinct streaming synthesis at NL=1/1
     //    single-column and gather-then-cascade otherwise. The encoder
@@ -1677,23 +1806,39 @@ fn write_slice(out: &mut Vec<u8>, cfg: &EncodeConfig, planes_u8: &[Vec<u8>]) -> 
         // DC-biased so the values fed into the entropy coder match the
         // dynamic range the decoder dequant path will produce when
         // copying straight back into the sample plane.
-        for py in 0..np_y {
-            for px in 0..np_x {
-                let pbytes =
-                    encode_precinct_cascade(cfg, &bands_per_comp, &comp_planes, py, px, cs)?;
-                out.extend_from_slice(&pbytes);
+        let mut t: u16 = 0;
+        let mut py_start = 0usize;
+        while py_start < np_y {
+            let py_end = (py_start + hsl_rows).min(np_y);
+            write_slh(out, t);
+            for py in py_start..py_end {
+                for px in 0..np_x {
+                    let pbytes =
+                        encode_precinct_cascade(cfg, &bands_per_comp, &comp_planes, py, px, cs)?;
+                    out.extend_from_slice(&pbytes);
+                }
             }
+            py_start = py_end;
+            t += 1;
         }
     } else {
         // NL=1/1 streaming per-precinct path. Handles 4:4:4 and chroma-
         // sub-sampled cases with a per-component effective NL,y and a
         // per-component precinct row range.
-        for py in 0..np_y {
-            let y0 = py * (hp_pow as usize);
-            let y1 = (y0 + hp_pow as usize).min(h);
-            let hp_real = y1 - y0;
-            let pbytes = encode_precinct_single_level(cfg, &comp_planes, y0, y1, hp_real)?;
-            out.extend_from_slice(&pbytes);
+        let mut t: u16 = 0;
+        let mut py_start = 0usize;
+        while py_start < np_y {
+            let py_end = (py_start + hsl_rows).min(np_y);
+            write_slh(out, t);
+            for py in py_start..py_end {
+                let y0 = py * (hp_pow as usize);
+                let y1 = (y0 + hp_pow as usize).min(h);
+                let hp_real = y1 - y0;
+                let pbytes = encode_precinct_single_level(cfg, &comp_planes, y0, y1, hp_real)?;
+                out.extend_from_slice(&pbytes);
+            }
+            py_start = py_end;
+            t += 1;
         }
     }
     Ok(())
@@ -4394,6 +4539,7 @@ mod tests {
             1, // cw
             0, // sd
             0, // fs
+            0, // hsl
             &[y_plane.clone(), u_plane.clone(), v_plane.clone()],
         )
         .expect("encode 64x8 4:2:2 Cw=1 NL=1/1");
@@ -4855,8 +5001,209 @@ mod tests {
             0, // cw
             0, // sd
             2, // fs: reserved → must reject
+            0, // hsl
             std::slice::from_ref(&pixels),
         );
         assert!(result.is_err(), "Fs=2 (reserved) must be rejected");
+    }
+
+    // === Round 103: multi-slice emission (Hsl > 0, Annex B.10) ==========
+
+    /// A smooth-ish gradient picture for the multi-slice round-trips.
+    fn round103_grad(w: usize, h: usize) -> Vec<u8> {
+        let mut p = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                p[y * w + x] = (((x * 5 + y * 3) ^ (x * y)) & 0xff) as u8;
+            }
+        }
+        p
+    }
+
+    /// Multi-slice luma: 32×32 at NL=2/2 → Hp=4, Np,y=8 precinct rows.
+    /// Hsl=2 partitions those into 4 slices. Self-roundtrips losslessly,
+    /// emits exactly 4 SLH markers, and the PIH carries Hsl=2.
+    #[test]
+    fn round103_hsl2_luma_32x32_nl_2_2_four_slices_lossless() {
+        let w = 32usize;
+        let h = 32usize;
+        let pixels = round103_grad(w, h);
+        let cs = encode_planar_hsl(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            0,
+            2, // hsl = 2 precinct rows per slice
+            std::slice::from_ref(&pixels),
+        )
+        .expect("encode 32x32 luma Hsl=2");
+        // Parse: PIH must carry Hsl=2, and the codestream must hold 4 slices.
+        let parsed = crate::codestream::parse(&cs).expect("parse codestream");
+        assert_eq!(parsed.pih.hsl, 2, "PIH Hsl must be 2");
+        assert_eq!(parsed.slices.len(), 4, "Np,y=8 / Hsl=2 → 4 slices");
+        let img = decode_codestream(&cs, None).expect("decode 32x32 luma Hsl=2");
+        assert_eq!(
+            img.planes[0].data, pixels,
+            "multi-slice luma must be lossless"
+        );
+    }
+
+    /// Multi-slice RGB + RCT (Cpih=1): 16×24 at NL=2/2 → Np,y=6, Hsl=3 →
+    /// 2 slices. Self-roundtrips losslessly across the slice boundary.
+    #[test]
+    fn round103_hsl3_rgb_rct_16x24_nl_2_2_two_slices_lossless() {
+        let w = 16usize;
+        let h = 24usize;
+        let r = round103_grad(w, h);
+        let g: Vec<u8> = r.iter().map(|&v| v.wrapping_add(40)).collect();
+        let b: Vec<u8> = r.iter().map(|&v| v.wrapping_sub(20)).collect();
+        let planes = [r.clone(), g.clone(), b.clone()];
+        let cs = encode_planar_hsl(w as u16, h as u16, 3, 1, 2, 2, 0, 3, &planes)
+            .expect("encode 16x24 RGB+RCT Hsl=3");
+        let parsed = crate::codestream::parse(&cs).expect("parse codestream");
+        assert_eq!(parsed.pih.hsl, 3, "PIH Hsl must be 3");
+        assert_eq!(parsed.slices.len(), 2, "Np,y=6 / Hsl=3 → 2 slices");
+        let img = decode_codestream(&cs, None).expect("decode RGB+RCT Hsl=3");
+        assert_eq!(img.planes[0].data, r, "R plane lossless");
+        assert_eq!(img.planes[1].data, g, "G plane lossless");
+        assert_eq!(img.planes[2].data, b, "B plane lossless");
+    }
+
+    /// Multi-slice lossy q=2 must still hold the per-codec PSNR floor.
+    #[test]
+    fn round103_hsl2_lossy_q2_psnr_floor() {
+        let w = 32usize;
+        let h = 32usize;
+        let pixels = round103_grad(w, h);
+        let cs = encode_planar_hsl(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            2, // q = 2
+            2, // hsl = 2
+            std::slice::from_ref(&pixels),
+        )
+        .expect("encode 32x32 luma Hsl=2 q=2");
+        let img = decode_codestream(&cs, None).expect("decode Hsl=2 q=2");
+        let p = psnr(&pixels, &img.planes[0].data);
+        assert!(
+            p >= 30.0,
+            "multi-slice lossy q=2 PSNR {p:.2} dB < 30 dB floor"
+        );
+    }
+
+    /// `hsl = 0` is the single-slice default and is byte-identical to
+    /// [`encode_planar_lossy`]; `hsl = Np,y` (the full picture in one
+    /// slice) is also byte-identical (one slice either way).
+    #[test]
+    fn round103_hsl0_and_hsl_full_match_single_slice() {
+        let w = 24usize;
+        let h = 16usize;
+        let pixels = round103_grad(w, h);
+        // NL=2/2 → Hp=4, Np,y = ⌈16/4⌉ = 4.
+        let baseline = encode_planar_lossy(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            0,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("baseline encode");
+        let hsl0 = encode_planar_hsl(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            0,
+            0, // hsl = 0 → single slice
+            std::slice::from_ref(&pixels),
+        )
+        .expect("hsl=0 encode");
+        let hsl_full = encode_planar_hsl(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            0,
+            4, // hsl = Np,y → single slice
+            std::slice::from_ref(&pixels),
+        )
+        .expect("hsl=Np,y encode");
+        assert_eq!(
+            hsl0, baseline,
+            "hsl=0 must be byte-identical to encode_planar_lossy"
+        );
+        // hsl=Np,y produces one slice too; only the PIH Hsl field differs
+        // from hsl=0 (Np,y vs Np,y — actually identical since hsl=0 emits
+        // Hsl=Np,y). So hsl_full must also equal the baseline.
+        assert_eq!(
+            hsl_full, baseline,
+            "hsl=Np,y must be byte-identical (one slice)"
+        );
+        let img = decode_codestream(&hsl0, None).expect("decode hsl=0");
+        assert_eq!(img.planes[0].data, pixels, "hsl=0 lossless");
+    }
+
+    /// Non-divisible Np,y: the last slice is shorter. 20-tall picture at
+    /// NL=2/2 → Hp=4, Np,y = ⌈20/4⌉ = 5; Hsl=2 → slices of 2, 2, 1 rows.
+    #[test]
+    fn round103_hsl2_non_divisible_last_slice_shorter() {
+        let w = 16usize;
+        let h = 20usize;
+        let pixels = round103_grad(w, h);
+        let cs = encode_planar_hsl(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            0,
+            2, // hsl = 2; Np,y = 5 → slices 2,2,1
+            std::slice::from_ref(&pixels),
+        )
+        .expect("encode 16x20 luma Hsl=2");
+        let parsed = crate::codestream::parse(&cs).expect("parse codestream");
+        assert_eq!(parsed.slices.len(), 3, "Np,y=5 / Hsl=2 → 3 slices (2,2,1)");
+        let img = decode_codestream(&cs, None).expect("decode 16x20 luma Hsl=2");
+        assert_eq!(
+            img.planes[0].data, pixels,
+            "non-divisible multi-slice lossless"
+        );
+    }
+
+    /// `hsl` exceeding the precinct-row count is rejected (would describe
+    /// a single slice running past the last precinct row, Annex B.10).
+    #[test]
+    fn round103_rejects_hsl_exceeding_np_y() {
+        let w = 16usize;
+        let h = 16usize;
+        let pixels = round103_grad(w, h);
+        // NL=2/2 → Np,y = ⌈16/4⌉ = 4; Hsl=5 is out of range.
+        let result = encode_planar_hsl(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            0,
+            5, // hsl > Np,y
+            std::slice::from_ref(&pixels),
+        );
+        assert!(result.is_err(), "Hsl > Np,y must be rejected");
     }
 }

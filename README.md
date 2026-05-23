@@ -12,7 +12,7 @@ framework but usable standalone.
 | Direction | Status |
 | --- | --- |
 | Decoder | working — multi-component, **multi-precinct-per-row (Cw ≥ 0)** subset (rounds 1–8) + **Sd > 0 (CWD, Annex A.4.7)** decomposition suppression (round 9) |
-| Encoder | Round 100 — luma + RGB 4:4:4 / 4:2:2 / 4:2:0 + 4-component CFA Star-Tetrix, Cpih ∈ {0, 1, 3}, **NL_x ∈ {1..=8} / NL_y ∈ {0..=NL_x}** (spec Annex A.4.4 Table A.7 hard max), **Cw ≥ 0** (`Cs = 8 × Cw × max(sx) × 2^NL,x` per Annex B.5, Np,x = ⌈Wf / Cs⌉ precincts per row), **Sd ∈ 0..Nc-1 (CWD, Annex A.4.7) with Nc up to 8 when Sd>0, composes with Cpih ∈ {1, 3}** (Annex F.2 Table F.1: RCT operand window `c < 3`, Star-Tetrix operand window `c < 4`; encoder validates `Nc - Sd >= 3 / 4`), odd dims, Dr ∈ {0, 1} VLC + raw picker with no-prediction (Table C.14) **and vertical-prediction (Table C.13)** sub-modes, **Fs ∈ {0, 1} sign handling (Annex A.4.4 Table A.11)** — joint signs in the data sub-packet (Table C.8) or a **separate sign sub-packet (Annex C.5.5, Table C.9, one bit per non-zero coefficient)** via `encode_planar_fs1`, **significance coding (D[p,b] bit 1, Annex C.5)** gating zero significance groups, **per-band gain-weighted Q** (`T[p,b] = clamp(Q−G[b], 0, 15)`, G ∈ {0,1,2}), **NLT quadratic forward map** (Annex G.4, Tnlt=1, Bw=18) via `encode_planar_nlt_quadratic`, **NLT extended forward map** (Annex G.5, Tnlt=2, three-segment gamma, Bw=18) via `encode_planar_nlt_extended` with reverse LUT inverter, Fq ∈ {0, 8} lossy with Q ∈ 0..=15. Self-roundtrip ∞ dB lossless at NL=3/3, 4/4, 5/5, 6/6 and Sd=1 Nc=4 / Sd=2 Nc=5 lossless; **Sd=1 Nc=4 + RCT** and **Sd=2 Nc=5 + RCT** and **Sd=1 Nc=5 + Star-Tetrix** self-roundtrip losslessly; **Fs=1 luma + RGB+RCT self-roundtrip losslessly** (decodes byte-identical to the Fs=0 layout, no larger on sparse-sign content); PSNR ≥ 40 dB at q=1, ≥ 30 dB at Sd=1 q=2 and at Fs=1 q=2, ≥ 25 dB at Sd=1+Cpih=1 q=2 and at q=4; NLT extended PSNR ≥ 30 dB at q=0, ≥ 25 dB at q=2; Cw=1 64×16 luma at NL=1/1 and NL=2/2 + Cw=2 128×32 RGB+RCT NL=2/2 + Cw=1 4:2:2 round-trip bit-exact |
+| Encoder | Round 103 — luma + RGB 4:4:4 / 4:2:2 / 4:2:0 + 4-component CFA Star-Tetrix, Cpih ∈ {0, 1, 3}, **NL_x ∈ {1..=8} / NL_y ∈ {0..=NL_x}** (spec Annex A.4.4 Table A.7 hard max), **Cw ≥ 0** (`Cs = 8 × Cw × max(sx) × 2^NL,x` per Annex B.5, Np,x = ⌈Wf / Cs⌉ precincts per row), **multi-slice Hsl ≥ 0** (Annex B.10 — `Hsl > 0` groups the `Np,y` precinct rows into `⌈Np,y / Hsl⌉` slices, one SLH per slice with `Yslh = t`, via `encode_planar_hsl`; `Hsl = 0` is the single-slice default), **Sd ∈ 0..Nc-1 (CWD, Annex A.4.7) with Nc up to 8 when Sd>0, composes with Cpih ∈ {1, 3}** (Annex F.2 Table F.1: RCT operand window `c < 3`, Star-Tetrix operand window `c < 4`; encoder validates `Nc - Sd >= 3 / 4`), odd dims, Dr ∈ {0, 1} VLC + raw picker with no-prediction (Table C.14) **and vertical-prediction (Table C.13)** sub-modes, **Fs ∈ {0, 1} sign handling (Annex A.4.4 Table A.11)** — joint signs in the data sub-packet (Table C.8) or a **separate sign sub-packet (Annex C.5.5, Table C.9, one bit per non-zero coefficient)** via `encode_planar_fs1`, **significance coding (D[p,b] bit 1, Annex C.5)** gating zero significance groups, **per-band gain-weighted Q** (`T[p,b] = clamp(Q−G[b], 0, 15)`, G ∈ {0,1,2}), **NLT quadratic forward map** (Annex G.4, Tnlt=1, Bw=18) via `encode_planar_nlt_quadratic`, **NLT extended forward map** (Annex G.5, Tnlt=2, three-segment gamma, Bw=18) via `encode_planar_nlt_extended` with reverse LUT inverter, Fq ∈ {0, 8} lossy with Q ∈ 0..=15. Self-roundtrip ∞ dB lossless at NL=3/3, 4/4, 5/5, 6/6 and Sd=1 Nc=4 / Sd=2 Nc=5 lossless; **Sd=1 Nc=4 + RCT** and **Sd=2 Nc=5 + RCT** and **Sd=1 Nc=5 + Star-Tetrix** self-roundtrip losslessly; **Fs=1 luma + RGB+RCT self-roundtrip losslessly** (decodes byte-identical to the Fs=0 layout, no larger on sparse-sign content); **multi-slice Hsl=2 luma (4 slices) + Hsl=3 RGB+RCT (2 slices) + non-divisible Np,y (2,2,1) self-roundtrip losslessly**; PSNR ≥ 40 dB at q=1, ≥ 30 dB at Sd=1 q=2 and at Fs=1 q=2 and at Hsl=2 q=2, ≥ 25 dB at Sd=1+Cpih=1 q=2 and at q=4; NLT extended PSNR ≥ 30 dB at q=0, ≥ 25 dB at q=2; Cw=1 64×16 luma at NL=1/1 and NL=2/2 + Cw=2 128×32 RGB+RCT NL=2/2 + Cw=1 4:2:2 round-trip bit-exact |
 
 End-to-end decoder for the multi-component, single-precinct-row
 subset of ISO/IEC 21122-1:2022. Supports:
@@ -107,6 +107,21 @@ Public API:
   form wastes `Ng = 4` sign bits per significant code group regardless
   of how many coefficients are non-zero). The decoder has threaded
   `pih.fs` end-to-end since the early rounds.
+* `oxideav_jpegxs::encoder::encode_planar_hsl(width, height, nc, cpih,
+  nlx, nly, q, hsl, &[Vec<u8>]) -> Result<Vec<u8>>` — round-103
+  multi-slice entry point. `hsl` is the slice height in precinct rows
+  (PIH `Hsl`, Annex B.10); `hsl = 0` is the single-slice default
+  (`Hsl = Np,y`, byte-identical to `encode_planar_lossy`). `hsl > 0`
+  partitions the `Np,y = ⌈Hf / 2^NL,y⌉` precinct rows into
+  `⌈Np,y / hsl⌉` slices of `hsl` rows each (the last slice is shorter
+  when `Np,y` is not a multiple of `hsl`), emitting one SLH marker per
+  slice (Annex A.4.12 Table A.25) with `Yslh = t` (top-down slice
+  order). Rejects `hsl > Np,y`. The decoder reconstructs the identical
+  grouping from PIH `Hsl` + `Np,y` (slice walker, Annex B.10), so the
+  output round-trips. Vertical prediction is precinct-scoped in this
+  encoder, so slice boundaries carry no cross-slice predictor state
+  (Annex B.10 disable-across-boundaries requirement is satisfied
+  trivially).
 * `oxideav_jpegxs::encode_planar_cw(width, height, nc, cpih, nlx, nly,
   q, cw, &[Vec<u8>]) -> Result<Vec<u8>>` — round-8 multi-precinct-per-
   row 4:4:4 entry point. `cw` controls the precinct-width parameter
@@ -194,7 +209,9 @@ Modules:
   and 1-D horizontal DWT for nly_i=0 chroma; asymmetric decomposition
   `NL_y ≤ NL_x`; Fs=0 joint-sign data sub-packet (Table C.8) or Fs=1
   separate sign sub-packet (Annex C.5.5, Table C.9, one bit per non-zero
-  coefficient) selectable via `encode_planar_fs1`; short packet
+  coefficient) selectable via `encode_planar_fs1`; multi-slice emission
+  (Annex B.10, one SLH per slice with `Yslh = t`, precinct rows grouped
+  `⌈Np,y / Hsl⌉`-ways) via `encode_planar_hsl`; short packet
   headers; symmetric reflection for partial bottom precincts (odd
   heights); CTS / CRG marker emission for `Cpih = 3`
 
@@ -202,10 +219,13 @@ Modules:
 
 * Output bit depths > 8 — Annex G kernels are bit-depth agnostic but
   the pack-to-plane helper currently emits `Vec<u8>` only.
-* Encoder round 96+: per-band per-precinct Q rate-distortion
-  optimization, multi-slice emission with `Hsl > 1` precinct rows per
-  slice.
-  (Round 95 lifts the round-9 (r91) blanket `Cpih = 0` restriction on
+* Encoder round 104+: per-band per-precinct Q rate-distortion
+  optimization; per-slice rate budgeting (now that multi-slice
+  emission exists, the encoder still uses a single constant `Q` across
+  every slice — slice-level rate control is the natural follow-on).
+  (Round 103 lands `Hsl > 0` multi-slice emission per Annex B.10 — one
+  SLH per slice, `Yslh = t`, precinct rows grouped `⌈Np,y / Hsl⌉`-ways.
+  Round 95 lifts the round-9 (r91) blanket `Cpih = 0` restriction on
   `Sd > 0`: the operand window of each colour transform — `c < 3` for
   RCT, `c < 4` for Star-Tetrix — is now allowed to coexist with the
   CWD-suppressed tail as long as `Nc - Sd >= 3 / 4`. Round 8 lands

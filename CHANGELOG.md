@@ -1,5 +1,46 @@
 # Changelog
 
+## Unreleased — round 103 (encoder multi-slice emission, `Hsl > 0`)
+
+Adds encoder support for multi-slice codestreams per ISO/IEC
+21122-1:2022 Annex B.10 (grouping of precincts into slices) + Annex
+A.4.12 Table A.25 (slice header). The decoder has reconstructed the
+precinct-to-slice grouping from the PIH `Hsl` field since the early
+rounds (`slice_walker::build_plan` walks `⌈Np,y / Hsl⌉` slices, and the
+codestream parser already loops over every SLH marker); the encoder
+previously hard-coded a single slice spanning the whole picture
+(`Hsl = Np,y`, one SLH with `Yslh = 0`). This round closes that gap on
+the encode side.
+
+* `encoder.rs` — **`EncodeConfig` gains an `hsl: u16` field** (default
+  0 = single slice). `validate` rejects `Hsl > Np,y` (a value that
+  would describe a slice running past the last precinct row, where
+  `Np,y = ⌈Hf / 2^NL,y⌉`). A new `effective_hsl` helper resolves the
+  on-wire `Hsl` field (`Np,y` when `cfg.hsl == 0`, else the caller's
+  value); `write_pih_body` emits it instead of the unconditional
+  `Np,y`.
+* `write_slice` — **emits one SLH marker per slice**. The two precinct
+  loops (multi-level cascade and NL=1/1 streaming) are now wrapped in a
+  slice partition: precinct rows are grouped into runs of `hsl_rows`
+  rows (the last run is shorter when `Np,y` is not a multiple of
+  `Hsl`), and each run is preceded by `SLH | Lslh=4 | Yslh=t` with `t`
+  the top-down slice order. The per-precinct coding is unchanged —
+  vertical prediction is already precinct-scoped in this encoder (the
+  M-top cache in `encode_precinct_cascade` is local to one precinct),
+  so the Annex B.10 requirement that vertical prediction be disabled
+  across slice boundaries is satisfied trivially (no predictor crosses
+  a precinct row in the first place).
+* **New public entry point `encode_planar_hsl(width, height, nc, cpih,
+  nlx, nly, q, hsl, planes)`** — same shape as `encode_planar_lossy`
+  with an explicit slice height. `hsl = 0` is byte-identical to
+  `encode_planar_lossy` (single slice).
+* **Tests** — 6 new (`round103_*`): Hsl=2 luma 4-slice lossless +
+  slice-count + PIH `Hsl` assertions, Hsl=3 RGB+RCT 2-slice lossless,
+  Hsl=2 lossy q=2 PSNR ≥ 30 dB floor, `hsl=0` / `hsl=Np,y`
+  single-slice byte-equivalence to `encode_planar_lossy`,
+  non-divisible `Np,y` last-slice-shorter (2,2,1) roundtrip, and
+  `Hsl > Np,y` rejection. 229 total (was 223); 0 ignored.
+
 ## Unreleased — round 100 (encoder `Fs = 1` separate sign sub-packet)
 
 Adds encoder support for the `Fs = 1` sign-handling strategy per
