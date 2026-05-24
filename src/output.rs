@@ -97,25 +97,27 @@ pub fn parse_nlt(body: &[u8]) -> Result<NltParams> {
     }
 }
 
-/// Apply Annex G output scaling to one component's sample plane in
-/// place. `omega` is the int32 plane (length `wc * hc`), `bw` is the
-/// picture-header `Bw`, `bc` is the per-component `B[i]`, and `nlt`
-/// is the parsed NLT body (`None` → linear path).
+/// Apply Annex G output scaling to one component's sample plane. `omega`
+/// is the int32 plane (length `wc * hc`), `bw` is the picture-header
+/// `Bw`, `bc` is the per-component `B[i]`, and `nlt` is the parsed NLT
+/// body (`None` → linear path).
 ///
-/// Returns a `Vec<u8>` for `B[i] == 8` paths; for higher bit depths the
-/// caller would need a `Vec<u16>` packing helper. Round-5 wires only the
-/// 8-bit output side (the only one exercised by the round-5 fixtures
-/// plus round-4 regression tests) but the kernels themselves run on
-/// arbitrary `B[i]`.
+/// Returns packed plane bytes in [`crate::image::JpegXsPlane`] format:
+/// one byte per sample for `B[i] == 8`, or two little-endian bytes per
+/// sample for `B[i] ∈ 9..=16` (round 118). The reconstruction kernels
+/// (Annex G.3 / G.4 / G.5) are parametric in `B[i]` and produce values
+/// in the component's nominal range `[0, 2^B[i] - 1]`; this function
+/// only chooses the packing width. Bit depths above 16 are not yet
+/// representable in the two-byte plane format.
 pub fn apply_output_scaling(
     omega: &[i32],
     bw: u8,
     bc: u8,
     nlt: Option<NltParams>,
 ) -> Result<Vec<u8>> {
-    if bc != 8 {
+    if !(8..=16).contains(&bc) {
         return Err(Error::Unsupported(format!(
-            "jpegxs output: B[i]={bc} non-8-bit packing is round-6 (need u16/u32 plane format)"
+            "jpegxs output: B[i]={bc} out of supported range 8..=16 (plane packing is u8 / u16-LE)"
         )));
     }
     if !(8..=20).contains(&bw) {
@@ -123,19 +125,39 @@ pub fn apply_output_scaling(
             "jpegxs output: Bw={bw} out of supported range 8..=20"
         )));
     }
-    let mut out = vec![0u8; omega.len()];
+    // The kernels compute the reconstructed sample value in
+    // `[0, 2^bc - 1]` for each position; pack[i] receives that value.
+    let mut recon = vec![0i32; omega.len()];
     match nlt {
-        None => linear_path(omega, bw, bc, &mut out),
-        Some(NltParams::Quadratic { dco }) => quadratic_path(omega, bw, bc, dco, &mut out),
+        None => linear_path(omega, bw, bc, &mut recon),
+        Some(NltParams::Quadratic { dco }) => quadratic_path(omega, bw, bc, dco, &mut recon),
         Some(NltParams::Extended { t1, t2, e }) => {
-            extended_path(omega, bw, bc, t1, t2, e, &mut out)
+            extended_path(omega, bw, bc, t1, t2, e, &mut recon)
         }
     }
-    Ok(out)
+    Ok(pack_plane(&recon, bc))
+}
+
+/// Pack reconstructed sample values (each already clamped to
+/// `[0, 2^bc - 1]`) into [`crate::image::JpegXsPlane`] byte layout:
+/// one byte per sample for `bc == 8`, two little-endian bytes per
+/// sample for `bc > 8`.
+fn pack_plane(recon: &[i32], bc: u8) -> Vec<u8> {
+    if bc <= 8 {
+        recon.iter().map(|&v| v as u8).collect()
+    } else {
+        let mut out = Vec::with_capacity(recon.len() * 2);
+        for &v in recon {
+            let s = v as u16;
+            out.push((s & 0xff) as u8);
+            out.push((s >> 8) as u8);
+        }
+        out
+    }
 }
 
 /// Annex G.3, Table G.2 — linear output scaling and clipping.
-fn linear_path(omega: &[i32], bw: u8, bc: u8, out: &mut [u8]) {
+fn linear_path(omega: &[i32], bw: u8, bc: u8, out: &mut [i32]) {
     let zeta = (bw as i32) - (bc as i32);
     let m = (1i32 << bc) - 1;
     let dc_bias = 1i32 << (bw - 1);
@@ -149,12 +171,12 @@ fn linear_path(omega: &[i32], bw: u8, bc: u8, out: &mut [u8]) {
             v.saturating_add(half) >> zeta_u
         };
         let v = v.clamp(0, m);
-        out[i] = v as u8;
+        out[i] = v;
     }
 }
 
 /// Annex G.4, Table G.3 — quadratic output scaling and clipping.
-fn quadratic_path(omega: &[i32], bw: u8, bc: u8, dco: i32, out: &mut [u8]) {
+fn quadratic_path(omega: &[i32], bw: u8, bc: u8, dco: i32, out: &mut [i32]) {
     let zeta = 2 * (bw as i32) - (bc as i32);
     let m = (1i32 << bc) - 1;
     let dc_bias = 1i32 << (bw - 1);
@@ -168,12 +190,12 @@ fn quadratic_path(omega: &[i32], bw: u8, bc: u8, dco: i32, out: &mut [u8]) {
         let v = v * v;
         let v = if zeta_u == 0 { v } else { (v + half) >> zeta_u };
         let v = (v + dco as i64).clamp(0, m as i64);
-        out[i] = v as u8;
+        out[i] = v as i32;
     }
 }
 
 /// Annex G.5, Table G.4 — extended (three-segment) output scaling.
-fn extended_path(omega: &[i32], bw: u8, bc: u8, t1: u32, t2: u32, e: u8, out: &mut [u8]) {
+fn extended_path(omega: &[i32], bw: u8, bc: u8, t1: u32, t2: u32, e: u8, out: &mut [i32]) {
     let bw_i = bw as i64;
     let m = (1i64 << bc) - 1;
     let dc_bias = 1i64 << (bw - 1);
@@ -210,7 +232,7 @@ fn extended_path(omega: &[i32], bw: u8, bc: u8, t1: u32, t2: u32, e: u8, out: &m
         }
         let v = if zeta_u == 0 { v } else { (v + half) >> zeta_u };
         let v = v.clamp(0, m);
-        out[i] = v as u8;
+        out[i] = v as i32;
     }
 }
 
@@ -310,6 +332,43 @@ mod tests {
         let omega = vec![1000i32, -1000];
         let out = apply_output_scaling(&omega, 8, 8, None).unwrap();
         assert_eq!(out, vec![255u8, 0u8]);
+    }
+
+    #[test]
+    fn linear_path_16bit_packs_little_endian() {
+        // Bw = B = 16, ζ = 0, dc_bias = 1<<15 = 32768, m = 65535.
+        // ω = 0 → 32768 (mid-grey). ω = 1 → 32769. ω = -32768 → 0.
+        // ω = 40000 → 72768 clamped to 65535.
+        let omega = vec![0i32, 1, -32768, 40000];
+        let out = apply_output_scaling(&omega, 16, 16, None).unwrap();
+        // Two bytes per sample, little-endian.
+        assert_eq!(out.len(), 8);
+        assert_eq!(&out[0..2], &32768u16.to_le_bytes());
+        assert_eq!(&out[2..4], &32769u16.to_le_bytes());
+        assert_eq!(&out[4..6], &0u16.to_le_bytes());
+        assert_eq!(&out[6..8], &65535u16.to_le_bytes());
+    }
+
+    #[test]
+    fn linear_path_10bit_lossless_round_trips_values() {
+        // Bw = B = 10, ζ = 0, dc_bias = 1<<9 = 512, m = 1023.
+        // ω = v - 512 on encode; decode is v + 512 clamped → identity for
+        // any sample in [0, 1023].
+        let samples: Vec<i32> = vec![0, 1, 512, 511, 1023];
+        let omega: Vec<i32> = samples.iter().map(|&s| s - 512).collect();
+        let out = apply_output_scaling(&omega, 10, 10, None).unwrap();
+        let decoded: Vec<u16> = out
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let expect: Vec<u16> = samples.iter().map(|&s| s as u16).collect();
+        assert_eq!(decoded, expect);
+    }
+
+    #[test]
+    fn rejects_bit_depth_above_16() {
+        let omega = vec![0i32; 1];
+        assert!(apply_output_scaling(&omega, 18, 17, None).is_err());
     }
 
     #[test]

@@ -44,8 +44,11 @@ pub struct JpegXsImage {
     /// from the codestream's `Cpih`. `0` = no transform, `1` = inverse
     /// RCT (Annex F.3), `3` = inverse Star-Tetrix (Annex F.5).
     pub cpih: u8,
-    /// Output bit depth per sample (`Bw`). Currently always `8`; the
-    /// decoder rejects everything else.
+    /// Output bit depth (`Bw`, the picture-header wavelet precision). For
+    /// the lossless paths `Bw == B[i]`, so this also reports the component
+    /// sample precision. `8` for the 8-bit paths; `9..=16` for the
+    /// high-bit-depth paths (round 118), in which case each plane's `data`
+    /// holds two little-endian bytes per sample.
     pub bit_depth: u8,
     /// One entry per component. Sub-sampled chroma plates appear at
     /// their downsampled dimensions; the caller can read the per-plane

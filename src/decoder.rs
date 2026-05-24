@@ -17,8 +17,9 @@
 //!   (Annex G.4 / G.5) is wired but the round-5 fixtures cover the
 //!   linear (no-NLT) path. The other paths are unit-tested in
 //!   [`crate::output`].
-//! * 8-bit output (`B[i] == 8`); higher bit depths return `Unsupported`
-//!   from the output mapper.
+//! * Output `B[i] ∈ 8..=16` (round 118): `B[i] == 8` packs one byte per
+//!   sample; `B[i] > 8` packs two little-endian bytes per sample (Annex G
+//!   kernels are bit-depth agnostic). `B[i] > 16` returns `Unsupported`.
 //!
 //! Anything outside this subset returns `Error::Unsupported`.
 

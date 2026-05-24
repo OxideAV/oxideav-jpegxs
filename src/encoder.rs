@@ -687,6 +687,95 @@ pub fn encode_planar_lossy(
     )
 }
 
+/// Round-118 high-bit-depth (`B[i] > 8`) lossless 4:4:4 entry point.
+///
+/// Codes a `bd`-bit picture losslessly with `Bw = B[i] = bd`
+/// (`bd ∈ 9..=16`, the lossless choice of Table A.8) and `Fq = 0`. The
+/// DC level shift is `1 << (bd - 1)` (Annex G.3 inverse), so each sample
+/// lands in the wavelet domain `[-2^(bd-1), 2^(bd-1) - 1]`; the 5/3 DWT,
+/// entropy coder, and (optional) reversible colour transform all operate
+/// on `i32` coefficients regardless of bit depth, so the only bit-depth-
+/// dependent pieces are this level shift and the output plane packing.
+///
+/// `planes[i]` carries the component samples as **little-endian `u16`**
+/// values in `0..=2^bd - 1`; the decoder returns the reconstructed plane
+/// in the same two-bytes-per-sample [`crate::image::JpegXsPlane`] layout
+/// (one byte per sample is still used for `bd == 8`). Samples above
+/// `2^bd - 1` are an encoder error (out of the component's nominal range).
+///
+/// `cpih ∈ {0, 1}`: no transform, or the reversible RCT (Annex F.3 — bit-
+/// depth agnostic). Star-Tetrix (`cpih = 3`) and NLT pre-distortion are
+/// not exposed on this path. `nlx`/`nly` follow the Annex A.4.4 limits.
+/// `q` is fixed at 0 (lossless) here; lossy high-bit-depth quantization is
+/// a later round. Self-roundtrips bit-exactly through
+/// [`crate::decode_jpeg_xs`].
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_highbd(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    bd: u8,
+    planes: &[Vec<u16>],
+) -> Result<Vec<u8>> {
+    if !(9..=16).contains(&bd) {
+        return Err(Error::Unsupported(format!(
+            "jpegxs encoder: encode_planar_highbd requires B[i] in 9..=16, got {bd} (use encode_planar_lossy for 8-bit)"
+        )));
+    }
+    if cpih != 0 && cpih != 1 {
+        return Err(Error::Unsupported(format!(
+            "jpegxs encoder: encode_planar_highbd supports Cpih in {{0, 1}}, got {cpih}"
+        )));
+    }
+    let max_sample: u16 = ((1u32 << bd) - 1) as u16;
+    // Pack each plane to little-endian u16 bytes (the EncodeConfig
+    // bit_depth > 8 plane format), validating the nominal range first.
+    let mut byte_planes: Vec<Vec<u8>> = Vec::with_capacity(planes.len());
+    for (i, p) in planes.iter().enumerate() {
+        let mut bytes = Vec::with_capacity(p.len() * 2);
+        for &s in p {
+            if s > max_sample {
+                return Err(Error::invalid(format!(
+                    "jpegxs encoder: plane {i} sample {s} exceeds B[i]={bd} max {max_sample}"
+                )));
+            }
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        byte_planes.push(bytes);
+    }
+    let sx = vec![1u8; nc as usize];
+    let sy = vec![1u8; nc as usize];
+    encode_planar_inner_bd(
+        width,
+        height,
+        nc,
+        bd,
+        cpih,
+        nlx,
+        nly,
+        0, // fq = 0 (lossless)
+        0, // q = 0 (lossless)
+        &sx,
+        &sy,
+        0,
+        0,
+        0,
+        0,
+        None,
+        Vec::new(),
+        0,
+        0,
+        0, // fs = 0
+        0, // hsl = 0 (single slice)
+        0, // qpih = 0 (deadzone, no-op at q=0)
+        0, // rp = 0 (no refinement)
+        &byte_planes,
+    )
+}
+
 /// Round-103 multi-slice 4:4:4 entry point (`Hsl > 0`).
 ///
 /// Same shape as [`encode_planar_lossy`] but takes an explicit slice
@@ -1400,12 +1489,71 @@ fn encode_planar_inner_nlt(
     rp: u8,
     planes: &[Vec<u8>],
 ) -> Result<Vec<u8>> {
-    let bw = if nlt.is_some() { 18 } else { 8 };
+    // 8-bit path: B[i] = 8, Bw = 8 (or 18 with NLT pre-distortion).
+    encode_planar_inner_bd(
+        width, height, nc, 8, cpih, nlx, nly, fq, q, sx, sy, cts_e1, cts_e2, cts_cf, st_ct, nlt,
+        band_gains, cw, sd, fs, hsl, qpih, rp, planes,
+    )
+}
+
+/// Inner encoder threading an explicit component bit depth `bd` (`B[i]`).
+/// `bd == 8` is the legacy 8-bit path (`planes[i]` is one byte per
+/// sample). For `bd ∈ 9..=16` (round 118) the picture is coded losslessly
+/// with `Bw = B[i] = bd`, the DC level shift is `1 << (bd - 1)`, and each
+/// `planes[i]` carries two little-endian bytes per sample (matching
+/// [`crate::image::JpegXsPlane`]). High-bit-depth is the linear (no-NLT)
+/// path only; NLT pre-distortion is 8-bit-input specific.
+#[allow(clippy::too_many_arguments)]
+fn encode_planar_inner_bd(
+    width: u16,
+    height: u16,
+    nc: u8,
+    bd: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    fq: u8,
+    q: u8,
+    sx: &[u8],
+    sy: &[u8],
+    cts_e1: u8,
+    cts_e2: u8,
+    cts_cf: u8,
+    st_ct: u8,
+    nlt: Option<NltParams>,
+    band_gains: Vec<u8>,
+    cw: u16,
+    sd: u8,
+    fs: u8,
+    hsl: u16,
+    qpih: u8,
+    rp: u8,
+    planes: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    if !(8..=16).contains(&bd) {
+        return Err(Error::Unsupported(format!(
+            "jpegxs encoder: component bit depth B[i]={bd} out of supported range 8..=16"
+        )));
+    }
+    if bd > 8 && nlt.is_some() {
+        return Err(Error::Unsupported(
+            "jpegxs encoder: NLT pre-distortion is 8-bit-input specific; high-bit-depth uses the linear path".to_string(),
+        ));
+    }
+    // For high bit depth, Bw = B[i] (lossless, Table A.8). For 8-bit the
+    // legacy choice stands: Bw = 18 with NLT, else Bw = 8.
+    let bw = if bd > 8 {
+        bd
+    } else if nlt.is_some() {
+        18
+    } else {
+        8
+    };
     let cfg = EncodeConfig {
         width,
         height,
         nc,
-        bit_depth: 8,
+        bit_depth: bd,
         bw,
         ng: 4,
         ss: 8,
@@ -1449,13 +1597,16 @@ fn encode_planar_inner_nlt(
             planes.len()
         )));
     }
+    // Bytes per sample on the wire: 1 for B[i] = 8, 2 (little-endian) for
+    // B[i] > 8 (round 118 high-bit-depth plane format).
+    let bps: usize = if cfg.bit_depth > 8 { 2 } else { 1 };
     for (i, p) in planes.iter().enumerate() {
         let wc = (width as usize) / (cfg.sx[i] as usize);
         let hc = (height as usize) / (cfg.sy[i] as usize);
-        let want = wc * hc;
+        let want = wc * hc * bps;
         if p.len() != want {
             return Err(Error::invalid(format!(
-                "jpegxs encoder: plane {i} size {} != Wc*Hc {want} (Wc={wc}, Hc={hc})",
+                "jpegxs encoder: plane {i} size {} != Wc*Hc*bps {want} (Wc={wc}, Hc={hc}, bps={bps})",
                 p.len()
             )));
         }
@@ -1993,11 +2144,27 @@ fn write_slice(out: &mut Vec<u8>, cfg: &EncodeConfig, planes_u8: &[Vec<u8>]) -> 
                 .collect()
         }
         None => {
-            // Normal linear path: u8 input shifted to i32 wavelet domain.
-            planes_u8
-                .iter()
-                .map(|p| p.iter().map(|&v| v as i32 - dc_bias).collect::<Vec<i32>>())
-                .collect()
+            // Normal linear path: input samples shifted to the i32 wavelet
+            // domain by the DC bias `1 << (Bw - 1)` (Annex G.3 inverse). For
+            // `B[i] == 8` the plane is one byte per sample; for `B[i] > 8`
+            // (round 118 high-bit-depth path) it is two little-endian bytes
+            // per sample, matching `crate::image::JpegXsPlane` so the encode
+            // and decode plane formats are symmetric.
+            if cfg.bit_depth <= 8 {
+                planes_u8
+                    .iter()
+                    .map(|p| p.iter().map(|&v| v as i32 - dc_bias).collect::<Vec<i32>>())
+                    .collect()
+            } else {
+                planes_u8
+                    .iter()
+                    .map(|p| {
+                        p.chunks_exact(2)
+                            .map(|c| u16::from_le_bytes([c[0], c[1]]) as i32 - dc_bias)
+                            .collect::<Vec<i32>>()
+                    })
+                    .collect()
+            }
         }
     };
 
@@ -6031,5 +6198,135 @@ mod tests {
         // rp = NL-1 is the legal maximum and must succeed.
         let ok = encode_planar_rp(32, 32, 1, 0, 2, 2, 2, nl - 1, std::slice::from_ref(&pixels));
         assert!(ok.is_ok(), "R[p]=NL-1={} must be accepted", nl - 1);
+    }
+
+    // === Round 118: high bit depth (B[i] > 8) ===========================
+
+    /// Synthetic `bd`-bit luma ramp filling the full `0..=2^bd-1` range.
+    fn make_synthetic_highbd(w: usize, h: usize, bd: u8) -> Vec<u16> {
+        let max = ((1u32 << bd) - 1) as i64;
+        let mut buf = vec![0u16; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                // A spread-out pattern that exercises the high bits.
+                let v = ((x as i64) * 277 + (y as i64) * 631 + ((x ^ y) as i64) * 53) % (max + 1);
+                buf[y * w + x] = v as u16;
+            }
+        }
+        buf
+    }
+
+    /// Reinterpret a two-byte-per-sample (little-endian) plane back into
+    /// `u16` samples for comparison.
+    fn plane_u16(data: &[u8]) -> Vec<u16> {
+        data.chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect()
+    }
+
+    #[test]
+    fn highbd_10bit_luma_nl1_round_trips_exactly() {
+        let src = make_synthetic_highbd(32, 32, 10);
+        let cs = encode_planar_highbd(32, 32, 1, 0, 1, 1, 10, std::slice::from_ref(&src))
+            .expect("encode 10-bit luma");
+        let img = decode_codestream(&cs, None).expect("decode 10-bit luma");
+        assert_eq!(img.bit_depth, 10, "PIH Bw must be 10");
+        assert_eq!(plane_u16(&img.planes[0].data), src);
+    }
+
+    #[test]
+    fn highbd_12bit_luma_nl3_round_trips_exactly() {
+        let src = make_synthetic_highbd(32, 32, 12);
+        let cs = encode_planar_highbd(32, 32, 1, 0, 3, 3, 12, std::slice::from_ref(&src))
+            .expect("encode 12-bit luma NL=3/3");
+        let img = decode_codestream(&cs, None).expect("decode 12-bit luma NL=3/3");
+        assert_eq!(plane_u16(&img.planes[0].data), src);
+    }
+
+    #[test]
+    fn highbd_16bit_luma_full_range_round_trips_exactly() {
+        // Drive the full 16-bit dynamic range, including the extremes.
+        let mut src = make_synthetic_highbd(16, 16, 16);
+        src[0] = 0;
+        src[1] = 65535;
+        src[2] = 32768;
+        let cs = encode_planar_highbd(16, 16, 1, 0, 2, 2, 16, std::slice::from_ref(&src))
+            .expect("encode 16-bit luma");
+        let img = decode_codestream(&cs, None).expect("decode 16-bit luma");
+        assert_eq!(plane_u16(&img.planes[0].data), src);
+    }
+
+    #[test]
+    fn highbd_16bit_flat_image_is_exact() {
+        let src = vec![40000u16; 32 * 32];
+        let cs = encode_planar_highbd(32, 32, 1, 0, 2, 2, 16, std::slice::from_ref(&src))
+            .expect("encode flat 16-bit");
+        let img = decode_codestream(&cs, None).expect("decode flat 16-bit");
+        assert_eq!(plane_u16(&img.planes[0].data), src);
+    }
+
+    #[test]
+    fn highbd_16bit_rgb_rct_round_trips_exactly() {
+        // Three 16-bit planes through the reversible RCT (Cpih = 1).
+        let r = make_synthetic_highbd(32, 32, 16);
+        let mut g = make_synthetic_highbd(32, 32, 16);
+        let mut b = make_synthetic_highbd(32, 32, 16);
+        // Perturb g/b so the colour transform actually moves data.
+        for v in g.iter_mut() {
+            *v = v.wrapping_add(11111);
+        }
+        for v in b.iter_mut() {
+            *v = v.wrapping_mul(3).wrapping_add(7);
+        }
+        let planes = vec![r.clone(), g.clone(), b.clone()];
+        let cs =
+            encode_planar_highbd(32, 32, 3, 1, 2, 2, 16, &planes).expect("encode 16-bit RGB + RCT");
+        let img = decode_codestream(&cs, None).expect("decode 16-bit RGB + RCT");
+        assert_eq!(plane_u16(&img.planes[0].data), r);
+        assert_eq!(plane_u16(&img.planes[1].data), g);
+        assert_eq!(plane_u16(&img.planes[2].data), b);
+    }
+
+    #[test]
+    fn highbd_12bit_rgb_no_transform_round_trips_exactly() {
+        let r = make_synthetic_highbd(16, 24, 12);
+        let g = make_synthetic_highbd(16, 24, 12);
+        let b = make_synthetic_highbd(16, 24, 12);
+        let planes = vec![r.clone(), g.clone(), b.clone()];
+        let cs = encode_planar_highbd(16, 24, 3, 0, 2, 1, 12, &planes)
+            .expect("encode 12-bit RGB no transform");
+        let img = decode_codestream(&cs, None).expect("decode 12-bit RGB no transform");
+        assert_eq!(plane_u16(&img.planes[0].data), r);
+        assert_eq!(plane_u16(&img.planes[1].data), g);
+        assert_eq!(plane_u16(&img.planes[2].data), b);
+    }
+
+    #[test]
+    fn highbd_rejects_bd_8_and_above_16() {
+        let src = vec![0u16; 4];
+        // bd = 8 must route through the 8-bit path, not this entry point.
+        assert!(encode_planar_highbd(2, 2, 1, 0, 1, 1, 8, std::slice::from_ref(&src)).is_err());
+        // bd = 17 exceeds the two-byte plane format.
+        assert!(encode_planar_highbd(2, 2, 1, 0, 1, 1, 17, std::slice::from_ref(&src)).is_err());
+    }
+
+    #[test]
+    fn highbd_rejects_sample_above_nominal_range() {
+        // A 10-bit picture with a sample of 1024 (== 2^10) is out of range.
+        let mut src = vec![100u16; 32 * 32];
+        src[5] = 1024;
+        assert!(
+            encode_planar_highbd(32, 32, 1, 0, 1, 1, 10, std::slice::from_ref(&src)).is_err(),
+            "sample exceeding 2^bd-1 must be rejected"
+        );
+    }
+
+    #[test]
+    fn highbd_rejects_star_tetrix_cpih() {
+        let src = vec![0u16; 4 * 4 * 4];
+        // Cpih = 3 (Star-Tetrix) is not exposed on the high-bit-depth path.
+        let planes = vec![vec![0u16; 16]; 4];
+        let _ = src;
+        assert!(encode_planar_highbd(4, 4, 4, 3, 1, 1, 12, &planes).is_err());
     }
 }
