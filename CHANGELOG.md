@@ -553,6 +553,21 @@ also passes 149 tests (was 140).
 
 ## Unreleased — encoder round 2 (multi-component RCT + multi-decomp + odd dims)
 
+## [0.0.5](https://github.com/OxideAV/oxideav-jpegxs/compare/v0.0.4...v0.0.5) - 2026-05-24
+
+### Other
+
+- encoder round 115: R[p] > 0 precinct refinement (Annex C.2 + C.6.2)
+- Qpih-aware forward quantizer (round 111)
+- encoder round 108: Qpih=1 uniform inverse quantizer (Annex A.4.4 Table A.10, Annex D.3)
+- multi-slice emission (Hsl > 0, Annex B.10)
+- encoder round 100: Fs=1 separate sign sub-packet (Annex C.5.5, Table C.9)
+- round 95 / r93: Sd > 0 composes with Cpih ∈ {1, 3}
+- round 9 / r91: Sd > 0 (CWD) decomposition suppression — encoder + decoder
+- round 8: end-to-end Cw > 0 (multi-precinct-per-row)
+- update stale comment referencing removed debug helper
+- encoder round 7: extended NLT (Tnlt=2) + NL cap raised to 8
+
 ## [0.0.4](https://github.com/OxideAV/oxideav-jpegxs/compare/v0.0.3...v0.0.4) - 2026-05-08
 
 ### Other
