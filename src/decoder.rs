@@ -245,8 +245,12 @@ pub(crate) fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<JpegXsIm
         let (wc, hc) = comp_dims[i];
         let bytes = apply_output_scaling(&samples[i], pih.bw, comp.bit_depth, nlt)?;
         let _ = hc;
+        // `JpegXsPlane::stride` is bytes per row: one byte per sample for
+        // B[i] == 8, two little-endian bytes per sample for B[i] > 8
+        // (round 118 high-bit-depth plane format).
+        let bps = if comp.bit_depth > 8 { 2 } else { 1 };
         planes.push(VideoPlane {
-            stride: wc,
+            stride: wc * bps,
             data: bytes,
         });
     }
