@@ -1,5 +1,52 @@
 # Changelog
 
+## Unreleased — round 115 (encoder `R[p] > 0` precinct refinement)
+
+Adds encoder support for the precinct-refinement parameter `R[p]` per
+ISO/IEC 21122-1:2022 Annex C.2 Table C.1 (precinct-header field) + Annex
+A.4.11 Table A.24 (WGT band priorities `P[b]`) + Annex C.6.2 Table C.10
+(truncation-position algorithm). The decoder has computed the refined
+truncation since the early rounds (`entropy::truncation_position` already
+implements `r = (P[b] < R[p]) ? 1 : 0`, `T[p,b] = clamp(Q − G[b] − r, 0,
+15)`), but the encoder always emitted `R[p] = 0` and `P[b] = 0`, so the
+refinement term `r` was permanently 0. This round wires the encoder side.
+
+* `encoder.rs` — **new public `encode_planar_rp(width, height, nc, cpih,
+  nlx, nly, q, rp, planes)`** entry point. `rp = 0` is the no-refinement
+  default (byte-identical to `encode_planar_lossy`); `rp > 0` activates
+  the Annex C.6.2 refinement.
+* **WGT now emits per-band priorities `P[b] = b`** (the true band index,
+  Annex B.6 `b = (Nc − Sd)×β + i`, or `(Nc − Sd)×Nβ + i` for the Sd
+  tail), built by the new `build_band_priorities_sd` in the same
+  existing-band emission order as `build_band_gains_sd`. With this
+  assignment a refinement `R[p] = k` refines exactly the `k` lowest-index
+  bands — LL first, since bands are enumerated in `β`-major order. This
+  replaces the all-zero `P[b]` rounds 1–111 emitted. The spec permits an
+  encoder-chosen priority ("Other choices are possible", Annex H NOTE);
+  the only invariant is that the WGT `P[b]` and precinct-header `R[p]`
+  reproduce the same `T[p,b]` the encoder quantized with, which the
+  decoder's `precinct_truncation` reads back identically.
+* **The precinct header `R[p]` byte** (offset 4) now carries `cfg.rp` in
+  both `encode_precinct_single_level` and `encode_precinct_cascade`
+  (previously hard-zero).
+* **Truncation in both precinct encoders** now applies the refinement:
+  `T[p,b] = clamp(Q − G[b] − r, 0, 15)`, `r = (b < R[p]) ? 1 : 0`. The
+  cascade path computes the band index for both wavelet bands and the Sd
+  suppressed tail; the single-level path uses `b = Nc×β + i`.
+* **`EncodeConfig`** gains `rp: u8` and `band_priorities: Vec<u8>`
+  fields, range-checked in `validate()`: `R[p] ∈ 0..=NL−1` where
+  `NL = (Nc − Sd)×Nβ + Sd` (Annex B.6). Out-of-range `R[p]` is rejected.
+* **At `q = 0`** the refinement is a no-op (T is already clamped to its 0
+  floor), so a lossless stream round-trips unchanged for any `rp`. The
+  refinement only shifts bits toward the refined low-frequency bands in
+  the lossy (`q > 0`, `Fq = 8`) path.
+* **Tests** — 7 new (`round115_*`): WGT priorities equal band indices,
+  `rp = 0` byte-identical to `encode_planar_lossy` at q∈{0,2,4}, `rp > 0`
+  lossless at q=0 across the full `R[p]` range, `rp > 0` lossy q=2
+  round-trip + PSNR floor, `rp > 0` changing the lossy stream vs `rp = 0`
+  (proving the refinement fires), RGB+RCT round-trip at q=0/q=2, and the
+  out-of-range `R[p]` rejection. 240 → 247 tests.
+
 ## Unreleased — round 111 (`Qpih`-aware forward quantizer)
 
 Adds a `Qpih`-selected forward quantizer so a `Qpih = 1` codestream is

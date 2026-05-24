@@ -168,6 +168,25 @@ struct EncodeConfig {
     /// must equal `count_existing_bands(cfg)` or be empty (→ all-zero
     /// gains, backward-compatible with rounds 1–4).
     band_gains: Vec<u8>,
+    /// Per-band priority values `P[b]` for the WGT marker (Annex A.4.11
+    /// Table A.24), in the same existing-band emission order as
+    /// [`EncodeConfig::band_gains`]. Each entry is the true band index
+    /// `b = (Nc - Sd)×β + i` (or `(Nc - Sd)×Nβ + i` for the Sd tail),
+    /// so a precinct refinement of `R[p] = k` refines exactly the bands
+    /// whose `P[b] < k` — i.e. the `k` lowest band indices, which run
+    /// LL-first per the `β`-major enumeration (Annex B.6). Length must
+    /// equal `band_gains.len()` or be empty (→ all-zero priorities,
+    /// backward-compatible with rounds 1–110: every band has `P[b] = 0`,
+    /// so no `R[p] > 0` refinement ever fires).
+    band_priorities: Vec<u8>,
+    /// Precinct refinement `R[p]` (Annex C.2 Table C.1), constant across
+    /// precincts. Range `0..=NL-1` where `NL = (Nc - Sd)×Nβ + Sd` is the
+    /// total band count (Annex B.6). `R[p] = 0` (the default through
+    /// round 111) disables refinement: `r = (P[b] < R[p]) ? 1 : 0` is
+    /// always 0, so `T[p,b] = clamp(Q - G[b], 0, 15)`. `R[p] > 0` grants
+    /// one extra retained bitplane (`r = 1`, lower `T`) to bands with
+    /// `P[b] < R[p]` per the Annex C.6.2 Table C.10 truncation algorithm.
+    rp: u8,
     /// Precinct-width parameter (`Cw`, PIH §A.4.4). `0` means a single
     /// precinct column spans the full picture width (`Cs = Wf`, the
     /// only mode supported up through round 7). For `Cw > 0` the
@@ -457,6 +476,24 @@ impl EncodeConfig {
                 )));
             }
         }
+        // R[p] > 0 — precinct refinement (Annex C.2 Table C.1, range
+        // 0..=NL-1). NL = (Nc - Sd)×Nβ + Sd is the total band count
+        // (Annex B.6 NL definition). Values at or above NL are invalid:
+        // the precinct header field is u(8) but the spec caps it at
+        // NL-1, and a refinement threshold past the highest band index
+        // would refine every band (degenerate).
+        if self.rp != 0 {
+            let nbeta = n_beta(self.nlx, self.nly);
+            let nl = (self.nc - self.sd) as u32 * nbeta + self.sd as u32;
+            if (self.rp as u32) > nl - 1 {
+                return Err(Error::invalid(format!(
+                    "jpegxs encoder: R[p]={} exceeds NL-1={} (NL={} bands, Annex C.2 Table C.1)",
+                    self.rp,
+                    nl - 1,
+                    nl
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -711,6 +748,7 @@ pub fn encode_planar_hsl(
         0,   // fs: signs jointly with data (Fs=0)
         hsl, // hsl: slice height in precinct rows
         0,   // qpih: deadzone inverse quantizer (Qpih=0)
+        0,   // rp: no precinct refinement (R[p] = 0)
         planes,
     )
 }
@@ -775,6 +813,84 @@ pub fn encode_planar_qpih(
         0, // fs: signs jointly with data (Fs=0)
         0, // hsl: single slice (Hsl = Np,y)
         1, // qpih: uniform inverse quantizer (Qpih=1, Annex D.3)
+        0, // rp: no precinct refinement (R[p] = 0)
+        planes,
+    )
+}
+
+/// Round-115 precinct-refinement entry point (`R[p] > 0`).
+///
+/// Same shape as [`encode_planar_lossy`] but takes an explicit precinct
+/// refinement `rp` (the `R[p]` field, Annex C.2 Table C.1, constant
+/// across precincts). `rp = 0` is the no-refinement default (bit-
+/// equivalent to [`encode_planar_lossy`]); `rp > 0` activates the Annex
+/// C.6.2 Table C.10 refinement term `r = (P[b] < R[p]) ? 1 : 0`, which
+/// subtracts one from the truncation position of every band whose
+/// priority is below the threshold:
+///
+/// ```text
+///   T[p,b] = clamp(Q[p] − G[b] − r, 0, 15)
+/// ```
+///
+/// The encoder assigns each band the priority `P[b] = b` (its true band
+/// index, Annex B.6 `b = (Nc - Sd)×β + i`), emitted in the WGT marker
+/// (Annex A.4.11). With that assignment `R[p] = k` refines exactly the
+/// `k` lowest-index bands — LL first, since bands are enumerated in
+/// `β`-major order — granting them one extra retained magnitude
+/// bitplane (lower `T`, finer quantization) at the cost of a few more
+/// coded bits in those bands. This is a valid encoder choice the spec
+/// permits ("Other choices are possible", Annex H NOTE); the decoder
+/// reconstructs the identical `T[p,b]` from the `(P[b], R[p])` pair it
+/// reads back, so any output round-trips through [`crate::decode_jpeg_xs`].
+///
+/// `rp` is range-checked against `NL-1` (the total band count minus one,
+/// Annex B.6); a value past the highest band index is rejected. At
+/// `q = 0` (lossless) refinement is a no-op — `T` is already clamped to
+/// its `0` floor — so a lossless stream round-trips unchanged regardless
+/// of `rp`. The refinement only changes the lossy (`q > 0`, `Fq = 8`)
+/// magnitudes, where it shifts bits toward the refined low-frequency
+/// bands.
+///
+/// `q` is the precinct quantization step (`0..=15`); `q = 0` is lossless
+/// and `q > 0` forces `Fq = 8` per Table A.8.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_rp(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    q: u8,
+    rp: u8,
+    planes: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    let sx = vec![1u8; nc as usize];
+    let sy = vec![1u8; nc as usize];
+    let fq = if q == 0 { 0 } else { 8 };
+    encode_planar_inner_nlt(
+        width,
+        height,
+        nc,
+        cpih,
+        nlx,
+        nly,
+        fq,
+        q,
+        &sx,
+        &sy,
+        0,
+        0,
+        0,
+        0,
+        None,
+        Vec::new(),
+        0,  // cw: single precinct column
+        0,  // sd: no CWD suppression
+        0,  // fs: signs jointly with data (Fs=0)
+        0,  // hsl: single slice (Hsl = Np,y)
+        0,  // qpih: deadzone inverse quantizer (Qpih=0)
+        rp, // rp: precinct refinement R[p]
         planes,
     )
 }
@@ -831,6 +947,7 @@ pub fn encode_planar_fs1(
         1, // fs: separate sign sub-packet (Table C.9)
         0, // hsl: single slice (Hsl = Np,y)
         0, // qpih: deadzone inverse quantizer (Qpih=0)
+        0, // rp: no precinct refinement (R[p] = 0)
         planes,
     )
 }
@@ -889,6 +1006,7 @@ pub fn encode_planar_cw(
         0, // fs: signs jointly with data (Fs=0)
         0, // hsl: single slice (Hsl = Np,y)
         0, // qpih: deadzone inverse quantizer (Qpih=0)
+        0, // rp: no precinct refinement (R[p] = 0)
         planes,
     )
 }
@@ -939,6 +1057,7 @@ pub fn encode_planar_sd(
         0, // fs: signs jointly with data (Fs=0)
         0, // hsl: single slice (Hsl = Np,y)
         0, // qpih: deadzone inverse quantizer (Qpih=0)
+        0, // rp: no precinct refinement (R[p] = 0)
         planes,
     )
 }
@@ -992,6 +1111,7 @@ pub fn encode_planar_sd_rct(
         0, // fs: signs jointly with data (Fs=0)
         0, // hsl: single slice (Hsl = Np,y)
         0, // qpih: deadzone inverse quantizer (Qpih=0)
+        0, // rp: no precinct refinement (R[p] = 0)
         planes,
     )
 }
@@ -1047,6 +1167,7 @@ pub fn encode_planar_sd_star_tetrix(
         0, // fs: signs jointly with data (Fs=0)
         0, // hsl: single slice (Hsl = Np,y)
         0, // qpih: deadzone inverse quantizer (Qpih=0)
+        0, // rp: no precinct refinement (R[p] = 0)
         planes,
     )
 }
@@ -1125,6 +1246,7 @@ pub fn encode_planar_nlt_quadratic(
         0, // fs: signs jointly with data (Fs=0)
         0, // hsl: single slice (Hsl = Np,y)
         0, // qpih: deadzone inverse quantizer (Qpih=0)
+        0, // rp: no precinct refinement (R[p] = 0)
         planes,
     )
 }
@@ -1201,6 +1323,7 @@ pub fn encode_planar_nlt_extended(
         0, // fs: signs jointly with data (Fs=0)
         0, // hsl: single slice (Hsl = Np,y)
         0, // qpih: deadzone inverse quantizer (Qpih=0)
+        0, // rp: no precinct refinement (R[p] = 0)
         planes,
     )
 }
@@ -1245,6 +1368,7 @@ fn encode_planar_inner(
         0, // fs: signs jointly with data (Fs=0)
         0, // hsl: single slice (Hsl = Np,y)
         0, // qpih: deadzone inverse quantizer (Qpih=0)
+        0, // rp: no precinct refinement (R[p] = 0)
         planes,
     )
 }
@@ -1273,6 +1397,7 @@ fn encode_planar_inner_nlt(
     fs: u8,
     hsl: u16,
     qpih: u8,
+    rp: u8,
     planes: &[Vec<u8>],
 ) -> Result<Vec<u8>> {
     let bw = if nlt.is_some() { 18 } else { 8 };
@@ -1300,16 +1425,19 @@ fn encode_planar_inner_nlt(
         st_ct,
         nlt,
         band_gains,
+        band_priorities: Vec::new(),
+        rp,
         cw,
         sd,
         hsl,
     };
     cfg.validate()?;
-    // Build per-band gains after validation so beta_key is called with
-    // known-good (nlx >= nly) parameters.
+    // Build per-band gains and priorities after validation so beta_key /
+    // band-index math runs with known-good (nlx >= nly) parameters.
     let cfg = if cfg.band_gains.is_empty() {
         EncodeConfig {
             band_gains: build_band_gains_sd(nc, sd, nlx, nly, sx, sy),
+            band_priorities: build_band_priorities_sd(nc, sd, nlx, nly, sy),
             ..cfg
         }
     } else {
@@ -1368,8 +1496,9 @@ fn write_main_header(out: &mut Vec<u8>, cfg: &EncodeConfig) -> Result<()> {
     out.extend_from_slice(&lwgt.to_be_bytes());
     for k in 0..n_existing as usize {
         let g = cfg.band_gains.get(k).copied().unwrap_or(0);
+        let p = cfg.band_priorities.get(k).copied().unwrap_or(0);
         out.push(g); // G[b]
-        out.push(0); // P[b] = 0
+        out.push(p); // P[b] (Annex A.4.11) — band index, see build_band_priorities_sd
     }
     // CWD marker — Annex A.4.7 Table A.18. Emitted whenever Sd > 0
     // (must precede the first SLH and follow PIH/CDT/WGT). Body is
@@ -1635,6 +1764,58 @@ fn build_band_gains_sd(nc: u8, sd: u8, nlx: u8, nly: u8, _sx: &[u8], sy: &[u8]) 
         gains.resize(gains.len() + sd as usize, 0);
     }
     gains
+}
+
+/// Build per-band priority values `P[b]` for the WGT marker (Annex
+/// A.4.11 Table A.24), in the same existing-band emission order as
+/// [`build_band_gains_sd`] (β-major, then component i).
+///
+/// Each priority is the band's *true* sequential index per Annex B.6:
+/// `b = (Nc - Sd)×β + i` for the wavelet bands (`i < Nc - Sd`) and
+/// `b = (Nc - Sd)×Nβ + i` for the `Sd` suppressed-tail bands. Because
+/// the band index counts from the LL band upward in `β`-major order, a
+/// precinct refinement `R[p] = k` refines exactly the `k` bands whose
+/// `P[b] < k` (Annex C.6.2 Table C.10) — i.e. the `k` lowest band
+/// indices, LL first. This is an encoder choice the spec permits
+/// ("Other choices are possible", Annex H NOTE); the only invariant the
+/// decoder enforces is that the priorities it reads from WGT and the
+/// `R[p]` it reads from the precinct header reproduce the same `T[p,b]`
+/// the encoder quantized with — which holds by construction here since
+/// the decoder's [`crate::entropy::precinct_truncation`] reads the same
+/// `(P[b], R[p])` pair.
+///
+/// `P[b]` is `u(8)` (0–255). Band indices beyond 255 are saturated to
+/// 255; for such large band counts a small `R[p]` still only refines
+/// the low-index bands, so saturation does not change which bands the
+/// refinement reaches (only bands `b < R[p] <= NL-1` can ever satisfy
+/// `P[b] < R[p]`, and `R[p]` itself never exceeds 255 in practice
+/// because the precinct-header field is `u(8)`).
+fn build_band_priorities_sd(nc: u8, sd: u8, nlx: u8, nly: u8, sy: &[u8]) -> Vec<u8> {
+    let nbeta_pic = n_beta(nlx, nly);
+    let n_decomposed = (nc - sd) as u32;
+    let mut prios = Vec::new();
+    for beta in 0..nbeta_pic {
+        for (i, &sy_val) in sy.iter().take(n_decomposed as usize).enumerate() {
+            let nly_i = nly.saturating_sub(match sy_val {
+                1 => 0,
+                2 => 1,
+                4 => 2,
+                _ => 0,
+            });
+            let nbeta_i = n_beta(nlx, nly_i);
+            if beta >= nbeta_i {
+                continue; // band does not exist for this component
+            }
+            let b = n_decomposed * beta + i as u32;
+            prios.push(b.min(255) as u8);
+        }
+    }
+    // Sd suppressed-tail bands: b = (Nc - Sd)×Nβ + i.
+    for i in 0..sd as u32 {
+        let b = n_decomposed * nbeta_pic + i;
+        prios.push(b.min(255) as u8);
+    }
+    prios
 }
 
 /// Per-(β, i) band geometry needed by the encoder.
@@ -2121,8 +2302,17 @@ fn encode_precinct_single_level(
 
     let mut entropy: Vec<u8> = Vec::new();
     // Per-band truncation positions. Single-level: β=0→G=0, β=1→G=1,
-    // β=2→G=1, β=3→G=2. Uses gain-weighted T[p,b] = clamp(Q-G, 0, 15).
-    let t_for_gain = |g: u8| -> u8 { (cfg.q as i32 - g as i32).clamp(0, 15) as u8 };
+    // β=2→G=1, β=3→G=2. Uses gain-weighted T[p,b] = clamp(Q-G-r, 0, 15)
+    // per Annex C.6.2 Table C.10. The single-level path is Sd=0, so the
+    // band index is `b = Nc×β + i`; the refinement term is `r = (b <
+    // R[p]) ? 1 : 0` (encoder assigns P[b] = b, Annex B.6). R[p] = 0
+    // disables refinement (r ≡ 0).
+    let nc_u32 = cfg.nc as u32;
+    let t_for_band = |gain: u8, beta: u32, comp_i: usize| -> u8 {
+        let band_index = nc_u32 * beta + comp_i as u32;
+        let refine = if band_index < cfg.rp as u32 { 1i32 } else { 0 };
+        (cfg.q as i32 - gain as i32 - refine).clamp(0, 15) as u8
+    };
 
     // First packet: β=0 (LL) for all components — but only those with
     // a non-empty LL line for this precinct.
@@ -2136,7 +2326,7 @@ fn encode_precinct_single_level(
         first_entries.push(PerBandEntry {
             wpb: cb.ll_w as u32,
             line: BandLineSlice::Direct(line_data),
-            t: t_for_gain(0),
+            t: t_for_band(0, 0, i),
         });
     }
     if !first_entries.is_empty() {
@@ -2170,7 +2360,7 @@ fn encode_precinct_single_level(
             let entries = vec![PerBandEntry {
                 wpb: wpb as u32,
                 line: BandLineSlice::Direct(line_data),
-                t: t_for_gain(gain),
+                t: t_for_band(gain, beta_idx as u32, i),
             }];
             emit_packet(&mut entropy, cfg, &entries)?;
         }
@@ -2191,8 +2381,8 @@ fn encode_precinct_single_level(
     precinct_bytes[1] = ((lprc >> 8) & 0xff) as u8;
     precinct_bytes[2] = (lprc & 0xff) as u8;
     precinct_bytes[3] = cfg.q.min(31);
-    // R[p] at offset 4 stays 0.
-    // D[p,b] bits at offset 5+ stay 0.
+    precinct_bytes[4] = cfg.rp; // R[p] — precinct refinement (Annex C.2 Table C.1)
+                                // D[p,b] bits at offset 5+ stay 0.
     precinct_bytes.extend_from_slice(&entropy);
     let _ = hp_real; // hp_real is the original-pixel-grid count; unused now
     Ok(precinct_bytes)
@@ -2368,13 +2558,32 @@ fn encode_precinct_cascade(
     let nly_u = nly as u32;
     let beta1 = nlx_u.max(nly_u) - nlx_u.min(nly_u) + 1;
 
-    // Per-band truncation: T[p,b] = clamp(Q - G[b], 0, 15).
-    // G[b] = #high-pass axes in band β for comp i (using comp-local nly_i).
+    // Per-band truncation: T[p,b] = clamp(Q - G[b] - r, 0, 15) per Annex
+    // C.6.2 Table C.10. G[b] = #high-pass axes in band β for comp i
+    // (using comp-local nly_i). The refinement term `r = (P[b] < R[p])`
+    // grants one extra retained bitplane to low-index (LL-first) bands;
+    // the encoder assigns `P[b] = b` (the true band index, Annex B.6), so
+    // `r = (b < R[p]) ? 1 : 0`. R[p] = 0 disables refinement (r ≡ 0).
+    let nd_u32 = n_decomposed as u32;
     let t_for_band = |beta: u32, comp_i: usize| -> u8 {
-        let nly_comp = nly_i[comp_i];
-        let key = beta_key(beta, cfg.nlx, nly_comp);
-        let gain = (if key.tau_x { 1u8 } else { 0 }) + (if key.tau_y { 1 } else { 0 });
-        (cfg.q as i32 - gain as i32).clamp(0, 15) as u8
+        let band_index: u32 = if comp_i < n_decomposed {
+            // Wavelet band: b = (Nc - Sd)×β + i.
+            nd_u32 * beta + comp_i as u32
+        } else {
+            // Sd suppressed-tail band: b = (Nc - Sd)×Nβ + (i - (Nc - Sd)).
+            nd_u32 * nbeta_pic + (comp_i as u32 - nd_u32)
+        };
+        let refine = if band_index < cfg.rp as u32 { 1i32 } else { 0 };
+        // Gain: suppressed-tail bands have no wavelet axes (G = 0); the
+        // wavelet bands use the τx/τy high-pass count from beta_key.
+        let gain: i32 = if comp_i < n_decomposed {
+            let nly_comp = nly_i[comp_i];
+            let key = beta_key(beta, cfg.nlx, nly_comp);
+            (if key.tau_x { 1 } else { 0 }) + (if key.tau_y { 1 } else { 0 })
+        } else {
+            0
+        };
+        (cfg.q as i32 - gain - refine).clamp(0, 15) as u8
     };
 
     // Helper: build a one-line band slice from a per-component band buffer.
@@ -2731,9 +2940,9 @@ fn encode_precinct_cascade(
     precinct_bytes[1] = ((lprc >> 8) & 0xff) as u8;
     precinct_bytes[2] = (lprc & 0xff) as u8;
     precinct_bytes[3] = cfg.q.min(31);
-    // R[p] at offset 4 stays 0.
-    // D[p,b] bits at offset 5+: pack 2 bits per existing band (Sig|Pred).
-    // D[p,b] = (sig_bit << 1) | pred_bit per Table C.1.
+    precinct_bytes[4] = cfg.rp; // R[p] — precinct refinement (Annex C.2 Table C.1)
+                                // D[p,b] bits at offset 5+: pack 2 bits per existing band (Sig|Pred).
+                                // D[p,b] = (sig_bit << 1) | pred_bit per Table C.1.
     let mut bit_cursor: usize = (24 + 8 + 8) as usize; // skip Lprc/Q/R bits
     for s in &slices {
         if !s.exists {
@@ -4690,6 +4899,7 @@ mod tests {
             0, // fs
             0, // hsl
             0, // qpih
+            0, // rp
             &[y_plane.clone(), u_plane.clone(), v_plane.clone()],
         )
         .expect("encode 64x8 4:2:2 Cw=1 NL=1/1");
@@ -5153,6 +5363,7 @@ mod tests {
             2, // fs: reserved → must reject
             0, // hsl
             0, // qpih
+            0, // rp
             std::slice::from_ref(&pixels),
         );
         assert!(result.is_err(), "Fs=2 (reserved) must be rejected");
@@ -5491,6 +5702,7 @@ mod tests {
             0, // fs
             0, // hsl
             2, // qpih: reserved → must reject
+            0, // rp
             std::slice::from_ref(&pixels),
         );
         assert!(result.is_err(), "Qpih=2 (reserved) must be rejected");
@@ -5630,6 +5842,7 @@ mod tests {
             1, // fs = 1
             0, // hsl
             1, // qpih = 1
+            0, // rp
             std::slice::from_ref(&pixels),
         )
         .expect("encode Qpih=1 Fs=1 luma lossless");
@@ -5638,5 +5851,185 @@ mod tests {
         assert_eq!(parsed.pih.fs, 1, "PIH Fs=1");
         let img = decode_codestream(&cs, None).expect("decode Qpih=1 Fs=1");
         assert_eq!(img.planes[0].data, pixels, "Qpih=1 Fs=1 lossless");
+    }
+
+    // === Round 115: R[p] > 0 precinct refinement (Annex C.6.2) ==========
+
+    /// Round 115: the WGT marker now carries per-band priorities `P[b] = b`
+    /// (the true band index, Annex B.6) instead of the all-zero priorities
+    /// rounds 1–111 emitted. The decoder reads them via `parse_wgt`; here we
+    /// confirm the priorities are the sequential band indices for a luma
+    /// NL=2/2 picture (Nβ = 6 bands for one component).
+    #[test]
+    fn round115_wgt_carries_band_index_priorities() {
+        let pixels = make_synthetic_32x32();
+        // q = 0 lossless; rp = 0 (priorities are emitted regardless of rp).
+        let cs = encode_planar_rp(32, 32, 1, 0, 2, 2, 0, 0, std::slice::from_ref(&pixels))
+            .expect("encode luma NL=2/2 rp=0");
+        let parsed = crate::codestream::parse(&cs).expect("parse codestream");
+        // Nβ for NL,x=2, NL,y=2 is 2*2 + 2 + 1 = ... use n_beta to avoid
+        // hard-coding; Nc=1 so NL = Nβ bands, one per β.
+        let nbeta = n_beta(2, 2);
+        let weights =
+            crate::slice_walker::parse_wgt(&parsed.wgt, nbeta as usize).expect("parse_wgt");
+        for (b, w) in weights.iter().enumerate() {
+            assert_eq!(
+                w.priority, b as u8,
+                "band {b} priority should equal its band index"
+            );
+        }
+    }
+
+    /// Round 115: `rp = 0` is the no-refinement default and must be
+    /// byte-identical to [`encode_planar_lossy`] at every `q` (priorities
+    /// are emitted but `r = (P[b] < 0)` is always false, so T is unchanged
+    /// and the WGT priority bytes are the only addition — which the lossy
+    /// path also carries now). Both paths route through the same builder, so
+    /// the streams are fully identical.
+    #[test]
+    fn round115_rp0_matches_encode_planar_lossy() {
+        let pixels = make_synthetic_32x32();
+        for q in [0u8, 2, 4] {
+            let lossy = encode_planar_lossy(32, 32, 1, 0, 2, 2, q, std::slice::from_ref(&pixels))
+                .expect("encode_planar_lossy");
+            let rp0 = encode_planar_rp(32, 32, 1, 0, 2, 2, q, 0, std::slice::from_ref(&pixels))
+                .expect("encode_planar_rp rp=0");
+            assert_eq!(
+                lossy, rp0,
+                "rp=0 must be byte-identical to encode_planar_lossy at q={q}"
+            );
+        }
+    }
+
+    /// Round 115: `rp > 0` self-roundtrips losslessly at q=0. At q=0 the
+    /// truncation T is already clamped to its 0 floor, so the refinement
+    /// term `r` cannot lower it further — the lossless invariant holds for
+    /// any `rp`.
+    #[test]
+    fn round115_rp_gt_zero_lossless_at_q0() {
+        let pixels = make_synthetic_32x32();
+        let nl = n_beta(2, 2); // NL = Nβ for Nc=1
+        for rp in 1..=(nl as u8 - 1) {
+            let cs = encode_planar_rp(32, 32, 1, 0, 2, 2, 0, rp, std::slice::from_ref(&pixels))
+                .unwrap_or_else(|e| panic!("encode rp={rp} q=0: {e:?}"));
+            let img = decode_codestream(&cs, None)
+                .unwrap_or_else(|e| panic!("decode rp={rp} q=0: {e:?}"));
+            assert_eq!(img.planes[0].data, pixels, "rp={rp} q=0 must be lossless");
+        }
+    }
+
+    /// Round 115: a `rp > 0` lossy stream self-roundtrips through the
+    /// decoder (which recomputes the same T[p,b] from the WGT priorities and
+    /// the precinct-header R[p]) and holds a PSNR floor at q=2. This is the
+    /// core correctness proof: the encoder quantized with the refined T and
+    /// the decoder dequantized with the matching refined T.
+    #[test]
+    fn round115_rp_gt_zero_lossy_q2_roundtrips_and_holds_psnr() {
+        let pixels = make_synthetic_32x32();
+        // rp = 1 refines band 0 (LL) only.
+        let cs = encode_planar_rp(32, 32, 1, 0, 2, 2, 2, 1, std::slice::from_ref(&pixels))
+            .expect("encode luma rp=1 q=2");
+        let parsed = crate::codestream::parse(&cs).expect("parse codestream");
+        // The precinct header R[p] byte sits at precinct-header offset 4;
+        // confirm the decoder side reconstructs the picture (round-trip is
+        // the authoritative check). Inspect the WGT priority of band 0.
+        let nbeta = n_beta(2, 2);
+        let weights =
+            crate::slice_walker::parse_wgt(&parsed.wgt, nbeta as usize).expect("parse_wgt");
+        assert_eq!(weights[0].priority, 0, "band 0 (LL) priority is 0");
+        let img = decode_codestream(&cs, None).expect("decode rp=1 q=2");
+        let p = psnr(&pixels, &img.planes[0].data);
+        assert!(p >= 30.0, "rp=1 q=2 PSNR {p:.2} dB below 30 dB floor");
+    }
+
+    /// Round 115: at q=2 a refinement `rp > 0` changes the data sub-packet
+    /// relative to `rp = 0` — the refined bands carry one extra magnitude
+    /// bitplane (lower T), so the codestream is not byte-identical. This
+    /// proves the refinement actually fires (it is not a silent no-op). The
+    /// refined stream is at least as large as the unrefined one because the
+    /// extra bitplane adds coded bits to the refined bands.
+    #[test]
+    fn round115_rp_gt_zero_changes_lossy_stream() {
+        let pixels = make_synthetic_32x32();
+        let rp0 = encode_planar_rp(32, 32, 1, 0, 2, 2, 2, 0, std::slice::from_ref(&pixels))
+            .expect("encode rp=0 q=2");
+        // rp = NL-1 refines every band except the highest-index one,
+        // guaranteeing several bands gain a bitplane.
+        let nl = n_beta(2, 2) as u8; // NL = Nβ for Nc=1
+        let rp_hi = encode_planar_rp(32, 32, 1, 0, 2, 2, 2, nl - 1, std::slice::from_ref(&pixels))
+            .expect("encode rp=NL-1 q=2");
+        assert_ne!(
+            rp0, rp_hi,
+            "rp>0 must change the lossy data sub-packet vs rp=0"
+        );
+        // Both still round-trip.
+        let img = decode_codestream(&rp_hi, None).expect("decode rp=NL-1 q=2");
+        let p = psnr(&pixels, &img.planes[0].data);
+        // Refining low-frequency bands should not collapse quality; hold a
+        // sane floor (the refined LL band carries more precision).
+        assert!(p >= 25.0, "rp=NL-1 q=2 PSNR {p:.2} dB below 25 dB floor");
+    }
+
+    /// Round 115: RGB under the reversible colour transform (Cpih=1) with
+    /// `rp > 0` self-roundtrips losslessly at q=0 and holds a PSNR floor at
+    /// q=2 — exercising the β-major-then-component band-index priority
+    /// assignment across 3 components.
+    #[test]
+    fn round115_rp_rgb_rct_roundtrips() {
+        let rgb = make_synthetic_rgb_32x32();
+        let mut r = vec![0u8; 32 * 32];
+        let mut g = vec![0u8; 32 * 32];
+        let mut b = vec![0u8; 32 * 32];
+        for i in 0..32 * 32 {
+            r[i] = rgb[i * 3];
+            g[i] = rgb[i * 3 + 1];
+            b[i] = rgb[i * 3 + 2];
+        }
+        let planes = [r.clone(), g.clone(), b.clone()];
+        // q=0 lossless with rp=2 (refines bands 0 and 1).
+        let cs0 =
+            encode_planar_rp(32, 32, 3, 1, 2, 2, 0, 2, &planes).expect("encode RGB+RCT rp=2 q=0");
+        let img0 = decode_codestream(&cs0, None).expect("decode RGB+RCT rp=2 q=0");
+        assert_eq!(img0.planes[0].data, r, "R lossless rp=2");
+        assert_eq!(img0.planes[1].data, g, "G lossless rp=2");
+        assert_eq!(img0.planes[2].data, b, "B lossless rp=2");
+        // q=2 lossy with rp=3.
+        let cs2 =
+            encode_planar_rp(32, 32, 3, 1, 2, 2, 2, 3, &planes).expect("encode RGB+RCT rp=3 q=2");
+        let img2 = decode_codestream(&cs2, None).expect("decode RGB+RCT rp=3 q=2");
+        for (plane, name) in [(&r, "R"), (&g, "G"), (&b, "B")]
+            .iter()
+            .map(|(p, n)| (*p, *n))
+        {
+            let idx = match name {
+                "R" => 0,
+                "G" => 1,
+                _ => 2,
+            };
+            let p = psnr(plane, &img2.planes[idx].data);
+            assert!(
+                p >= 25.0,
+                "{name} rp=3 q=2 PSNR {p:.2} dB below 25 dB floor"
+            );
+        }
+    }
+
+    /// Round 115: the encoder rejects an out-of-range `R[p]` (>= NL). The
+    /// precinct-header field is u(8) but Table C.1 caps it at NL-1; a value
+    /// past the highest band index would refine every band and is invalid.
+    #[test]
+    fn round115_rejects_rp_out_of_range() {
+        let pixels = make_synthetic_32x32();
+        let nl = n_beta(2, 2) as u8; // NL = Nβ for Nc=1, NL=2/2
+                                     // rp = NL is one past the legal maximum (NL-1).
+        let result = encode_planar_rp(32, 32, 1, 0, 2, 2, 2, nl, std::slice::from_ref(&pixels));
+        assert!(
+            result.is_err(),
+            "R[p]={nl} (== NL) must be rejected (legal max is NL-1={})",
+            nl - 1
+        );
+        // rp = NL-1 is the legal maximum and must succeed.
+        let ok = encode_planar_rp(32, 32, 1, 0, 2, 2, 2, nl - 1, std::slice::from_ref(&pixels));
+        assert!(ok.is_ok(), "R[p]=NL-1={} must be accepted", nl - 1);
     }
 }
