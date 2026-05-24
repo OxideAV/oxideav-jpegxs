@@ -1,5 +1,43 @@
 # Changelog
 
+## Unreleased — round 111 (`Qpih`-aware forward quantizer)
+
+Adds a `Qpih`-selected forward quantizer so a `Qpih = 1` codestream is
+now encoded with the spec's uniform (round-to-nearest) quantization
+index instead of the deadzone (floored) one. Round 108 signalled
+`Qpih = 1` in the PIH but the encoder still picked the quantization
+index by deadzone truncation (`v = |c| >> T`, Annex D.4 Table D.3) — a
+valid stream, but it leaves the bottom of each uniform bucket as the
+implied reconstruction target, so lossy magnitudes were biased low. The
+uniform inverse (Annex D.3 Table D.2) was already wired on the decode
+side and expects the matching uniform forward index (Annex D.5 Table
+D.4).
+
+* `encoder.rs` — **new `forward_quant_index(qpih, c, m, t)`** returns the
+  on-wire quantization index `v[p,λ,b,x]` for the active quantizer:
+  * `Qpih = 0` (deadzone, Table D.3): `v = |c| >> T` — unchanged from the
+    round-3 path; bit-identical output.
+  * `Qpih = 1` (uniform, Table D.4): with `ζ = M − T + 1` and `d = |c|`,
+    `v = ((d << ζ) − d + (1 << M)) >> (M + 1)` — round-to-nearest into
+    equal-sized buckets (`Δ = 2^(M+1) / (2^(M+1−T) − 1)`). Returns 0 when
+    `M ≤ T` (no stored bitplanes). Computed in `u64` so `d << ζ` cannot
+    overflow.
+* **The data sub-packet** now writes the `M − T` bits of `v` (MSB-first)
+  rather than reusing `|c|`'s bits `[T, M)`. For `Qpih = 0` the two are
+  identical (`v`'s bits `[0, M−T)` equal `|c|`'s bits `[T, M)`), so every
+  deadzone stream stays byte-for-byte the same. For `Qpih = 1` the data
+  sub-packet now diverges from the deadzone form at `q > 0`.
+* **The `Fs = 1` sign sub-packet** gating predicate now tests the active
+  forward index `v != 0` (matching the decoder's `coef.v != 0`), keeping
+  the uniform path consistent with separate-sign streams.
+* **At `q = 0` (`T = 0`)** the uniform forward index is the identity
+  (`v = |c|`), so all round-108 lossless / one-byte-diff invariants hold.
+* **Tests** — 6 new (`round111_*`): `forward_quant_index` deadzone +
+  uniform unit cases hand-checked against Tables D.3 / D.4, the `T = 0`
+  identity, the `Qpih = 1` lossy data sub-packet now diverging from
+  `Qpih = 0`, a uniform-path PSNR floor at q=3, and `Qpih = 1` + `Fs = 1`
+  lossless round-trip. 234 → 240 tests.
+
 ## Unreleased — round 108 (encoder `Qpih = 1` uniform inverse quantizer)
 
 Adds encoder support for the `Qpih = 1` inverse-quantizer type per

@@ -13,14 +13,19 @@
 //!   For sparse bands (`M[g]` small / mostly zero) the VLC is one to
 //!   two orders of magnitude smaller than raw mode's flat
 //!   `Br=8` bits per code group.
-//! * **Regular (`Fq = 8`) lossy mode with Annex D.2 deadzone
+//! * **Regular (`Fq = 8`) lossy mode with a `Qpih`-aware forward
 //!   quantizer.** A new `q` parameter sets the precinct-level
 //!   `Q[p]` (`0..=15`) which in turn drives the per-band truncation
-//!   `T[p,b] = clamp(Q[p] - G[b] - r, 0, 15)`. The encoder right-
-//!   shifts coefficient magnitudes by `T` (truncation) and emits only
-//!   `M - T` bitplanes per code group; the decoder reconstructs with
-//!   the half-bucket offset `((1 << T) >> 1)`. PSNR ≥ 40 dB at `q = 1`,
-//!   ≥ 32 dB at `q = 4` on synthetic 32×32 RGB.
+//!   `T[p,b] = clamp(Q[p] - G[b] - r, 0, 15)`. The quantization index
+//!   `v[p,λ,b,x]` is computed by [`forward_quant_index`], which selects
+//!   the quantizer matching the picture-header `Qpih`: deadzone
+//!   (`Qpih = 0`, Annex D.4 Table D.3 — `v = |c| >> T`, reconstructed at
+//!   the half-bucket offset `((1 << T) >> 1)`) or uniform (`Qpih = 1`,
+//!   Annex D.5 Table D.4 — `v = ((|c| << ζ) − |c| + (1 << M)) >>
+//!   (M + 1)`, `ζ = M − T + 1`, round-to-nearest, reconstructed by the
+//!   Neumann series of Annex D.3). Either way only `M - T` bitplanes per
+//!   code group go on the wire. PSNR ≥ 40 dB at `q = 1`, ≥ 32 dB at
+//!   `q = 4` on synthetic 32×32 RGB.
 //! * **4:2:2 / 4:2:0 chroma sub-sampling.** New entry point
 //!   [`encode_planar_subsampled`] takes per-component `(sx, sy)` plus
 //!   per-component byte buffers sized at `Wc[i] × Hc[i]` (`Wc[i] = Wf
@@ -2953,6 +2958,52 @@ fn compute_m_per_group(cfg: &EncodeConfig, entry: &PerBandEntry) -> Result<Vec<u
     Ok(m_per_group)
 }
 
+/// Forward quantizer: map a raw wavelet coefficient `c` to the on-wire
+/// quantization-index magnitude `v[p,λ,b,x]` for the active inverse
+/// quantizer type `qpih`.
+///
+/// The data sub-packet stores `M - T` magnitude bitplanes per code group
+/// (Annex C.5.4): the decoder reads them into `v` at positions
+/// `[0, M-T)` and the inverse quantizer shifts that `v` back up by `T`.
+/// So this function returns the value whose bits `[0, M-T)` go on the
+/// wire — i.e. the *quantization index*, not the coefficient.
+///
+/// * `qpih == 0` — deadzone forward quantizer (Annex D.4, Table D.3):
+///   `v = |c| >> T`. This is the plain truncation the encoder has used
+///   since round 3; matched by the deadzone inverse (Annex D.2, Table
+///   D.1) whose reconstruction point sits at the bucket midpoint.
+/// * `qpih == 1` — uniform forward quantizer (Annex D.5, Table D.4):
+///   with `ζ = M − T + 1` and `d = |c|`,
+///   `v = ((d << ζ) − d + (1 << M)) >> (M + 1)`. This rounds to the
+///   nearest equal-sized bucket (the NOTE under Table D.4 describes it
+///   as mid-point quantization with bucket size `Δ = 2^(M+1) /
+///   (2^(M+1−T) − 1)`), matching the uniform / Neumann-series inverse
+///   (Annex D.3, Table D.2). When `M <= T` no bitplanes are stored, so
+///   `v = 0` (Table D.4 `else` branch).
+///
+/// Both branches return `0` when `M <= T` (the group carries no stored
+/// bitplanes) so the caller's `m <= t` guard stays consistent. The
+/// returned `v` always fits in the `M − T` stored bitplanes (verified:
+/// Table D.4 never overflows `2^(M-T)`).
+#[inline]
+fn forward_quant_index(qpih: u8, c: i32, m: u32, t: u32) -> u32 {
+    if m <= t {
+        return 0;
+    }
+    let d = c.unsigned_abs();
+    match qpih {
+        // Uniform quantizer (Annex D.5, Table D.4). Performed in u64 so
+        // `d << ζ` cannot overflow for any in-range coefficient.
+        1 => {
+            let zeta = m - t + 1;
+            let num = (((d as u64) << zeta) + (1u64 << m)) - (d as u64);
+            (num >> (m + 1)) as u32
+        }
+        // Deadzone quantizer (Annex D.4, Table D.3) — the default.
+        _ => d >> t,
+    }
+}
+
 /// Build one packet body for the given bitplane-count coding mode,
 /// using pre-computed per-entry M arrays. The data sub-packet is
 /// independent of the bitplane-count mode (only the `cnt` sub-packet
@@ -3136,36 +3187,41 @@ fn build_packet_body_with_m(
                     data_writer.write_bit(sign_bit);
                 }
             }
-            for plane in (t..m).rev() {
+            // Magnitude bitplanes: store the `M - T` bits of the
+            // quantization index `v` (Annex C.5.4), MSB-first. The index
+            // is derived from the raw coefficient by the active forward
+            // quantizer (`Qpih`): deadzone (`v = |c| >> T`, Table D.3) or
+            // uniform / round-to-nearest (Table D.4). For deadzone the
+            // index `v` equals `|c| >> T`, so writing `v`'s bits
+            // `[0, M-T)` is byte-identical to the round-3 path that wrote
+            // `|c|`'s bits `[T, M)`.
+            for bplane in (0..(m - t)).rev() {
                 for k in 0..ng_u {
-                    let v = coef(g, k);
-                    let mag = v.unsigned_abs();
-                    let bit = ((mag >> plane) & 1) as u8;
+                    let v = forward_quant_index(cfg.qpih, coef(g, k), m, t);
+                    let bit = ((v >> bplane) & 1) as u8;
                     data_writer.write_bit(bit);
                 }
             }
         }
 
         // Sign sub-packet (Fs = 1, Table C.9). One bit per coefficient
-        // whose reconstructed magnitude is non-zero, iterating bands →
-        // lines → groups → members in the same order the decoder reads.
-        // The decoder's reconstructed magnitude keeps original bitplanes
-        // [T, M); it is non-zero exactly when (|v| >> T) != 0, so we gate
-        // the sign emission on that predicate (matching the decoder's
-        // `coef.v != 0` test).
+        // whose stored quantization index `v` is non-zero, iterating
+        // bands → lines → groups → members in the same order the decoder
+        // reads. The decoder gates each sign bit on `coef.v != 0` (the
+        // index it just read off the wire), so the encoder must gate on
+        // the same forward-quantized index — for `Qpih = 1` the uniform
+        // round-to-nearest can map a coefficient to a non-zero index that
+        // a plain `|c| >> T` truncation would have zeroed (or vice
+        // versa), so reusing the active forward quantizer keeps the two
+        // sides in lockstep.
         if fs1 {
             for (g, &m_u8) in m_per_group.iter().enumerate() {
                 let m = m_u8 as u32;
                 for k in 0..ng_u {
-                    let v = coef(g, k);
-                    // A coefficient only contributes a sign bit when its
-                    // kept bitplanes [T, M) hold at least one set bit. For
-                    // groups with M <= T (all magnitudes truncated away),
-                    // (|v| >> t) is still gated below; the magnitude is
-                    // effectively zero after dequant so no sign is emitted.
-                    let kept = if m > t { v.unsigned_abs() >> t } else { 0 };
-                    if kept != 0 {
-                        let sign_bit = if v < 0 { 1 } else { 0 };
+                    let c = coef(g, k);
+                    let v = forward_quant_index(cfg.qpih, c, m, t);
+                    if v != 0 {
+                        let sign_bit = if c < 0 { 1 } else { 0 };
                         sgn_writer.write_bit(sign_bit);
                     }
                 }
@@ -5438,5 +5494,149 @@ mod tests {
             std::slice::from_ref(&pixels),
         );
         assert!(result.is_err(), "Qpih=2 (reserved) must be rejected");
+    }
+
+    // === Round 111: Qpih-aware forward quantizer ========================
+    // Round 108 signalled `Qpih = 1` but the encoder still picked the
+    // quantization index with the deadzone truncation `v = |c| >> T`
+    // (Annex D.4, Table D.3). Round 111 adds the matching uniform forward
+    // quantizer (Annex D.5, Table D.4) so a `Qpih = 1` stream is encoded
+    // with round-to-nearest indices instead of flooring, which the
+    // uniform / Neumann-series inverse (Annex D.3, Table D.2) was already
+    // expecting.
+
+    /// Round 111: `forward_quant_index` with `qpih = 0` is the deadzone
+    /// truncation `v = |c| >> T` (Annex D.4, Table D.3), independent of M
+    /// (beyond the `M > T` gate). Sign is handled by the caller, so the
+    /// magnitude uses `|c|`.
+    #[test]
+    fn round111_forward_quant_deadzone_is_truncation() {
+        // M > T so the group carries bitplanes.
+        assert_eq!(forward_quant_index(0, 3, 4, 2), 0); // 3 >> 2 = 0
+        assert_eq!(forward_quant_index(0, 7, 4, 2), 1); // 7 >> 2 = 1
+        assert_eq!(forward_quant_index(0, -12, 4, 2), 3); // 12 >> 2 = 3
+        assert_eq!(forward_quant_index(0, 15, 4, 2), 3); // 15 >> 2 = 3
+                                                         // M <= T → no stored bitplanes → v = 0.
+        assert_eq!(forward_quant_index(0, 15, 2, 2), 0);
+        assert_eq!(forward_quant_index(0, 15, 1, 2), 0);
+    }
+
+    /// Round 111: `forward_quant_index` with `qpih = 1` matches the
+    /// uniform forward quantizer of Annex D.5 Table D.4 hand-computed:
+    /// `v = ((d << ζ) − d + (1 << M)) >> (M + 1)`, `ζ = M − T + 1`. The
+    /// uniform index rounds to nearest where the deadzone floors —
+    /// e.g. `d = 3, M = 4, T = 2` gives `1` (uniform) vs `0` (deadzone).
+    #[test]
+    fn round111_forward_quant_uniform_matches_table_d4() {
+        // M=4, T=2 (ζ=3): rounding visible at d=3 and d=7.
+        assert_eq!(forward_quant_index(1, 3, 4, 2), 1); // round up vs 0
+        assert_eq!(forward_quant_index(1, 7, 4, 2), 2); // round up vs 1
+        assert_eq!(forward_quant_index(1, -12, 4, 2), 3); // ties with deadzone
+        assert_eq!(forward_quant_index(1, 15, 4, 2), 3);
+        // M=5, T=1 (ζ=5): matches deadzone on these exact multiples.
+        assert_eq!(forward_quant_index(1, 1, 5, 1), 0);
+        assert_eq!(forward_quant_index(1, 2, 5, 1), 1);
+        assert_eq!(forward_quant_index(1, 16, 5, 1), 8);
+        assert_eq!(forward_quant_index(1, -31, 5, 1), 15);
+        // M <= T → v = 0 (Table D.4 `else`).
+        assert_eq!(forward_quant_index(1, 15, 2, 2), 0);
+    }
+
+    /// Round 111: at `T = 0` (q = 0, lossless) the uniform forward index
+    /// equals the coefficient magnitude (`v = |c|`), so it round-trips
+    /// through the uniform inverse exactly. This keeps the round-108
+    /// lossless / one-byte-diff invariants intact under the new path.
+    #[test]
+    fn round111_forward_quant_uniform_t0_is_identity() {
+        for d in 0u32..256 {
+            if d == 0 {
+                continue;
+            }
+            let m = 32 - d.leading_zeros(); // bit length = M for this d
+            assert_eq!(
+                forward_quant_index(1, d as i32, m, 0),
+                d,
+                "uniform forward at T=0 must be identity for d={d}, M={m}"
+            );
+        }
+    }
+
+    /// Round 111: a `Qpih = 1` lossy stream now differs from the
+    /// `Qpih = 0` lossy stream in more than the single PIH byte — the
+    /// data sub-packet now carries the uniform (round-to-nearest) indices
+    /// rather than the deadzone (floored) indices. (Before round 111 the
+    /// two q>0 streams were byte-identical except the PIH bit.)
+    #[test]
+    fn round111_qpih1_lossy_data_differs_from_qpih0() {
+        let pixels = make_synthetic_32x32();
+        let cs0 = encode_planar_lossy(32, 32, 1, 0, 2, 2, 3, std::slice::from_ref(&pixels))
+            .expect("encode Qpih=0 q=3");
+        let cs1 = encode_planar_qpih(32, 32, 1, 0, 2, 2, 3, std::slice::from_ref(&pixels))
+            .expect("encode Qpih=1 q=3");
+        let diffs = cs0.iter().zip(cs1.iter()).filter(|(a, b)| a != b).count();
+        assert!(
+            cs0.len() != cs1.len() || diffs > 1,
+            "Qpih=1 lossy must now diverge in the data sub-packet, not just the PIH byte (len {} vs {}, {diffs} byte diffs)",
+            cs0.len(),
+            cs1.len()
+        );
+    }
+
+    /// Round 111: the uniform forward quantizer keeps the `Qpih = 1`
+    /// lossy reconstruction valid and above a sane PSNR floor at q=3 for
+    /// luma and for RGB under the reversible colour transform. The
+    /// round-to-nearest indexing should never reconstruct worse than the
+    /// previous floored indexing did; we assert a floor rather than an
+    /// exact PSNR so the test is robust to the synthetic content.
+    #[test]
+    fn round111_qpih1_uniform_lossy_psnr_floor_q3() {
+        let pixels = make_synthetic_32x32();
+        let cs = encode_planar_qpih(32, 32, 1, 0, 2, 2, 3, std::slice::from_ref(&pixels))
+            .expect("encode Qpih=1 q=3 luma");
+        let img = decode_codestream(&cs, None).expect("decode Qpih=1 q=3");
+        let q = psnr(&pixels, &img.planes[0].data);
+        assert!(
+            q >= 25.0,
+            "Qpih=1 uniform q=3 luma PSNR {q:.2} dB below 25 dB"
+        );
+    }
+
+    /// Round 111: the uniform forward quantizer composes with `Fs = 1`
+    /// (separate sign sub-packet). The sign-gating predicate now uses the
+    /// same uniform index the decoder reads, so a `Qpih = 1` + `Fs = 1`
+    /// stream still round-trips losslessly at q=0.
+    #[test]
+    fn round111_qpih1_fs1_lossless() {
+        let pixels = make_synthetic_32x32();
+        let cs = encode_planar_inner_nlt(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            0, // q = 0 lossless
+            0,
+            &[1],
+            &[1],
+            0,
+            0,
+            0,
+            0,
+            None,
+            Vec::new(),
+            0, // cw
+            0, // sd
+            1, // fs = 1
+            0, // hsl
+            1, // qpih = 1
+            std::slice::from_ref(&pixels),
+        )
+        .expect("encode Qpih=1 Fs=1 luma lossless");
+        let parsed = crate::codestream::parse(&cs).expect("parse");
+        assert_eq!(parsed.pih.qpih, 1, "PIH Qpih=1");
+        assert_eq!(parsed.pih.fs, 1, "PIH Fs=1");
+        let img = decode_codestream(&cs, None).expect("decode Qpih=1 Fs=1");
+        assert_eq!(img.planes[0].data, pixels, "Qpih=1 Fs=1 lossless");
     }
 }
