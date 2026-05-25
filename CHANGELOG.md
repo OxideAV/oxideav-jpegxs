@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased — round 133 (encoder high-bit-depth lossy, `B[i] > 8` + `q > 0`)
+
+Adds the lossy companion to the round-118 high-bit-depth (`B[i] ∈ 9..=16`)
+encoder path. Round 118 coded high-bit-depth pictures losslessly only
+(`q = 0`, `Fq = 0`); the "Out of scope (next round)" note flagged lossy
+`q > 0` as the natural follow-on. Bit depth is orthogonal to quantization
+— the forward quantizer (`forward_quant_index`) and the inverse
+dequantizer both operate on `i32` wavelet coefficients regardless of
+`B[i]`, so the only bit-depth-dependent pieces remain the DC level shift
+(`1 << (bd − 1)`, Annex G.3 inverse) and the two-bytes-per-sample `u16`-LE
+plane packing — already in place since round 118. This round just exposes
+the path.
+
+* `encoder.rs` — **new public `encode_planar_highbd_lossy(width, height,
+  nc, cpih, nlx, nly, bd, q, planes)`** entry point. Same plane format as
+  `encode_planar_highbd` (little-endian `u16` samples in `0..=2^bd − 1`,
+  `Bw = B[i] = bd`) but threads a non-zero precinct quantization step
+  `q ∈ 1..=15` (Annex C.2 `Q[p]`) with `Fq = 8` (regular mode, Table A.8).
+  The per-band deadzone truncation `T[p,b] = clamp(Q − G[b], 0, 15)`
+  (Annex D.4 Table D.3) drops low bitplanes; the decoder reconstructs with
+  the matching deadzone inverse (Annex D.2, `Qpih = 0`).
+* `cpih ∈ {0, 1}` (no transform / reversible RCT). `q = 0` is rejected
+  (use `encode_planar_highbd` for lossless); `bd = 8` and `cpih = 3`
+  (Star-Tetrix) are rejected, mirroring the lossless entry point.
+* **Tests** — 10-bit luma q=1 ≥ 40 dB PSNR; 12-bit luma q=2 NL=3/3 ≥ 30
+  dB; 16-bit RGB+RCT q=1 ≥ 40 dB per component; q=2 produces a strictly
+  smaller stream than the lossless q=0 path (quantizer bites); reject
+  cases for q=0 / bd=8 / Cpih=3.
+
 ## Unreleased — round 115 (encoder `R[p] > 0` precinct refinement)
 
 Adds encoder support for the precinct-refinement parameter `R[p]` per

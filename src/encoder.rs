@@ -776,6 +776,102 @@ pub fn encode_planar_highbd(
     )
 }
 
+/// Round-133 high-bit-depth (`B[i] > 8`) **lossy** 4:4:4 entry point.
+///
+/// The lossy companion to [`encode_planar_highbd`]: same plane format
+/// (little-endian `u16` samples in `0..=2^bd - 1`, `bd ∈ 9..=16`, `Bw =
+/// B[i] = bd`, DC level shift `1 << (bd - 1)` per the Annex G.3 inverse)
+/// but with a non-zero precinct quantization step `q` (Annex C.2 `Q[p]`,
+/// `1..=15`). `q > 0` forces `Fq = 8` (regular mode, Table A.8) so the
+/// per-band deadzone truncation `T[p,b] = clamp(Q − G[b], 0, 15)` (Annex
+/// D.4 Table D.3) drops the low bitplanes; the decoder reconstructs with
+/// the matching deadzone inverse (Annex D.2, `Qpih = 0`).
+///
+/// Bit depth is orthogonal to quantization here: the forward quantizer
+/// ([`forward_quant_index`]) and the inverse dequantizer both operate on
+/// `i32` wavelet coefficients regardless of `B[i]`, so the only bit-depth-
+/// dependent pieces remain the level shift and the `u16`-LE plane packing —
+/// exactly as on the round-118 lossless path. The reconstructed plane is
+/// returned in the two-bytes-per-sample [`crate::image::JpegXsPlane`]
+/// layout and clipped to `0..=2^bd - 1`.
+///
+/// `cpih ∈ {0, 1}` (no transform / reversible RCT, Annex F.3 — bit-depth
+/// agnostic). Star-Tetrix (`cpih = 3`) and NLT pre-distortion stay 8-bit-
+/// input specific. `q = 0` is rejected — use [`encode_planar_highbd`] for
+/// the lossless path.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_highbd_lossy(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    bd: u8,
+    q: u8,
+    planes: &[Vec<u16>],
+) -> Result<Vec<u8>> {
+    if !(9..=16).contains(&bd) {
+        return Err(Error::Unsupported(format!(
+            "jpegxs encoder: encode_planar_highbd_lossy requires B[i] in 9..=16, got {bd} (use encode_planar_lossy for 8-bit)"
+        )));
+    }
+    if q == 0 {
+        return Err(Error::invalid(
+            "jpegxs encoder: encode_planar_highbd_lossy requires q > 0 (use encode_planar_highbd for lossless)".to_string(),
+        ));
+    }
+    if cpih != 0 && cpih != 1 {
+        return Err(Error::Unsupported(format!(
+            "jpegxs encoder: encode_planar_highbd_lossy supports Cpih in {{0, 1}}, got {cpih}"
+        )));
+    }
+    let max_sample: u16 = ((1u32 << bd) - 1) as u16;
+    // Pack each plane to little-endian u16 bytes (the EncodeConfig
+    // bit_depth > 8 plane format), validating the nominal range first.
+    let mut byte_planes: Vec<Vec<u8>> = Vec::with_capacity(planes.len());
+    for (i, p) in planes.iter().enumerate() {
+        let mut bytes = Vec::with_capacity(p.len() * 2);
+        for &s in p {
+            if s > max_sample {
+                return Err(Error::invalid(format!(
+                    "jpegxs encoder: plane {i} sample {s} exceeds B[i]={bd} max {max_sample}"
+                )));
+            }
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        byte_planes.push(bytes);
+    }
+    let sx = vec![1u8; nc as usize];
+    let sy = vec![1u8; nc as usize];
+    encode_planar_inner_bd(
+        width,
+        height,
+        nc,
+        bd,
+        cpih,
+        nlx,
+        nly,
+        8, // fq = 8 (regular, Table A.8 — required for q > 0)
+        q,
+        &sx,
+        &sy,
+        0,
+        0,
+        0,
+        0,
+        None,
+        Vec::new(),
+        0,
+        0,
+        0, // fs = 0
+        0, // hsl = 0 (single slice)
+        0, // qpih = 0 (deadzone)
+        0, // rp = 0 (no refinement)
+        &byte_planes,
+    )
+}
+
 /// Round-103 multi-slice 4:4:4 entry point (`Hsl > 0`).
 ///
 /// Same shape as [`encode_planar_lossy`] but takes an explicit slice
@@ -6328,5 +6424,116 @@ mod tests {
         let planes = vec![vec![0u16; 16]; 4];
         let _ = src;
         assert!(encode_planar_highbd(4, 4, 4, 3, 1, 1, 12, &planes).is_err());
+    }
+
+    // === Round 133: high bit depth lossy (B[i] > 8, q > 0) ===============
+
+    /// PSNR between two `u16` planes at `bd`-bit peak (`2^bd - 1`).
+    fn psnr_u16(a: &[u16], b: &[u16], bd: u8) -> f64 {
+        assert_eq!(a.len(), b.len());
+        let mut sse: u64 = 0;
+        for (x, y) in a.iter().zip(b.iter()) {
+            let d = (*x as i64) - (*y as i64);
+            sse += (d * d) as u64;
+        }
+        if sse == 0 {
+            return f64::INFINITY;
+        }
+        let mse = sse as f64 / a.len() as f64;
+        let peak = ((1u32 << bd) - 1) as f64;
+        20.0 * peak.log10() - 10.0 * mse.log10()
+    }
+
+    #[test]
+    fn highbd_lossy_10bit_luma_psnr_q1() {
+        // q = 1 on a 10-bit luma ramp: near-lossless, PSNR must stay high.
+        let src = make_synthetic_highbd(32, 32, 10);
+        let cs = encode_planar_highbd_lossy(32, 32, 1, 0, 2, 2, 10, 1, std::slice::from_ref(&src))
+            .expect("encode 10-bit luma q=1");
+        let img = decode_codestream(&cs, None).expect("decode 10-bit luma q=1");
+        assert_eq!(img.bit_depth, 10, "PIH Bw must be 10");
+        let rec = plane_u16(&img.planes[0].data);
+        assert_eq!(rec.len(), src.len());
+        let p = psnr_u16(&src, &rec, 10);
+        assert!(p >= 40.0, "10-bit q=1 PSNR {p:.2} dB must be >= 40 dB");
+    }
+
+    #[test]
+    fn highbd_lossy_12bit_luma_psnr_q2_nl3() {
+        // q = 2, NL = 3/3 on a 12-bit luma ramp.
+        let src = make_synthetic_highbd(32, 32, 12);
+        let cs = encode_planar_highbd_lossy(32, 32, 1, 0, 3, 3, 12, 2, std::slice::from_ref(&src))
+            .expect("encode 12-bit luma q=2 NL=3/3");
+        let img = decode_codestream(&cs, None).expect("decode 12-bit luma q=2 NL=3/3");
+        let rec = plane_u16(&img.planes[0].data);
+        let p = psnr_u16(&src, &rec, 12);
+        assert!(p >= 30.0, "12-bit q=2 PSNR {p:.2} dB must be >= 30 dB");
+    }
+
+    #[test]
+    fn highbd_lossy_16bit_rgb_rct_psnr_q1() {
+        // Three 16-bit planes through the reversible RCT (Cpih = 1), q = 1.
+        let r = make_synthetic_highbd(32, 32, 16);
+        let mut g = make_synthetic_highbd(32, 32, 16);
+        let mut b = make_synthetic_highbd(32, 32, 16);
+        for v in g.iter_mut() {
+            *v = v.wrapping_add(11111);
+        }
+        for v in b.iter_mut() {
+            *v = v.wrapping_mul(3).wrapping_add(7);
+        }
+        let planes = vec![r.clone(), g.clone(), b.clone()];
+        let cs = encode_planar_highbd_lossy(32, 32, 3, 1, 2, 2, 16, 1, &planes)
+            .expect("encode 16-bit RGB + RCT q=1");
+        let img = decode_codestream(&cs, None).expect("decode 16-bit RGB + RCT q=1");
+        for (i, orig) in [&r, &g, &b].iter().enumerate() {
+            let rec = plane_u16(&img.planes[i].data);
+            let p = psnr_u16(orig, &rec, 16);
+            assert!(
+                p >= 40.0,
+                "16-bit RGB+RCT comp {i} q=1 PSNR {p:.2} dB must be >= 40 dB"
+            );
+        }
+    }
+
+    #[test]
+    fn highbd_lossy_compresses_smaller_than_lossless() {
+        // q = 2 must produce a strictly smaller codestream than q = 0
+        // (lossless) on the same 12-bit picture — the quantizer is biting.
+        let src = make_synthetic_highbd(32, 32, 12);
+        let lossless = encode_planar_highbd(32, 32, 1, 0, 2, 2, 12, std::slice::from_ref(&src))
+            .expect("encode lossless");
+        let lossy =
+            encode_planar_highbd_lossy(32, 32, 1, 0, 2, 2, 12, 2, std::slice::from_ref(&src))
+                .expect("encode q=2");
+        assert!(
+            lossy.len() < lossless.len(),
+            "q=2 stream ({}) must be smaller than lossless ({})",
+            lossy.len(),
+            lossless.len()
+        );
+    }
+
+    #[test]
+    fn highbd_lossy_rejects_q0_and_bad_bd() {
+        let src = vec![100u16; 16 * 16];
+        // q = 0 belongs on the lossless entry point.
+        assert!(
+            encode_planar_highbd_lossy(16, 16, 1, 0, 1, 1, 10, 0, std::slice::from_ref(&src))
+                .is_err(),
+            "q=0 must be rejected (use encode_planar_highbd)"
+        );
+        // bd = 8 must route through the 8-bit lossy path.
+        assert!(
+            encode_planar_highbd_lossy(16, 16, 1, 0, 1, 1, 8, 2, std::slice::from_ref(&src))
+                .is_err(),
+            "bd=8 must be rejected"
+        );
+        // Cpih = 3 (Star-Tetrix) is not exposed here.
+        let planes = vec![vec![0u16; 16]; 4];
+        assert!(
+            encode_planar_highbd_lossy(4, 4, 4, 3, 1, 1, 12, 2, &planes).is_err(),
+            "Cpih=3 must be rejected"
+        );
     }
 }
