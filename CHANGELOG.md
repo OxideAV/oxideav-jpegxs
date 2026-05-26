@@ -1,5 +1,45 @@
 # Changelog
 
+## Unreleased — round 151 (high bit depth + chroma sub-sampling)
+
+Widens the round-118 / round-133 high-bit-depth (`B[i] ∈ 9..=16`) paths
+from 4:4:4-only to arbitrary per-component `(sx, sy) ∈ {1, 2}` sub-
+sampling. The existing inner pipeline (`encode_planar_inner_bd`) already
+threaded both `bd` and `(sx[i], sy[i])` independently, so this round
+exposes two new entry points that wrap it for the high-bit-depth 4:2:2 /
+4:2:0 case.
+
+* `oxideav_jpegxs::encoder::encode_planar_subsampled_highbd(width,
+  height, nc, cpih, nlx, nly, bd, sx, sy, &[Vec<u16>])` — lossless
+  high-bit-depth chroma-sub-sampled entry point. `bd ∈ 9..=16` codes the
+  picture with `Bw = B[i] = bd`, DC level shift `1 << (bd − 1)` per the
+  Annex G.3 inverse, and `Fq = 0` (lossless, Table A.8). Per-component
+  `(sx[i], sy[i]) ∈ {1, 2}` sub-sampling uses the existing 8-bit
+  per-component effective vertical decomposition depth `N'L,y[i] = NL,y
+  − log2(sy[i])` path. `Cpih ∈ {0, 1}` — per Annex F.2 Table F.1 the
+  reversible RCT requires `sx[i] = sy[i] = 1` for `i < 3`, so the
+  typical 4:2:2 / 4:2:0 configurations are exposed only with `Cpih = 0`.
+  Star-Tetrix (`Cpih = 3`) and NLT pre-distortion stay 8-bit-input
+  specific.
+* `oxideav_jpegxs::encoder::encode_planar_subsampled_highbd_lossy(width,
+  height, nc, cpih, nlx, nly, bd, q, sx, sy, &[Vec<u16>])` — the
+  `q > 0` companion. Same plane format and constraints, but with
+  `q ∈ 1..=15` and `Fq = 8` (regular mode, Table A.8 — required for
+  `q > 0`). The per-band deadzone truncation `T[p,b] = clamp(Q − G[b],
+  0, 15)` (Annex D.4 Table D.3) drops low magnitude bitplanes; the
+  decoder reconstructs with the matching deadzone inverse (Annex D.2).
+  Bit depth is orthogonal to quantization (both run on `i32` wavelet
+  coefficients), so the only bit-depth-dependent pieces remain the
+  level shift and `u16` packing.
+
+Tests landed (288 total, +9 vs round 143): 10-bit 4:2:2 + 12-bit 4:2:0
++ 16-bit 4:2:2 lossless self-roundtrip bit-exact; 4:2:0 codestream
+strictly smaller than 4:4:4 of the same luma; q=2 lossy stream strictly
+smaller than q=0 lossless; PSNR ≥ 40 dB at 10-bit 4:2:2 q=1 and ≥ 30 dB
+at 12-bit 4:2:0 q=2; full rejection sweep (`bd = 8`, `bd = 17`, `cpih =
+3`, `q = 0` on the lossy entry point, RCT with chroma sub-sampling,
+mismatched plane sample counts, samples above `2^bd − 1`).
+
 ## Unreleased — round 143 (Part-2 profile / level / sublevel conformance)
 
 Adds a normative parse + conformance-check surface for ISO/IEC 21122-2:2019

@@ -872,6 +872,221 @@ pub fn encode_planar_highbd_lossy(
     )
 }
 
+/// Round-151 high-bit-depth chroma-sub-sampled entry point (lossless).
+///
+/// Widens [`encode_planar_highbd`] from 4:4:4-only to arbitrary per-
+/// component `(sx[i], sy[i]) ∈ {1, 2}` sub-sampling at component bit
+/// depth `bd ∈ 9..=16`. Same plane format as the round-118 lossless
+/// path: each `planes[i]` carries `(width / sx[i]) * (height / sy[i])`
+/// little-endian `u16` samples in `0..=2^bd - 1`. The codestream uses
+/// `Bw = B[i] = bd` and `Fq = 0` (the lossless choice of Table A.8);
+/// the DC level shift is `1 << (bd - 1)` per the Annex G.3 inverse, so
+/// each sample lands in the wavelet domain `[−2^(bd−1), 2^(bd−1) − 1]`
+/// independent of sub-sampling.
+///
+/// Per Annex F.2 Table F.1 the reversible RCT (`Cpih = 1`) requires
+/// `sx[i] = sy[i] = 1` for `i < 3`, so the typical 4:2:2 / 4:2:0
+/// configurations are exposed only with `Cpih = 0` (no transform).
+/// Star-Tetrix (`Cpih = 3`) and NLT pre-distortion stay 8-bit-input
+/// specific and are not exposed on this path.
+///
+/// The 5/3 DWT and entropy coder operate on `i32` coefficients
+/// independent of bit depth, and the per-component effective vertical
+/// decomposition depth `N'L,y[i] = NL,y − log2(sy[i])` (used in the
+/// 4:2:2 / 4:2:0 case) is the same path as the 8-bit sub-sampled
+/// encoder. The decoder packs `u16` LE per plane when `B[i] > 8`
+/// regardless of sub-sampling, so the output round-trips bit-exactly
+/// through [`crate::decode_jpeg_xs`].
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_subsampled_highbd(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    bd: u8,
+    sx: &[u8],
+    sy: &[u8],
+    planes: &[Vec<u16>],
+) -> Result<Vec<u8>> {
+    if !(9..=16).contains(&bd) {
+        return Err(Error::Unsupported(format!(
+            "jpegxs encoder: encode_planar_subsampled_highbd requires B[i] in 9..=16, got {bd} (use encode_planar_subsampled for 8-bit)"
+        )));
+    }
+    if cpih != 0 && cpih != 1 {
+        return Err(Error::Unsupported(format!(
+            "jpegxs encoder: encode_planar_subsampled_highbd supports Cpih in {{0, 1}}, got {cpih}"
+        )));
+    }
+    if sx.len() != nc as usize || sy.len() != nc as usize {
+        return Err(Error::invalid(format!(
+            "jpegxs encoder: sx/sy must have length nc={nc}, got sx={}, sy={}",
+            sx.len(),
+            sy.len()
+        )));
+    }
+    let max_sample: u16 = ((1u32 << bd) - 1) as u16;
+    // Pack each plane to little-endian u16 bytes (the EncodeConfig
+    // bit_depth > 8 plane format), validating the nominal range and
+    // per-component sub-sampled dimensions first.
+    let mut byte_planes: Vec<Vec<u8>> = Vec::with_capacity(planes.len());
+    for (i, p) in planes.iter().enumerate() {
+        let want = (width as usize / sx[i] as usize) * (height as usize / sy[i] as usize);
+        if p.len() != want {
+            return Err(Error::invalid(format!(
+                "jpegxs encoder: plane {i} sample count {} != Wc*Hc {} (sx={}, sy={})",
+                p.len(),
+                want,
+                sx[i],
+                sy[i]
+            )));
+        }
+        let mut bytes = Vec::with_capacity(p.len() * 2);
+        for &s in p {
+            if s > max_sample {
+                return Err(Error::invalid(format!(
+                    "jpegxs encoder: plane {i} sample {s} exceeds B[i]={bd} max {max_sample}"
+                )));
+            }
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        byte_planes.push(bytes);
+    }
+    encode_planar_inner_bd(
+        width,
+        height,
+        nc,
+        bd,
+        cpih,
+        nlx,
+        nly,
+        0, // fq = 0 (lossless)
+        0, // q = 0 (lossless)
+        sx,
+        sy,
+        0,
+        0,
+        0,
+        0,
+        None,
+        Vec::new(),
+        0,
+        0,
+        0, // fs = 0
+        0, // hsl = 0 (single slice)
+        0, // qpih = 0 (deadzone, no-op at q=0)
+        0, // rp = 0 (no refinement)
+        &byte_planes,
+    )
+}
+
+/// Round-151 high-bit-depth chroma-sub-sampled entry point (lossy).
+///
+/// The `q > 0` companion to [`encode_planar_subsampled_highbd`]: same
+/// `u16`-LE plane format, same `Bw = B[i] = bd` (`bd ∈ 9..=16`), same
+/// per-component `(sx, sy)`, but with a non-zero precinct quantization
+/// step `q ∈ 1..=15` (Annex C.2 `Q[p]`) and `Fq = 8` (regular mode,
+/// Table A.8). The per-band deadzone truncation
+/// `T[p,b] = clamp(Q − G[b], 0, 15)` (Annex D.4 Table D.3) drops the
+/// low magnitude bitplanes and the decoder reconstructs with the
+/// matching deadzone inverse (Annex D.2, `Qpih = 0`).
+///
+/// Bit depth is orthogonal to quantization (the forward quantizer and
+/// the inverse dequantizer both run on `i32` wavelet coefficients
+/// regardless of `B[i]`), so the only bit-depth-dependent pieces remain
+/// the level shift and `u16` packing — same as the round-118 / 133
+/// 4:4:4 paths. `cpih ∈ {0, 1}`. Rejects `q = 0` (use
+/// [`encode_planar_subsampled_highbd`]).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_subsampled_highbd_lossy(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    bd: u8,
+    q: u8,
+    sx: &[u8],
+    sy: &[u8],
+    planes: &[Vec<u16>],
+) -> Result<Vec<u8>> {
+    if !(9..=16).contains(&bd) {
+        return Err(Error::Unsupported(format!(
+            "jpegxs encoder: encode_planar_subsampled_highbd_lossy requires B[i] in 9..=16, got {bd} (use encode_planar_subsampled for 8-bit)"
+        )));
+    }
+    if q == 0 {
+        return Err(Error::invalid(
+            "jpegxs encoder: encode_planar_subsampled_highbd_lossy requires q > 0 (use encode_planar_subsampled_highbd for lossless)".to_string(),
+        ));
+    }
+    if cpih != 0 && cpih != 1 {
+        return Err(Error::Unsupported(format!(
+            "jpegxs encoder: encode_planar_subsampled_highbd_lossy supports Cpih in {{0, 1}}, got {cpih}"
+        )));
+    }
+    if sx.len() != nc as usize || sy.len() != nc as usize {
+        return Err(Error::invalid(format!(
+            "jpegxs encoder: sx/sy must have length nc={nc}, got sx={}, sy={}",
+            sx.len(),
+            sy.len()
+        )));
+    }
+    let max_sample: u16 = ((1u32 << bd) - 1) as u16;
+    let mut byte_planes: Vec<Vec<u8>> = Vec::with_capacity(planes.len());
+    for (i, p) in planes.iter().enumerate() {
+        let want = (width as usize / sx[i] as usize) * (height as usize / sy[i] as usize);
+        if p.len() != want {
+            return Err(Error::invalid(format!(
+                "jpegxs encoder: plane {i} sample count {} != Wc*Hc {} (sx={}, sy={})",
+                p.len(),
+                want,
+                sx[i],
+                sy[i]
+            )));
+        }
+        let mut bytes = Vec::with_capacity(p.len() * 2);
+        for &s in p {
+            if s > max_sample {
+                return Err(Error::invalid(format!(
+                    "jpegxs encoder: plane {i} sample {s} exceeds B[i]={bd} max {max_sample}"
+                )));
+            }
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        byte_planes.push(bytes);
+    }
+    encode_planar_inner_bd(
+        width,
+        height,
+        nc,
+        bd,
+        cpih,
+        nlx,
+        nly,
+        8, // fq = 8 (regular, Table A.8 — required for q > 0)
+        q,
+        sx,
+        sy,
+        0,
+        0,
+        0,
+        0,
+        None,
+        Vec::new(),
+        0,
+        0,
+        0, // fs = 0
+        0, // hsl = 0 (single slice)
+        0, // qpih = 0 (deadzone)
+        0, // rp = 0 (no refinement)
+        &byte_planes,
+    )
+}
+
 /// Round-103 multi-slice 4:4:4 entry point (`Hsl > 0`).
 ///
 /// Same shape as [`encode_planar_lossy`] but takes an explicit slice
@@ -6534,6 +6749,364 @@ mod tests {
         assert!(
             encode_planar_highbd_lossy(4, 4, 4, 3, 1, 1, 12, 2, &planes).is_err(),
             "Cpih=3 must be rejected"
+        );
+    }
+
+    // === Round 151: high bit depth + chroma sub-sampling =================
+
+    /// Build a sub-sampled chroma plane of `bd`-bit samples by stride-
+    /// sampling the synthetic luma ramp generator.
+    fn make_highbd_chroma(w: usize, h: usize, bd: u8, salt: i64) -> Vec<u16> {
+        let max = ((1u32 << bd) - 1) as i64;
+        let mut buf = vec![0u16; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let v =
+                    ((x as i64) * 173 + (y as i64) * 449 + salt * ((x ^ y) as i64 + 1)) % (max + 1);
+                buf[y * w + x] = v as u16;
+            }
+        }
+        buf
+    }
+
+    #[test]
+    fn highbd_subsampled_10bit_422_lossless_round_trips_exactly() {
+        // 4:2:2 — chroma planes are W/2 × H, 10-bit YCbCr.
+        let w = 32u16;
+        let h = 16u16;
+        let y = make_synthetic_highbd(w as usize, h as usize, 10);
+        let cb = make_highbd_chroma((w / 2) as usize, h as usize, 10, 7);
+        let cr = make_highbd_chroma((w / 2) as usize, h as usize, 10, 11);
+        let planes = vec![y.clone(), cb.clone(), cr.clone()];
+        let cs =
+            encode_planar_subsampled_highbd(w, h, 3, 0, 2, 2, 10, &[1, 2, 2], &[1, 1, 1], &planes)
+                .expect("encode 10-bit 4:2:2 lossless");
+        let img = decode_codestream(&cs, None).expect("decode 10-bit 4:2:2 lossless");
+        assert_eq!(img.bit_depth, 10, "PIH Bw must be 10");
+        assert_eq!(plane_u16(&img.planes[0].data), y);
+        assert_eq!(plane_u16(&img.planes[1].data), cb);
+        assert_eq!(plane_u16(&img.planes[2].data), cr);
+    }
+
+    #[test]
+    fn highbd_subsampled_12bit_420_lossless_round_trips_exactly() {
+        // 4:2:0 — chroma planes are W/2 × H/2, 12-bit YCbCr at NL=1/1
+        // (matching the 8-bit 4:2:0 test's decomposition depth).
+        let w = 32u16;
+        let h = 32u16;
+        let y = make_synthetic_highbd(w as usize, h as usize, 12);
+        let cb = make_highbd_chroma((w / 2) as usize, (h / 2) as usize, 12, 13);
+        let cr = make_highbd_chroma((w / 2) as usize, (h / 2) as usize, 12, 19);
+        let planes = vec![y.clone(), cb.clone(), cr.clone()];
+        let cs =
+            encode_planar_subsampled_highbd(w, h, 3, 0, 1, 1, 12, &[1, 2, 2], &[1, 2, 2], &planes)
+                .expect("encode 12-bit 4:2:0 lossless");
+        let img = decode_codestream(&cs, None).expect("decode 12-bit 4:2:0 lossless");
+        assert_eq!(img.bit_depth, 12, "PIH Bw must be 12");
+        assert_eq!(plane_u16(&img.planes[0].data), y);
+        assert_eq!(plane_u16(&img.planes[1].data), cb);
+        assert_eq!(plane_u16(&img.planes[2].data), cr);
+    }
+
+    #[test]
+    fn highbd_subsampled_16bit_422_lossless_round_trips_exactly() {
+        // 4:2:2 — chroma planes are W/2 × H, full 16-bit range.
+        let w = 16u16;
+        let h = 16u16;
+        let mut y = make_synthetic_highbd(w as usize, h as usize, 16);
+        y[0] = 0;
+        y[1] = 65535;
+        y[2] = 32768;
+        let cb = make_highbd_chroma((w / 2) as usize, h as usize, 16, 23);
+        let cr = make_highbd_chroma((w / 2) as usize, h as usize, 16, 29);
+        let planes = vec![y.clone(), cb.clone(), cr.clone()];
+        let cs =
+            encode_planar_subsampled_highbd(w, h, 3, 0, 2, 2, 16, &[1, 2, 2], &[1, 1, 1], &planes)
+                .expect("encode 16-bit 4:2:2 lossless");
+        let img = decode_codestream(&cs, None).expect("decode 16-bit 4:2:2 lossless");
+        assert_eq!(plane_u16(&img.planes[0].data), y);
+        assert_eq!(plane_u16(&img.planes[1].data), cb);
+        assert_eq!(plane_u16(&img.planes[2].data), cr);
+    }
+
+    #[test]
+    fn highbd_subsampled_lossy_10bit_422_psnr_q1() {
+        // q = 1 on a 10-bit 4:2:2 YCbCr picture: near-lossless luma + chroma.
+        let w = 32u16;
+        let h = 16u16;
+        let y = make_synthetic_highbd(w as usize, h as usize, 10);
+        let cb = make_highbd_chroma((w / 2) as usize, h as usize, 10, 7);
+        let cr = make_highbd_chroma((w / 2) as usize, h as usize, 10, 11);
+        let planes = vec![y.clone(), cb.clone(), cr.clone()];
+        let cs = encode_planar_subsampled_highbd_lossy(
+            w,
+            h,
+            3,
+            0,
+            2,
+            2,
+            10,
+            1,
+            &[1, 2, 2],
+            &[1, 1, 1],
+            &planes,
+        )
+        .expect("encode 10-bit 4:2:2 q=1");
+        let img = decode_codestream(&cs, None).expect("decode 10-bit 4:2:2 q=1");
+        assert_eq!(img.bit_depth, 10);
+        for (i, orig) in [&y, &cb, &cr].iter().enumerate() {
+            let rec = plane_u16(&img.planes[i].data);
+            let p = psnr_u16(orig, &rec, 10);
+            assert!(
+                p >= 40.0,
+                "10-bit 4:2:2 comp {i} q=1 PSNR {p:.2} dB must be >= 40 dB"
+            );
+        }
+    }
+
+    #[test]
+    fn highbd_subsampled_lossy_12bit_420_psnr_q2() {
+        // q = 2 on a 12-bit 4:2:0 YCbCr picture (NL = 1/1): PSNR ≥ 30 dB.
+        let w = 32u16;
+        let h = 32u16;
+        let y = make_synthetic_highbd(w as usize, h as usize, 12);
+        let cb = make_highbd_chroma((w / 2) as usize, (h / 2) as usize, 12, 13);
+        let cr = make_highbd_chroma((w / 2) as usize, (h / 2) as usize, 12, 19);
+        let planes = vec![y.clone(), cb.clone(), cr.clone()];
+        let cs = encode_planar_subsampled_highbd_lossy(
+            w,
+            h,
+            3,
+            0,
+            1,
+            1,
+            12,
+            2,
+            &[1, 2, 2],
+            &[1, 2, 2],
+            &planes,
+        )
+        .expect("encode 12-bit 4:2:0 q=2");
+        let img = decode_codestream(&cs, None).expect("decode 12-bit 4:2:0 q=2");
+        for (i, orig) in [&y, &cb, &cr].iter().enumerate() {
+            let rec = plane_u16(&img.planes[i].data);
+            let p = psnr_u16(orig, &rec, 12);
+            assert!(
+                p >= 30.0,
+                "12-bit 4:2:0 comp {i} q=2 PSNR {p:.2} dB must be >= 30 dB"
+            );
+        }
+    }
+
+    #[test]
+    fn highbd_subsampled_420_smaller_than_444() {
+        // 12-bit 4:2:0 codestream must be smaller than 12-bit 4:4:4 of the
+        // same luma — chroma byte budget halves twice.
+        let w = 32u16;
+        let h = 32u16;
+        let y = make_synthetic_highbd(w as usize, h as usize, 12);
+        let chroma_full = y.clone();
+        let cs_444 = encode_planar_highbd(
+            w,
+            h,
+            3,
+            0,
+            1,
+            1,
+            12,
+            &[y.clone(), chroma_full.clone(), chroma_full],
+        )
+        .expect("encode 12-bit 4:4:4 lossless");
+        let cb420 = make_highbd_chroma((w / 2) as usize, (h / 2) as usize, 12, 13);
+        let cr420 = make_highbd_chroma((w / 2) as usize, (h / 2) as usize, 12, 19);
+        let cs_420 = encode_planar_subsampled_highbd(
+            w,
+            h,
+            3,
+            0,
+            1,
+            1,
+            12,
+            &[1, 2, 2],
+            &[1, 2, 2],
+            &[y, cb420, cr420],
+        )
+        .expect("encode 12-bit 4:2:0 lossless");
+        assert!(
+            cs_420.len() < cs_444.len(),
+            "4:2:0 codestream ({}) must be smaller than 4:4:4 ({})",
+            cs_420.len(),
+            cs_444.len()
+        );
+    }
+
+    #[test]
+    fn highbd_subsampled_lossy_compresses_smaller_than_lossless() {
+        // Bit depth orthogonal to quantization: q = 2 stream must still be
+        // strictly smaller than q = 0 on the same 12-bit 4:2:2 picture.
+        let w = 32u16;
+        let h = 16u16;
+        let y = make_synthetic_highbd(w as usize, h as usize, 12);
+        let cb = make_highbd_chroma((w / 2) as usize, h as usize, 12, 13);
+        let cr = make_highbd_chroma((w / 2) as usize, h as usize, 12, 19);
+        let planes = vec![y, cb, cr];
+        let lossless =
+            encode_planar_subsampled_highbd(w, h, 3, 0, 2, 2, 12, &[1, 2, 2], &[1, 1, 1], &planes)
+                .expect("encode lossless");
+        let lossy = encode_planar_subsampled_highbd_lossy(
+            w,
+            h,
+            3,
+            0,
+            2,
+            2,
+            12,
+            2,
+            &[1, 2, 2],
+            &[1, 1, 1],
+            &planes,
+        )
+        .expect("encode q=2");
+        assert!(
+            lossy.len() < lossless.len(),
+            "12-bit 4:2:2 q=2 ({}) must be smaller than lossless ({})",
+            lossy.len(),
+            lossless.len()
+        );
+    }
+
+    #[test]
+    fn highbd_subsampled_rejects_bad_inputs() {
+        let y = vec![0u16; 4 * 4];
+        let chroma = vec![0u16; 2 * 4];
+        // bd = 8 must route through the 8-bit subsampled path.
+        assert!(
+            encode_planar_subsampled_highbd(
+                4,
+                4,
+                3,
+                0,
+                1,
+                1,
+                8,
+                &[1, 2, 2],
+                &[1, 1, 1],
+                &[y.clone(), chroma.clone(), chroma.clone()]
+            )
+            .is_err(),
+            "bd=8 must be rejected"
+        );
+        // bd = 17 exceeds the two-byte plane format.
+        assert!(
+            encode_planar_subsampled_highbd(
+                4,
+                4,
+                3,
+                0,
+                1,
+                1,
+                17,
+                &[1, 2, 2],
+                &[1, 1, 1],
+                &[y.clone(), chroma.clone(), chroma.clone()]
+            )
+            .is_err(),
+            "bd=17 must be rejected"
+        );
+        // Cpih = 3 (Star-Tetrix) is not exposed here.
+        let four_planes = vec![vec![0u16; 16]; 4];
+        assert!(
+            encode_planar_subsampled_highbd(
+                4,
+                4,
+                4,
+                3,
+                1,
+                1,
+                12,
+                &[1, 1, 1, 1],
+                &[1, 1, 1, 1],
+                &four_planes
+            )
+            .is_err(),
+            "Cpih=3 must be rejected"
+        );
+        // q = 0 must route through the lossless entry point.
+        assert!(
+            encode_planar_subsampled_highbd_lossy(
+                4,
+                4,
+                3,
+                0,
+                1,
+                1,
+                10,
+                0,
+                &[1, 2, 2],
+                &[1, 1, 1],
+                &[y.clone(), chroma.clone(), chroma.clone()]
+            )
+            .is_err(),
+            "q=0 must be rejected on the lossy entry point"
+        );
+        // RCT (Cpih=1) requires sx=sy=1 for i<3.
+        assert!(
+            encode_planar_subsampled_highbd(
+                4,
+                4,
+                3,
+                1,
+                1,
+                1,
+                10,
+                &[1, 2, 2],
+                &[1, 1, 1],
+                &[y.clone(), chroma.clone(), chroma]
+            )
+            .is_err(),
+            "Cpih=1 with chroma sub-sampling must be rejected (Annex F.2)"
+        );
+        // Plane sample count must match (width/sx) * (height/sy).
+        let bad_chroma = vec![0u16; 3]; // wrong size for 4:2:2 chroma at 4x4
+        assert!(
+            encode_planar_subsampled_highbd(
+                4,
+                4,
+                3,
+                0,
+                1,
+                1,
+                10,
+                &[1, 2, 2],
+                &[1, 1, 1],
+                &[y, bad_chroma.clone(), bad_chroma]
+            )
+            .is_err(),
+            "mismatched plane sample count must be rejected"
+        );
+    }
+
+    #[test]
+    fn highbd_subsampled_rejects_sample_above_nominal_range() {
+        let mut y = vec![100u16; 16 * 16];
+        y[7] = 1024; // exceeds 2^10 - 1
+        let cb = vec![0u16; 8 * 16];
+        let cr = vec![0u16; 8 * 16];
+        assert!(
+            encode_planar_subsampled_highbd(
+                16,
+                16,
+                3,
+                0,
+                1,
+                1,
+                10,
+                &[1, 2, 2],
+                &[1, 1, 1],
+                &[y, cb, cr]
+            )
+            .is_err(),
+            "sample exceeding 2^bd-1 must be rejected"
         );
     }
 }
