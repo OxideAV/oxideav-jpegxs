@@ -369,32 +369,25 @@ pub enum Sublevel {
 
 impl Sublevel {
     /// Decode the low byte of `Plev` (Table A.13). The high 4 bits of
-    /// the low byte are `XXXX` (don't-care); only the low 4 bits carry
-    /// the sublevel id.
+    /// `plev` are `XXXX XXXX` (level/don't-care); the low byte carries
+    /// the sublevel id. Convenience wrapper around
+    /// [`Sublevel::from_plev_low_byte`].
     pub fn from_plev_low(plev: u16) -> Option<Sublevel> {
-        Some(match plev & 0x000f {
-            0x0 => {
-                // Two table rows share the low nibble 0 (Unrestricted
-                // and Full); they're disambiguated by the next nibble.
-                if (plev & 0x00f0) == 0x0080 {
-                    Sublevel::Full
-                } else {
-                    Sublevel::Unrestricted
-                }
-            }
-            0x4 => Sublevel::Sublev3bpp,
-            0x8 => Sublevel::Sublev6bpp,
-            0xc => Sublevel::Sublev9bpp,
-            // Sublev12bpp = low byte 0001 0000 → mask 0x10 with low
-            // nibble == 0. We handled the 0x0 case above; this branch
-            // only fires if the next-nibble bit indicates 12bpp.
-            _ => return None,
-        })
+        Sublevel::from_plev_low_byte((plev & 0x00ff) as u8)
     }
 
-    /// The 12-bpp sublevel is encoded as low-byte `0001 0000` per
-    /// Table A.13, which collides with the `XXXX 0000` family above.
-    /// This helper handles the unambiguous case.
+    /// Decode the `Plev` low byte directly per Table A.13. The five
+    /// non-reserved rows are:
+    ///
+    /// * `0000 0000` — Unrestricted
+    /// * `1000 0000` — Full
+    /// * `0001 0000` — Sublev12bpp
+    /// * `0000 1100` — Sublev9bpp
+    /// * `0000 1000` — Sublev6bpp
+    /// * `0000 0100` — Sublev3bpp
+    ///
+    /// Any other byte value is *Reserved for ISO/IEC purposes* and
+    /// yields `None`.
     pub fn from_plev_low_byte(low: u8) -> Option<Sublevel> {
         // Sublev12bpp explicitly has the next-nibble bit `0001`.
         if low == 0x10 {
