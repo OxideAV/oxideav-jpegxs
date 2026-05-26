@@ -1,5 +1,61 @@
 # Changelog
 
+## Unreleased — round 143 (Part-2 profile / level / sublevel conformance)
+
+Adds a normative parse + conformance-check surface for ISO/IEC 21122-2:2019
+Annex A (profiles, levels and sublevels). The decoder has carried the
+underlying `ppih` / `plev` fields since round 1; this round names them and
+checks them.
+
+* **New `profile` module** — exposed at the crate root as
+  `oxideav_jpegxs::{Profile, Level, Sublevel, ProfileLimits, ChromaFormat,
+  ColumnMode, QpihAllowed, classify_chroma, column_width, check_profile,
+  check_level}`.
+* **Profile ↔ `Ppih` mapping** per Table A.5 — `Profile::from_ppih(u16) ->
+  Option<Profile>` / `Profile::ppih(self) -> u16` for the nine documented
+  rows (`Unrestricted`, `Light{422.10,444.12}`, `Light-Subline 422.10`,
+  `Main{422.10,444.12,4444.12}`, `High{444.12,4444.12}`). Reserved values
+  return `None`.
+* **Level ↔ `Plev` high byte** per Table A.12 — `Level::from_plev_high` for
+  `{2k-1, 4k-1, 4k-2, 4k-3, 8k-1, 8k-2, 8k-3, 10k-1}` plus `Unrestricted`,
+  with `Level::{max_width, max_height, max_samples}` per Table A.6.
+* **Sublevel ↔ `Plev` low byte** per Table A.13 —
+  `Sublevel::from_plev_low_byte` for `{Full, Sublev12bpp, Sublev9bpp,
+  Sublev6bpp, Sublev3bpp}` plus `Unrestricted`, with
+  `Sublevel::nominal_bpp` per Table A.7.
+* **`ProfileLimits` constraint set** — per-profile static table encoding
+  the Tables A.1 / A.2 / A.3 columns (`allowed_bit_depths`,
+  `allowed_chroma`, `nlx_range`, `max_nly`, `allowed_qpih`, `column_mode`,
+  `max_column_width`, `slice_height`, `max_components`). `Light` family
+  permits `Qpih = 0` only (DZQ); `Main` / `High` / `Light-Subline` permit
+  `Qpih ∈ {0, 1}`. `High` family raises `NL,y` to 2; `Light-Subline` caps
+  `Cs ≤ 2048` per formula A.2.
+* **`check_profile(&Codestream, Profile)`** enforces every observable
+  constraint: `Nc ≤ max_components`, per-component `B[i] ∈
+  allowed_bit_depths`, chroma format (classified from CDT `(sx, sy)`
+  factors) `∈ allowed_chroma`, `NL,x ∈ nlx_range`, `NL,y ≤ max_nly`,
+  `NL,x ≥ NL,y` (Table A.1 footnote c), `Qpih` ∈ allowed set, slice height
+  `Hsl × 2^NL,y == 16` image rows, and column-mode rules including the
+  `Cs ≤ 2048` Light-Subline cap (formula A.3). `Unrestricted` always
+  succeeds (§A.2.2 — not a conformance point).
+* **`check_level(&Codestream)`** enforces level-derived `Wmax` / `Hmax` /
+  `Lmax` bounds (Table A.6) against `Wf` / `Hf`.
+* **Buffer-model bounds (Annexes B / C / D) are explicitly out of scope**
+  for this module — they require a transmission-channel rate that is a
+  host-side quantity, not a codestream-observable property.
+* **15 new unit tests** — `Ppih` round-trip across all 9 profile rows,
+  chroma classification for mono / 4:2:2 / 4:2:0 / 4:4:4 / 4:2:2:4 /
+  4:4:4:4, profile-conformance acceptance + rejection for every documented
+  constraint (Light + 12-bit reject, Light + uniform Qpih reject, Light +
+  4:4:4 reject, Main + `Cw > 0` with `NL,y != 0` reject, Light-Subline
+  `Cs ≤ 2048` cap, High `NL,y = 2` accept + Main reject, Main4444 4-comp
+  accept + Main444 reject, Unrestricted permissive), Level / Sublevel
+  decoder spot-checks, level `Wmax` and `Lmax` enforcement.
+
+No encoder / decoder hot-path bytes change in this round. The new
+module is read-only against the existing `Codestream` and
+`ComponentTable` parser surfaces.
+
 ## Unreleased — round 133 (encoder high-bit-depth lossy, `B[i] > 8` + `q > 0`)
 
 Adds the lossy companion to the round-118 high-bit-depth (`B[i] ∈ 9..=16`)

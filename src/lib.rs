@@ -64,6 +64,7 @@ pub mod markers;
 pub mod output;
 pub mod picture_header;
 pub mod probe;
+pub mod profile;
 pub mod slice_header;
 pub mod slice_walker;
 
@@ -84,6 +85,10 @@ pub use image::{JpegXsImage, JpegXsPlane};
 pub use markers::Marker;
 pub use picture_header::PictureHeader;
 pub use probe::{probe, JpegXsFileInfo};
+pub use profile::{
+    check_codestream as check_profile, check_level, classify_chroma, column_width, ChromaFormat,
+    ColumnMode, Level, Profile, ProfileLimits, QpihAllowed, Sublevel,
+};
 pub use slice_header::SliceHeader;
 
 /// Public codec id string. Matches the aggregator feature name `jpegxs`.

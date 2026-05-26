@@ -49,6 +49,32 @@ Codestream marker-chain parser per ISO/IEC 21122-1:2022 Annex A:
 * `COM` / `CWD` — optional segments (raw payload)
 * `SLH` (`FF 20`) — slice header
 
+ISO/IEC 21122-2:2019 Annex A profile / level / sublevel surface
+(round 143, `profile` module):
+
+* `Profile::from_ppih(u16)` / `Profile::ppih(self) -> u16` — Table A.5
+  bidirectional map across the nine documented `Ppih` rows
+  (`Unrestricted`, `Light{422.10,444.12}`, `Light-Subline 422.10`,
+  `Main{422.10,444.12,4444.12}`, `High{444.12,4444.12}`). Reserved
+  values → `None`.
+* `Level::from_plev_high(u16)` per Table A.12 (`{2k-1, 4k-1, 4k-2, 4k-3,
+  8k-1, 8k-2, 8k-3, 10k-1}` + `Unrestricted`) with `max_width` /
+  `max_height` / `max_samples` per Table A.6.
+* `Sublevel::from_plev_low_byte(u8)` per Table A.13 (`{Full, Sublev12bpp,
+  Sublev9bpp, Sublev6bpp, Sublev3bpp}` + `Unrestricted`) with
+  `nominal_bpp` per Table A.7.
+* `check_profile(&Codestream, Profile)` — enforces every observable
+  constraint from Tables A.1 / A.2 / A.3: `Nc ≤ max_components`, per-
+  component `B[i] ∈ allowed_bit_depths`, chroma format (classified from
+  CDT `(sx, sy)`) ∈ `allowed_chroma`, `NL,x ∈ nlx_range`, `NL,y ≤
+  max_nly`, `NL,x ≥ NL,y` (Table A.1 footnote c), `Qpih` ∈ allowed set,
+  slice height `Hsl × 2^NL,y == 16` image rows, column-mode rules
+  including the `Cs ≤ 2048` Light-Subline cap (formula A.3). Buffer-
+  model bounds (Annexes B/C/D) are out of scope — they require a
+  transmission-channel rate that isn't observable from the codestream.
+* `check_level(&Codestream)` — enforces level `Wmax` / `Hmax` / `Lmax`
+  bounds against `Wf` / `Hf`.
+
 Public API:
 
 * `oxideav_jpegxs::probe(&[u8]) -> Option<JpegXsFileInfo>` —
