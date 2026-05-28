@@ -4570,6 +4570,249 @@ mod tests {
         );
     }
 
+    /// r174 baseline: 4:4:4 at NL=3/3 — should already work (no chroma sub-sampling).
+    #[test]
+    fn r174_baseline_444_nl3_lossless_round_trip() {
+        let w = 64u16;
+        let h = 64u16;
+        let n = (w as usize) * (h as usize);
+        let mut planes: [Vec<u8>; 3] = [vec![0u8; n], vec![0u8; n], vec![0u8; n]];
+        for (i, slot) in planes[0].iter_mut().enumerate() {
+            *slot = ((i * 7 + 13) % 256) as u8;
+        }
+        for (i, slot) in planes[1].iter_mut().enumerate() {
+            *slot = ((i * 11 + 17) % 256) as u8;
+        }
+        for (i, slot) in planes[2].iter_mut().enumerate() {
+            *slot = ((i * 19 + 23) % 256) as u8;
+        }
+        let cs = encode_planar(
+            w,
+            h,
+            3,
+            0,
+            3,
+            3,
+            &[planes[0].clone(), planes[1].clone(), planes[2].clone()],
+        )
+        .expect("encode 4:4:4 NL=3/3");
+        let img = crate::decoder::decode_codestream(&cs, None).expect("decode 4:4:4 NL=3/3");
+        assert_eq!(img.num_components, 3);
+        assert_eq!(img.planes[0].data, planes[0]);
+        assert_eq!(img.planes[1].data, planes[1]);
+        assert_eq!(img.planes[2].data, planes[2]);
+    }
+
+    /// r174: 4:2:2 at NL=3/3 — chroma N'L,y == NL,y, no vertical subsampling issue.
+    #[test]
+    fn r174_chroma_422_nl3_lossless_round_trip() {
+        let w = 64u16;
+        let h = 64u16;
+        let n_y = (w as usize) * (h as usize);
+        let n_c = ((w as usize) / 2) * (h as usize);
+        let mut y_plane = vec![0u8; n_y];
+        let mut cb_plane = vec![0u8; n_c];
+        let mut cr_plane = vec![0u8; n_c];
+        for (i, slot) in y_plane.iter_mut().enumerate() {
+            *slot = ((i * 7 + 13) % 256) as u8;
+        }
+        for i in 0..n_c {
+            cb_plane[i] = ((i * 11 + 17) % 256) as u8;
+            cr_plane[i] = ((i * 19 + 23) % 256) as u8;
+        }
+        let cs = encode_planar_subsampled(
+            w,
+            h,
+            3,
+            0,
+            3,
+            3,
+            0,
+            &[1, 2, 2],
+            &[1, 1, 1],
+            &[y_plane.clone(), cb_plane.clone(), cr_plane.clone()],
+        )
+        .expect("encode 4:2:2 NL=3/3");
+        let img = crate::decoder::decode_codestream(&cs, None).expect("decode 4:2:2 NL=3/3");
+        assert_eq!(img.num_components, 3);
+        assert_eq!(img.planes[0].data, y_plane);
+        assert_eq!(img.planes[1].data, cb_plane);
+        assert_eq!(img.planes[2].data, cr_plane);
+    }
+
+    /// r174: 4:2:0 lossy at NL=2/2 q=2 — fix also covers the Fq=8 path.
+    #[test]
+    fn r174_chroma_420_nl2_lossy_q2_round_trip() {
+        let w = 64u16;
+        let h = 64u16;
+        let n_y = (w as usize) * (h as usize);
+        let n_c = ((w as usize) / 2) * ((h as usize) / 2);
+        let mut y_plane = vec![0u8; n_y];
+        let mut cb_plane = vec![0u8; n_c];
+        let mut cr_plane = vec![0u8; n_c];
+        for (i, slot) in y_plane.iter_mut().enumerate() {
+            *slot = ((i * 7 + 13) % 256) as u8;
+        }
+        for i in 0..n_c {
+            cb_plane[i] = ((i * 11 + 17) % 256) as u8;
+            cr_plane[i] = ((i * 19 + 23) % 256) as u8;
+        }
+        let cs = encode_planar_subsampled(
+            w,
+            h,
+            3,
+            0,
+            2,
+            2,
+            2, // q = 2 lossy
+            &[1, 2, 2],
+            &[1, 2, 2],
+            &[y_plane.clone(), cb_plane.clone(), cr_plane.clone()],
+        )
+        .expect("encode 4:2:0 NL=2/2 q=2 lossy");
+        let img = crate::decoder::decode_codestream(&cs, None).expect("decode 4:2:0 NL=2/2 q=2");
+        assert_eq!(img.num_components, 3);
+        // Lossy path — check that bytes-out matches plane sample count and
+        // values are within a reasonable error range of the originals (sanity).
+        assert_eq!(img.planes[0].data.len(), y_plane.len());
+        assert_eq!(img.planes[1].data.len(), cb_plane.len());
+        assert_eq!(img.planes[2].data.len(), cr_plane.len());
+        let psnr = |orig: &[u8], rec: &[u8]| -> f64 {
+            let mut mse = 0f64;
+            for (a, b) in orig.iter().zip(rec.iter()) {
+                let d = (*a as f64) - (*b as f64);
+                mse += d * d;
+            }
+            mse /= orig.len() as f64;
+            if mse <= 0.0 {
+                f64::INFINITY
+            } else {
+                10.0 * (255.0f64 * 255.0 / mse).log10()
+            }
+        };
+        // Picture content is high-frequency (deterministic pseudo-random),
+        // so PSNR is below the high-fidelity threshold but should still be
+        // unambiguously decodable — 20 dB is a generous floor for sanity.
+        let psnr_y = psnr(&y_plane, &img.planes[0].data);
+        let psnr_cb = psnr(&cb_plane, &img.planes[1].data);
+        let psnr_cr = psnr(&cr_plane, &img.planes[2].data);
+        assert!(
+            psnr_y >= 20.0 && psnr_cb >= 20.0 && psnr_cr >= 20.0,
+            "4:2:0 NL=2/2 q=2 PSNR below 20 dB floor: Y={psnr_y} Cb={psnr_cb} Cr={psnr_cr}"
+        );
+    }
+
+    /// r174: 4:2:0 at NL,y=2 with NL,x=3 (asymmetric) — chroma N'L,y = 1.
+    #[test]
+    fn r174_chroma_420_nl3x2y_lossless_round_trip() {
+        let w = 64u16;
+        let h = 64u16;
+        let n_y = (w as usize) * (h as usize);
+        let n_c = ((w as usize) / 2) * ((h as usize) / 2);
+        let mut y_plane = vec![0u8; n_y];
+        let mut cb_plane = vec![0u8; n_c];
+        let mut cr_plane = vec![0u8; n_c];
+        for (i, slot) in y_plane.iter_mut().enumerate() {
+            *slot = ((i * 7 + 13) % 256) as u8;
+        }
+        for i in 0..n_c {
+            cb_plane[i] = ((i * 11 + 17) % 256) as u8;
+            cr_plane[i] = ((i * 19 + 23) % 256) as u8;
+        }
+        let cs = encode_planar_subsampled(
+            w,
+            h,
+            3,
+            0,
+            3,
+            2,
+            0,
+            &[1, 2, 2],
+            &[1, 2, 2],
+            &[y_plane.clone(), cb_plane.clone(), cr_plane.clone()],
+        )
+        .expect("encode 4:2:0 NL=3/2 lossless");
+        let img = crate::decoder::decode_codestream(&cs, None).expect("decode 4:2:0 NL=3/2");
+        assert_eq!(img.num_components, 3);
+        assert_eq!(img.planes[0].data, y_plane);
+        assert_eq!(img.planes[1].data, cb_plane);
+        assert_eq!(img.planes[2].data, cr_plane);
+    }
+
+    /// r174 probe: 4:2:0 at NL,y >= 2 — does it round-trip?
+    #[test]
+    fn r174_probe_chroma_420_nly2_lossless() {
+        let w = 64u16;
+        let h = 64u16;
+        let n_y = (w as usize) * (h as usize);
+        let n_c = ((w as usize) / 2) * ((h as usize) / 2);
+        let mut y_plane = vec![0u8; n_y];
+        let mut cb_plane = vec![0u8; n_c];
+        let mut cr_plane = vec![0u8; n_c];
+        for (i, slot) in y_plane.iter_mut().enumerate() {
+            *slot = ((i * 7 + 13) % 256) as u8;
+        }
+        for i in 0..n_c {
+            cb_plane[i] = ((i * 11 + 17) % 256) as u8;
+            cr_plane[i] = ((i * 19 + 23) % 256) as u8;
+        }
+        let cs = encode_planar_subsampled(
+            w,
+            h,
+            3,
+            0,
+            2,
+            2,
+            0,
+            &[1, 2, 2],
+            &[1, 2, 2],
+            &[y_plane.clone(), cb_plane.clone(), cr_plane.clone()],
+        )
+        .expect("encode 4:2:0 NL=2/2 lossless");
+        let img = crate::decoder::decode_codestream(&cs, None).expect("decode 4:2:0 NL=2/2");
+        assert_eq!(img.num_components, 3);
+        assert_eq!(img.planes[0].data, y_plane);
+        assert_eq!(img.planes[1].data, cb_plane);
+        assert_eq!(img.planes[2].data, cr_plane);
+    }
+
+    /// r174 probe: 4:2:2 (sy=1) at NL,y=2 — control. Chroma N'L,y[i] == NL,y here.
+    #[test]
+    fn r174_probe_chroma_422_nly2_lossless() {
+        let w = 64u16;
+        let h = 64u16;
+        let n_y = (w as usize) * (h as usize);
+        let n_c = ((w as usize) / 2) * (h as usize);
+        let mut y_plane = vec![0u8; n_y];
+        let mut cb_plane = vec![0u8; n_c];
+        let mut cr_plane = vec![0u8; n_c];
+        for (i, slot) in y_plane.iter_mut().enumerate() {
+            *slot = ((i * 7 + 13) % 256) as u8;
+        }
+        for i in 0..n_c {
+            cb_plane[i] = ((i * 11 + 17) % 256) as u8;
+            cr_plane[i] = ((i * 19 + 23) % 256) as u8;
+        }
+        let cs = encode_planar_subsampled(
+            w,
+            h,
+            3,
+            0,
+            2,
+            2,
+            0,
+            &[1, 2, 2],
+            &[1, 1, 1],
+            &[y_plane.clone(), cb_plane.clone(), cr_plane.clone()],
+        )
+        .expect("encode 4:2:2 NL=2/2 lossless");
+        let img = crate::decoder::decode_codestream(&cs, None).expect("decode 4:2:2 NL=2/2");
+        assert_eq!(img.num_components, 3);
+        assert_eq!(img.planes[0].data, y_plane);
+        assert_eq!(img.planes[1].data, cb_plane);
+        assert_eq!(img.planes[2].data, cr_plane);
+    }
+
     // === Round 4: Star-Tetrix (Cpih=3) =====================================
 
     fn make_cfa_8x8() -> [Vec<u8>; 4] {

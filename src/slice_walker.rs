@@ -829,15 +829,19 @@ fn compute_packet_layouts(
         for i in 0..n_decomposed {
             let b = (n_decomposed * beta + i) as usize;
             if b < bands.len() && bands[b].exists {
-                let l0 = bands[b].l0 as u32;
-                // Subsampling guard from Table B.4: (λ + L0) umod sy[i] == 0.
                 let sy_i = sy[i as usize] as u32;
-                if sy_i != 0 && (l0 % sy_i) != 0 {
+                let sy_i_safe = sy_i.max(1);
+                // Subsampling guard from Table B.4 with λ=0 and image-
+                // grid L0 (= band-grid L0 × sy[i]):
+                //   (0 + L0_image) umod sy[i] == 0
+                let l0_band = bands[b].l0 as u32;
+                let l0_image = l0_band * sy_i_safe;
+                if sy_i != 0 && (l0_image % sy_i) != 0 {
                     continue;
                 }
                 first_pkt.push(PacketEntry {
                     band: b as u16,
-                    line: l0 as u16,
+                    line: l0_band as u16,
                 });
             }
         }
@@ -863,9 +867,11 @@ fn compute_packet_layouts(
     };
     let mut beta0 = beta1;
     while beta0 < nbeta_u {
-        // Use β0's dy for the loop bound — should match across all
-        // components since dy depends on β only (not i). Look up via
-        // component 0's array index.
+        // Per Annex B.7 Table B.4 proxy-level outer loop:
+        //   for(λ=0; λ < 2^(NL,y - dy[0,β0]); λ=λ+1)
+        // λ runs over IMAGE-grid lines using the FIRST (luma) component's
+        // dy[0,β0]. dy stored in this walker is indexed `i * nbeta + β`,
+        // so luma (i=0) is at `arr_idx0 = β0`.
         let arr_idx0 = beta0 as usize;
         if arr_idx0 >= dy.len() {
             break;
@@ -884,19 +890,34 @@ fn compute_packet_layouts(
                     if b >= bands.len() || !bands[b].exists {
                         continue;
                     }
-                    let l0 = bands[b].l0 as u32;
-                    let l1 = bands[b].l1 as u32;
-                    let line_in_precinct = l0 + lambda_within;
-                    if line_in_precinct >= l1 {
-                        continue;
-                    }
                     let sy_i = sy[i as usize] as u32;
-                    if sy_i != 0 && (line_in_precinct % sy_i) != 0 {
+                    let sy_i_safe = sy_i.max(1);
+                    // L0[p,b] and L1[p,b] are stored in per-component
+                    // band-grid units (component-effective N'L,y[i]).
+                    // Spec B.6 defines L0 in image-grid units with the
+                    // PICTURE-level NL,y; the band-grid value scales by
+                    // 1 / sy[i]. So the spec image-grid L0 / L1 are:
+                    let l0_band = bands[b].l0 as u32;
+                    let l1_band = bands[b].l1 as u32;
+                    let l0_image = l0_band * sy_i_safe;
+                    let l1_image = l1_band * sy_i_safe;
+                    let line_image = l0_image + lambda_within;
+                    // Spec B.7 Table B.4 line-in-precinct check, image-grid:
+                    if line_image >= l1_image {
                         continue;
                     }
+                    // Spec B.7 Table B.4 sub-sampling guard, image-grid:
+                    //   (λ + L0[p,b]) umod sy[i] == 0
+                    if sy_i != 0 && (line_image % sy_i) != 0 {
+                        continue;
+                    }
+                    // Convert back to band-grid for the entry.line field
+                    // so `entry.line - band.l0` yields a band-grid row
+                    // index when consumed in entropy / packet_body.
+                    let line_band = line_image / sy_i_safe;
                     layouts.push(vec![PacketEntry {
                         band: b as u16,
-                        line: line_in_precinct as u16,
+                        line: line_band as u16,
                     }]);
                 }
             }

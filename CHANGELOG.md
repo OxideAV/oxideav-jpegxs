@@ -1,5 +1,50 @@
 # Changelog
 
+## Unreleased — round 174 (4:2:0 chroma decoder packet-layout fix at NL,y >= 2)
+
+Fixes a latent decoder bug where 4:2:0 sub-sampled chroma at `NL,y >= 2`
+failed with `InvalidData("jpegxs entropy: read_bit past end of buffer")`.
+The decoder's `compute_packet_layouts` proxy-level and first-packet loops
+applied the Annex B.7 Table B.4 sub-sampling guard `(λ + L0) umod sy[i]
+== 0` and the line-in-precinct check `λ + L0 < L1` against the per-
+component **band-grid** `L0[p,b]` / `L1[p,b]` stored in the slice walker,
+but the spec defines both checks in **image-grid** units (Annex B.6:
+`L0[p,b] = 2^max(NL,y - dy[i,β], 0) · τy[β]`, where `NL,y` is picture-
+level and `dy[i,β]` is per-component). For chroma at `sy=2`, image-grid
+`L0` is `2×` the band-grid value; the band-grid mod check then dropped
+valid τy=1 chroma packets that the encoder had emitted, producing
+fewer decoded packets than written → buffer underflow on subsequent
+packets in the same slice.
+
+* `src/slice_walker.rs` — `compute_packet_layouts` first-packet and
+  proxy-level loops now compute `L0_image = L0_band × sy[i]` and
+  `L1_image = L1_band × sy[i]` and apply the Table B.4 checks in image-
+  grid coordinates, converting back to band-grid for the
+  `PacketEntry.line` field so consumers (`packet_body::decode_packet_body`,
+  `entropy::*`) that index by `entry.line - band.l0` keep their semantics.
+  The 4:4:4 / 4:2:2 paths are unaffected (`sy[i] = 1` makes image-grid
+  equal to band-grid).
+
+Tests landed (294 total, +6 vs round 151): 4:2:0 NL=2/2 lossless round-
+trip bit-exact (previously crashed); 4:2:2 NL=2/2 control; 4:2:0 NL=3/2
+asymmetric (chroma N'L,y=1) lossless bit-exact; 4:4:4 NL=3/3 and 4:2:2
+NL=3/3 baselines; 4:2:0 NL=2/2 q=2 lossy PSNR >= 20 dB on a synthetic
+high-frequency picture.
+
+Follow-up (deferred to a later round): 4:2:0 at `NL,y >= 3` (chroma's
+N'L,y >= 2) still produces value-corrupted output rather than crashing.
+The root cause is a deeper structural mismatch between the codec's non-
+spec internal β-enumeration convention (chroma's bands packed
+contiguously at picture-β slots `0..nbeta_chroma` using chroma's
+effective NL for the β formula) and the spec's β-enumeration (chroma
+bands at picture-β values computed with **picture** NL,x/NL,y, leaving
+gaps where chroma has no equivalent band). The luma-driven outer-loop
+lambda count under-iterates chroma's deeper-level proxy clusters in the
+non-spec convention, so chroma packets for the second row of a 2-row
+band are never coded. Repairing this requires reconciling the band
+indexing across encoder + decoder + DWT cascade and is out of scope for
+this round's fix.
+
 ## Unreleased — round 151 (high bit depth + chroma sub-sampling)
 
 Widens the round-118 / round-133 high-bit-depth (`B[i] ∈ 9..=16`) paths
