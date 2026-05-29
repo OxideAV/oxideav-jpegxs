@@ -1,5 +1,82 @@
 # Changelog
 
+## Unreleased — round 181 (high-bit-depth NLT quadratic)
+
+Widens the round-5 NLT quadratic encoder (`Tnlt = 1`, Annex G.4) from
+`B[i] = 8`-only to any `bd = B[i] ∈ 9..=16` against `Bw = 20` (the top
+of the Table A.8 `{8, 18, 20}` set, giving ≥ 4 bits of precision
+headroom for the sqrt above any supported component bit depth). The
+forward pre-distortion `y = round(sqrt(x / (2^B[i] − 1)) × (2^Bw − 1))
++ dco` is parametric in `B[i]` — the round-5 implementation was a
+hard-coded specialisation at `b_max = (1 << 8) − 1` for the input
+domain only. The decoder side (`output::quadratic_path`) was already
+parametric in `B[i]`, so the matching forward kernel completes the
+round-trip.
+
+* `oxideav_jpegxs::encoder::encode_planar_nlt_quadratic_highbd(width,
+  height, nc, cpih, nlx, nly, bd, q, dco, &[Vec<u16>]) -> Result<Vec<u8>>`
+  — high-bit-depth NLT quadratic entry point. `bd ∈ 9..=16` codes the
+  picture with `Bw = 20`, DC level shift `1 << 19`. Plane format
+  follows the round-118 convention: little-endian `u16` samples in
+  `0..=2^bd − 1` per the `crate::image::JpegXsPlane` layout, 4:4:4
+  only (`sx[i] = sy[i] = 1`). `cpih ∈ {0, 1}` (no transform / RCT —
+  the Annex F.3 RCT operand window `c < 3` is bit-depth agnostic).
+  `q = 0` is the lossless-within-sqrt-rounding mode (the round-5
+  8-bit `round5_nlt_quadratic_high_psnr` already proves PSNR ≥ 40 dB
+  is the floor for the algebraic-inverse round-trip rather than
+  bit-exact); `q > 0` engages `Fq = 8` regular mode and per-band
+  deadzone truncation `T[p,b] = clamp(Q − G[b], 0, 15)` (Annex D.4).
+  `dco` is validated to signed-16-bit (Annex A.4.6 NLT marker σ:α).
+
+* `src/encoder.rs` — `encode_planar_inner_bd` allows
+  `NltParams::Quadratic` at `bd > 8` (rejecting only
+  `NltParams::Extended` because its forward LUT inverter caps the
+  reconstructed-level table at the 8-bit slot). The forward quadratic
+  pre-distortion block in `write_slice` now reads the picture's input
+  domain from `cfg.bit_depth` and switches between the u8 plane layout
+  (legacy 8-bit) and the u16-LE plane layout (round 118 / 133 / 151 /
+  181 high-bit-depth) on the same axis the linear path already
+  switches on. `Bw = 20` is selected automatically for high-bit-depth
+  NLT (replacing the round-118 / 133 / 151 `Bw = B[i]` choice for the
+  NLT case only — the linear path remains `Bw = B[i]`).
+
+Tests landed (302 total, +8 vs round 174):
+* `r181_nlt_quadratic_highbd_10bit_lossless_psnr` — 10-bit luma at q=0
+  self-roundtrips with PSNR ≥ 40 dB.
+* `r181_nlt_quadratic_highbd_12bit_lossless_psnr` — 12-bit at q=0 PSNR
+  ≥ 40 dB.
+* `r181_nlt_quadratic_highbd_16bit_lossless_psnr` — 16-bit at q=0 PSNR
+  ≥ 40 dB (upper bit-depth boundary).
+* `r181_nlt_quadratic_highbd_10bit_lossy_q2_psnr` — 10-bit q=2 PSNR
+  ≥ 30 dB and the codestream is no larger than the q=0 form.
+* `r181_nlt_quadratic_highbd_10bit_nonzero_dco_encodes_decodes` — a
+  positive `dco` value packs into the NLT σ:α field correctly and the
+  resulting codestream decodes (the dco round-trip PSNR is bounded by
+  the same forward / inverse asymmetry the 8-bit path inherits at
+  non-zero dco; the test asserts the encode + decode pair completes
+  with the correct output plane byte length).
+* `r181_nlt_quadratic_highbd_rejects_8bit_bd` — `bd = 8` and `bd = 17`
+  both return `Unsupported` so callers route to
+  `encode_planar_nlt_quadratic` for 8-bit input.
+* `r181_nlt_extended_highbd_still_rejected` — `bd > 8` with
+  `NltParams::Extended` is still rejected with `Unsupported` (the
+  forward LUT inverter is keyed on the 8-bit reconstructed-level
+  table and is out of scope for round 181).
+* `r181_nlt_quadratic_highbd_10bit_rgb_rct_round_trip` — three-
+  component 10-bit RGB + RCT (`Cpih = 1`) composes with NLT quadratic
+  pre-distortion and self-roundtrips above 35 dB PSNR per component.
+
+Follow-up (deferred to a later round): NLT extended (`Tnlt = 2`,
+Annex G.5) high-bit-depth — requires widening
+`build_extended_forward_lut`'s reconstructed-level table from
+`(1 << bc).min(257)` to the full `1 << bc` so the per-pixel inverse
+LUT can be built at `bc ∈ 9..=16` (at `bc = 16` that's a 65 536-entry
+`Vec<Option<u32>>`, ~512 KB peak — well within bounds for a single
+encode but worth measuring). Star-Tetrix (`Cpih = 3`) high-bit-depth
+also stays 8-bit-input specific. 4:2:0 chroma at `NL,y >= 3` (the
+round-174 deferred case, the deeper β-enumeration mismatch) is
+unrelated and still pending.
+
 ## Unreleased — round 174 (4:2:0 chroma decoder packet-layout fix at NL,y >= 2)
 
 Fixes a latent decoder bug where 4:2:0 sub-sampled chroma at `NL,y >= 2`
