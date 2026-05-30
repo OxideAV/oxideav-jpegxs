@@ -1,5 +1,79 @@
 # Changelog
 
+## Unreleased — round 193 (high-bit-depth NLT extended)
+
+Widens the round-7 NLT extended encoder (`Tnlt = 2`, Annex G.5) from
+`B[i] = 8`-only to any `bd = B[i] ∈ 9..=16` against `Bw = 20`
+(matching the round-181 NLT quadratic high-bit-depth choice — the top
+of the Table A.8 `{8, 18, 20}` set, giving ≥ 4 bits of headroom for
+the three-segment kernel above any supported component bit depth).
+
+The blocker called out in round 181's "Out of scope" tail was the
+`(1usize << bc).min(257)` cap on `build_extended_forward_lut`'s
+reconstructed-level table. The cap was an 8-bit shortcut: at `bc = 8`
+the table is 256 entries and the +1 is a defensive head-room slot, but
+at `bc ∈ 9..=16` the cap dropped the table to a stale 257-entry size,
+so the LUT could not address every input sample. This round drops the
+cap; the LUT is now exactly `1 << bd` entries (max 65 536 at
+`bd = 16`, ~512 KB of transient state, allocated once per encode).
+
+The matching `bd > 8 && nlt = Some(Extended { .. })` rejection in
+`encode_planar_inner_bd` is removed; the high-bit-depth Extended path
+now flows through the same `Bw = 20` inner-bd routine as quadratic.
+
+* `encode_planar_nlt_extended_highbd(width, height, nc, cpih, nlx,
+  nly, bd, q, t1, t2, e, &[Vec<u16>]) -> Result<Vec<u8>>` — new
+  public entry point. `bd ∈ 9..=16`, `cpih ∈ {0, 1}` (no transform or
+  reversible RCT — bit-depth agnostic Annex F.3), plane format is
+  little-endian `u16` per `JpegXsPlane` (`(width / sx[i]) × (height /
+  sy[i])` samples with `sx[i] = sy[i] = 1`), `q = 0` is the
+  lossless-within-LUT-resolution case and `q > 0` engages `Fq = 8`
+  + per-band deadzone truncation `T[p,b] = clamp(Q − G[b], 0, 15)`
+  (Annex D.4). Rejects `bd = 8` (use 8-bit `encode_planar_nlt_extended`),
+  Star-Tetrix `cpih = 3`, out-of-range samples, and the same
+  `(t1, t2, e)` constraints as the 8-bit form (`0 < t1 < t2 ≤
+  2^Bw − 1`, `1 ≤ e ≤ 4`).
+* `build_extended_forward_lut` — drops `.min(257)` on the level-table
+  size; now allocates `1 << bc` slots. The 8-bit path (`bc = 8`)
+  remains byte-identical (`1 << 8 = 256` was already below the cap).
+* `encode_planar_inner_bd` — removes the `bd > 8 && Extended`
+  rejection guard; high-bit-depth Extended now lands on the same
+  `bw = 20` branch the round-181 quadratic widening introduced. The
+  inline LUT consumer reads `chunks_exact(2)` little-endian `u16`
+  for `bd > 8` (mirroring the linear / quadratic paths in the same
+  match) and the legacy single-byte path for `bd = 8`.
+* `encode_planar_nlt_quadratic_highbd` doc — refreshed: the
+  "NLT extended Tnlt=2 stays 8-bit-input specific" tail now points at
+  the round-193 `encode_planar_nlt_extended_highbd` instead.
+
+Tests landed (317 total → +10 vs round 190's 307):
+* `r193_nlt_extended_highbd_10bit_psnr_above_30db` — 32×32 10-bit
+  synthetic ramp self-round-trips at PSNR ≥ 30 dB.
+* `r193_nlt_extended_highbd_12bit_psnr_above_30db` — 12-bit cover.
+* `r193_nlt_extended_highbd_16bit_psnr_above_30db` — 16-bit upper
+  boundary, exercising the full 65 536-entry LUT.
+* `r193_nlt_extended_highbd_10bit_lossy_q2_psnr` — q=2 lossy
+  ≥ 25 dB, stream ≤ q=0 stream.
+* `r193_nlt_extended_highbd_10bit_rgb_rct_round_trip` — 10-bit
+  RGB+RCT (`Cpih = 1`) composes: each plane self-decodes ≥ 30 dB.
+* `r193_nlt_extended_highbd_rejects_bad_bd` — `bd ∈ {8, 17}` raise
+  `Unsupported`.
+* `r193_nlt_extended_highbd_rejects_star_tetrix_cpih` — `Cpih = 3`
+  on this path raises `Unsupported`.
+* `r193_nlt_extended_highbd_rejects_bad_params` — `t2 ≤ t1`,
+  `t1 = 0`, `e ∈ {0, 5}`, `t2 > 2^Bw − 1` (Bw=20).
+* `r193_nlt_extended_highbd_rejects_out_of_range_sample` — sample
+  above `2^bd − 1` raises `InvalidData`.
+* `r193_nlt_extended_highbd_now_accepted` — replaces the deleted
+  round-181 `r181_nlt_extended_highbd_still_rejected` (which asserted
+  the now-removed `bd > 8 && Extended` guard); confirms the path
+  encodes and decodes to the expected plane byte count.
+
+The Annex G.5 decoder (`output::extended_path`) was already parametric
+in `B[i]` (round-118 widened `apply_output_scaling` to pack `u16` for
+any `bc ∈ 9..=16`), so the decoder side needs no changes — every
+round-193 codestream parses with the existing high-bit-depth pipeline.
+
 ## Unreleased — round 190 (picture-β slot indexing for 4:2:0 chroma)
 
 Closes the `NL,y ≥ 3` 4:2:0 round-trip blocker tracked as task #1139 by
