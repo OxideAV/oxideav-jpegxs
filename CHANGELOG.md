@@ -887,6 +887,20 @@ also passes 149 tests (was 140).
 
 ## Unreleased — encoder round 2 (multi-component RCT + multi-decomp + odd dims)
 
+## [0.0.6](https://github.com/OxideAV/oxideav-jpegxs/compare/v0.0.5...v0.0.6) - 2026-05-30
+
+### Other
+
+- picture-β slot indexing for 4:2:0 chroma (Annex B.3 Figure B.2)
+- encoder round 181: high-bit-depth NLT quadratic (Tnlt=1, Annex G.4)
+- fix 4:2:0 chroma decoder packet layout at NL,y >= 2
+- encoder round 151: high bit depth + chroma sub-sampling (4:2:2 / 4:2:0)
+- `Sublevel::from_plev_low` delegate to byte form (round 143 polish)
+- round 143: Part-2 profile / level / sublevel conformance
+- encoder round 133: high-bit-depth lossy (B[i] > 8, q > 0)
+- report byte stride for high-bit-depth planes (round 118)
+- encoder round 118: high bit depth B[i] in 9..=16 (lossless, Annex G.3)
+
 ## [0.0.5](https://github.com/OxideAV/oxideav-jpegxs/compare/v0.0.4...v0.0.5) - 2026-05-24
 
 ### Other
