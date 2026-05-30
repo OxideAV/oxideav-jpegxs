@@ -2302,16 +2302,13 @@ fn count_existing_bands(cfg: &EncodeConfig) -> u32 {
     let n_decomposed = (cfg.nc - cfg.sd) as usize;
     let mut n = 0u32;
     for i in 0..n_decomposed {
-        let nly_i = cfg.nly.saturating_sub(match cfg.sy[i] {
-            1 => 0,
-            2 => 1,
-            4 => 2,
-            _ => 0,
-        });
-        let nbeta_i = n_beta(cfg.nlx, nly_i);
-        // Only the first nbeta_i bands of the picture-level β layout
-        // exist for component i; the rest are non-existent (Annex B.4).
-        n += nbeta_pic.min(nbeta_i);
+        for beta in 0..nbeta_pic {
+            if crate::slice_walker::picture_beta_to_local_beta(beta, cfg.nlx, cfg.nly, cfg.sy[i])
+                .is_some()
+            {
+                n += 1;
+            }
+        }
     }
     // Sd tail bands always exist (sx=sy=1 enforced upstream).
     n += cfg.sd as u32;
@@ -2337,18 +2334,23 @@ fn build_band_gains_sd(nc: u8, sd: u8, nlx: u8, nly: u8, _sx: &[u8], sy: &[u8]) 
     let n_decomposed = (nc - sd) as usize;
     let mut gains = Vec::new();
     for beta in 0..nbeta_pic {
-        for &sy_val in sy.iter().take(n_decomposed) {
+        for (i, &sy_val) in sy.iter().enumerate().take(n_decomposed) {
             let nly_i = nly.saturating_sub(match sy_val {
                 1 => 0,
                 2 => 1,
                 4 => 2,
                 _ => 0,
             });
-            let nbeta_i = n_beta(nlx, nly_i);
-            if beta >= nbeta_i {
-                continue; // band does not exist for this component
-            }
-            let key = beta_key(beta, nlx, nly_i);
+            // Skip non-existent picture-β slots (Annex B.4 bx[β,i]=0)
+            // and resolve the gain from the component's chroma-local β
+            // (its τx/τy reflect the actual band content, not the
+            // picture-β slot label).
+            let Some(local_beta) =
+                crate::slice_walker::picture_beta_to_local_beta(beta, nlx, nly, sy[i])
+            else {
+                continue;
+            };
+            let key = beta_key(local_beta, nlx, nly_i);
             let gain = (if key.tau_x { 1u8 } else { 0 }) + (if key.tau_y { 1 } else { 0 });
             gains.push(gain);
         }
@@ -2389,16 +2391,10 @@ fn build_band_priorities_sd(nc: u8, sd: u8, nlx: u8, nly: u8, sy: &[u8]) -> Vec<
     let n_decomposed = (nc - sd) as u32;
     let mut prios = Vec::new();
     for beta in 0..nbeta_pic {
-        for (i, &sy_val) in sy.iter().take(n_decomposed as usize).enumerate() {
-            let nly_i = nly.saturating_sub(match sy_val {
-                1 => 0,
-                2 => 1,
-                4 => 2,
-                _ => 0,
-            });
-            let nbeta_i = n_beta(nlx, nly_i);
-            if beta >= nbeta_i {
-                continue; // band does not exist for this component
+        for (i, &_sy_val) in sy.iter().take(n_decomposed as usize).enumerate() {
+            // Skip non-existent picture-β slots (Annex B.4).
+            if crate::slice_walker::picture_beta_to_local_beta(beta, nlx, nly, sy[i]).is_none() {
+                continue;
             }
             let b = n_decomposed * beta + i as u32;
             prios.push(b.min(255) as u8);
@@ -3064,8 +3060,13 @@ fn encode_precinct_cascade(
         })
         .collect();
 
-    // Collect per-(β, i) slices for this precinct. Bands not existing
-    // for component i (because β >= n_beta(nlx, nly_i[i])) are skipped.
+    // Collect per-(β_pic, i) slices for this precinct. `β` here is the
+    // *picture-level* β slot (Annex B.3 b = (Nc - Sd) × β + i). The
+    // per-component DWT output buffers (`bands_per_comp[i]`) are
+    // indexed by chroma's LOCAL β, so each slice carries
+    // `local_beta = picture_beta_to_local_beta(β_pic, NL,x, NL,y, sy[i])`
+    // for the downstream extract_band_line lookup. Slots where bx[β,i]=0
+    // (Annex B.4) are marked non-existent.
     struct Slice {
         wpb: usize,
         lines: usize,
@@ -3078,7 +3079,11 @@ fn encode_precinct_cascade(
         /// multiple of `8 * max(sx) * 2^NL,x`).
         pic_col_offset: usize,
         comp_i: usize,
+        /// Picture-level β slot (used for bitstream ordering and `b`).
         beta: u32,
+        /// Chroma-local β — index into the component's own DWT cascade
+        /// output (`bands_per_comp[comp_i][local_beta]`).
+        local_beta: u32,
         exists: bool,
     }
     let sd_u = cfg.sd as usize;
@@ -3088,10 +3093,11 @@ fn encode_precinct_cascade(
         for (i, &nly_comp) in nly_i.iter().enumerate().take(n_decomposed) {
             let wc = w / (cfg.sx[i] as usize);
             let hc = h / (cfg.sy[i] as usize);
-            // Existence: β must be < n_beta(nlx, nly_i[i]).
-            let nbeta_i = n_beta(cfg.nlx, nly_comp);
-            let exists_per_comp = beta < nbeta_i;
-            if !exists_per_comp {
+            // Existence per Annex B.4: bx[β,i] = 0 when this picture-β
+            // slot has no equivalent in component i's DWT.
+            let Some(local_beta) =
+                crate::slice_walker::picture_beta_to_local_beta(beta, cfg.nlx, cfg.nly, cfg.sy[i])
+            else {
                 slices.push(Slice {
                     wpb: 0,
                     lines: 0,
@@ -3100,34 +3106,33 @@ fn encode_precinct_cascade(
                     pic_col_offset: 0,
                     comp_i: i,
                     beta,
+                    local_beta: 0,
                     exists: false,
                 });
                 continue;
-            }
-            let key = beta_key(beta, cfg.nlx, nly_comp);
-            let (pic_bw, pic_bh) = band_dims(wc, hc, cfg.nlx, nly_comp, beta);
-            // pow_h is computed against the *picture-level* nly; for
-            // sub-sampled components the precinct still holds
-            // `pow_h(nly, dy)` band-rows on average — but each component
-            // contributes only `pow_h_i = 2^max(nly_i - dy, 0)` because
-            // the per-component decomposition is shallower. The
-            // sub-sample-aware Annex B.6 says lines per precinct =
-            // 2^max(NL,y - dy, 0) / sy[i].
-            let pow_pic = pow_h(cfg.nly, key.dy);
-            let pow_eff = pow_pic / (cfg.sy[i] as usize).max(1);
-            let pow_eff = pow_eff.max(1);
+            };
+            // The component's DWT band lives at chroma-local β; pull
+            // its (dx, dy) and dimensions from the component's own
+            // enumeration NL,x / N'L,y[i].
+            let key = beta_key(local_beta, cfg.nlx, nly_comp);
+            let (pic_bw, pic_bh) = band_dims(wc, hc, cfg.nlx, nly_comp, local_beta);
+            // pow_h in chroma's BAND-grid units. Per Annex B.6 the
+            // image-grid pow is `2^(NL,y - dy_picture)`; the chroma-
+            // band-grid pow follows from dividing by sy[i] — but the
+            // component's own dy (from beta_levels with N'L,y[i]) is
+            // the depth in chroma's frame, so we apply `pow_h(N'L,y[i], dy_chroma_local)`
+            // directly to get chroma-band-grid rows per precinct.
+            let pow_eff = pow_h(nly_comp, key.dy).max(1);
             let row_offset = py * pow_eff;
             let lines = if row_offset >= pic_bh {
                 0
             } else {
                 pow_eff.min(pic_bh - row_offset)
             };
-            // Per-precinct Wpb[p,b]. For Cw == 0 every precinct equals
-            // pic_bw (the picture-level band width). For Cw > 0 the
-            // band-cols-per-precinct equals `Cs / (sx[i] * 2^dx)` for
-            // both low- and high-pass, since `Cs = 8 × Cw × max(sx) ×
-            // 2^NL,x` is an exact multiple of `sx[i] * 2^dx` for any
-            // dx ∈ {0..=NL,x}.
+            // Per-precinct Wpb[p,b] in chroma's band-grid columns. The
+            // chroma's band width per precinct is `Cs / (sx[i] * 2^dx)`
+            // — same formula as 4:4:4 since horizontal sub-sampling
+            // already shrinks Wc by sx.
             let sx_i = cfg.sx[i] as usize;
             let dx = key.dx as usize;
             let cols_per_uniform = (cs as usize) / (sx_i * (1usize << dx)).max(1);
@@ -3146,6 +3151,7 @@ fn encode_precinct_cascade(
                 pic_col_offset,
                 comp_i: i,
                 beta,
+                local_beta,
                 exists: true,
             });
         }
@@ -3174,6 +3180,7 @@ fn encode_precinct_cascade(
             pic_col_offset: pic_col_offset_sd,
             comp_i: i,
             beta: 0,
+            local_beta: 0,
             exists: lines_this_precinct > 0 && wp_this > 0,
         });
     }
@@ -3203,7 +3210,7 @@ fn encode_precinct_cascade(
     let nd_u32 = n_decomposed as u32;
     let t_for_band = |beta: u32, comp_i: usize| -> u8 {
         let band_index: u32 = if comp_i < n_decomposed {
-            // Wavelet band: b = (Nc - Sd)×β + i.
+            // Wavelet band: b = (Nc - Sd)×β_pic + i.
             nd_u32 * beta + comp_i as u32
         } else {
             // Sd suppressed-tail band: b = (Nc - Sd)×Nβ + (i - (Nc - Sd)).
@@ -3211,11 +3218,19 @@ fn encode_precinct_cascade(
         };
         let refine = if band_index < cfg.rp as u32 { 1i32 } else { 0 };
         // Gain: suppressed-tail bands have no wavelet axes (G = 0); the
-        // wavelet bands use the τx/τy high-pass count from beta_key.
+        // wavelet bands use the τx/τy high-pass count from beta_key, but
+        // the (τx, τy) come from the *component's* local β slot in its
+        // own DWT enumeration. Resolve picture-β→local-β here.
         let gain: i32 = if comp_i < n_decomposed {
             let nly_comp = nly_i[comp_i];
-            let key = beta_key(beta, cfg.nlx, nly_comp);
-            (if key.tau_x { 1 } else { 0 }) + (if key.tau_y { 1 } else { 0 })
+            let sy_i = cfg.sy[comp_i];
+            match crate::slice_walker::picture_beta_to_local_beta(beta, cfg.nlx, cfg.nly, sy_i) {
+                Some(local_beta) => {
+                    let key = beta_key(local_beta, cfg.nlx, nly_comp);
+                    (if key.tau_x { 1 } else { 0 }) + (if key.tau_y { 1 } else { 0 })
+                }
+                None => 0,
+            }
         } else {
             0
         };
@@ -3244,7 +3259,11 @@ fn encode_precinct_cascade(
             let row_end = row_start + s.wpb;
             return Some(plane[row_start..row_end].to_vec());
         }
-        let band_buf = &bands_per_comp[s.comp_i][s.beta as usize];
+        // The per-component DWT cascade was run at NL,x / N'L,y[i] —
+        // it emits bands indexed by chroma's LOCAL β. The picture-β slot
+        // in `s.beta` is for bitstream ordering; the band data lives at
+        // `s.local_beta` in the component's DWT output array.
+        let band_buf = &bands_per_comp[s.comp_i][s.local_beta as usize];
         let pic_row = s.pic_row_offset + line_off;
         let row_start = pic_row * s.pic_bw + s.pic_col_offset;
         let row_end = row_start + s.wpb;
@@ -4928,6 +4947,89 @@ mod tests {
         )
         .expect("encode 4:2:0 NL=2/2 lossless");
         let img = crate::decoder::decode_codestream(&cs, None).expect("decode 4:2:0 NL=2/2");
+        assert_eq!(img.num_components, 3);
+        assert_eq!(img.planes[0].data, y_plane);
+        assert_eq!(img.planes[1].data, cb_plane);
+        assert_eq!(img.planes[2].data, cr_plane);
+    }
+
+    /// r190: 4:2:0 at NL=3/3 lossy q=2 — must round-trip with a
+    /// reasonable PSNR (the picture-β refactor must not break the
+    /// quantization pipeline).
+    #[test]
+    fn r190_chroma_420_nl3_lossy_q2_round_trip() {
+        let w = 64u16;
+        let h = 64u16;
+        let n_y = (w as usize) * (h as usize);
+        let n_c = ((w as usize) / 2) * ((h as usize) / 2);
+        let mut y_plane = vec![0u8; n_y];
+        let mut cb_plane = vec![0u8; n_c];
+        let mut cr_plane = vec![0u8; n_c];
+        for (i, slot) in y_plane.iter_mut().enumerate() {
+            *slot = ((i * 7 + 13) % 256) as u8;
+        }
+        for i in 0..n_c {
+            cb_plane[i] = ((i * 11 + 17) % 256) as u8;
+            cr_plane[i] = ((i * 19 + 23) % 256) as u8;
+        }
+        let cs = encode_planar_subsampled(
+            w,
+            h,
+            3,
+            0,
+            3,
+            3,
+            2,
+            &[1, 2, 2],
+            &[1, 2, 2],
+            &[y_plane.clone(), cb_plane.clone(), cr_plane.clone()],
+        )
+        .expect("encode 4:2:0 NL=3/3 q=2");
+        let img = crate::decoder::decode_codestream(&cs, None).expect("decode 4:2:0 NL=3/3 q=2");
+        assert_eq!(img.num_components, 3);
+        assert_eq!(img.planes[0].data.len(), y_plane.len());
+        assert_eq!(img.planes[1].data.len(), cb_plane.len());
+        assert_eq!(img.planes[2].data.len(), cr_plane.len());
+    }
+
+    /// r190: 4:2:0 at NL=3/3 — the previously-blocked case where
+    /// N'L,y[chroma] = 2 puts chroma's deepest LH/HH triple at a proxy
+    /// level that the picture-level β-slot enumeration (Annex B.4 /
+    /// Figure B.2) places at picture-β = 7,8,9 rather than the chroma's
+    /// local-β = 5,6,7 slots. Fixed in r190 by introducing the
+    /// `picture_beta_to_local_beta` permutation across walker /
+    /// encoder / decoder.
+    #[test]
+    fn r190_chroma_420_nl3_lossless_round_trip() {
+        let w = 64u16;
+        let h = 64u16;
+        let n_y = (w as usize) * (h as usize);
+        let n_c = ((w as usize) / 2) * ((h as usize) / 2);
+        let mut y_plane = vec![0u8; n_y];
+        let mut cb_plane = vec![0u8; n_c];
+        let mut cr_plane = vec![0u8; n_c];
+        for (i, slot) in y_plane.iter_mut().enumerate() {
+            *slot = ((i * 7 + 13) % 256) as u8;
+        }
+        for i in 0..n_c {
+            cb_plane[i] = ((i * 11 + 17) % 256) as u8;
+            cr_plane[i] = ((i * 19 + 23) % 256) as u8;
+        }
+        let cs = encode_planar_subsampled(
+            w,
+            h,
+            3,
+            0,
+            3,
+            3,
+            0,
+            &[1, 2, 2],
+            &[1, 2, 2],
+            &[y_plane.clone(), cb_plane.clone(), cr_plane.clone()],
+        )
+        .expect("encode 4:2:0 NL=3/3 lossless");
+        let img =
+            crate::decoder::decode_codestream(&cs, None).expect("decode 4:2:0 NL=3/3 lossless");
         assert_eq!(img.num_components, 3);
         assert_eq!(img.planes[0].data, y_plane);
         assert_eq!(img.planes[1].data, cb_plane);

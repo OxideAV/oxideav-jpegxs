@@ -1,5 +1,92 @@
 # Changelog
 
+## Unreleased — round 190 (picture-β slot indexing for 4:2:0 chroma)
+
+Closes the `NL,y ≥ 3` 4:2:0 round-trip blocker tracked as task #1139 by
+reconciling the band-index convention shared by the slice walker, the
+forward cascade encoder and the inverse cascade decoder with the spec's
+**picture-level** β slot enumeration (Annex B.3 Figure B.2, Annex B.4
+`bx[β,i]`).
+
+Prior to this round the codebase used a packed *per-component* β index
+for the bitstream band id `b = (Nc − Sd) × β + i`: chroma's local
+`n_beta(NL,x, N'L,y[i])` slots were placed at `β_pic ∈ [0, n_beta_local)`
+with the tail slots `[n_beta_local, n_beta_pic)` marked non-existent. At
+`NL,y = 2` (`NL=2/2` 4:2:0) the convention happened to round-trip
+because chroma's deepest proxy level had `pow_chroma_band = 1` and
+luma's level-1 outer-loop pow matched, but at `NL,y ≥ 3` the chroma
+proxy depth diverged from luma's: chroma's deepest local-β triple
+(`HL1,1 / LH1,1 / HH1,1`) lived inside luma's `β0 = 4` proxy iteration
+(luma's `HL2,2 / LH2,2 / HH2,2` group), and the umod-`sy[i]` line-
+inclusion guard dropped every odd image-grid λ — producing fewer
+packets than the decoder's `BandCoefficients` buffer expected, leaving
+half of chroma's deeper-band rows at zero. Result: value-corrupted
+4:2:0 output at `NL=3/3` even though the bitstream parsed cleanly.
+
+Per Figure B.2 the picture-β enumeration is *common to all components*
+and shaded slots indicate chroma's missing bands (`β = 5, 6` for
+`NL=5/2` 4:2:0; `β = 2, 3` for `NL=3/3` 4:2:0). Chroma's local DWT
+output is then placed at the surviving picture-β slots via a
+permutation that this round records explicitly.
+
+* `slice_walker::picture_beta_to_local_beta(β_pic, NL,x, NL,y, sy[i])
+  -> Option<u32>` — the new helper. Returns the chroma-local-β whose
+  DWT output (from `forward_cascade_2d(wc, hc, NL,x, N'L,y[i])`)
+  belongs at the picture-β slot, or `None` when the slot is missing
+  for the component (`bx[β,i] = 0`). Identity for `sy[i] = 1`. For
+  `sy[i] = 2` the mapping has the form
+  - LL (β_pic = 0) → 0
+  - Pure-horizontal `HL_k,NL,y` (β_pic ∈ [1, β1_pic)): chroma-local at
+    `NL,x − dx + 1` (chroma's pure-H zone if `dx > N'L,y[i]`) or
+    `β1_chroma + 3·(N'L,y[i] − dx)` (chroma's proxy zone if
+    `dx ≤ N'L,y[i]`).
+  - Proxy (τy = 1) with `dy_pic > N'L,y[i]` → `None` (the level is
+    below chroma's plane resolution).
+  - Proxy with `dy_pic ≤ N'L,y[i]`: chroma-local at
+    `β1_chroma + 3·(N'L,y[i] − dy_pic) + within` (within 1 = LH,
+    2 = HH).
+* `PrecinctPlan::band_local_beta` — new field carrying the chroma-
+  local-β per band slot. `u32::MAX` for non-existent slots; otherwise
+  the index into `gathered[i][local_β]` (decoder) and
+  `bands_per_comp[i][local_β]` (encoder).
+* `build_plan_sd` populates `dx_arr / dy_arr / tau_x / tau_y / wb /
+  hb / exists_arr` indexed by picture-β slot, with the (dx, dy, τx,
+  τy) read from the component's *local* `beta_levels(local_β,
+  NL,x, N'L,y[i])`. The Annex B.4 existence check is the
+  `picture_beta_to_local_beta` `None` case.
+* `encode_precinct_cascade` resolves the picture-β slot to chroma's
+  local-β at slice-collection time and indexes
+  `bands_per_comp[s.comp_i][s.local_beta]` in `extract_band_line`.
+* `gather_precinct` walks picture-β slots and uses
+  `precinct_plan.band_local_beta[b]` to address `gathered[i][local_β]`.
+* `count_existing_bands / build_band_gains_sd /
+  build_band_priorities_sd` walk picture-β slots and use
+  `picture_beta_to_local_beta` to (a) decide existence and (b)
+  resolve the τx/τy of the gain for the WGT body. The forward
+  encoder's `t_for_band` does the same lookup so encoder T and
+  decoder `precinct_truncation` agree on the band's gain.
+
+Tests landed (306 total → 308, +6 vs round 181):
+* `slice_walker::picture_beta_to_local_beta_444` — sy=1 identity over
+  every `NL=k/m` with `k ≤ 5, m ≤ k`.
+* `slice_walker::picture_beta_to_local_beta_420_nl5_2_figure_b2` —
+  worked example from Figure B.2 (NL=5/2 4:2:0); chroma exists at
+  picture-β ∈ {0,1,2,3,4,7,8,9}, mapping to chroma-local
+  {0,1,2,3,4,5,6,7}.
+* `slice_walker::picture_beta_to_local_beta_420_nl3` — NL=3/3 4:2:0.
+* `slice_walker::picture_beta_to_local_beta_420_nl2` — NL=2/2 4:2:0
+  (regression cover for the pre-existing case).
+* `encoder::r190_chroma_420_nl3_lossless_round_trip` — 64×64 4:2:0
+  NL=3/3 lossless self-round-trip is bit-exact across all three
+  planes. This is task #1139 closed.
+* `encoder::r190_chroma_420_nl3_lossy_q2_round_trip` — same shape
+  at `q = 2` self-decodes to the correct plane byte counts (the
+  quantization pipeline now finds the matching T on both sides
+  via the corrected WGT-gain enumeration).
+
+The `band_exists` Annex-B.4 standalone helper is removed; existence is
+now decided by `picture_beta_to_local_beta` returning `None`.
+
 ## Unreleased — round 181 (high-bit-depth NLT quadratic)
 
 Widens the round-5 NLT quadratic encoder (`Tnlt = 1`, Annex G.4) from

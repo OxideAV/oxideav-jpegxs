@@ -384,7 +384,11 @@ fn gather_precinct(
     let px = (precinct_plan.p as usize) % np_x.max(1);
     let nly_pic = pih.nly;
 
-    // Wavelet components (i < Nc - Sd).
+    // Wavelet components (i < Nc - Sd). Iterate over picture-β slots
+    // (the bitstream's flat band id `b = (Nc - Sd) × β_pic + i`). For
+    // each existing slot the precinct plan records the matching
+    // chroma-local β (the index into the component's own DWT cascade
+    // output buffer `gathered[i][local_β]`) per Annex B.4 / Figure B.2.
     for (i, c) in cdt
         .components
         .iter()
@@ -398,11 +402,14 @@ fn gather_precinct(
             4 => 2,
             _ => 0,
         });
-        let nb_i = beta_count(pih.nlx, nly_i) as u32;
-        for beta in 0..nbeta.min(nb_i) {
-            let b = (n_decomposed * beta + i as u32) as usize;
+        for beta_pic in 0..nbeta {
+            let b = (n_decomposed * beta_pic + i as u32) as usize;
             let band_geom = &precinct_plan.geometry.bands[b];
             if !band_geom.exists {
+                continue;
+            }
+            let local_beta = precinct_plan.band_local_beta[b];
+            if local_beta == u32::MAX {
                 continue;
             }
             let lines = (band_geom.l1 - band_geom.l0) as usize;
@@ -410,20 +417,16 @@ fn gather_precinct(
                 continue;
             }
             let wpb = band_geom.wpb as usize;
-            // Picture-level band dimensions for this (β, i).
+            // Picture-level band dimensions for chroma's *local* β — the
+            // chroma plane decomposed at NL,x / N'L,y[i] produces a band
+            // sized (pic_bw × pic_bh) in chroma's grid.
             let wc = (pih.wf as usize) / (c.sx as usize);
             let hc = (pih.hf as usize) / (sy_i as usize);
-            let (pic_bw, pic_bh) = band_dims(wc, hc, pih.nlx, nly_i, beta);
-            // Column offset of this precinct (px) in the picture-level
-            // band. For a uniform-Cs precinct grid all precincts before
-            // the rightmost have the same Wpb value computed from Cs;
-            // the rightmost picks up the remainder. Cs is the per-row
-            // band step in image-grid units; converting it to band-grid
-            // units gives the column stride per precinct.
+            let (pic_bw, pic_bh) = band_dims(wc, hc, pih.nlx, nly_i, local_beta);
             let band_cols_per_uniform_precinct: usize = {
                 let cs = plan.cs as usize;
                 let sx_i = c.sx as usize;
-                let key = beta_key_for(beta, pih.nlx, nly_i);
+                let key = beta_key_for(local_beta, pih.nlx, nly_i);
                 let dx = key.dx as usize;
                 let tx = key.tau_x;
                 let denom_low = sx_i * (1usize << dx);
@@ -435,42 +438,16 @@ fn gather_precinct(
                 }
             };
             let band_col_offset = px * band_cols_per_uniform_precinct;
-            // Map this precinct's band-line slice [0..lines) into the
-            // picture-level band rows. The first picture-band-line for
-            // precinct py is `py * (pow)`, where pow = 2^max(NL,y - dy, 0).
-            // Equivalently, lines per precinct = (L1 - L0); the row
-            // offset in the picture-level band = py * (lines per
-            // precinct from L0 alignment), but L0 is constant across
-            // precincts so we use py * pow. We recover pow from
-            // L1 - L0 + (anything truncated by Hb — handled by saturating
-            // the picture row at pic_bh).
-            //
-            // For the standard square cascade (NL,x = NL,y = N) and
-            // NL,y > 0, every band has pow = 2^max(N - dy, 0). The
-            // precinct contains exactly `pow` band-lines (or fewer at
-            // the picture's bottom edge), so picture-row = py * pow + λ
-            // where λ ∈ [0, lines).
-            let pow = pic_bh.div_ceil(
-                plan.slices
-                    .iter()
-                    .map(|s| s.n_precincts)
-                    .sum::<u32>()
-                    .max(1) as usize,
-            );
-            let _ = pow;
-            // Better: derive pow from the non-truncated case — the
-            // first precinct should have lines == pow, so we can just
-            // use the first precinct's `lines` directly via the band
-            // geometry's pow encoded as `min(pow, hb_remaining)`. For
-            // py = 0 it's `min(pow, hb)` = pow when hb >= pow, but
-            // when hb < pow it's hb. Since we want the offset into the
-            // picture-band, we compute it directly from band geometry.
-            let pow_h = cascade_band_pow_h(pih.nlx, nly_i, beta, hc);
+            // Row offset in chroma's picture-level band buffer for this
+            // precinct. Uses the component's own dy (chroma-local) so
+            // 2^max(N'L,y[i] - dy_chroma, 0) is the chroma-band-grid
+            // rows per precinct.
+            let pow_h = cascade_band_pow_h(pih.nlx, nly_i, local_beta, hc);
             let row_offset = py * pow_h;
-            let band_buf = &mut gathered[i][beta as usize];
+            let band_buf = &mut gathered[i][local_beta as usize];
             if band_buf.len() != pic_bw * pic_bh {
                 return Err(Error::invalid(format!(
-                    "jpegxs decoder gather: band buffer for comp {i} β={beta} sized {} != {}*{}",
+                    "jpegxs decoder gather: band buffer for comp {i} picture-β={beta_pic} local-β={local_beta} sized {} != {}*{}",
                     band_buf.len(),
                     pic_bw,
                     pic_bh
@@ -481,7 +458,6 @@ fn gather_precinct(
                 if pic_row >= pic_bh {
                     break;
                 }
-                // Bound the copy width to the available picture columns.
                 let copy_w = wpb.min(pic_bw.saturating_sub(band_col_offset));
                 if copy_w == 0 {
                     break;

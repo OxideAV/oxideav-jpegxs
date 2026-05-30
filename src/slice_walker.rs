@@ -85,7 +85,18 @@ pub struct PrecinctPlan {
     /// for `Sd == 0`, `i[b] = b % (Nc - Sd)`.
     pub band_component: Vec<u8>,
     /// Per-band β (filter type) index, parallel to `geometry.bands`.
+    /// This is the *picture-level* β slot as used by the bitstream's
+    /// flat band id `b = (Nc − Sd) × β + i` (Annex B.3).
     pub band_beta: Vec<u32>,
+    /// Per-band chroma-local-β: the index into the component's own DWT
+    /// cascade output (`oxideav_jpegxs::dwt::forward_cascade_2d` etc.)
+    /// that supplies this band's coefficients. For 4:4:4 / 4:2:2 (sy=1)
+    /// this equals `band_beta[k]`; for vertically sub-sampled
+    /// components (sy=2 / 4) the picture-β slot can map to a different
+    /// chroma-local-β per Annex B.4 (e.g. picture β=7 = HL1,1 maps to
+    /// chroma's local β=5 for NL=5/2 4:2:0 per Figure B.2). `u32::MAX`
+    /// for slots that don't exist for the component (bx[β,i] = 0).
+    pub band_local_beta: Vec<u32>,
 }
 
 /// Plan for a single slice: a contiguous run of precincts.
@@ -220,24 +231,105 @@ fn beta_levels(beta: u32, nlx: u8, nly: u8) -> (u32, u32, bool, bool) {
     }
 }
 
-/// Compute `b'x[b]` per Annex B.4.
-fn band_exists(beta: u32, _i_in_decomposed: usize, nly: u8, dy: u32, sy: u8, tau_y: bool) -> bool {
-    if sy == 0 {
-        return false;
+/// Map a picture-level filter index `β_pic` to the equivalent
+/// chroma-local filter index used by the per-component DWT cascade.
+///
+/// Background. Annex B.3 enumerates the wavelet filter types β with
+/// the *picture-level* (`NL,x`, `NL,y`) — see Table B.3. The
+/// per-component band index then comes from `b = (Nc − Sd) × β_pic + i`,
+/// so the picture's β indexing is what the slice walker and packet
+/// inclusion rule (Table B.4) operate on.
+///
+/// However the per-component forward / inverse DWT cascade (in
+/// `oxideav_jpegxs::dwt`) decomposes each component at its own
+/// effective vertical depth `N′L,y[i] = NL,y − log2(sy[i])`, so the
+/// cascade emits / consumes bands at *chroma-local* β indexing
+/// `(0..n_beta(NL,x, N′L,y[i]))` not the picture-level enumeration.
+///
+/// For the 4:4:4 / 4:2:2 case (sy[i] == 1) the two indexings coincide
+/// because chroma's effective NL,y equals the picture's NL,y. For
+/// 4:2:0 (sy[i] == 2) chroma loses one vertical level, and the
+/// picture's β slots split into:
+///
+/// * Picture-β slots that don't exist for chroma — Annex B.4
+///   bx[β,i] = 0 — these are the picture's LH/HH triples at the
+///   deepest vertical depth(s). The bitstream has no entries for them.
+/// * Picture-β slots that map 1:1 to a chroma-local β with matching
+///   (dx, τx, τy) and `dy_chroma = dy_pic − log2(sy[i])` for proxy
+///   bands, or matching dx for pure-horizontal bands (where dy is
+///   irrelevant because τy = 0).
+///
+/// Returns `None` when bx[β_pic, i] = 0 (band doesn't exist for this
+/// component). Returns `Some(β_local)` when the picture-β slot maps
+/// to a chroma-local-β in the component's own DWT cascade output.
+pub(crate) fn picture_beta_to_local_beta(
+    beta_pic: u32,
+    nlx: u8,
+    nly_pic: u8,
+    sy_i: u8,
+) -> Option<u32> {
+    if sy_i == 0 {
+        return None;
     }
-    let _ = beta;
-    // Test: 2^max(NL,y - dy) × τy[β] mod sy[i] != 0 → not exists.
-    let pow = if dy > nly as u32 {
+    // Compute chroma's effective NL,y per Annex B.2.
+    let log2_sy: u8 = match sy_i {
+        1 => 0,
+        2 => 1,
+        4 => 2,
+        _ => return None,
+    };
+    let nly_i = nly_pic.saturating_sub(log2_sy);
+    // 4:4:4 / 4:2:2 vertical (sy=1) — identity mapping.
+    if log2_sy == 0 {
+        return Some(beta_pic);
+    }
+    // Decode picture-β to (dx, dy_pic, tx, ty) under picture-level NL,y.
+    let (dx_pic, dy_pic, tx, ty) = beta_levels(beta_pic, nlx, nly_pic);
+    let nly_pic_u = nly_pic as u32;
+    let nly_i_u = nly_i as u32;
+    let nlx_u = nlx as u32;
+    // Annex B.4 existence check: bx[β,i] = 0 iff 2^max(NL,y − dy)·τy[β] mod sy[i] != 0.
+    let pow = if dy_pic > nly_pic_u {
         1u32
     } else {
-        1u32 << (nly as u32 - dy)
+        1u32 << (nly_pic_u - dy_pic)
     };
-    let l0 = if tau_y { pow } else { 0 };
-    let sy_u = sy as u32;
-    if sy_u == 0 {
-        return false;
+    let l0_image = if ty { pow } else { 0 };
+    if (l0_image % sy_i as u32) != 0 {
+        return None;
     }
-    (l0 % sy_u) == 0
+    // LL — both picture and chroma have β=0 as LL.
+    if !ty && !tx {
+        return Some(0);
+    }
+    if !ty {
+        // Picture's pure-horizontal HL (τy=0, τx=1) at picture's level
+        // dy_pic = NL,y (always, since pure-H zone uses dy=NL,y). The
+        // matching chroma band is chroma's HL at the same dx in chroma's
+        // own enumeration.
+        let beta1_chroma = nlx_u - nly_i_u + 1;
+        if dx_pic > nly_i_u {
+            // Chroma's pure-horizontal zone — same formula as picture's.
+            return Some(nlx_u + 1 - dx_pic);
+        }
+        // Chroma's proxy zone HL: triple is `nly_i_u - dx_pic` (since
+        // chroma's proxy goes dx = nly_i, nly_i - 1, ..., 1).
+        let triple = nly_i_u - dx_pic;
+        return Some(beta1_chroma + 3 * triple); // within=0 → HL
+    }
+    // τy = 1 (LH or HH). The band lives in the proxy zone of both
+    // picture and chroma. Picture's (dx_pic, dy_pic) are equal (per
+    // proxy structure); the same applies to chroma. The chroma matching
+    // band has the same dy (since τy=1 bands track the picture's
+    // dy_pic — chroma can only carry it when dy_pic ≤ nly_i, which the
+    // bx check above already enforced).
+    if dy_pic > nly_i_u {
+        return None;
+    }
+    let beta1_chroma = nlx_u - nly_i_u + 1;
+    let triple = nly_i_u - dy_pic;
+    let within: u32 = if tx { 2 } else { 1 }; // HH=2, LH=1
+    Some(beta1_chroma + 3 * triple + within)
 }
 
 /// Build a [`PicturePlan`] from the picture header / component table /
@@ -364,8 +456,17 @@ pub fn build_plan_sd(
         })
         .collect();
 
-    // Pre-compute per-(β, i) band geometry. Index into `wb` / `hb` /
-    // `dx_arr` / `dy_arr` / `tau_y` is `i * nbeta + beta`.
+    // Pre-compute per-(β_pic, i) band geometry. Index into `wb` / `hb` /
+    // `dx_arr` / `dy_arr` / `tau_y` is `i * nbeta + beta_pic` where
+    // `beta_pic` is the picture-level β slot used by the bitstream's
+    // band index `b = (Nc - Sd) × β_pic + i` (Annex B.3). For each
+    // (i, β_pic) we resolve the chroma-local-β via
+    // [`picture_beta_to_local_beta`] then take that band's (dx, dy)
+    // from the component's own DWT enumeration (NL,x, N'L,y[i]). When
+    // the picture-β slot has no chroma equivalent (bx[β,i] = 0), the
+    // slot is marked non-existent. `local_beta_arr` stores the
+    // chroma-local-β for each existing slot so the encoder and decoder
+    // can read the per-component DWT output buffers.
     let arr_size = (nbeta as usize) * (nc as usize);
     let mut wb = vec![0u32; arr_size];
     let mut hb = vec![0u32; arr_size];
@@ -374,6 +475,7 @@ pub fn build_plan_sd(
     let mut tau_x = vec![false; arr_size];
     let mut tau_y = vec![false; arr_size];
     let mut exists_arr = vec![false; arr_size];
+    let mut local_beta_arr = vec![u32::MAX; arr_size];
     for (i, comp) in cdt.components.iter().enumerate() {
         // Suppressed components (Sd): the picture-level wavelet array is
         // skipped entirely. Their data lives in the Sd tail bands of the
@@ -383,26 +485,24 @@ pub fn build_plan_sd(
         }
         let wc = wf / (comp.sx as u32);
         let hc = hf / (comp.sy as u32);
-        let nlx_i = nlx; // Annex B.2: N'L,x[i] = NL,x for i < Nc - Sd
         let nly_i = nly_per_component[i];
-        let nbeta_i = n_beta(nlx_i, nly_i);
-        for beta in 0..nbeta {
-            let idx = i * (nbeta as usize) + beta as usize;
-            // Cap β by the per-component number of filter types: if a
-            // β is not defined for component i (because nly_i < nly),
-            // skip the geometry computation (which would underflow on
-            // `dx = nlx + 1 - beta` for β > nlx + 1) and mark the band
-            // non-existent.
-            if beta >= nbeta_i {
+        for beta_pic in 0..nbeta {
+            let idx = i * (nbeta as usize) + beta_pic as usize;
+            let Some(local_beta) = picture_beta_to_local_beta(beta_pic, nlx, nly, comp.sy) else {
+                // Annex B.4 bx[β,i] = 0 — slot has no band for this
+                // component. Leave exists = false.
                 exists_arr[idx] = false;
                 continue;
-            }
-            let (dx, dy, tx, ty) = beta_levels(beta, nlx_i, nly_i);
+            };
+            // (dx, dy, τx, τy) of the chroma's actual band — taken from
+            // chroma's own DWT enumeration NL,x / N'L,y[i].
+            let (dx, dy, tx, ty) = beta_levels(local_beta, nlx, nly_i);
             dx_arr[idx] = dx;
             dy_arr[idx] = dy;
             tau_x[idx] = tx;
             tau_y[idx] = ty;
-            // Band geometry per Annex B.2.
+            local_beta_arr[idx] = local_beta;
+            // Band geometry per Annex B.2 — uses chroma's plane dims (wc, hc).
             let wb_b = if !tx {
                 if dx == 0 {
                     wc
@@ -425,7 +525,7 @@ pub fn build_plan_sd(
             };
             wb[idx] = wb_b;
             hb[idx] = hb_b;
-            exists_arr[idx] = band_exists(beta, i, nly, dy, comp.sy, ty);
+            exists_arr[idx] = true;
         }
     }
 
@@ -517,8 +617,10 @@ pub fn build_plan_sd(
                 hf,
                 &dx_arr,
                 &dy_arr,
+                &tau_x,
                 &tau_y,
                 &exists_arr,
+                &local_beta_arr,
                 &wb,
                 &hb,
                 &weights_by_band,
@@ -604,8 +706,10 @@ fn build_precinct_plan(
     hf: u32,
     dx: &[u32],
     dy: &[u32],
+    tau_x: &[bool],
     tau_y: &[bool],
     exists_arr: &[bool],
+    local_beta: &[u32],
     _wb: &[u32],
     hb: &[u32],
     weights_by_band: &[BandWeight],
@@ -624,48 +728,33 @@ fn build_precinct_plan(
     let mut bands: Vec<BandGeometry> = Vec::with_capacity(n_bands as usize);
     let mut band_component: Vec<u8> = Vec::with_capacity(n_bands as usize);
     let mut band_beta: Vec<u32> = Vec::with_capacity(n_bands as usize);
-    // Fill per-band geometry in band-id order: b = (Nc - Sd) * β + i for
-    // i ∈ [0, Nc-Sd). Sd suppressed bands are appended afterward.
+    let mut band_local_beta: Vec<u32> = Vec::with_capacity(n_bands as usize);
+    // Fill per-band geometry in band-id order: b = (Nc - Sd) * β_pic + i
+    // for i ∈ [0, Nc - Sd). `β` here is the *picture-level* β slot as
+    // used by the bitstream; the (dx, dy, τx, τy) read from dx/dy/
+    // tau_x/tau_y arrays are the **component's local** values (chroma's
+    // own decomposition at NL,x / N'L,y[i]). Sd suppressed bands are
+    // appended afterward.
     for beta in 0..nbeta {
         for i in 0..n_decomposed as usize {
             let arr_idx = i * (nbeta as usize) + beta as usize;
             let dx_b = dx[arr_idx];
             let dy_b = dy[arr_idx];
+            let tx_b = tau_x[arr_idx];
             let tau_y_b = if tau_y[arr_idx] { 1u32 } else { 0u32 };
             let exists = exists_arr[arr_idx];
+            let local_b = local_beta[arr_idx];
 
             // Per-band Wpb: matches the picture-level band width Wb[β,i]
-            // when Cw == 0 (single precinct column). For τx = false
-            // (low-pass-horizontal bands LL/LH) the band has
-            // ⌈Wc / 2^dx⌉ coefficients per row; for τx = true (HL/HH)
-            // the band has ⌊LL_{dx-1}.w / 2⌋ = ⌈Wc/2^(dx-1)⌉ / 2
-            // coefficients per row. The legacy formula
-            // `Wp.div_ceil(sx * 2^dx)` matches Wb only when Wc is a
-            // power-of-2 multiple of 2^dx and breaks for odd
-            // dimensions in the τx = true bands; the corrected form
-            // mirrors the cascade band-dim formula in
-            // [`crate::dwt::inverse_cascade_2d`].
-            let wpb = {
+            // when Cw == 0 (single precinct column). For τx = false the
+            // band has ⌈Wc / 2^dx⌉ coefficients per row; for τx = true
+            // the band has ⌈Wc / 2^(dx-1)⌉ / 2 coefficients per row.
+            // Both dx and τx come from the *component's local* β
+            // enumeration so the formula matches each component's own
+            // DWT band dimensions.
+            let wpb = if exists {
                 let wc_p = (wp / sx[i] as u32).max(1);
-                let tx = beta != 0 && {
-                    // For β > 0 we infer τx from the position of β
-                    // among the proxy levels; this mirrors `beta_levels`.
-                    let nlx_u = nlx as u32;
-                    let nly_u = nly_per_component[i] as u32;
-                    if nly_u == 0 {
-                        true // β > 0 in NL,y == 0 path are all HL
-                    } else {
-                        let beta1 = nlx_u - nly_u + 1;
-                        if beta < beta1 {
-                            true // pure-horizontal HL series
-                        } else {
-                            let group_in = beta - beta1;
-                            let within = group_in % 3;
-                            within == 0 || within == 2 // HL or HH
-                        }
-                    }
-                };
-                if !tx {
+                if !tx_b {
                     if dx_b == 0 {
                         wc_p
                     } else {
@@ -675,9 +764,14 @@ fn build_precinct_plan(
                     let denom_minus1 = if dx_b == 0 { 1 } else { 1u32 << (dx_b - 1) };
                     wc_p.div_ceil(denom_minus1) / 2
                 }
+            } else {
+                0
             };
 
-            // L0[p,b] = 2^max(NL,y - dy[i,β], 0) × τy[β]
+            // L0[p,b] = 2^max(N'L,y[i] - dy[i,β], 0) × τy[β] (band-grid
+            // for component i). The image-grid equivalent (Annex B.6) is
+            // L0 × sy[i]. We carry the band-grid value in the geometry
+            // because the entropy decoder indexes by band-grid lines.
             let nly_i = nly_per_component[i] as u32;
             let dy_eff = if nly == 0 { 0 } else { dy_b };
             let pow = if dy_eff > nly_i || nly_i == 0 {
@@ -687,10 +781,9 @@ fn build_precinct_plan(
             };
             let l0 = pow * tau_y_b;
 
-            // L1 — see spec subclause B.6:
-            //   L1 = L0 + min(Hb[β,i] − ⌊p / Np_x⌋ × 2^max(NL,y - dy, 0),
-            //                   2^max(NL,y - dy, 0))
-            // ⌊p / Np_x⌋ is the precinct row index py.
+            // L1 (band-grid): L1 = L0 + min(Hb − py·pow, pow). Hb is the
+            // per-component picture-level band height (chroma's own DWT
+            // produces a band Hb_chroma rows tall).
             let row_offset = py * pow;
             let band_h_remaining = (hb[arr_idx]).saturating_sub(row_offset);
             let l1_extent = band_h_remaining.min(pow);
@@ -715,6 +808,7 @@ fn build_precinct_plan(
             });
             band_component.push(i as u8);
             band_beta.push(beta);
+            band_local_beta.push(local_b);
         }
     }
 
@@ -744,6 +838,7 @@ fn build_precinct_plan(
         });
         band_component.push(comp_idx as u8);
         band_beta.push(0);
+        band_local_beta.push(0);
     }
 
     let geometry = PrecinctGeometry {
@@ -789,6 +884,7 @@ fn build_precinct_plan(
         cs,
         band_component,
         band_beta,
+        band_local_beta,
     })
 }
 
@@ -1038,6 +1134,116 @@ mod tests {
         assert_eq!((dx, tx), (5, true));
         let (dx, _, tx, _) = beta_levels(5, 5, 0);
         assert_eq!((dx, tx), (1, true));
+    }
+
+    #[test]
+    fn picture_beta_to_local_beta_444() {
+        // 4:4:4 (sy=1) — identity mapping for any NL.
+        for nlx in 1u8..=5 {
+            for nly in 0u8..=nlx {
+                for beta_pic in 0..n_beta(nlx, nly) {
+                    assert_eq!(
+                        picture_beta_to_local_beta(beta_pic, nlx, nly, 1),
+                        Some(beta_pic),
+                        "4:4:4 identity broken at NL={nlx}/{nly}, β={beta_pic}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn picture_beta_to_local_beta_420_nl5_2_figure_b2() {
+        // Annex B.3 Figure B.2 worked example: NL,x=5, NL,y=2, 4:2:0.
+        // Chroma (Cb / Cr) appears at band b=1,4,7,10,13,22,25,28
+        // (i.e. picture-β = 0,1,2,3,4,7,8,9; gap at β=5,6) per the
+        // shaded cells in the figure.
+        let cases = [
+            (0u32, Some(0u32)),
+            (1, Some(1)),
+            (2, Some(2)),
+            (3, Some(3)),
+            (4, Some(4)),
+            (5, None),
+            (6, None),
+            (7, Some(5)),
+            (8, Some(6)),
+            (9, Some(7)),
+        ];
+        for (bp, want) in cases {
+            assert_eq!(
+                picture_beta_to_local_beta(bp, 5, 2, 2),
+                want,
+                "NL=5/2 4:2:0 picture-β={bp}"
+            );
+        }
+    }
+
+    #[test]
+    fn picture_beta_to_local_beta_420_nl3() {
+        // NL=3/3, sy=2 (4:2:0 vertical). Per Table B.3-equivalent at
+        // (NL,x=3, NL,y=3) the picture β enumeration is:
+        //   0: LL3,3  1: HL3,3  2: LH3,3  3: HH3,3
+        //   4: HL2,2  5: LH2,2  6: HH2,2
+        //   7: HL1,1  8: LH1,1  9: HH1,1
+        // For chroma (sy=2, N'L,y=2) the LH3/HH3 slots (β=2,3) have
+        // L0 = 2^(3-3)·1 = 1 image-grid line → 1 mod 2 != 0 → bx = 0.
+        // The remaining picture slots map to chroma-local β as:
+        //   0 → 0 (LL)
+        //   1 → 1 (HL3)
+        //   2 → None (LH3 — vertically incompatible with sy=2)
+        //   3 → None (HH3)
+        //   4 → 2 (HL2)
+        //   5 → 3 (LH2)
+        //   6 → 4 (HH2)
+        //   7 → 5 (HL1)
+        //   8 → 6 (LH1)
+        //   9 → 7 (HH1)
+        let cases = [
+            (0u32, Some(0u32)),
+            (1, Some(1)),
+            (2, None),
+            (3, None),
+            (4, Some(2)),
+            (5, Some(3)),
+            (6, Some(4)),
+            (7, Some(5)),
+            (8, Some(6)),
+            (9, Some(7)),
+        ];
+        for (bp, want) in cases {
+            assert_eq!(
+                picture_beta_to_local_beta(bp, 3, 3, 2),
+                want,
+                "NL=3/3 4:2:0 picture-β={bp}"
+            );
+        }
+    }
+
+    #[test]
+    fn picture_beta_to_local_beta_420_nl2() {
+        // NL=2/2, sy=2 (4:2:0). Chroma N'L,y = 1, nbeta_chroma = 5.
+        // Picture β enumeration at NL=2/2:
+        //   0: LL2,2  1: HL2,2  2: LH2,2  3: HH2,2  4: HL1,1  5: LH1,1  6: HH1,1
+        // Chroma at NL=2/1: 0:LL  1:HL2  2:HL1,1  3:LH1,1  4:HH1,1
+        // bx for picture-β at sy=2: β=2 LH2,2 dy=2 ty=1 → l0=1, skip; β=3 same.
+        // β=4 HL1,1 ty=0 → exists; β=5 LH1,1 dy=1 ty=1 → l0=2, exists; β=6 same.
+        let cases = [
+            (0u32, Some(0u32)),
+            (1, Some(1)),
+            (2, None),
+            (3, None),
+            (4, Some(2)),
+            (5, Some(3)),
+            (6, Some(4)),
+        ];
+        for (bp, want) in cases {
+            assert_eq!(
+                picture_beta_to_local_beta(bp, 2, 2, 2),
+                want,
+                "NL=2/2 4:2:0 picture-β={bp}"
+            );
+        }
     }
 
     #[test]
