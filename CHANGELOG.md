@@ -1,6 +1,66 @@
 # Changelog
 
-## Unreleased — round 193 (high-bit-depth NLT extended)
+## Unreleased — round 195 (high-bit-depth Star-Tetrix)
+
+Widens the round-4 Star-Tetrix encoder (`Cpih = 3`, Annex F.5) from
+`B[i] = 8`-only to any `bd = B[i] ∈ 9..=16`. Closes the last
+high-bit-depth gap called out as the round-181 / 193 "out of scope"
+tail (along with the round-118 / 133 / 151 `encode_planar_highbd*`
+docstrings).
+
+Star-Tetrix is the four-component CFA colour transform from Annex F.5
+(Tables F.4–F.8). Its four lifting steps are integer linear
+combinations on `i32` coefficients, identical for any input bit depth —
+the existing `forward_star_tetrix` in `colour_transform.rs` already
+accepts `&mut [i32]` slices and `encode_planar_inner_bd` already
+dispatches to it when `cfg.cpih == 3`. The round-195 widening is
+therefore pure plumbing: a new public entry point that packs
+`u16`-LE planes (matching the round-118 high-bit-depth plane format)
+and routes through `encode_planar_inner_bd` with `Bw = B[i] = bd` and
+`Fq = 0` (the lossless choice of Table A.8). The DC level shift is
+`1 << (bd − 1)` per the Annex G.3 inverse, identical to the
+no-transform / RCT high-bit-depth paths.
+
+* `encode_planar_star_tetrix_highbd(width, height, nlx, nly, bd, e1,
+  e2, cf, ct, &[Vec<u16>]) -> Result<Vec<u8>>` — new public entry
+  point. `bd ∈ 9..=16`; pins `Nc = 4` (Annex F.2 Table F.1
+  Star-Tetrix operand window), `sx[i] = sy[i] = 1` for `i < 4`, `Cpih
+  = 3`, `Fq = 0`, `q = 0`. Input plane order is `Ω = [R, G1, G2, B]`
+  matching the 8-bit `encode_planar_star_tetrix`; each plane is
+  `width * height` little-endian `u16` samples in `0..=2^bd − 1`.
+  Emits the CTS marker (`Cf`, `e1`, `e2`) and the CRG marker
+  (Table F.9 RGGB layout for `Ct = 0`, GRBG layout for `Ct = 1`)
+  identical to the 8-bit form; only the per-component CDT `B[i]`
+  byte and the PIH `Bw` byte change on the wire. Rejects `bd = 8`
+  (use `encode_planar_star_tetrix`), `bd > 16`, wrong plane count,
+  oversize samples; the rest of the parameter validation
+  (`e1, e2 ≤ 3`, `cf ∈ {0, 3}`, `ct ≤ 1`, `nlx / nly` per Annex
+  A.4.4) flows through the shared `EncodeConfig::validate`.
+
+The matching `(rounds 118 / 133 / 151 / 181 / 193)
+encode_planar_highbd*` rejection guards on `cpih = 3` stay in place —
+those entry points remain scoped to `cpih ∈ {0, 1}` so callers reach
+Star-Tetrix high-bit-depth through the dedicated
+`encode_planar_star_tetrix_highbd` instead.
+
+Tests landed (323 total → +6 vs round 193's 317):
+* `r195_star_tetrix_highbd_10bit_round_trip` — 16×16 four-component
+  CFA at NL=2/2 self-round-trips bit-exactly (PSNR `INFINITY` ≥ 30 dB
+  floor).
+* `r195_star_tetrix_highbd_12bit_ct1_round_trip` — 12-bit cover with
+  Ct=1 (GRBG layout) + non-default `e1=2 / e2=3 / cf=3` (in-line),
+  confirms the CTS / CRG markers survive on the high-bit-depth path.
+* `r195_star_tetrix_highbd_16bit_round_trip` — 16-bit upper boundary,
+  exercises the full `[0, 65535]` sample range through the Annex F.5
+  lifting cascade.
+* `r195_star_tetrix_highbd_rejects_bad_bd` — `bd ∈ {8, 17}` raise
+  `Unsupported`.
+* `r195_star_tetrix_highbd_rejects_oversize_sample` — a sample
+  exceeding `2^bd − 1` is rejected.
+* `r195_star_tetrix_highbd_rejects_wrong_plane_count` — a 3-plane
+  input is rejected (Cpih=3 pins Nc=4).
+
+## Round 193 — high-bit-depth NLT extended
 
 Widens the round-7 NLT extended encoder (`Tnlt = 2`, Annex G.5) from
 `B[i] = 8`-only to any `bd = B[i] ∈ 9..=16` against `Bw = 20`
