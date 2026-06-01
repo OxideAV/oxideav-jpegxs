@@ -1,5 +1,89 @@
 # Changelog
 
+## Unreleased — round 206 (per-slice `Q[p]` override / slice-level rate budgeting)
+
+Closes the "single constant `Q` across every slice" tail called out in
+the round-103 / 195 / 201 Out-of-scope sections of the README. Before
+this round the multi-slice path emitted every precinct with the same
+picture-level `Q[p]`, which made `encode_planar_hsl` a layout-only
+multi-slice primitive (one SLH per slice + a precinct-row partition)
+without any per-slice rate-allocation lever. Round 206 lifts that to
+an explicit per-slice `Q[p]` slice — one value per slice, in top-down
+`Yslh` order.
+
+Per Annex C.2 Table C.1, `Q[p]` is a per-precinct field — the
+bitstream model already supports a different `Q[p]` for every
+precinct, and the decoder reads `Q[p]` per precinct (via
+`parse_precinct_header` + `precinct_truncation` in
+`crate::entropy`). The encoder was the only side enforcing a
+constant `Q[p]`; this round drops that synthetic constraint and lets
+the caller pick `Q[p]` per slice. The bitstream-wire impact is
+exactly the per-precinct `Q` byte inside each slice — SOC / CAP /
+PIH / CDT / WGT / SLH markers and the entropy-data layout are
+unchanged.
+
+* `encode_planar_hsl_qslice(width, height, nc, cpih, nlx, nly, hsl,
+  q_slices: &[u8], &[Vec<u8>]) -> Result<Vec<u8>>` — new public
+  entry point. `hsl` is the slice height in precinct rows (PIH
+  `Hsl`, identical semantics to `encode_planar_hsl`); `q_slices.len()`
+  must exactly equal the slice count `⌈Np,y / max(hsl, 1)⌉` and each
+  entry is in `0..=15` (the band-truncation
+  `T[p,b] = clamp(Q − G[b] − r, 0, 15)` math is identical, only the
+  source of `Q[p]` changes). The encoder picks `Fq` automatically:
+  `Fq = 0` (lossless) when every entry is `0`, else `Fq = 8`
+  (regular, Table A.8 — required for any non-zero `Q[p]`). Rejects
+  wrong-length `q_slices` and entries `> 15`.
+* `EncodeConfig::q_slices: Vec<u8>` — new field (empty preserves the
+  byte-identical legacy single-`Q[p]` path; non-empty is validated
+  against the slice count + per-entry range in
+  `EncodeConfig::validate`).
+* `slice_cfg_for(cfg, t)` — new internal helper. Returns
+  `Some(clone)` with `cfg.q = q_slices[t]` when an override fires,
+  otherwise `None`. The slice-emission loop in `write_slice` falls
+  back to the picture-level `cfg.q` when this returns `None`, so the
+  pre-round-206 callers stay on the byte-identical legacy path.
+* The slice-emission loop in `write_slice` clones the config to the
+  slice-local `Q[p]` once per slice and passes the slice-local
+  config to every precinct emission inside that slice (both the
+  multi-level `encode_precinct_cascade` path and the single-level
+  `encode_precinct_single_level` path).
+
+Lossless / lossy mixing is supported: a salient picture region's
+slice can carry `Q[p] = 0` (lossless inside that slice's `T[p,b] = 0`
+clamp) while edge slices carry `Q[p] = 4` (lossy). The `Fq = 8`
+picture-level setting plus per-slice `Q[p] = 0` is a benign
+configuration — the band-truncation `T[p,b] = clamp(0 − G[b] − 0, 0,
+15) = 0` clamps to zero, so the deadzone quantizer kernel becomes
+the identity and the slice is reconstructed exactly.
+
+Tests landed (335 total → +7 vs round 201's 328):
+* `round206_qslice_all_zero_matches_hsl_lossless` — `q_slices = [0;
+  4]` over a 4-slice 32×32 luma picture is byte-identical to
+  `encode_planar_hsl(.., q = 0, hsl = 2, ..)`.
+* `round206_qslice_uniform_q_matches_hsl_lossy` — `q_slices = [2;
+  4]` is byte-identical to `encode_planar_hsl(.., q = 2, hsl = 2,
+  ..)`.
+* `round206_qslice_mixed_q_round_trip_and_diverges` — mixed
+  `q_slices = [0, 2, 4, 2]` keeps more bits than a constant-`Q = 4`
+  baseline, the picture still decodes (PSNR ≥ 30 dB), and PIH still
+  carries `Hsl = 2` + 4 slices.
+* `round206_qslice_wire_carries_per_slice_q` — `q_slices = [0, 1, 2,
+  3]` lands one distinct `Q[p]` byte per slice on the wire (verified
+  by parsing the codestream + peeking at each slice's first
+  precinct-header `Q[p]` byte).
+* `round206_qslice_rejects_wrong_length` — `q_slices.len() != Np,y /
+  Hsl` is rejected.
+* `round206_qslice_rejects_oversize_q` — any `Q[p] > 15` is
+  rejected.
+* `round206_qslice_single_slice_matches_lossy` — `q_slices = [3]`
+  with `hsl = 0` is byte-identical to `encode_planar_lossy(.., q =
+  3, ..)`.
+
+Out of scope (next round): a PSNR-driven slice budgeter — given a
+rate budget, compute the per-slice `Q[p]` assignment that minimizes
+distortion (or maximises PSNR). Round 206 lands only the primitive;
+the picker is a follow-on.
+
 ## Unreleased — round 201 (high-bit-depth Star-Tetrix LOSSY)
 
 Closes the last remaining high-bit-depth gap in the encoder surface

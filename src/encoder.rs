@@ -212,6 +212,21 @@ struct EncodeConfig {
     /// slice boundaries fall cleanly between precinct rows with no
     /// cross-slice predictor state to reset (Annex B.10).
     hsl: u16,
+    /// Per-slice `Q[p]` overrides (round 206 — slice-level rate budgeting).
+    /// Empty → every slice uses the single picture-level `q` (the round-3
+    /// .. round-201 behaviour). Non-empty must hold exactly one entry per
+    /// slice (i.e. `⌈Np,y / effective_hsl⌉` values), with each value in
+    /// `0..=15`; the slice's `Q[p]` is then `q_slices[t]` and the
+    /// precinct header carries that per-slice value for every precinct
+    /// inside the slice (Annex C.2 Table C.1 — Q is a per-precinct
+    /// field, so any per-slice partition is spec-compliant).
+    ///
+    /// The decoder reads `Q[p]` per precinct (`precinct_truncation` in
+    /// the entropy module), so no decoder change is needed; this is a
+    /// pure encoder rate-allocation lever. The bitstream-wire impact is
+    /// only the per-precinct `Q` byte. Existing callers that pass an
+    /// empty `q_slices` keep the byte-identical legacy stream.
+    q_slices: Vec<u8>,
 }
 
 impl EncodeConfig {
@@ -494,6 +509,39 @@ impl EncodeConfig {
                 )));
             }
         }
+        // Round 206 — per-slice Q overrides (Annex C.2 Table C.1, Q[p] is a
+        // per-precinct field so any per-slice partition is spec-compliant).
+        // Validate length matches the number of slices the encoder will
+        // emit, and each Q is in the same `0..=15` range as the picture-
+        // level `q` (the band-truncation `T[p,b] = clamp(Q - G - r, 0,
+        // 15)` math is identical, only the source of Q changes).
+        if !self.q_slices.is_empty() {
+            let hp_pow = 1u32 << self.nly;
+            let np_y = (self.height as u32).div_ceil(hp_pow);
+            let hsl_rows = if self.hsl == 0 { np_y } else { self.hsl as u32 };
+            let n_slices = np_y.div_ceil(hsl_rows) as usize;
+            if self.q_slices.len() != n_slices {
+                return Err(Error::invalid(format!(
+                    "jpegxs encoder: q_slices length {} != slice count {} (Np,y={}, Hsl={})",
+                    self.q_slices.len(),
+                    n_slices,
+                    np_y,
+                    hsl_rows
+                )));
+            }
+            for (t, &qs) in self.q_slices.iter().enumerate() {
+                if qs > 15 {
+                    return Err(Error::invalid(format!(
+                        "jpegxs encoder: q_slices[{t}] = {qs} > 15 (per-band T clamp range)"
+                    )));
+                }
+                if qs > 0 && self.fq == 0 {
+                    return Err(Error::invalid(format!(
+                        "jpegxs encoder: q_slices[{t}] = {qs} > 0 requires Fq = 8 (regular mode); for lossless use q = 0 everywhere"
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -771,10 +819,11 @@ pub fn encode_planar_star_tetrix_highbd(
         Vec::new(),
         0,
         0,
-        0, // fs = 0
-        0, // hsl = 0 (single slice)
-        0, // qpih = 0 (deadzone, no-op at q=0)
-        0, // rp = 0 (no refinement)
+        0,          // fs = 0
+        0,          // hsl = 0 (single slice)
+        0,          // qpih = 0 (deadzone, no-op at q=0)
+        0,          // rp = 0 (no refinement)
+        Vec::new(), // q_slices: single picture-level q
         &byte_planes,
     )
 }
@@ -889,10 +938,11 @@ pub fn encode_planar_star_tetrix_highbd_lossy(
         Vec::new(),
         0,
         0,
-        0, // fs = 0
-        0, // hsl = 0 (single slice)
-        0, // qpih = 0 (deadzone)
-        0, // rp = 0 (no refinement)
+        0,          // fs = 0
+        0,          // hsl = 0 (single slice)
+        0,          // qpih = 0 (deadzone)
+        0,          // rp = 0 (no refinement)
+        Vec::new(), // q_slices: single picture-level q
         &byte_planes,
     )
 }
@@ -999,10 +1049,11 @@ pub fn encode_planar_highbd(
         Vec::new(),
         0,
         0,
-        0, // fs = 0
-        0, // hsl = 0 (single slice)
-        0, // qpih = 0 (deadzone, no-op at q=0)
-        0, // rp = 0 (no refinement)
+        0,          // fs = 0
+        0,          // hsl = 0 (single slice)
+        0,          // qpih = 0 (deadzone, no-op at q=0)
+        0,          // rp = 0 (no refinement)
+        Vec::new(), // q_slices: single picture-level q
         &byte_planes,
     )
 }
@@ -1095,10 +1146,11 @@ pub fn encode_planar_highbd_lossy(
         Vec::new(),
         0,
         0,
-        0, // fs = 0
-        0, // hsl = 0 (single slice)
-        0, // qpih = 0 (deadzone)
-        0, // rp = 0 (no refinement)
+        0,          // fs = 0
+        0,          // hsl = 0 (single slice)
+        0,          // qpih = 0 (deadzone)
+        0,          // rp = 0 (no refinement)
+        Vec::new(), // q_slices: single picture-level q
         &byte_planes,
     )
 }
@@ -1205,10 +1257,11 @@ pub fn encode_planar_subsampled_highbd(
         Vec::new(),
         0,
         0,
-        0, // fs = 0
-        0, // hsl = 0 (single slice)
-        0, // qpih = 0 (deadzone, no-op at q=0)
-        0, // rp = 0 (no refinement)
+        0,          // fs = 0
+        0,          // hsl = 0 (single slice)
+        0,          // qpih = 0 (deadzone, no-op at q=0)
+        0,          // rp = 0 (no refinement)
+        Vec::new(), // q_slices: single picture-level q
         &byte_planes,
     )
 }
@@ -1310,10 +1363,11 @@ pub fn encode_planar_subsampled_highbd_lossy(
         Vec::new(),
         0,
         0,
-        0, // fs = 0
-        0, // hsl = 0 (single slice)
-        0, // qpih = 0 (deadzone)
-        0, // rp = 0 (no refinement)
+        0,          // fs = 0
+        0,          // hsl = 0 (single slice)
+        0,          // qpih = 0 (deadzone)
+        0,          // rp = 0 (no refinement)
+        Vec::new(), // q_slices: single picture-level q
         &byte_planes,
     )
 }
@@ -1374,12 +1428,104 @@ pub fn encode_planar_hsl(
         0,
         None,
         Vec::new(),
+        0,          // cw: single precinct column
+        0,          // sd: no CWD suppression
+        0,          // fs: signs jointly with data (Fs=0)
+        hsl,        // hsl: slice height in precinct rows
+        0,          // qpih: deadzone inverse quantizer (Qpih=0)
+        0,          // rp: no precinct refinement (R[p] = 0)
+        Vec::new(), // q_slices: single picture-level q
+        planes,
+    )
+}
+
+/// Round-206 per-slice rate-budgeting entry point (`Hsl > 0` multi-slice
+/// + per-slice `Q[p]` override, Annex C.2 Table C.1).
+///
+/// Same shape as [`encode_planar_hsl`] but lifts the picture-level `q`
+/// from a single scalar to a `q_slices` vector — one value per slice
+/// (in top-down order, matching `Yslh = t`). The encoder partitions the
+/// `Np,y = ⌈Hf / 2^NL,y⌉` precinct rows into `⌈Np,y / hsl⌉` slices the
+/// same way [`encode_planar_hsl`] does, but emits each precinct's
+/// header with the slice's `Q[p]` instead of the constant `cfg.q`.
+///
+/// `q_slices.len()` must exactly equal `⌈Np,y / hsl⌉` (the slice count
+/// the encoder will emit). When `hsl == 0` the encoder is in single-
+/// slice mode and `q_slices` must hold exactly one entry. Each entry
+/// is in the encoder's working `0..=15` range (the band-truncation
+/// `T[p,b] = clamp(Q − G[b] − r, 0, 15)` math is identical, only the
+/// source of `Q[p]` changes); any entry above 15 is rejected.
+///
+/// Lossless / lossy mixing is allowed: if every `q_slices[t] == 0`,
+/// `Fq` is forced to 0 (lossless); if any is `> 0`, `Fq = 8`
+/// (regular, Table A.8 — required for `q > 0`). The decoder reads
+/// `Q[p]` per precinct (`parse_precinct_header` + `precinct_truncation`
+/// in [`crate::entropy`]), so the slice-local `Q[p]` flows through
+/// the existing inverse-quantizer path with no decoder change.
+///
+/// The bitstream-wire impact is exactly the per-precinct `Q` byte
+/// inside each slice. SOC / CAP / PIH / CDT / WGT / SLH markers and
+/// the entropy-data layout are unchanged. When `q_slices` carries a
+/// single repeated value the output is byte-identical to
+/// [`encode_planar_hsl`] at that `q`.
+///
+/// Intended use: bit-budgeted live workflows where slices closer to
+/// the visually-important picture region get a lower `Q[p]` than
+/// non-salient slices. The encoder leaves the `q_slices` assignment
+/// to the caller (no rate-distortion search is performed); a
+/// follow-up round can wrap this with a PSNR-driven slice budgeter.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_hsl_qslice(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    hsl: u16,
+    q_slices: &[u8],
+    planes: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    let sx = vec![1u8; nc as usize];
+    let sy = vec![1u8; nc as usize];
+    // Pick the picture-level fallback Q (used by the precinct path only
+    // if `q_slices` resolves empty per-slice via `slice_cfg_for` — which
+    // never happens here because the public entry always supplies it).
+    // We still set `cfg.q` to a representative value so the validate()
+    // q <= 15 guard runs against a known-good scalar, and so any future
+    // code path reading `cfg.q` directly observes a sensible default.
+    let q_pic = q_slices.iter().copied().max().unwrap_or(0);
+    // Fq = 8 whenever any slice quantizes; 0 only when every slice is
+    // lossless (so the byte-identical lossless layout is preserved).
+    let fq = if q_slices.iter().any(|&v| v > 0) {
+        8
+    } else {
+        0
+    };
+    encode_planar_inner_nlt(
+        width,
+        height,
+        nc,
+        cpih,
+        nlx,
+        nly,
+        fq,
+        q_pic,
+        &sx,
+        &sy,
+        0,
+        0,
+        0,
+        0,
+        None,
+        Vec::new(),
         0,   // cw: single precinct column
         0,   // sd: no CWD suppression
         0,   // fs: signs jointly with data (Fs=0)
         hsl, // hsl: slice height in precinct rows
         0,   // qpih: deadzone inverse quantizer (Qpih=0)
         0,   // rp: no precinct refinement (R[p] = 0)
+        q_slices.to_vec(),
         planes,
     )
 }
@@ -1439,12 +1585,13 @@ pub fn encode_planar_qpih(
         0,
         None,
         Vec::new(),
-        0, // cw: single precinct column
-        0, // sd: no CWD suppression
-        0, // fs: signs jointly with data (Fs=0)
-        0, // hsl: single slice (Hsl = Np,y)
-        1, // qpih: uniform inverse quantizer (Qpih=1, Annex D.3)
-        0, // rp: no precinct refinement (R[p] = 0)
+        0,          // cw: single precinct column
+        0,          // sd: no CWD suppression
+        0,          // fs: signs jointly with data (Fs=0)
+        0,          // hsl: single slice (Hsl = Np,y)
+        1,          // qpih: uniform inverse quantizer (Qpih=1, Annex D.3)
+        0,          // rp: no precinct refinement (R[p] = 0)
+        Vec::new(), // q_slices: single picture-level q
         planes,
     )
 }
@@ -1516,12 +1663,13 @@ pub fn encode_planar_rp(
         0,
         None,
         Vec::new(),
-        0,  // cw: single precinct column
-        0,  // sd: no CWD suppression
-        0,  // fs: signs jointly with data (Fs=0)
-        0,  // hsl: single slice (Hsl = Np,y)
-        0,  // qpih: deadzone inverse quantizer (Qpih=0)
-        rp, // rp: precinct refinement R[p]
+        0,          // cw: single precinct column
+        0,          // sd: no CWD suppression
+        0,          // fs: signs jointly with data (Fs=0)
+        0,          // hsl: single slice (Hsl = Np,y)
+        0,          // qpih: deadzone inverse quantizer (Qpih=0)
+        rp,         // rp: precinct refinement R[p]
+        Vec::new(), // q_slices: single picture-level q
         planes,
     )
 }
@@ -1573,12 +1721,13 @@ pub fn encode_planar_fs1(
         0,
         None,
         Vec::new(),
-        0, // cw
-        0, // sd
-        1, // fs: separate sign sub-packet (Table C.9)
-        0, // hsl: single slice (Hsl = Np,y)
-        0, // qpih: deadzone inverse quantizer (Qpih=0)
-        0, // rp: no precinct refinement (R[p] = 0)
+        0,          // cw
+        0,          // sd
+        1,          // fs: separate sign sub-packet (Table C.9)
+        0,          // hsl: single slice (Hsl = Np,y)
+        0,          // qpih: deadzone inverse quantizer (Qpih=0)
+        0,          // rp: no precinct refinement (R[p] = 0)
+        Vec::new(), // q_slices: single picture-level q
         planes,
     )
 }
@@ -1634,10 +1783,11 @@ pub fn encode_planar_cw(
         Vec::new(),
         cw,
         0,
-        0, // fs: signs jointly with data (Fs=0)
-        0, // hsl: single slice (Hsl = Np,y)
-        0, // qpih: deadzone inverse quantizer (Qpih=0)
-        0, // rp: no precinct refinement (R[p] = 0)
+        0,          // fs: signs jointly with data (Fs=0)
+        0,          // hsl: single slice (Hsl = Np,y)
+        0,          // qpih: deadzone inverse quantizer (Qpih=0)
+        0,          // rp: no precinct refinement (R[p] = 0)
+        Vec::new(), // q_slices: single picture-level q
         planes,
     )
 }
@@ -1685,10 +1835,11 @@ pub fn encode_planar_sd(
         Vec::new(),
         0, // cw
         sd,
-        0, // fs: signs jointly with data (Fs=0)
-        0, // hsl: single slice (Hsl = Np,y)
-        0, // qpih: deadzone inverse quantizer (Qpih=0)
-        0, // rp: no precinct refinement (R[p] = 0)
+        0,          // fs: signs jointly with data (Fs=0)
+        0,          // hsl: single slice (Hsl = Np,y)
+        0,          // qpih: deadzone inverse quantizer (Qpih=0)
+        0,          // rp: no precinct refinement (R[p] = 0)
+        Vec::new(), // q_slices: single picture-level q
         planes,
     )
 }
@@ -1739,10 +1890,11 @@ pub fn encode_planar_sd_rct(
         Vec::new(),
         0, // cw
         sd,
-        0, // fs: signs jointly with data (Fs=0)
-        0, // hsl: single slice (Hsl = Np,y)
-        0, // qpih: deadzone inverse quantizer (Qpih=0)
-        0, // rp: no precinct refinement (R[p] = 0)
+        0,          // fs: signs jointly with data (Fs=0)
+        0,          // hsl: single slice (Hsl = Np,y)
+        0,          // qpih: deadzone inverse quantizer (Qpih=0)
+        0,          // rp: no precinct refinement (R[p] = 0)
+        Vec::new(), // q_slices: single picture-level q
         planes,
     )
 }
@@ -1795,10 +1947,11 @@ pub fn encode_planar_sd_star_tetrix(
         Vec::new(),
         0, // cw
         sd,
-        0, // fs: signs jointly with data (Fs=0)
-        0, // hsl: single slice (Hsl = Np,y)
-        0, // qpih: deadzone inverse quantizer (Qpih=0)
-        0, // rp: no precinct refinement (R[p] = 0)
+        0,          // fs: signs jointly with data (Fs=0)
+        0,          // hsl: single slice (Hsl = Np,y)
+        0,          // qpih: deadzone inverse quantizer (Qpih=0)
+        0,          // rp: no precinct refinement (R[p] = 0)
+        Vec::new(), // q_slices: single picture-level q
         planes,
     )
 }
@@ -1874,10 +2027,11 @@ pub fn encode_planar_nlt_quadratic(
         Vec::new(), // band_gains built inside after validation
         0,
         0,
-        0, // fs: signs jointly with data (Fs=0)
-        0, // hsl: single slice (Hsl = Np,y)
-        0, // qpih: deadzone inverse quantizer (Qpih=0)
-        0, // rp: no precinct refinement (R[p] = 0)
+        0,          // fs: signs jointly with data (Fs=0)
+        0,          // hsl: single slice (Hsl = Np,y)
+        0,          // qpih: deadzone inverse quantizer (Qpih=0)
+        0,          // rp: no precinct refinement (R[p] = 0)
+        Vec::new(), // q_slices: single picture-level q
         planes,
     )
 }
@@ -1951,10 +2105,11 @@ pub fn encode_planar_nlt_extended(
         Vec::new(),
         0,
         0,
-        0, // fs: signs jointly with data (Fs=0)
-        0, // hsl: single slice (Hsl = Np,y)
-        0, // qpih: deadzone inverse quantizer (Qpih=0)
-        0, // rp: no precinct refinement (R[p] = 0)
+        0,          // fs: signs jointly with data (Fs=0)
+        0,          // hsl: single slice (Hsl = Np,y)
+        0,          // qpih: deadzone inverse quantizer (Qpih=0)
+        0,          // rp: no precinct refinement (R[p] = 0)
+        Vec::new(), // q_slices: single picture-level q
         planes,
     )
 }
@@ -2056,10 +2211,11 @@ pub fn encode_planar_nlt_quadratic_highbd(
         Vec::new(),
         0,
         0,
-        0, // fs = 0 (joint signs)
-        0, // hsl = 0 (single slice)
-        0, // qpih = 0 (deadzone inverse)
-        0, // rp = 0 (no precinct refinement)
+        0,          // fs = 0 (joint signs)
+        0,          // hsl = 0 (single slice)
+        0,          // qpih = 0 (deadzone inverse)
+        0,          // rp = 0 (no precinct refinement)
+        Vec::new(), // q_slices: single picture-level q
         &byte_planes,
     )
 }
@@ -2174,10 +2330,11 @@ pub fn encode_planar_nlt_extended_highbd(
         Vec::new(),
         0,
         0,
-        0, // fs = 0 (joint signs)
-        0, // hsl = 0 (single slice)
-        0, // qpih = 0 (deadzone inverse)
-        0, // rp = 0 (no precinct refinement)
+        0,          // fs = 0 (joint signs)
+        0,          // hsl = 0 (single slice)
+        0,          // qpih = 0 (deadzone inverse)
+        0,          // rp = 0 (no precinct refinement)
+        Vec::new(), // q_slices: single picture-level q
         &byte_planes,
     )
 }
@@ -2219,10 +2376,11 @@ fn encode_planar_inner(
         Vec::new(),
         0,
         0,
-        0, // fs: signs jointly with data (Fs=0)
-        0, // hsl: single slice (Hsl = Np,y)
-        0, // qpih: deadzone inverse quantizer (Qpih=0)
-        0, // rp: no precinct refinement (R[p] = 0)
+        0,          // fs: signs jointly with data (Fs=0)
+        0,          // hsl: single slice (Hsl = Np,y)
+        0,          // qpih: deadzone inverse quantizer (Qpih=0)
+        0,          // rp: no precinct refinement (R[p] = 0)
+        Vec::new(), // q_slices: single picture-level q
         planes,
     )
 }
@@ -2252,12 +2410,13 @@ fn encode_planar_inner_nlt(
     hsl: u16,
     qpih: u8,
     rp: u8,
+    q_slices: Vec<u8>,
     planes: &[Vec<u8>],
 ) -> Result<Vec<u8>> {
     // 8-bit path: B[i] = 8, Bw = 8 (or 18 with NLT pre-distortion).
     encode_planar_inner_bd(
         width, height, nc, 8, cpih, nlx, nly, fq, q, sx, sy, cts_e1, cts_e2, cts_cf, st_ct, nlt,
-        band_gains, cw, sd, fs, hsl, qpih, rp, planes,
+        band_gains, cw, sd, fs, hsl, qpih, rp, q_slices, planes,
     )
 }
 
@@ -2297,6 +2456,7 @@ fn encode_planar_inner_bd(
     hsl: u16,
     qpih: u8,
     rp: u8,
+    q_slices: Vec<u8>,
     planes: &[Vec<u8>],
 ) -> Result<Vec<u8>> {
     if !(8..=16).contains(&bd) {
@@ -2357,6 +2517,7 @@ fn encode_planar_inner_bd(
         cw,
         sd,
         hsl,
+        q_slices,
     };
     cfg.validate()?;
     // Build per-band gains and priorities after validation so beta_key /
@@ -2536,6 +2697,30 @@ fn write_pih_body(out: &mut Vec<u8>, cfg: &EncodeConfig) {
     // kernel (0 = deadzone, 1 = uniform); Fs (bits 3:2, Table A.11)
     // selects sign handling. Lh/Rl/Rm stay 0.
     out.push(((cfg.qpih & 0x03) << 4) | ((cfg.fs & 0x03) << 2));
+}
+
+/// Build a slice-local `EncodeConfig` whose `q` is overridden by the
+/// per-slice value in `cfg.q_slices` (round 206 — slice-level rate
+/// budgeting). Returns `None` when `cfg.q_slices` is empty, in which
+/// case the precinct emission keeps using the picture-level `cfg.q`
+/// (so the byte-identical legacy stream is preserved for the round-3 ..
+/// round-201 callers that never set per-slice quantization).
+///
+/// `t` is the slice's top-down order (`Yslh`), 0-indexed; the length
+/// of `cfg.q_slices` is already validated against the slice count in
+/// [`EncodeConfig::validate`], so `t < cfg.q_slices.len()` whenever
+/// this returns `Some`.
+fn slice_cfg_for(cfg: &EncodeConfig, t: usize) -> Option<EncodeConfig> {
+    if cfg.q_slices.is_empty() {
+        return None;
+    }
+    let qs = cfg.q_slices[t];
+    if qs == cfg.q {
+        return None;
+    }
+    let mut cloned = cfg.clone();
+    cloned.q = qs;
+    Some(cloned)
 }
 
 /// Resolve the `Hsl` field (slice height in precinct rows) emitted in
@@ -3091,10 +3276,22 @@ fn write_slice(out: &mut Vec<u8>, cfg: &EncodeConfig, planes_u8: &[Vec<u8>]) -> 
         while py_start < np_y {
             let py_end = (py_start + hsl_rows).min(np_y);
             write_slh(out, t);
+            // Round 206 — pick the slice's Q[p] from cfg.q_slices when
+            // non-empty (length already validated to match the slice
+            // count). Empty falls back to the picture-level cfg.q,
+            // preserving byte-identical output for the legacy path.
+            let slice_cfg = slice_cfg_for(cfg, t as usize);
+            let cfg_ref = slice_cfg.as_ref().unwrap_or(cfg);
             for py in py_start..py_end {
                 for px in 0..np_x {
-                    let pbytes =
-                        encode_precinct_cascade(cfg, &bands_per_comp, &comp_planes, py, px, cs)?;
+                    let pbytes = encode_precinct_cascade(
+                        cfg_ref,
+                        &bands_per_comp,
+                        &comp_planes,
+                        py,
+                        px,
+                        cs,
+                    )?;
                     out.extend_from_slice(&pbytes);
                 }
             }
@@ -3110,11 +3307,15 @@ fn write_slice(out: &mut Vec<u8>, cfg: &EncodeConfig, planes_u8: &[Vec<u8>]) -> 
         while py_start < np_y {
             let py_end = (py_start + hsl_rows).min(np_y);
             write_slh(out, t);
+            // Round 206 — pick the slice's Q[p] override; see the
+            // multi_level branch comment above.
+            let slice_cfg = slice_cfg_for(cfg, t as usize);
+            let cfg_ref = slice_cfg.as_ref().unwrap_or(cfg);
             for py in py_start..py_end {
                 let y0 = py * (hp_pow as usize);
                 let y1 = (y0 + hp_pow as usize).min(h);
                 let hp_real = y1 - y0;
-                let pbytes = encode_precinct_single_level(cfg, &comp_planes, y0, y1, hp_real)?;
+                let pbytes = encode_precinct_single_level(cfg_ref, &comp_planes, y0, y1, hp_real)?;
                 out.extend_from_slice(&pbytes);
             }
             py_start = py_end;
@@ -6938,12 +7139,13 @@ mod tests {
             0,
             None,
             Vec::new(),
-            1, // cw
-            0, // sd
-            0, // fs
-            0, // hsl
-            0, // qpih
-            0, // rp
+            1,          // cw
+            0,          // sd
+            0,          // fs
+            0,          // hsl
+            0,          // qpih
+            0,          // rp
+            Vec::new(), // q_slices: single picture-level q
             &[y_plane.clone(), u_plane.clone(), v_plane.clone()],
         )
         .expect("encode 64x8 4:2:2 Cw=1 NL=1/1");
@@ -7402,12 +7604,13 @@ mod tests {
             0,
             None,
             Vec::new(),
-            0, // cw
-            0, // sd
-            2, // fs: reserved → must reject
-            0, // hsl
-            0, // qpih
-            0, // rp
+            0,          // cw
+            0,          // sd
+            2,          // fs: reserved → must reject
+            0,          // hsl
+            0,          // qpih
+            0,          // rp
+            Vec::new(), // q_slices: single picture-level q
             std::slice::from_ref(&pixels),
         );
         assert!(result.is_err(), "Fs=2 (reserved) must be rejected");
@@ -7613,6 +7816,273 @@ mod tests {
         assert!(result.is_err(), "Hsl > Np,y must be rejected");
     }
 
+    // === Round 206: per-slice Q[p] override (slice-level rate budgeting) ==
+    //
+    // The base round-103 multi-slice path emitted every precinct with the
+    // same Q (constant across the picture). Round 206 lifts that to a
+    // per-slice override carried in `q_slices`: one Q value per slice, in
+    // top-down (Yslh) order. The decoder reads Q per precinct via
+    // `parse_precinct_header` + `precinct_truncation`, so no decoder change
+    // is needed — only the per-precinct `Q` byte in the bitstream changes.
+
+    /// All-zero q_slices over a 4-slice picture is bit-equivalent to
+    /// `encode_planar_hsl` at q=0 (both are lossless deadzone with
+    /// T[p,b] = 0 everywhere, so the byte-identical legacy stream is
+    /// preserved).
+    #[test]
+    fn round206_qslice_all_zero_matches_hsl_lossless() {
+        let w = 32usize;
+        let h = 32usize;
+        let pixels = round103_grad(w, h);
+        // NL=2/2 → Hp=4, Np,y=8; Hsl=2 → 4 slices.
+        let baseline = encode_planar_hsl(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            0,
+            2,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("baseline encode");
+        let qs = encode_planar_hsl_qslice(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            2,
+            &[0, 0, 0, 0],
+            std::slice::from_ref(&pixels),
+        )
+        .expect("qslice all-zero encode");
+        assert_eq!(
+            qs, baseline,
+            "all-zero q_slices must be byte-identical to encode_planar_hsl at q=0"
+        );
+    }
+
+    /// All-equal q_slices over a 4-slice picture is bit-equivalent to
+    /// `encode_planar_hsl` at the same Q — every precinct picks the same
+    /// Q either way.
+    #[test]
+    fn round206_qslice_uniform_q_matches_hsl_lossy() {
+        let w = 32usize;
+        let h = 32usize;
+        let pixels = round103_grad(w, h);
+        let baseline = encode_planar_hsl(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            2,
+            2,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("baseline encode q=2");
+        let qs = encode_planar_hsl_qslice(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            2,
+            &[2, 2, 2, 2],
+            std::slice::from_ref(&pixels),
+        )
+        .expect("qslice uniform-q encode");
+        assert_eq!(
+            qs, baseline,
+            "uniform-Q q_slices must be byte-identical to encode_planar_hsl at the same Q"
+        );
+    }
+
+    /// Mixed per-slice Q produces a different (and smaller-at-higher-Q)
+    /// stream than the all-equal-Q baseline, and the picture still
+    /// round-trips through the decoder.
+    #[test]
+    fn round206_qslice_mixed_q_round_trip_and_diverges() {
+        let w = 32usize;
+        let h = 32usize;
+        let pixels = round103_grad(w, h);
+        // NL=2/2 → Hp=4, Np,y=8; Hsl=2 → 4 slices.
+        let mixed_q: [u8; 4] = [0, 2, 4, 2];
+        let mixed = encode_planar_hsl_qslice(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            2,
+            &mixed_q,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("mixed q_slices encode");
+        let constant_q4 = encode_planar_hsl(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            4,
+            2,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("constant q=4 baseline");
+        // The mixed stream should keep more bits in the q=0 slice than
+        // the constant-q=4 baseline of the same picture (mixed has at
+        // least one lossless slice).
+        assert!(
+            mixed.len() > constant_q4.len(),
+            "mixed q_slices ({} B) must keep more bits than constant Q=4 ({} B)",
+            mixed.len(),
+            constant_q4.len()
+        );
+        // Decoder reconstructs the picture (lossy in the q>0 slices,
+        // lossless in the q=0 slice).
+        let img = decode_codestream(&mixed, None).expect("decode mixed q_slices");
+        let p = psnr(&pixels, &img.planes[0].data);
+        assert!(
+            p >= 30.0,
+            "mixed-Q multi-slice PSNR {p:.2} dB < 30 dB floor"
+        );
+        // PIH still carries Hsl=2 (slice layout unchanged).
+        let parsed = crate::codestream::parse(&mixed).expect("parse codestream");
+        assert_eq!(parsed.pih.hsl, 2, "PIH Hsl unchanged by per-slice Q");
+        assert_eq!(parsed.slices.len(), 4, "Np,y=8 / Hsl=2 → 4 slices");
+    }
+
+    /// Each slice's precinct-header Q[p] byte carries the override —
+    /// verified by parsing the codestream and checking each slice's
+    /// first precinct header.
+    #[test]
+    fn round206_qslice_wire_carries_per_slice_q() {
+        let w = 32usize;
+        let h = 32usize;
+        let pixels = round103_grad(w, h);
+        let qslices: [u8; 4] = [0, 1, 2, 3];
+        let cs = encode_planar_hsl_qslice(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            2,
+            &qslices,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("qslice wire encode");
+        let parsed = crate::codestream::parse(&cs).expect("parse");
+        assert_eq!(parsed.slices.len(), 4, "expected 4 slices");
+        // The first byte of each slice's entropy data is the Lprc[p]
+        // top byte of the first precinct header; precinct_bytes[3] is
+        // the Q[p] byte (per Annex C.2 Table C.1, after the 24-bit
+        // Lprc field). Peek at each slice's payload to confirm the
+        // per-slice Q[p] override surfaces on the wire.
+        for (t, slice) in parsed.slices.iter().enumerate() {
+            assert!(
+                slice.data_length >= 5,
+                "slice {t} payload too small to hold a precinct header"
+            );
+            // Slice payload starts with the first precinct header;
+            // the Q[p] byte is at offset 3 within that header (after
+            // the 24-bit Lprc).
+            let q_byte = cs[slice.data_offset + 3];
+            assert_eq!(
+                q_byte, qslices[t],
+                "slice {t} first-precinct Q[p] must equal q_slices[{t}]={}",
+                qslices[t]
+            );
+        }
+    }
+
+    /// Wrong q_slices length is rejected (must equal the slice count).
+    #[test]
+    fn round206_qslice_rejects_wrong_length() {
+        let w = 32usize;
+        let h = 32usize;
+        let pixels = round103_grad(w, h);
+        // Np,y=8, Hsl=2 → 4 slices, but only 3 q values.
+        let result = encode_planar_hsl_qslice(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            2,
+            &[0, 1, 2],
+            std::slice::from_ref(&pixels),
+        );
+        assert!(result.is_err(), "wrong q_slices length must be rejected");
+    }
+
+    /// Out-of-range q_slices entry (> 15) is rejected.
+    #[test]
+    fn round206_qslice_rejects_oversize_q() {
+        let w = 16usize;
+        let h = 16usize;
+        let pixels = round103_grad(w, h);
+        // Np,y=4, Hsl=2 → 2 slices.
+        let result = encode_planar_hsl_qslice(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            2,
+            &[0, 16],
+            std::slice::from_ref(&pixels),
+        );
+        assert!(result.is_err(), "q_slices entry > 15 must be rejected");
+    }
+
+    /// Single-slice (hsl=0) with q_slices of length 1 must accept and be
+    /// byte-identical to `encode_planar_lossy` at that single Q.
+    #[test]
+    fn round206_qslice_single_slice_matches_lossy() {
+        let w = 32usize;
+        let h = 32usize;
+        let pixels = round103_grad(w, h);
+        let baseline = encode_planar_lossy(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            3,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("baseline encode_planar_lossy q=3");
+        let qs = encode_planar_hsl_qslice(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            0,
+            &[3],
+            std::slice::from_ref(&pixels),
+        )
+        .expect("single-slice qslice encode");
+        assert_eq!(
+            qs, baseline,
+            "single-slice q_slices=[3] must equal encode_planar_lossy at q=3"
+        );
+    }
+
     // === Round 108: Qpih=1 uniform inverse quantizer (Annex D.3) ========
 
     /// Round 108: Qpih=1 luma round-trips losslessly and the PIH carries
@@ -7741,12 +8211,13 @@ mod tests {
             0,
             None,
             Vec::new(),
-            0, // cw
-            0, // sd
-            0, // fs
-            0, // hsl
-            2, // qpih: reserved → must reject
-            0, // rp
+            0,          // cw
+            0,          // sd
+            0,          // fs
+            0,          // hsl
+            2,          // qpih: reserved → must reject
+            0,          // rp
+            Vec::new(), // q_slices: single picture-level q
             std::slice::from_ref(&pixels),
         );
         assert!(result.is_err(), "Qpih=2 (reserved) must be rejected");
@@ -7881,12 +8352,13 @@ mod tests {
             0,
             None,
             Vec::new(),
-            0, // cw
-            0, // sd
-            1, // fs = 1
-            0, // hsl
-            1, // qpih = 1
-            0, // rp
+            0,          // cw
+            0,          // sd
+            1,          // fs = 1
+            0,          // hsl
+            1,          // qpih = 1
+            0,          // rp
+            Vec::new(), // q_slices: single picture-level q
             std::slice::from_ref(&pixels),
         )
         .expect("encode Qpih=1 Fs=1 luma lossless");
