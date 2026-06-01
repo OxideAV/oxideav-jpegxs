@@ -1,5 +1,49 @@
 # Changelog
 
+## Unreleased — round 201 (high-bit-depth Star-Tetrix LOSSY)
+
+Closes the last remaining high-bit-depth gap in the encoder surface
+called out as the round-195 "out of scope" tail: lossy Star-Tetrix
+(`Cpih = 3`, Annex F.5) at `B[i] ∈ 9..=16`. The inner
+`encode_planar_inner_bd` already accepted `q > 0` with `cfg.cpih == 3`
+since the original round-4 Star-Tetrix landing — round 195 wired up the
+high-bit-depth plumbing but pinned `q = 0` for its lossless scope, so
+the only delta here is a new public entry point that lifts that pin.
+
+Bit depth, quantization, and the Star-Tetrix lifting are mutually
+orthogonal: the Annex F.5 lifting (Tables F.4–F.8) is an integer linear
+combination on `i32` coefficients, the forward quantizer
+(`forward_quant_index`) and the inverse dequantizer both operate on
+`i32` wavelet coefficients regardless of `B[i]`, and the colour
+transform runs in the un-quantized wavelet domain — so the same Annex
+D.4 Table D.3 deadzone truncation `T[p,b] = clamp(Q − G[b], 0, 15)`
+that drives the round-133 / 151 high-bit-depth lossy paths drives this
+one as well. The decoder reconstructs with the matching Annex D.2
+inverse (`Qpih = 0`).
+
+* `encode_planar_star_tetrix_highbd_lossy(width, height, nlx, nly, bd,
+  q, e1, e2, cf, ct, &[Vec<u16>]) -> Result<Vec<u8>>` — new public
+  entry point. `bd ∈ 9..=16`; `q ∈ 1..=15`; pins `Nc = 4`,
+  `sx[i] = sy[i] = 1` for `i < 4`, `Cpih = 3`, `Fq = 8` (regular,
+  Table A.8 — required for `q > 0`). Input plane order is `Ω = [R, G1,
+  G2, B]` matching the 8-bit `encode_planar_star_tetrix` and the
+  round-195 lossless high-bit-depth form. Same little-endian `u16`
+  plane format (`width * height` samples per plane in `0..=2^bd − 1`)
+  and same DC level shift `1 << (bd − 1)` (Annex G.3 inverse) as the
+  round-118 / 133 / 151 / 195 high-bit-depth paths. Emits the CTS
+  marker (`Cf`, `e1`, `e2`) and the CRG marker (Table F.9 RGGB layout
+  for `Ct = 0`, GRBG layout for `Ct = 1`) identical to the 8-bit /
+  round-195 forms; only the per-component CDT `B[i]` byte, the PIH
+  `Bw` byte, and the per-precinct `Q` field change on the wire.
+  Rejects `q = 0` (use `encode_planar_star_tetrix_highbd`), `bd = 8`
+  (use `encode_planar_star_tetrix` with `q > 0`), `bd > 16`, wrong
+  plane count, and oversize samples.
+
+Validation: PSNR ≥ 40 dB at 10-bit q=1 and at 16-bit Ct=1 q=1, ≥ 30 dB
+at 12-bit q=2 on the synthetic 16×16 CFA fixture at NL=2/2. The q=2
+codestream is strictly smaller than the lossless q=0 stream on the
+same 12-bit picture — the Annex D.4 deadzone is biting.
+
 ## Unreleased — round 195 (high-bit-depth Star-Tetrix)
 
 Widens the round-4 Star-Tetrix encoder (`Cpih = 3`, Annex F.5) from

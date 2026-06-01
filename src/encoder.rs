@@ -779,6 +779,124 @@ pub fn encode_planar_star_tetrix_highbd(
     )
 }
 
+/// Round-201 high-bit-depth (`B[i] > 8`) **lossy** Star-Tetrix
+/// (`Cpih = 3`) entry point.
+///
+/// The `q > 0` companion to [`encode_planar_star_tetrix_highbd`]: same
+/// four-component CFA plane layout (`[R, G1, G2, B]`, each
+/// `width * height` little-endian `u16` samples in `0..=2^bd − 1`, `bd
+/// ∈ 9..=16`), same `Bw = B[i] = bd` and DC level shift `1 << (bd − 1)`
+/// (Annex G.3 inverse), but with a non-zero precinct quantization step
+/// `q ∈ 1..=15` (Annex C.2 `Q[p]`) and `Fq = 8` (regular mode,
+/// Table A.8). The per-band deadzone truncation
+/// `T[p,b] = clamp(Q − G[b], 0, 15)` (Annex D.4 Table D.3) drops the
+/// low magnitude bitplanes and the decoder reconstructs with the
+/// matching deadzone inverse (Annex D.2, `Qpih = 0`).
+///
+/// Bit depth, quantization, and the Star-Tetrix lifting are mutually
+/// orthogonal here: the Annex F.5 lifting (Tables F.4–F.8) is an
+/// integer linear combination on `i32` coefficients, the forward
+/// quantizer and the inverse dequantizer both operate on `i32` wavelet
+/// coefficients regardless of `B[i]`, and the colour transform runs in
+/// the un-quantized wavelet domain — so the only bit-depth-dependent
+/// pieces remain the DC level shift and the two-bytes-per-sample
+/// `u16`-LE plane packing established by the round-118 / 133 / 151 /
+/// 195 paths.
+///
+/// Per Annex F.2 Table F.1 the Star-Tetrix operand window is `c < 4`,
+/// so this entry point pins `Nc = 4`, `sx[i] = sy[i] = 1` for `i < 4`,
+/// and `Cpih = 3` (4:4:4 CFA only). The CTS / CRG markers (`Cf`, `e1`,
+/// `e2`, RGGB/GRBG via `Ct`) survive on the high-bit-depth lossy path
+/// identically to the round-195 lossless form — only the per-component
+/// CDT `B[i]` byte, the PIH `Bw` byte, and the per-precinct `Q` field
+/// change.
+///
+/// Rejects `q = 0` (use [`encode_planar_star_tetrix_highbd`] for the
+/// lossless path), `bd = 8` (use [`encode_planar_star_tetrix`] with
+/// `q > 0`), `bd > 16`, and any plane-count `!= 4`. `e1`, `e2`, `cf`,
+/// `ct` share the same validation as the 8-bit / lossless high-bit-
+/// depth forms (in [`EncodeConfig::validate`]).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_star_tetrix_highbd_lossy(
+    width: u16,
+    height: u16,
+    nlx: u8,
+    nly: u8,
+    bd: u8,
+    q: u8,
+    e1: u8,
+    e2: u8,
+    cf: u8,
+    ct: u8,
+    planes: &[Vec<u16>],
+) -> Result<Vec<u8>> {
+    if !(9..=16).contains(&bd) {
+        return Err(Error::Unsupported(format!(
+            "jpegxs encoder: encode_planar_star_tetrix_highbd_lossy requires B[i] in 9..=16, got {bd} (use encode_planar_star_tetrix for 8-bit)"
+        )));
+    }
+    if q == 0 {
+        return Err(Error::invalid(
+            "jpegxs encoder: encode_planar_star_tetrix_highbd_lossy requires q > 0 (use encode_planar_star_tetrix_highbd for lossless)".to_string(),
+        ));
+    }
+    if planes.len() != 4 {
+        return Err(Error::invalid(format!(
+            "jpegxs encoder: encode_planar_star_tetrix_highbd_lossy requires exactly 4 component planes (Cpih=3, Annex F.2), got {}",
+            planes.len()
+        )));
+    }
+    let max_sample: u16 = ((1u32 << bd) - 1) as u16;
+    let want_samples = (width as usize) * (height as usize);
+    let mut byte_planes: Vec<Vec<u8>> = Vec::with_capacity(4);
+    for (i, p) in planes.iter().enumerate() {
+        if p.len() != want_samples {
+            return Err(Error::invalid(format!(
+                "jpegxs encoder: Star-Tetrix highbd lossy plane {i} sample count {} != width*height {want_samples}",
+                p.len()
+            )));
+        }
+        let mut bytes = Vec::with_capacity(p.len() * 2);
+        for &s in p {
+            if s > max_sample {
+                return Err(Error::invalid(format!(
+                    "jpegxs encoder: plane {i} sample {s} exceeds B[i]={bd} max {max_sample}"
+                )));
+            }
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        byte_planes.push(bytes);
+    }
+    let sx = vec![1u8; 4];
+    let sy = vec![1u8; 4];
+    encode_planar_inner_bd(
+        width,
+        height,
+        4,
+        bd,
+        3, // Cpih = 3 (Star-Tetrix)
+        nlx,
+        nly,
+        8, // fq = 8 (regular, Table A.8 — required for q > 0)
+        q,
+        &sx,
+        &sy,
+        e1,
+        e2,
+        cf,
+        ct,
+        None,
+        Vec::new(),
+        0,
+        0,
+        0, // fs = 0
+        0, // hsl = 0 (single slice)
+        0, // qpih = 0 (deadzone)
+        0, // rp = 0 (no refinement)
+        &byte_planes,
+    )
+}
+
 /// Lossy entry point. `q` is the precinct quantization step (0..=15);
 /// 0 reduces to lossless. `fq` must be 8 for `q > 0` per Table A.8.
 #[allow(clippy::too_many_arguments)]
@@ -8366,6 +8484,166 @@ mod tests {
         assert!(
             encode_planar_star_tetrix_highbd(8, 8, 1, 1, 10, 0, 0, 0, 0, &planes).is_err(),
             "plane count 3 must be rejected (Cpih=3 requires Nc=4)"
+        );
+    }
+
+    // === Round 201: high bit depth Star-Tetrix LOSSY (Cpih = 3, q > 0) =====
+
+    /// 10-bit Star-Tetrix lossy at q=1 holds PSNR ≥ 40 dB per component
+    /// on the 16×16 CFA fixture at NL=2/2. q=1 is the near-lossless rung
+    /// and matches the floor that the round-133 4:4:4 / round-151 sub-
+    /// sampled high-bit-depth lossy paths assert at q=1.
+    #[test]
+    fn r201_star_tetrix_highbd_lossy_10bit_psnr_q1() {
+        let [r, g1, g2, b] = make_cfa_highbd(16, 16, 10);
+        let cs = encode_planar_star_tetrix_highbd_lossy(
+            16,
+            16,
+            2,
+            2,
+            10,
+            1, // q = 1 (near-lossless)
+            0,
+            0,
+            0,
+            0,
+            &[r.clone(), g1.clone(), g2.clone(), b.clone()],
+        )
+        .expect("encode 10-bit Cpih=3 q=1");
+        let img = decode_codestream(&cs, None).expect("decode 10-bit Cpih=3 q=1");
+        assert_eq!(img.num_components, 4);
+        assert_eq!(img.bit_depth, 10, "PIH Bw must be 10");
+        assert_eq!(img.cpih, 3, "PIH Cpih must be 3 (Star-Tetrix)");
+        for (i, orig) in [&r, &g1, &g2, &b].iter().enumerate() {
+            let rec = plane_u16(&img.planes[i].data);
+            let p = psnr_u16(orig, &rec, 10);
+            assert!(
+                p >= 40.0,
+                "10-bit Star-Tetrix q=1 comp {i} PSNR {p:.2} dB must be >= 40 dB"
+            );
+        }
+    }
+
+    /// 12-bit Star-Tetrix lossy at q=2 holds PSNR ≥ 30 dB per component.
+    /// Mirrors the round-133 12-bit q=2 floor; the Annex D.4 deadzone is
+    /// the same kernel.
+    #[test]
+    fn r201_star_tetrix_highbd_lossy_12bit_psnr_q2() {
+        let [r, g1, g2, b] = make_cfa_highbd(16, 16, 12);
+        let cs = encode_planar_star_tetrix_highbd_lossy(
+            16,
+            16,
+            2,
+            2,
+            12,
+            2, // q = 2
+            0,
+            0,
+            0,
+            0,
+            &[r.clone(), g1.clone(), g2.clone(), b.clone()],
+        )
+        .expect("encode 12-bit Cpih=3 q=2");
+        let img = decode_codestream(&cs, None).expect("decode 12-bit Cpih=3 q=2");
+        assert_eq!(img.bit_depth, 12);
+        assert_eq!(img.cpih, 3);
+        for (i, orig) in [&r, &g1, &g2, &b].iter().enumerate() {
+            let rec = plane_u16(&img.planes[i].data);
+            let p = psnr_u16(orig, &rec, 12);
+            assert!(
+                p >= 30.0,
+                "12-bit Star-Tetrix q=2 comp {i} PSNR {p:.2} dB must be >= 30 dB"
+            );
+        }
+    }
+
+    /// 16-bit Star-Tetrix lossy at q=1 with Ct=1 (GRBG) + non-default
+    /// e1/e2/Cf. Exercises the full 16-bit dynamic range through the
+    /// Annex F.5 lifting with the lossy quantizer engaged, and confirms
+    /// the CTS / CRG markers survive on the high-bit-depth lossy path
+    /// identically to the 8-bit / lossless forms.
+    #[test]
+    fn r201_star_tetrix_highbd_lossy_16bit_ct1_psnr_q1() {
+        let [r, g1, g2, b] = make_cfa_highbd(16, 16, 16);
+        let cs = encode_planar_star_tetrix_highbd_lossy(
+            16,
+            16,
+            2,
+            2,
+            16,
+            1, // q = 1
+            2, // e1
+            3, // e2
+            3, // cf = 3 (in-line)
+            1, // ct = 1 (GRBG)
+            &[r.clone(), g1.clone(), g2.clone(), b.clone()],
+        )
+        .expect("encode 16-bit Cpih=3 Ct=1 q=1");
+        let img = decode_codestream(&cs, None).expect("decode 16-bit Cpih=3 Ct=1 q=1");
+        assert_eq!(img.bit_depth, 16);
+        assert_eq!(img.cpih, 3);
+        for (i, orig) in [&r, &g1, &g2, &b].iter().enumerate() {
+            let rec = plane_u16(&img.planes[i].data);
+            let p = psnr_u16(orig, &rec, 16);
+            assert!(
+                p >= 40.0,
+                "16-bit Star-Tetrix Ct=1 q=1 comp {i} PSNR {p:.2} dB must be >= 40 dB"
+            );
+        }
+    }
+
+    /// q=2 stream must be strictly smaller than the lossless q=0 stream
+    /// on the same 12-bit Star-Tetrix CFA fixture — the deadzone
+    /// truncation is biting.
+    #[test]
+    fn r201_star_tetrix_highbd_lossy_compresses_smaller_than_lossless() {
+        let [r, g1, g2, b] = make_cfa_highbd(16, 16, 12);
+        let planes = [r.clone(), g1.clone(), g2.clone(), b.clone()];
+        let lossless = encode_planar_star_tetrix_highbd(16, 16, 2, 2, 12, 0, 0, 0, 0, &planes)
+            .expect("encode 12-bit Cpih=3 q=0");
+        let lossy =
+            encode_planar_star_tetrix_highbd_lossy(16, 16, 2, 2, 12, 2, 0, 0, 0, 0, &planes)
+                .expect("encode 12-bit Cpih=3 q=2");
+        assert!(
+            lossy.len() < lossless.len(),
+            "12-bit Cpih=3 q=2 stream ({}) must be smaller than lossless q=0 stream ({})",
+            lossy.len(),
+            lossless.len()
+        );
+    }
+
+    /// Reject `q = 0` (use the lossless entry point), `bd = 8` (route
+    /// through `encode_planar_star_tetrix`), `bd = 17` (above the spec's
+    /// supported high-bit-depth ceiling), and any plane-count != 4
+    /// (Cpih=3 operand window per Annex F.2).
+    #[test]
+    fn r201_star_tetrix_highbd_lossy_rejects_bad_args() {
+        let planes: Vec<Vec<u16>> = (0..4).map(|_| vec![0u16; 16 * 16]).collect();
+        // q = 0 must route through the lossless path.
+        let err = encode_planar_star_tetrix_highbd_lossy(16, 16, 2, 2, 10, 0, 0, 0, 0, 0, &planes)
+            .expect_err("q=0 must be rejected");
+        assert!(matches!(err, Error::InvalidData(_)), "got {err:?}");
+        // bd = 8 must route through `encode_planar_star_tetrix`.
+        let err = encode_planar_star_tetrix_highbd_lossy(16, 16, 2, 2, 8, 2, 0, 0, 0, 0, &planes)
+            .expect_err("bd=8 must be rejected");
+        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+        // bd = 17 exceeds the two-byte plane format.
+        let err = encode_planar_star_tetrix_highbd_lossy(16, 16, 2, 2, 17, 2, 0, 0, 0, 0, &planes)
+            .expect_err("bd=17 must be rejected");
+        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+        // Plane-count != 4 must be rejected.
+        let three: Vec<Vec<u16>> = (0..3).map(|_| vec![0u16; 8 * 8]).collect();
+        assert!(
+            encode_planar_star_tetrix_highbd_lossy(8, 8, 1, 1, 10, 2, 0, 0, 0, 0, &three).is_err(),
+            "plane count 3 must be rejected (Cpih=3 requires Nc=4)"
+        );
+        // Out-of-range sample (1024 > 2^10 - 1).
+        let bd = 10u8;
+        let mut bad: Vec<Vec<u16>> = (0..4).map(|_| vec![0u16; 8 * 8]).collect();
+        bad[0][0] = (1u16 << bd) + 5;
+        assert!(
+            encode_planar_star_tetrix_highbd_lossy(8, 8, 1, 1, bd, 2, 0, 0, 0, 0, &bad).is_err(),
+            "sample exceeding 2^bd-1 must be rejected"
         );
     }
 
