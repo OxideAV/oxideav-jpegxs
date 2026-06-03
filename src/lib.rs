@@ -81,8 +81,9 @@ pub use crg::{cfa_pattern_type, parse_crg, CrgEntry, CrgMarker};
 pub use cts::{parse_cts, CtsExtent, CtsMarker};
 pub use encoder::{
     encode_image, encode_luma_8bit, encode_planar_cw, encode_planar_hsl_qslice,
-    encode_planar_star_tetrix_highbd_lossy, encode_planar_subsampled_highbd,
-    encode_planar_subsampled_highbd_lossy, encode_raw_luma,
+    encode_planar_hsl_target_bytes, encode_planar_star_tetrix_highbd_lossy,
+    encode_planar_subsampled_highbd, encode_planar_subsampled_highbd_lossy, encode_raw_luma,
+    pick_q_slices_for_target_bytes,
 };
 pub use error::{JpegXsError, Result};
 pub use image::{JpegXsImage, JpegXsPlane};

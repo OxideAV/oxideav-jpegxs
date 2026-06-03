@@ -1,5 +1,53 @@
 # Changelog
 
+## Unreleased — round 212 (rate-budget driven per-slice `Q[p]` picker, encoder side)
+
+Builds directly on the round-206 per-slice `Q[p]` slice. Round 206
+gave the caller the *mechanism* to set `Q[p]` per slice; round 212
+adds the *policy* — a deterministic, library-free picker that
+chooses a `q_slices` vector against a caller-supplied byte budget
+and concentrates bits on visually-salient (low-activity) slices.
+
+* `pick_q_slices_for_target_bytes(width, height, nc, cpih, nlx, nly,
+  hsl, target_bytes, &[Vec<u8>]) -> Result<Vec<u8>>` — three-pass
+  search: (1) lossless probe at `q = [0; n_slices]`, return it if
+  it fits; (2) uniform-Q binary search on `1..=15`; (3) per-slice
+  relaxation walks the lowest-activity slices first, dropping their
+  Q one step at a time while the candidate still fits the budget.
+  Every measurement is a real call into `encode_planar_hsl_qslice`
+  — the picker has no internal model of the entropy coder. Errors
+  with `target_bytes unreachable; Q=15 emits N bytes` if even the
+  most aggressive uniform-Q overshoots, and rejects `target_bytes == 0`
+  as a precondition.
+* `encode_planar_hsl_target_bytes(.., target_bytes, &[Vec<u8>]) ->
+  Result<(Vec<u8>, Vec<u8>)>` — convenience wrapper that returns
+  `(codestream, q_slices)`. The codestream is byte-identical to a
+  follow-up `encode_planar_hsl_qslice(.., q_slices, ..)` call, so
+  callers can persist the picked vector for reproducible re-encode.
+* Activity ranking is the L1 norm of the row-to-row first-difference
+  summed across every plane within each slice's image-row range —
+  cheap (no FFT, no wavelet), spec-orthogonal, and reused as the
+  per-slice priority key for the pass-3 relaxation. Single-slice
+  mode (`hsl == 0`) collapses to a scalar bisect with the relaxation
+  pass as a no-op.
+
+6 new tests (335 → 341 total):
+* `round212_picker_loose_budget_returns_lossless` — budget ≥
+  lossless length picks `q = [0; n_slices]`.
+* `round212_picker_tight_budget_fits_within_target` — half-of-
+  lossless budget triggers the uniform-Q bisect, picker output fits
+  and at least one slice is quantized.
+* `round212_picker_unreachable_budget_errors` — `target_bytes = 1`
+  errors with `unreachable` in the message.
+* `round212_picker_zero_target_rejected` — explicit precondition
+  rejection.
+* `round212_picker_wrapper_is_byte_identical_to_qslice_encode` —
+  `encode_planar_hsl_target_bytes` returns `(cs, q)` where re-
+  encoding with `q` reproduces `cs` byte-for-byte, and the decoded
+  picture clears the 25 dB PSNR floor.
+* `round212_picker_single_slice_degenerate` — `hsl == 0` returns a
+  length-1 vector and the picked codestream still fits the budget.
+
 ## Unreleased — round 206 (per-slice `Q[p]` override / slice-level rate budgeting)
 
 Closes the "single constant `Q` across every slice" tail called out in

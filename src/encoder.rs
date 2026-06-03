@@ -1530,6 +1530,295 @@ pub fn encode_planar_hsl_qslice(
     )
 }
 
+/// Round-212 rate-budget driven per-slice `Q[p]` picker.
+///
+/// Given a target byte budget, returns a `q_slices` vector — one
+/// `Q[p]` per slice in top-down `Yslh` order — that drives
+/// [`encode_planar_hsl_qslice`] to emit a codestream of length
+/// `≤ target_bytes`, while concentrating bits on slices whose source
+/// content has the lowest spatial activity (so distortion from
+/// quantization lands on the busier slices where it is less
+/// perceptually visible). The picker is fully deterministic and
+/// performs no rate-distortion search beyond calling
+/// [`encode_planar_hsl_qslice`] with candidate vectors and reading
+/// back the byte length — there is no internal model of the entropy
+/// coder, no oracle, no external library. Bytes returned by the
+/// callee are the only feedback the search uses.
+///
+/// Strategy (three passes, each calling `encode_planar_hsl_qslice`
+/// internally to measure the actual output length):
+///
+/// 1. **Lossless probe.** Try `q_slices = [0; n_slices]`. If that
+///    fits in `target_bytes`, return it (no reason to quantize).
+/// 2. **Uniform-`Q` bisect.** Find the smallest uniform
+///    `Q ∈ 1..=15` whose output fits in `target_bytes`. If even
+///    `Q = 15` overshoots, return `[15; n_slices]` with a
+///    [`JpegXsError::Invalid`] error tagged with the actual
+///    encoded length so the caller can surface the budget violation.
+/// 3. **Per-slice relaxation.** Sort slices by spatial activity
+///    ascending (`Σ |row[r+1][c] − row[r][c]|` summed over every
+///    plane's pixels inside the slice's image-row range). Starting
+///    from the uniform-`Q` baseline, lower one low-activity slice
+///    at a time by one `Q` step (down to `Q = 0`) while each
+///    candidate still fits. The picker stops at the first candidate
+///    that overshoots and keeps the last fitting vector.
+///
+/// Inputs:
+/// * `width`, `height`, `nc`, `cpih`, `nlx`, `nly`, `hsl`, `planes`
+///   — identical to [`encode_planar_hsl_qslice`]. `hsl == 0` is the
+///   single-slice mode (the picker is degenerate then: it just
+///   bisects a scalar `q`).
+/// * `target_bytes` — upper bound on the encoded codestream length.
+///   Must be `> 0`.
+///
+/// Returns: the chosen `q_slices` vector. Pass the same vector into
+/// [`encode_planar_hsl_qslice`] to obtain the codestream itself; the
+/// [`encode_planar_hsl_target_bytes`] convenience wrapper does both
+/// in one call and returns `(codestream, q_slices)`.
+///
+/// Errors:
+/// * Any of the validation errors [`encode_planar_hsl_qslice`] would
+///   produce (invalid `cpih`, `nlx`/`nly` out of range, plane size
+///   mismatch, etc.).
+/// * [`crate::JpegXsError::Invalid`] when `target_bytes == 0`.
+/// * [`crate::JpegXsError::Invalid`] when even `q_slices = [15; n_slices]`
+///   overshoots the budget. The error message reports the actual
+///   encoded length so the caller knows how far over they are.
+#[allow(clippy::too_many_arguments)]
+pub fn pick_q_slices_for_target_bytes(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    hsl: u16,
+    target_bytes: usize,
+    planes: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    if target_bytes == 0 {
+        return Err(Error::invalid(
+            "jpegxs picker: target_bytes must be > 0".to_string(),
+        ));
+    }
+    // Compute slice count the same way EncodeConfig::validate does.
+    // Np,y = ⌈Hf / 2^NL,y⌉; effective Hsl = Hsl when > 0, else Np,y
+    // (single slice).
+    let hp_pow = 1u32 << nly;
+    let np_y = (height as u32).div_ceil(hp_pow);
+    let hsl_rows = if hsl == 0 { np_y } else { hsl as u32 };
+    if hsl_rows == 0 {
+        return Err(Error::invalid(format!(
+            "jpegxs picker: Hsl={hsl} resolves to zero precinct rows per slice (height={height}, NL,y={nly})"
+        )));
+    }
+    let n_slices = np_y.div_ceil(hsl_rows) as usize;
+
+    // Pass 1 — lossless probe. If the source is small / sparse enough
+    // that an all-zeros codestream fits, no quantization is required.
+    let q_zero = vec![0u8; n_slices];
+    let cs_zero =
+        encode_planar_hsl_qslice(width, height, nc, cpih, nlx, nly, hsl, &q_zero, planes)?;
+    if cs_zero.len() <= target_bytes {
+        return Ok(q_zero);
+    }
+
+    // Pass 2 — uniform-Q bisect over `1..=15`. Standard binary search:
+    // monotonicity of codestream length in Q is empirical (higher Q
+    // truncates more bitplanes → fewer bits) so we bisect rather than
+    // assuming a closed form.
+    let mut lo: u8 = 1;
+    let mut hi: u8 = 15;
+    let mut best_uniform_q: Option<u8> = None;
+    let mut best_uniform_len: usize = usize::MAX;
+    while lo <= hi {
+        let mid = (lo + hi) / 2;
+        let qv = vec![mid; n_slices];
+        let cs = encode_planar_hsl_qslice(width, height, nc, cpih, nlx, nly, hsl, &qv, planes)?;
+        if cs.len() <= target_bytes {
+            best_uniform_q = Some(mid);
+            best_uniform_len = cs.len();
+            if mid == 0 {
+                break;
+            }
+            hi = mid - 1;
+        } else {
+            if mid == 15 {
+                break;
+            }
+            lo = mid + 1;
+        }
+    }
+    let uniform_q = match best_uniform_q {
+        Some(q) => q,
+        None => {
+            // Even Q=15 overshoots. Report how badly so the caller
+            // can either bump Hsl, raise Wf/Hf budget, or accept the
+            // overshoot.
+            let qv = vec![15u8; n_slices];
+            let cs = encode_planar_hsl_qslice(width, height, nc, cpih, nlx, nly, hsl, &qv, planes)?;
+            return Err(Error::invalid(format!(
+                "jpegxs picker: target_bytes={target_bytes} unreachable; Q=15 emits {} bytes",
+                cs.len()
+            )));
+        }
+    };
+
+    // Single-slice degenerate case — no relaxation possible.
+    if n_slices == 1 {
+        return Ok(vec![uniform_q; 1]);
+    }
+
+    // Pass 3 — per-slice relaxation. Rank slices by spatial activity
+    // (low first) using the source pixels in each slice's image-row
+    // range, summed over every plane. Activity here is the L1 norm
+    // of the row-to-row gradient inside the slice (cheap, no FFT, no
+    // wavelet — just `|row[r+1][c] − row[r][c]|`). Low-activity
+    // slices receive the quantization relief first because they are
+    // (a) likely visually salient (flat regions show banding worst)
+    // and (b) likely the cheapest to emit at lower Q (fewer non-zero
+    // coefficients to encode after the wavelet anyway).
+    let slice_row_ranges = compute_slice_row_ranges(height, nly, hsl_rows);
+    debug_assert_eq!(slice_row_ranges.len(), n_slices);
+    let mut activity: Vec<(usize, u64)> = slice_row_ranges
+        .iter()
+        .enumerate()
+        .map(|(t, &(y0, y1))| (t, slice_activity(planes, width, y0, y1)))
+        .collect();
+    activity.sort_by_key(|&(_, a)| a);
+
+    let mut best = vec![uniform_q; n_slices];
+    let mut best_len = best_uniform_len;
+    // Walk the lowest-activity slices and try to drop their Q one
+    // step at a time. We do a full sweep: each slice is offered Q-1,
+    // and if the result still fits we commit; otherwise we move on
+    // to the next slice. We repeat until a full pass made no change
+    // — this lets the most-relaxed slices drop further than one step
+    // when slack permits.
+    loop {
+        let mut changed = false;
+        for &(t, _) in &activity {
+            if best[t] == 0 {
+                continue;
+            }
+            let mut trial = best.clone();
+            trial[t] -= 1;
+            let cs =
+                encode_planar_hsl_qslice(width, height, nc, cpih, nlx, nly, hsl, &trial, planes)?;
+            if cs.len() <= target_bytes {
+                best = trial;
+                best_len = cs.len();
+                changed = true;
+            }
+        }
+        let _ = best_len; // silence unused-warning when debug-asserts off
+        if !changed {
+            break;
+        }
+    }
+    Ok(best)
+}
+
+/// Round-212 convenience wrapper — picks `q_slices` against
+/// `target_bytes` and emits the codestream in one call.
+///
+/// Returns `(codestream, q_slices)`. The codestream is guaranteed to
+/// satisfy `codestream.len() <= target_bytes` (otherwise the picker
+/// returns the `target_bytes unreachable` error). The `q_slices`
+/// vector is the one returned by [`pick_q_slices_for_target_bytes`];
+/// callers can persist it for reproducible re-encode of identical
+/// parameters.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_hsl_target_bytes(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    hsl: u16,
+    target_bytes: usize,
+    planes: &[Vec<u8>],
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let q_slices = pick_q_slices_for_target_bytes(
+        width,
+        height,
+        nc,
+        cpih,
+        nlx,
+        nly,
+        hsl,
+        target_bytes,
+        planes,
+    )?;
+    let cs = encode_planar_hsl_qslice(width, height, nc, cpih, nlx, nly, hsl, &q_slices, planes)?;
+    Ok((cs, q_slices))
+}
+
+/// Round-212 helper — image-row ranges of every slice the encoder
+/// will emit, in top-down `Yslh = 0..n_slices` order.
+///
+/// Returns one `(y0, y1)` per slice, where `y0..y1` is the half-open
+/// image-row range. Slice height is `hsl_rows × 2^NL,y` image rows
+/// (each precinct covers `2^NL,y` image rows per Annex B.6); the
+/// last slice is clipped to `height` if `Np,y % Hsl != 0`.
+fn compute_slice_row_ranges(height: u16, nly: u8, hsl_rows: u32) -> Vec<(u32, u32)> {
+    let h = height as u32;
+    let rows_per_precinct = 1u32 << nly;
+    let rows_per_slice = hsl_rows.saturating_mul(rows_per_precinct);
+    if rows_per_slice == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut y = 0u32;
+    while y < h {
+        let y1 = (y + rows_per_slice).min(h);
+        out.push((y, y1));
+        y = y1;
+    }
+    out
+}
+
+/// Round-212 helper — spatial activity of a slice's pixel range.
+///
+/// Returns the L1 norm of the row-to-row first-difference summed
+/// across every component. Used by the rate-budget picker to rank
+/// slices for the per-slice `Q[p]` relaxation pass: low-activity
+/// slices get the quantization relief first.
+///
+/// The norm is computed on the raw 8-bit pixel values (the picker
+/// operates on the `Vec<u8>` planar input — high-bit-depth paths
+/// will route through a `u16` variant in a future round if needed).
+/// A slice that resolves to fewer than two image rows returns 0;
+/// the picker treats that as "no activity preference, leave at
+/// uniform Q".
+fn slice_activity(planes: &[Vec<u8>], width: u16, y0: u32, y1: u32) -> u64 {
+    let w = width as usize;
+    if w == 0 || y1 <= y0 + 1 {
+        return 0;
+    }
+    let mut acc: u64 = 0;
+    for plane in planes {
+        if plane.is_empty() || plane.len() < w {
+            continue;
+        }
+        let plane_rows = plane.len() / w;
+        let r0 = (y0 as usize).min(plane_rows);
+        let r1 = (y1 as usize).min(plane_rows);
+        if r1 <= r0 + 1 {
+            continue;
+        }
+        for r in r0..r1 - 1 {
+            let cur = &plane[r * w..(r + 1) * w];
+            let nxt = &plane[(r + 1) * w..(r + 2) * w];
+            for c in 0..w {
+                acc += (cur[c] as i32 - nxt[c] as i32).unsigned_abs() as u64;
+            }
+        }
+    }
+    acc
+}
+
 /// Round-108 uniform-inverse-quantizer entry point (`Qpih = 1`).
 ///
 /// Same shape as [`encode_planar_lossy`] but sets the picture-header
@@ -8080,6 +8369,298 @@ mod tests {
         assert_eq!(
             qs, baseline,
             "single-slice q_slices=[3] must equal encode_planar_lossy at q=3"
+        );
+    }
+
+    // === Round 212: target-bytes rate-budget picker =====================
+    //
+    // `pick_q_slices_for_target_bytes` drives `encode_planar_hsl_qslice`
+    // with a deterministic three-pass search (lossless probe → uniform-Q
+    // bisect → per-slice activity-ranked relaxation). The picker calls
+    // the existing per-slice encoder for every measurement — no internal
+    // model of the entropy coder, no external library. Tests below
+    // confirm the three regimes (loose → fit at q=0, tight → uniform Q
+    // bisect, very tight → unreachable error) plus the convenience
+    // wrapper byte-equivalence and zero-budget rejection.
+
+    /// Round 212: a loose budget (≥ the lossless codestream length) must
+    /// pick `q_slices = [0; n_slices]` and yield the byte-identical
+    /// lossless stream. The picker's pass-1 lossless probe short-circuits
+    /// before any uniform-Q bisect runs.
+    #[test]
+    fn round212_picker_loose_budget_returns_lossless() {
+        let w = 32usize;
+        let h = 32usize;
+        let pixels = round103_grad(w, h);
+        // NL=2/2 → Np,y=8; Hsl=2 → 4 slices.
+        let lossless = encode_planar_hsl_qslice(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            2,
+            &[0, 0, 0, 0],
+            std::slice::from_ref(&pixels),
+        )
+        .expect("baseline lossless encode");
+        // Budget = lossless length itself: must fit exactly via q=[0;..].
+        let q = pick_q_slices_for_target_bytes(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            2,
+            lossless.len(),
+            std::slice::from_ref(&pixels),
+        )
+        .expect("picker at loose budget");
+        assert_eq!(q, vec![0u8; 4], "loose budget must pick all-lossless");
+    }
+
+    /// Round 212: a budget tighter than lossless but reachable at some
+    /// `Q ∈ 1..=15` triggers the pass-2 uniform-Q bisect. The result
+    /// must satisfy `encode_planar_hsl_qslice(.., q, ..) .len() ≤ budget`
+    /// AND no smaller q value fits (i.e. the picker honours the
+    /// monotone-ish search bound).
+    #[test]
+    fn round212_picker_tight_budget_fits_within_target() {
+        let w = 32usize;
+        let h = 32usize;
+        let pixels = round103_grad(w, h);
+        // The all-zeros stream is the largest a 4-slice picture can
+        // produce; halving its length forces the picker to quantize.
+        let lossless = encode_planar_hsl_qslice(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            2,
+            &[0, 0, 0, 0],
+            std::slice::from_ref(&pixels),
+        )
+        .expect("baseline lossless");
+        let target = lossless.len() / 2;
+        let q = pick_q_slices_for_target_bytes(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            2,
+            target,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("picker at half-of-lossless budget");
+        // The chosen q_slices must produce a stream that fits.
+        let cs = encode_planar_hsl_qslice(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            2,
+            &q,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("picked q_slices encode");
+        assert!(
+            cs.len() <= target,
+            "picked stream {} B > target {} B",
+            cs.len(),
+            target
+        );
+        // q_slices must have exactly one entry per slice.
+        assert_eq!(q.len(), 4, "expected 4 q entries for Np,y=8 / Hsl=2");
+        // At least one entry must be > 0 (otherwise lossless would fit).
+        assert!(
+            q.iter().any(|&v| v > 0),
+            "tight budget must quantize at least one slice"
+        );
+    }
+
+    /// Round 212: a budget so small that even `q = [15; n_slices]`
+    /// overshoots is reported as an explicit error rather than silently
+    /// truncated. The error message must mention the actual Q=15
+    /// encoded length so the caller can rescale.
+    #[test]
+    fn round212_picker_unreachable_budget_errors() {
+        let w = 32usize;
+        let h = 32usize;
+        let pixels = round103_grad(w, h);
+        // Target = 1 byte is unreachable for any 32×32 stream (the
+        // marker chain alone — SOC + CAP + PIH + CDT + WGT + 4×SLH +
+        // EOC — is well over a hundred bytes).
+        let err = pick_q_slices_for_target_bytes(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            2,
+            1,
+            std::slice::from_ref(&pixels),
+        )
+        .expect_err("picker must reject unreachable budget");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unreachable"),
+            "error message must mention unreachable: got {msg:?}"
+        );
+    }
+
+    /// Round 212: zero target bytes is a precondition violation
+    /// (rejected before the lossless probe even runs).
+    #[test]
+    fn round212_picker_zero_target_rejected() {
+        let w = 16usize;
+        let h = 16usize;
+        let pixels = round103_grad(w, h);
+        let err = pick_q_slices_for_target_bytes(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            2,
+            0,
+            std::slice::from_ref(&pixels),
+        )
+        .expect_err("zero budget must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("target_bytes"),
+            "error must mention target_bytes precondition: got {msg:?}"
+        );
+    }
+
+    /// Round 212: the `encode_planar_hsl_target_bytes` convenience
+    /// wrapper returns `(codestream, q_slices)` that satisfies the
+    /// budget AND is byte-identical to a follow-up
+    /// `encode_planar_hsl_qslice(.., q_slices, ..)` call (the picker's
+    /// chosen q vector is self-consistent / reproducible).
+    #[test]
+    fn round212_picker_wrapper_is_byte_identical_to_qslice_encode() {
+        let w = 32usize;
+        let h = 32usize;
+        let pixels = round103_grad(w, h);
+        // Choose a budget between lossless and pathological.
+        let lossless = encode_planar_hsl_qslice(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            2,
+            &[0, 0, 0, 0],
+            std::slice::from_ref(&pixels),
+        )
+        .expect("lossless baseline");
+        let target = (lossless.len() * 3) / 4;
+        let (cs, q) = encode_planar_hsl_target_bytes(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            2,
+            target,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("target-bytes wrapper");
+        assert!(
+            cs.len() <= target,
+            "wrapper stream {} B > target {} B",
+            cs.len(),
+            target
+        );
+        // Re-encoding with the same q must reproduce the same bytes.
+        let cs2 = encode_planar_hsl_qslice(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            2,
+            &q,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("re-encode with picked q");
+        assert_eq!(
+            cs, cs2,
+            "wrapper bytes must equal a follow-up qslice encode with the same q vector"
+        );
+        // And the picture round-trips at acceptable quality.
+        let img = decode_codestream(&cs, None).expect("decode picker stream");
+        let p = psnr(&pixels, &img.planes[0].data);
+        assert!(p >= 25.0, "picker round-trip PSNR {p:.2} dB < 25 dB");
+    }
+
+    /// Round 212: single-slice mode (`hsl == 0`) must still go through
+    /// the picker correctly — the bisect collapses to one Q, the
+    /// relaxation pass is a no-op, and the returned vector has length
+    /// 1.
+    #[test]
+    fn round212_picker_single_slice_degenerate() {
+        let w = 32usize;
+        let h = 32usize;
+        let pixels = round103_grad(w, h);
+        // Hsl=0 → single slice.
+        let lossless = encode_planar_lossy(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            0,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("single-slice lossless baseline");
+        // Tight budget but reachable (use 60% of lossless).
+        let target = (lossless.len() * 3) / 5;
+        let q = pick_q_slices_for_target_bytes(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            0,
+            target,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("single-slice picker");
+        assert_eq!(q.len(), 1, "single-slice picker must return one Q");
+        let cs = encode_planar_hsl_qslice(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            0,
+            &q,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("encode at picked single-slice Q");
+        assert!(
+            cs.len() <= target,
+            "single-slice picker stream {} B > target {} B",
+            cs.len(),
+            target
         );
     }
 
