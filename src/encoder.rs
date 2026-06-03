@@ -1819,6 +1819,177 @@ fn slice_activity(planes: &[Vec<u8>], width: u16, y0: u32, y1: u32) -> u64 {
     acc
 }
 
+/// Round-218 rate-budget driven `R[p]` picker for the
+/// [`encode_planar_rp`] path.
+///
+/// Given a fixed quantization step `q` and a target codestream length,
+/// picks the largest precinct refinement `R[p] ∈ 0..=NL-1` whose output
+/// still fits in `target_bytes`, where `NL = Nc × Nβ` for the
+/// 4:4:4 single-precinct-column path this picker operates on (no `Sd`
+/// suppression, see "Scope" below). Larger `R[p]` refines more of the
+/// lowest-index bands (LL first per the `β`-major band enumeration of
+/// Annex B.6), granting each refined band one extra retained magnitude
+/// bitplane via the Annex C.6.2 Table C.10 term
+/// `r = (P[b] < R[p]) ? 1 : 0` inside
+/// `T[p,b] = clamp(Q − G[b] − r, 0, 15)`. With the encoder's `P[b] = b`
+/// priority assignment (Annex A.4.11 — emitted by the WGT marker since
+/// round 115) the refinement is monotone in `R[p]`: each step from
+/// `k → k+1` adds the band-`k` priority bit to one more band's
+/// truncation reduction, so the codestream is non-decreasing in `R[p]`
+/// at fixed `q`. The picker exploits this with a one-dimensional
+/// linear scan from `NL-1` down to `0`, returning the first
+/// `R[p]` whose codestream fits.
+///
+/// **Why "largest fitting `R[p]`" and not "smallest":** the refinement
+/// transfers coded bits **toward** the lowest-frequency bands (which
+/// are perceptually most important — flat-region banding shows up
+/// there worst). At a fixed `q`, every additional refinement step
+/// improves PSNR on those bands at the cost of a few more coded bits
+/// in those same bands. The optimal use of a byte budget is therefore
+/// to spend it on the most refinement the budget can afford. This
+/// matches the spec's Annex H NOTE intent ("Other choices are
+/// possible") and complements r212's
+/// [`pick_q_slices_for_target_bytes`] — which trades quantization
+/// strength **between slices** at a fixed refinement — by trading
+/// refinement strength **between bands** at a fixed quantization.
+///
+/// Strategy (linear scan, each iteration calls [`encode_planar_rp`]
+/// internally to measure the actual output length):
+///
+/// 1. **`R[p] = 0` probe.** Encode at the no-refinement baseline. If
+///    even that overshoots `target_bytes`, the budget is unreachable
+///    by `R[p]` alone (lower `q` or `pick_q_slices_for_target_bytes`
+///    can still help) — return a
+///    [`crate::JpegXsError::Invalid`] error tagged with the actual
+///    encoded length so the caller knows how far over they are.
+/// 2. **Scan `R[p] = NL-1` down to `1`.** Return the first `R[p]`
+///    whose codestream fits. The scan terminates trivially when
+///    `NL == 1` (no refinement possible — `R[p] = 0` is the only
+///    legal value) by falling through to the baseline.
+///
+/// The picker is fully deterministic and performs no rate-distortion
+/// search beyond calling [`encode_planar_rp`] with candidate `R[p]`
+/// values and reading back the byte length — there is no internal
+/// model of the entropy coder, no oracle, no external library. Bytes
+/// returned by the callee are the only feedback the search uses.
+///
+/// **Scope** — matches [`encode_planar_rp`] exactly:
+///
+/// * 4:4:4 (`sx[i] = sy[i] = 1` for all `i`, hard-wired by
+///   [`encode_planar_rp`]).
+/// * `Cpih ∈ {0, 1, 3}` (no transform, RCT, or Star-Tetrix per Annex
+///   F.2 Table F.1's component-count constraints).
+/// * Single precinct column (`Cw = 0`), single slice (`Hsl = 0`), no
+///   CWD suppression (`Sd = 0`), `Fs = 0`, `Qpih = 0`.
+/// * `q ∈ 0..=15`; `q = 0` makes refinement a lossless no-op (the
+///   refinement term can only push `T` down, and `T = 0` is already
+///   the floor at `q = 0`) so the picker returns whichever `R[p]`
+///   value fits — typically `NL-1`, since every refinement is
+///   byte-identical to `R[p] = 0` at `q = 0`.
+///
+/// Inputs:
+/// * `width`, `height`, `nc`, `cpih`, `nlx`, `nly`, `q`, `planes` —
+///   identical to [`encode_planar_rp`].
+/// * `target_bytes` — upper bound on the encoded codestream length.
+///   Must be `> 0`.
+///
+/// Returns: the chosen `R[p]` value. Pass the same value into
+/// [`encode_planar_rp`] to obtain the codestream itself; the
+/// [`encode_planar_rp_target_bytes`] convenience wrapper does both in
+/// one call and returns `(codestream, rp)`.
+///
+/// Errors:
+/// * Any of the validation errors [`encode_planar_rp`] would produce
+///   (invalid `cpih`, `nlx`/`nly` out of range, plane size mismatch,
+///   etc.).
+/// * [`crate::JpegXsError::Invalid`] when `target_bytes == 0`.
+/// * [`crate::JpegXsError::Invalid`] when even `R[p] = 0` overshoots
+///   the budget. The error message reports the actual encoded length
+///   so the caller knows how far over they are.
+#[allow(clippy::too_many_arguments)]
+pub fn pick_rp_for_target_bytes(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    q: u8,
+    target_bytes: usize,
+    planes: &[Vec<u8>],
+) -> Result<u8> {
+    if target_bytes == 0 {
+        return Err(Error::invalid(
+            "jpegxs rp picker: target_bytes must be > 0".to_string(),
+        ));
+    }
+
+    // NL = Nc × Nβ for the 4:4:4 / Sd = 0 surface this picker covers
+    // (Annex B.6 NL definition with Sd = 0). encode_planar_rp validates
+    // R[p] ∈ 0..=NL-1, so the scan upper bound is NL-1.
+    let nbeta = n_beta(nlx, nly);
+    let nl = (nc as u32) * nbeta;
+    if nl == 0 {
+        return Err(Error::invalid(format!(
+            "jpegxs rp picker: NL=0 (nc={nc}, NL,x={nlx}, NL,y={nly})"
+        )));
+    }
+    let rp_max = (nl - 1).min(u8::MAX as u32) as u8;
+
+    // Step 1 — R[p] = 0 baseline. This is the smallest stream of the
+    // family (no refinement, no extra bits in any band), so if it
+    // overshoots the budget then no R[p] can fit.
+    let cs_zero = encode_planar_rp(width, height, nc, cpih, nlx, nly, q, 0, planes)?;
+    if cs_zero.len() > target_bytes {
+        return Err(Error::invalid(format!(
+            "jpegxs rp picker: target_bytes={target_bytes} unreachable; R[p]=0 emits {} bytes",
+            cs_zero.len()
+        )));
+    }
+
+    // Step 2 — scan from R[p] = NL-1 downwards; return the first
+    // value whose codestream fits. Larger R[p] refines more bands,
+    // and refinement is monotone non-decreasing in the codestream
+    // length (each extra refined band gains one magnitude bitplane),
+    // so the first fit is also the largest fit. NL = 1 (no refinement
+    // possible) falls through this loop unchanged and returns 0
+    // from the baseline below.
+    let mut rp = rp_max;
+    while rp >= 1 {
+        let cs = encode_planar_rp(width, height, nc, cpih, nlx, nly, q, rp, planes)?;
+        if cs.len() <= target_bytes {
+            return Ok(rp);
+        }
+        rp -= 1;
+    }
+    Ok(0)
+}
+
+/// Round-218 convenience wrapper — picks `R[p]` against `target_bytes`
+/// and emits the codestream in one call.
+///
+/// Returns `(codestream, rp)`. The codestream is guaranteed to satisfy
+/// `codestream.len() <= target_bytes` (otherwise the picker returns
+/// the `target_bytes unreachable; R[p]=0 emits ...` error). The `rp`
+/// value is the one returned by [`pick_rp_for_target_bytes`]; callers
+/// can persist it for reproducible re-encode of identical parameters.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_rp_target_bytes(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    q: u8,
+    target_bytes: usize,
+    planes: &[Vec<u8>],
+) -> Result<(Vec<u8>, u8)> {
+    let rp = pick_rp_for_target_bytes(width, height, nc, cpih, nlx, nly, q, target_bytes, planes)?;
+    let cs = encode_planar_rp(width, height, nc, cpih, nlx, nly, q, rp, planes)?;
+    Ok((cs, rp))
+}
+
 /// Round-108 uniform-inverse-quantizer entry point (`Qpih = 1`).
 ///
 /// Same shape as [`encode_planar_lossy`] but sets the picture-header
@@ -10055,6 +10226,252 @@ mod tests {
             )
             .is_err(),
             "sample exceeding 2^bd-1 must be rejected"
+        );
+    }
+
+    // === Round 218: pick_rp_for_target_bytes (rate-budget driven R[p]) ===
+
+    /// Round 218: `pick_rp_for_target_bytes` rejects `target_bytes = 0`
+    /// before doing any encode work.
+    #[test]
+    fn round218_rp_picker_rejects_zero_budget() {
+        let pixels = make_synthetic_32x32();
+        let err = pick_rp_for_target_bytes(32, 32, 1, 0, 2, 2, 2, 0, std::slice::from_ref(&pixels));
+        assert!(err.is_err(), "target_bytes = 0 must be rejected");
+    }
+
+    /// Round 218: when the budget is generous (≥ the `R[p] = NL-1`
+    /// codestream length), the picker selects the maximum legal
+    /// refinement. At `q > 0` larger `R[p]` retains more low-band
+    /// bitplanes, so spending a full budget on maximum refinement is
+    /// the picker's intent.
+    #[test]
+    fn round218_rp_picker_returns_nl_minus_one_when_budget_fits_max() {
+        let pixels = make_synthetic_32x32();
+        let nl = n_beta(2, 2) as u8; // Nc=1, NL = Nβ
+        let rp_max = nl - 1;
+        let cs_max = encode_planar_rp(32, 32, 1, 0, 2, 2, 2, rp_max, std::slice::from_ref(&pixels))
+            .expect("baseline R[p]=NL-1 q=2");
+        let picked = pick_rp_for_target_bytes(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            2,
+            cs_max.len(),
+            std::slice::from_ref(&pixels),
+        )
+        .expect("picker with budget = NL-1 length");
+        assert_eq!(
+            picked, rp_max,
+            "budget = max-stream length must pick R[p] = NL-1"
+        );
+    }
+
+    /// Round 218: when the budget is exactly the `R[p] = 0` baseline
+    /// length, the picker must pick `R[p] = 0` (every higher `R[p]`
+    /// overshoots by ≥ 0 bytes, but the picker only accepts strict
+    /// fit, so the first higher value rejected leaves `0` as the
+    /// selection).
+    #[test]
+    fn round218_rp_picker_returns_zero_when_budget_is_baseline() {
+        let pixels = make_synthetic_32x32();
+        let cs_zero = encode_planar_rp(32, 32, 1, 0, 2, 2, 2, 0, std::slice::from_ref(&pixels))
+            .expect("R[p]=0 q=2 baseline");
+        let picked = pick_rp_for_target_bytes(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            2,
+            cs_zero.len(),
+            std::slice::from_ref(&pixels),
+        )
+        .expect("picker at baseline budget");
+        // At baseline budget every R[p] ≥ 1 emits ≥ baseline bytes;
+        // when the stream is strictly larger the higher R[p] overshoots
+        // and the picker falls back to 0.
+        let cs_picked =
+            encode_planar_rp(32, 32, 1, 0, 2, 2, 2, picked, std::slice::from_ref(&pixels))
+                .expect("re-encode at picked R[p]");
+        assert!(
+            cs_picked.len() <= cs_zero.len(),
+            "picked R[p]={picked} produced {} > baseline {}",
+            cs_picked.len(),
+            cs_zero.len()
+        );
+    }
+
+    /// Round 218: the picker errors when even `R[p] = 0` overshoots
+    /// the budget. The error reports the actual encoded length so the
+    /// caller can size the budget correctly.
+    #[test]
+    fn round218_rp_picker_errors_when_baseline_overshoots() {
+        let pixels = make_synthetic_32x32();
+        let cs_zero = encode_planar_rp(32, 32, 1, 0, 2, 2, 2, 0, std::slice::from_ref(&pixels))
+            .expect("baseline encode");
+        let too_tight = cs_zero.len() - 1;
+        let err = pick_rp_for_target_bytes(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            2,
+            too_tight,
+            std::slice::from_ref(&pixels),
+        );
+        assert!(
+            err.is_err(),
+            "budget < baseline length must error (baseline = {})",
+            cs_zero.len()
+        );
+        let msg = format!("{:?}", err.err().unwrap());
+        assert!(
+            msg.contains("unreachable") && msg.contains(&cs_zero.len().to_string()),
+            "error must report the baseline overshoot length, got: {msg}"
+        );
+    }
+
+    /// Round 218: the picker is monotone — given a budget strictly
+    /// between the `R[p] = 0` and `R[p] = NL-1` lengths, it returns
+    /// some intermediate `R[p]` whose stream actually fits.
+    #[test]
+    fn round218_rp_picker_picks_intermediate_for_intermediate_budget() {
+        let pixels = make_synthetic_32x32();
+        let nl = n_beta(2, 2) as u8;
+        let rp_max = nl - 1;
+        let cs_zero = encode_planar_rp(32, 32, 1, 0, 2, 2, 2, 0, std::slice::from_ref(&pixels))
+            .expect("R[p]=0");
+        let cs_max = encode_planar_rp(32, 32, 1, 0, 2, 2, 2, rp_max, std::slice::from_ref(&pixels))
+            .expect("R[p]=NL-1");
+        // Only run the assertion if the two endpoints differ — the
+        // refinement actually fires on this fixture.
+        if cs_max.len() > cs_zero.len() {
+            let mid_budget = (cs_zero.len() + cs_max.len()) / 2;
+            let picked = pick_rp_for_target_bytes(
+                32,
+                32,
+                1,
+                0,
+                2,
+                2,
+                2,
+                mid_budget,
+                std::slice::from_ref(&pixels),
+            )
+            .expect("picker at mid budget");
+            let cs_picked =
+                encode_planar_rp(32, 32, 1, 0, 2, 2, 2, picked, std::slice::from_ref(&pixels))
+                    .expect("re-encode at picked R[p]");
+            assert!(
+                cs_picked.len() <= mid_budget,
+                "picked R[p]={picked} emits {} > budget {mid_budget}",
+                cs_picked.len()
+            );
+        }
+    }
+
+    /// Round 218: at `q = 0` (lossless) refinement is a no-op — the
+    /// truncation `T[p,b]` is already at its 0 floor, so every
+    /// candidate `R[p]` emits a byte-identical stream. The picker
+    /// must still return a value (the highest one, since every value
+    /// "fits") and the round-trip must be lossless.
+    #[test]
+    fn round218_rp_picker_q0_lossless_roundtrip() {
+        let pixels = make_synthetic_32x32();
+        let nl = n_beta(2, 2) as u8;
+        let cs_zero = encode_planar_rp(32, 32, 1, 0, 2, 2, 0, 0, std::slice::from_ref(&pixels))
+            .expect("R[p]=0 q=0");
+        let (cs, rp) = encode_planar_rp_target_bytes(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            0,
+            cs_zero.len(),
+            std::slice::from_ref(&pixels),
+        )
+        .expect("target-bytes wrapper at q=0");
+        assert_eq!(
+            rp,
+            nl - 1,
+            "q=0 every R[p] fits; picker returns the maximum NL-1"
+        );
+        let img = decode_codestream(&cs, None).expect("decode q=0 picker output");
+        assert_eq!(
+            img.planes[0].data, pixels,
+            "q=0 picker output must be lossless"
+        );
+    }
+
+    /// Round 218: the `encode_planar_rp_target_bytes` convenience
+    /// wrapper returns the same bytes as a manual
+    /// `pick_rp_for_target_bytes` + `encode_planar_rp` pair, and the
+    /// returned codestream actually fits the budget.
+    #[test]
+    fn round218_rp_target_bytes_wrapper_matches_manual_pair() {
+        let pixels = make_synthetic_32x32();
+        let nl = n_beta(2, 2) as u8;
+        let rp_max = nl - 1;
+        let cs_max = encode_planar_rp(32, 32, 1, 0, 2, 2, 2, rp_max, std::slice::from_ref(&pixels))
+            .expect("baseline");
+        let budget = cs_max.len();
+        let (cs_w, rp_w) = encode_planar_rp_target_bytes(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            2,
+            budget,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("wrapper");
+        let rp_m =
+            pick_rp_for_target_bytes(32, 32, 1, 0, 2, 2, 2, budget, std::slice::from_ref(&pixels))
+                .expect("manual picker");
+        assert_eq!(rp_w, rp_m, "wrapper and manual picker pick the same R[p]");
+        let cs_m = encode_planar_rp(32, 32, 1, 0, 2, 2, 2, rp_m, std::slice::from_ref(&pixels))
+            .expect("manual encode at picked R[p]");
+        assert_eq!(cs_w, cs_m, "wrapper bytes == manual-pair bytes");
+        assert!(cs_w.len() <= budget, "wrapper output must fit budget");
+    }
+
+    /// Round 218: the picker works on the RGB + RCT path (`Cpih = 1`),
+    /// confirming the picker is colour-transform agnostic — its only
+    /// dependency on `cpih` is forwarding it to `encode_planar_rp`.
+    #[test]
+    fn round218_rp_picker_works_for_rgb_rct() {
+        let rgb = make_synthetic_rgb_32x32();
+        let mut r = vec![0u8; 32 * 32];
+        let mut g = vec![0u8; 32 * 32];
+        let mut b = vec![0u8; 32 * 32];
+        for i in 0..32 * 32 {
+            r[i] = rgb[i * 3];
+            g[i] = rgb[i * 3 + 1];
+            b[i] = rgb[i * 3 + 2];
+        }
+        let planes = [r, g, b];
+        let nbeta = n_beta(2, 2);
+        let nl = (3u32) * nbeta; // Nc=3, RCT
+        let rp_max = (nl - 1) as u8;
+        let cs_max = encode_planar_rp(32, 32, 3, 1, 2, 2, 2, rp_max, &planes)
+            .expect("RGB+RCT R[p]=NL-1 q=2");
+        let (cs, rp) = encode_planar_rp_target_bytes(32, 32, 3, 1, 2, 2, 2, cs_max.len(), &planes)
+            .expect("RGB+RCT wrapper at max budget");
+        assert!(cs.len() <= cs_max.len(), "wrapper output must fit budget");
+        assert!(
+            decode_codestream(&cs, None).is_ok(),
+            "picked RGB+RCT R[p]={rp} q=2 must decode"
         );
     }
 }

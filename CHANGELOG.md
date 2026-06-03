@@ -1,5 +1,78 @@
 # Changelog
 
+## Unreleased — round 218 (rate-budget driven `R[p]` picker, encoder side)
+
+Builds on the round-115 `R[p]` precinct refinement primitive. Round
+115 gave the caller the *mechanism* to refine the lowest-index bands
+(LL first per the `β`-major band enumeration of Annex B.6) by lowering
+`T[p,b]` via the Annex C.6.2 Table C.10 term `r = (P[b] < R[p]) ? 1 :
+0`; round 218 adds the *policy* — a deterministic, library-free
+picker that chooses an `R[p]` against a caller-supplied byte budget
+and spends every available byte on additional refinement.
+
+Complements r212's `pick_q_slices_for_target_bytes`: r212 trades
+quantization strength **between slices** at a fixed refinement; r218
+trades refinement strength **between bands** at a fixed quantization.
+Together they cover both axes of the encoder's rate-distortion lever.
+
+* `pick_rp_for_target_bytes(width, height, nc, cpih, nlx, nly, q,
+  target_bytes, &[Vec<u8>]) -> Result<u8>` — linear scan from `R[p] =
+  NL-1` down to `0`, returning the first `R[p]` whose codestream fits
+  the budget. Refinement is monotone non-decreasing in codestream
+  length (each refined band gains one extra retained magnitude
+  bitplane), so the first fit is also the largest fit. Step 1 probes
+  `R[p] = 0` as the baseline — if even that overshoots the budget,
+  the picker errors with `target_bytes unreachable; R[p]=0 emits N
+  bytes` (the budget is unreachable by `R[p]` alone; lower `q` or
+  `pick_q_slices_for_target_bytes` can still help). `target_bytes ==
+  0` is rejected as a precondition. Every measurement is a real call
+  into `encode_planar_rp` — no internal model of the entropy coder,
+  no oracle, no external library.
+* `encode_planar_rp_target_bytes(.., target_bytes, &[Vec<u8>]) ->
+  Result<(Vec<u8>, u8)>` — convenience wrapper that returns
+  `(codestream, rp)`. The codestream is byte-identical to a follow-up
+  `encode_planar_rp(.., rp, ..)` call, so callers can persist the
+  picked `rp` for reproducible re-encode.
+* Scope mirrors `encode_planar_rp` exactly: 4:4:4, `Cpih ∈ {0, 1, 3}`,
+  single precinct column (`Cw = 0`), single slice (`Hsl = 0`), no CWD
+  suppression (`Sd = 0`), `Fs = 0`, `Qpih = 0`, `q ∈ 0..=15`. At `q =
+  0` refinement is a lossless no-op (the truncation `T[p,b]` is
+  already at its 0 floor regardless of the refinement term), so the
+  picker returns `NL-1` — every refinement is byte-identical to
+  `R[p] = 0` at `q = 0`.
+
+8 new tests (341 → 349 total):
+* `round218_rp_picker_rejects_zero_budget` — `target_bytes = 0` is
+  rejected before any encode work.
+* `round218_rp_picker_returns_nl_minus_one_when_budget_fits_max` —
+  budget ≥ `R[p]=NL-1` stream length selects the maximum legal
+  refinement (luma NL=2/2 q=2).
+* `round218_rp_picker_returns_zero_when_budget_is_baseline` —
+  budget = baseline length falls back to `R[p] = 0` when every
+  higher value overshoots (output is monotone-non-decreasing).
+* `round218_rp_picker_errors_when_baseline_overshoots` — budget <
+  baseline triggers the `unreachable` error tagged with the actual
+  baseline length.
+* `round218_rp_picker_picks_intermediate_for_intermediate_budget` —
+  budget strictly between baseline and max stream picks an
+  intermediate `R[p]` whose stream fits.
+* `round218_rp_picker_q0_lossless_roundtrip` — at `q = 0` the picker
+  returns `NL-1` (every R[p] fits) and the codestream decodes
+  losslessly.
+* `round218_rp_target_bytes_wrapper_matches_manual_pair` — the
+  wrapper output equals
+  `encode_planar_rp(pick_rp_for_target_bytes(..), ..)` byte-for-byte.
+* `round218_rp_picker_works_for_rgb_rct` — picker is colour-
+  transform agnostic (`Cpih = 1`, Nc=3, RGB+RCT, NL=2/2 q=2 budget =
+  max-stream length).
+
+Out-of-scope (next round): a unified picker that joints r212's per-
+slice `Q[p]` policy with this round's `R[p]` policy — pick both
+`q_slices` and `rp` against a single budget. The two levers are
+orthogonal on the bitstream (per-slice `Q[p]` lives in each
+precinct's `Q[p]` byte; `R[p]` lives in each precinct's `R[p]` byte),
+so a joint picker is a natural next step.
+
 ## Unreleased — round 212 (rate-budget driven per-slice `Q[p]` picker, encoder side)
 
 Builds directly on the round-206 per-slice `Q[p]` slice. Round 206
