@@ -1,5 +1,93 @@
 # Changelog
 
+## Unreleased — round 224 (joint per-slice `Q[p]` + `R[p]` rate-budget picker, encoder side)
+
+Closes the round-218 "next round" tail: the **joint** picker that
+simultaneously picks `q_slices` (per-slice `Q[p]`, Annex C.2 Table C.1
+lifted to per-slice in round 206) and `rp` (precinct refinement
+`R[p]`, Annex C.2 Table C.1 + Annex C.6.2 Table C.10) against a single
+byte budget.
+
+The two levers are orthogonal on the bitstream: per-slice `Q[p]`
+lives in each precinct's `Q` byte and `R[p]` lives in each precinct's
+`R` byte, so any `(q_slices, rp)` pair the picker emits is
+spec-compliant. The Annex C.6.2 Table C.10 truncation
+`T[p,b] = clamp(Q[p] − G[b] − r, 0, 15)` with
+`r = (P[b] < R[p]) ? 1 : 0` is monotone non-increasing in `Q[p]` and
+monotone non-decreasing in `R[p]`, so the joint picker walks both
+axes in a nested search.
+
+* `encode_planar_hsl_qslice_rp(width, height, nc, cpih, nlx, nly,
+  hsl, q_slices, rp, &[Vec<u8>]) -> Result<Vec<u8>>` — the joint
+  primitive. Composes [`encode_planar_hsl_qslice`] (round 206 per-
+  slice `Q[p]`) and [`encode_planar_rp`] (round 115 precinct
+  refinement) on a single encode call. All-equal `q_slices` + `rp =
+  0` is byte-identical to `encode_planar_hsl_qslice` at that
+  `q_slices`; single-entry + `hsl = 0` + `rp > 0` is byte-identical
+  to `encode_planar_rp` at the same `(q, rp)`; `q_slices = [0; n]`
+  with any `rp` is byte-identical to the lossless `rp = 0` stream
+  (refinement is a no-op when `T` is already at its 0 floor).
+* `pick_q_slices_rp_for_target_bytes(width, height, nc, cpih, nlx,
+  nly, hsl, target_bytes, &[Vec<u8>]) -> Result<(Vec<u8>, u8)>` —
+  two-axis nested picker. Outer loop on `rp` from `0` up to `NL-1`,
+  keeping the last fitting solution; inner loop reuses r212's three-
+  pass `q_slices` strategy (lossless probe, uniform-`Q` bisect,
+  activity-driven per-slice relaxation) against
+  `encode_planar_hsl_qslice_rp` at the current `rp`. Promotion rule:
+  if the inner search succeeds at `rp+1`, replace the best;
+  otherwise stop (refinement is monotone non-decreasing in
+  codestream length at fixed `Q[p]`, so higher `rp` cannot fit
+  either). Baseline reachability: if even `rp = 0` + `Q = 15`
+  overshoots, errors with `target_bytes unreachable; rp=0 Q=15 emits
+  N bytes` (no choice of `(q_slices, rp)` can fit). `target_bytes ==
+  0` rejected. Every measurement is a real call into
+  `encode_planar_hsl_qslice_rp` — no internal model of the entropy
+  coder, no oracle, no external library.
+* `encode_planar_hsl_qslice_rp_target_bytes(.., target_bytes,
+  &[Vec<u8>]) -> Result<(Vec<u8>, Vec<u8>, u8)>` — convenience
+  wrapper returning `(codestream, q_slices, rp)`. The codestream is
+  byte-identical to a follow-up `encode_planar_hsl_qslice_rp(..,
+  q_slices, rp, ..)` call, so callers can persist `(q_slices, rp)`
+  for reproducible re-encode.
+* Scope: 4:4:4, `Cpih ∈ {0, 1, 3}`, `Cw = 0`, `Sd = 0`, `Fs = 0`,
+  `Qpih = 0`, `B[i] = 8`. The inner encoder already plumbs all four
+  parameters through `encode_planar_inner_bd`, so a future round
+  could widen to high-bit-depth without changing the picker's
+  contract.
+
+10 new tests (349 → 359 total):
+* `round224_joint_primitive_matches_hsl_qslice_rp_zero` — all-equal
+  `q_slices` + `rp = 0` byte-identical to `encode_planar_hsl_qslice`.
+* `round224_joint_primitive_matches_rp_when_single_slice` —
+  single-slice + `hsl = 0` + `rp > 0` byte-identical to
+  `encode_planar_rp` at the same `(q, rp)`.
+* `round224_joint_lossless_roundtrip_independent_of_rp` —
+  `q_slices = [0; n]` at any `rp` self-roundtrips losslessly.
+* `round224_joint_picker_rejects_zero_budget` — `target_bytes = 0`
+  rejected before any encode work.
+* `round224_joint_picker_returns_max_rp_when_budget_is_huge` —
+  budget ≥ `(rp = NL-1, q = [0; n])` stream selects the maximum
+  refinement with lossless slices.
+* `round224_joint_picker_errors_when_budget_unreachable` — tiny
+  budget triggers the `unreachable` error.
+* `round224_joint_picker_output_fits_budget` — mid-range budget
+  produces an output `<= target_bytes`.
+* `round224_joint_target_bytes_wrapper_matches_manual_pair` — the
+  wrapper output equals `encode_planar_hsl_qslice_rp(
+  pick_q_slices_rp_for_target_bytes(..), ..)` byte-for-byte.
+* `round224_joint_picker_works_for_rgb_rct` — picker is colour-
+  transform agnostic (`Cpih = 1`, Nc=3, RGB+RCT).
+* `round224_joint_picker_at_least_as_good_as_rp_alone` — at a
+  budget where `pick_rp_for_target_bytes` finds a non-zero answer,
+  the joint picker matches or exceeds that refinement level (it
+  can additionally lower `Q[p]` to free up bytes for more `R[p]`).
+
+Out-of-scope (next round): an `R[p]`-driven PSNR-optimizing
+**priority assignment** that replaces the plain band-index priorities
+`P[b] = b` with a content-adaptive ordering; high-bit-depth widening
+of the joint primitive (`encode_planar_inner_bd` already plumbs all
+four parameters).
+
 ## Unreleased — round 218 (rate-budget driven `R[p]` picker, encoder side)
 
 Builds on the round-115 `R[p]` precinct refinement primitive. Round

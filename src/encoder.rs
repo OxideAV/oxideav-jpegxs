@@ -1990,6 +1990,429 @@ pub fn encode_planar_rp_target_bytes(
     Ok((cs, rp))
 }
 
+/// Round-224 joint per-slice `Q[p]` + precinct refinement `R[p]` encoder
+/// primitive — composes [`encode_planar_hsl_qslice`] (round 206) and
+/// [`encode_planar_rp`] (round 115) on a single encode call.
+///
+/// Both axes live on independent precinct-header fields per Annex C.2
+/// Table C.1: `Q[p]` is the per-precinct quantization step (one byte
+/// per precinct, lifted to "one value per slice" in round 206) and
+/// `R[p]` is the per-precinct refinement (one byte per precinct,
+/// constant across precincts in this encoder). The Annex C.6.2 Table
+/// C.10 per-band truncation
+/// `T[p,b] = clamp(Q[p] − G[b] − r, 0, 15)` with
+/// `r = (P[b] < R[p]) ? 1 : 0` combines them additively inside one
+/// `clamp`, so the two axes are orthogonal on the bitstream — `Q[p]`
+/// lives in the `Q` byte of each precinct header and `R[p]` lives in
+/// the `R` byte. There is no cross-axis coupling beyond the shared
+/// `clamp` floor at 0 (which already governs each axis in isolation).
+///
+/// The decoder reconstructs the identical `T[p,b]` from the
+/// `(P[b], R[p], Q[p])` triple it reads back from the wire, so any
+/// output of this entry point round-trips through
+/// [`crate::decode_jpeg_xs`].
+///
+/// `hsl`, `q_slices`, and `rp` follow the same semantics as in
+/// [`encode_planar_hsl_qslice`] and [`encode_planar_rp`]:
+///
+/// * `hsl` is the slice height in precinct rows (PIH `Hsl`, Annex B.10);
+///   `hsl == 0` is the single-slice default (`Hsl = Np,y`, one slice
+///   covering the picture).
+/// * `q_slices.len()` must exactly equal the slice count
+///   `⌈Np,y / max(hsl, 1)⌉` (single entry when `hsl == 0`); each entry
+///   is in `0..=15`. `Fq` is auto-selected — `0` when every entry is
+///   `0`, else `8` (regular mode, required for any non-zero `Q[p]`).
+/// * `rp` is the precinct refinement `R[p] ∈ 0..=NL-1` where
+///   `NL = Nc × Nβ` for this picker's 4:4:4 / Sd = 0 surface. `rp = 0`
+///   is the no-refinement default; `rp > 0` activates the Annex C.6.2
+///   Table C.10 refinement term lowering `T[p,b]` by one for the `rp`
+///   lowest-index (LL-first) bands. The encoder emits per-band
+///   priorities `P[b] = b` in the WGT marker (Annex A.4.11), identical
+///   to round 115.
+///
+/// **Composition behaviour:**
+///
+/// * `q_slices = [0; n]` with any `rp` — every precinct lossless (`T =
+///   0` regardless of refinement), output is byte-identical to the
+///   `rp = 0` lossless stream from [`encode_planar_hsl_qslice`].
+/// * `q_slices` all-equal + `rp = 0` — byte-identical to
+///   [`encode_planar_hsl_qslice`] at that `q_slices`.
+/// * `q_slices.len() == 1` + `hsl = 0` + `rp = 0` — byte-identical to
+///   [`encode_planar_lossy`] at that `q`.
+/// * `q_slices.len() == 1` + `hsl = 0` + `rp > 0` — byte-identical to
+///   [`encode_planar_rp`] at that `q` and `rp`.
+///
+/// **Scope** — 4:4:4, `Cpih ∈ {0, 1, 3}`, `Cw = 0`, `Sd = 0`, `Fs = 0`,
+/// `Qpih = 0`, `B[i] = 8`. The mixed high-bit-depth + per-slice +
+/// refinement surface is a future round if the demand arises (the inner
+/// encoder already plumbs all four parameters through
+/// `encode_planar_inner_bd`).
+///
+/// Errors: validation errors from [`EncodeConfig::validate`] (wrong
+/// `q_slices` length, entries > 15, `R[p] >= NL`, etc.).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_hsl_qslice_rp(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    hsl: u16,
+    q_slices: &[u8],
+    rp: u8,
+    planes: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    let sx = vec![1u8; nc as usize];
+    let sy = vec![1u8; nc as usize];
+    let q_pic = q_slices.iter().copied().max().unwrap_or(0);
+    let fq = if q_slices.iter().any(|&v| v > 0) {
+        8
+    } else {
+        0
+    };
+    encode_planar_inner_nlt(
+        width,
+        height,
+        nc,
+        cpih,
+        nlx,
+        nly,
+        fq,
+        q_pic,
+        &sx,
+        &sy,
+        0,
+        0,
+        0,
+        0,
+        None,
+        Vec::new(),
+        0,   // cw: single precinct column
+        0,   // sd: no CWD suppression
+        0,   // fs: signs jointly with data (Fs=0)
+        hsl, // hsl: slice height in precinct rows
+        0,   // qpih: deadzone inverse quantizer (Qpih=0)
+        rp,  // rp: precinct refinement R[p]
+        q_slices.to_vec(),
+        planes,
+    )
+}
+
+/// Round-224 joint rate-budget picker — picks both `q_slices` (per-slice
+/// `Q[p]`, Annex C.2 Table C.1 lifted to per-slice in round 206) and `rp`
+/// (precinct refinement `R[p]`, Annex C.2 Table C.1 + Annex C.6.2 Table
+/// C.10) against a single byte budget, driving the round-224 joint
+/// primitive [`encode_planar_hsl_qslice_rp`].
+///
+/// The two levers are orthogonal on the bitstream: per-slice `Q[p]`
+/// lives in each precinct's `Q` byte and `R[p]` lives in each precinct's
+/// `R` byte, so any `(q_slices, rp)` pair the picker emits is
+/// spec-compliant. The Annex C.6.2 Table C.10 truncation
+/// `T[p,b] = clamp(Q[p] − G[b] − r, 0, 15)` with
+/// `r = (P[b] < R[p]) ? 1 : 0` is monotone non-increasing in `Q[p]` and
+/// monotone non-decreasing in `R[p]` (lower `Q` keeps more low-magnitude
+/// bits; higher `R[p]` refines more bands toward retaining one extra
+/// bitplane), so the joint picker can trade them against each other at
+/// the byte-budget boundary.
+///
+/// **Strategy — two-axis nested search:**
+///
+/// 1. **Outer loop on `rp`** from `0` up to `NL-1`. Refinement is
+///    monotone non-decreasing in codestream length at any fixed `q`
+///    (each refined band gains one extra retained magnitude bitplane),
+///    so larger `rp` shifts more bits toward the low-index bands. We
+///    want the largest `rp` whose inner `q_slices` search still fits
+///    the budget — start at `rp = 0` (cheapest) and walk upward,
+///    keeping the last fitting solution.
+/// 2. **Inner loop on `q_slices`** at the current `rp`. Reuse r212's
+///    three-pass strategy verbatim — lossless probe, uniform-`Q`
+///    bisect on `1..=15`, per-slice low-activity relaxation — but call
+///    [`encode_planar_hsl_qslice_rp`] (with the current `rp`) instead
+///    of [`encode_planar_hsl_qslice`] (which pins `rp = 0`).
+///    Returns either the fitting `q_slices` or "Q=15 unreachable" if
+///    even max-quantization at this `rp` overshoots.
+/// 3. **Promotion rule.** If the inner search at `rp+1` succeeds and
+///    still fits, replace the current best with that pair. If it
+///    fails (Q=15 unreachable at higher `rp`), stop — higher `rp`
+///    cannot fit either since `R[p]` is monotone non-decreasing in
+///    codestream length at any fixed `Q[p]`.
+/// 4. **Baseline rejection.** If even `rp = 0` + `q_slices = [15;n]`
+///    overshoots the budget, the budget is unreachable by these two
+///    levers alone (no choice of `(q_slices, rp)` can fit). Errors
+///    with `target_bytes unreachable; rp=0 Q=15 emits N bytes`.
+///
+/// The picker is fully deterministic and performs no rate-distortion
+/// search beyond calling [`encode_planar_hsl_qslice_rp`] with candidate
+/// triples and reading back the byte length — there is no internal model
+/// of the entropy coder, no oracle, no external library. Every
+/// measurement is a real encode call.
+///
+/// **Scope** matches [`encode_planar_hsl_qslice_rp`] exactly: 4:4:4,
+/// `Cpih ∈ {0, 1, 3}`, `Cw = 0`, `Sd = 0`, `Fs = 0`, `Qpih = 0`,
+/// `B[i] = 8`.
+///
+/// **Why "largest fitting `rp`" beats "smallest":** refinement transfers
+/// coded bits toward the lowest-frequency bands (where flat-region
+/// banding shows worst). At any fixed `q_slices` budget, every
+/// additional `rp` step improves PSNR on the refined bands at the cost
+/// of a few more coded bits in those same bands. The optimal use of a
+/// byte budget is therefore to spend as many bits as the budget allows
+/// on additional refinement — matching the Annex H NOTE intent
+/// ("Other choices are possible") and complementing r212's
+/// activity-driven `Q[p]` relaxation.
+///
+/// Inputs / outputs follow [`pick_q_slices_for_target_bytes`] and
+/// [`pick_rp_for_target_bytes`] respectively: returns
+/// `Result<(Vec<u8>, u8)>` carrying the chosen `q_slices` and `rp`.
+/// The [`encode_planar_hsl_qslice_rp_target_bytes`] convenience wrapper
+/// does both in one call and returns `(codestream, q_slices, rp)`.
+#[allow(clippy::too_many_arguments)]
+pub fn pick_q_slices_rp_for_target_bytes(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    hsl: u16,
+    target_bytes: usize,
+    planes: &[Vec<u8>],
+) -> Result<(Vec<u8>, u8)> {
+    if target_bytes == 0 {
+        return Err(Error::invalid(
+            "jpegxs joint picker: target_bytes must be > 0".to_string(),
+        ));
+    }
+    // NL = Nc × Nβ for the 4:4:4 / Sd = 0 surface.
+    let nbeta = n_beta(nlx, nly);
+    let nl = (nc as u32) * nbeta;
+    if nl == 0 {
+        return Err(Error::invalid(format!(
+            "jpegxs joint picker: NL=0 (nc={nc}, NL,x={nlx}, NL,y={nly})"
+        )));
+    }
+    let rp_max = (nl - 1).min(u8::MAX as u32) as u8;
+
+    // Slice count — mirrors EncodeConfig::validate + r212's picker.
+    let hp_pow = 1u32 << nly;
+    let np_y = (height as u32).div_ceil(hp_pow);
+    let hsl_rows = if hsl == 0 { np_y } else { hsl as u32 };
+    if hsl_rows == 0 {
+        return Err(Error::invalid(format!(
+            "jpegxs joint picker: Hsl={hsl} resolves to zero precinct rows per slice (height={height}, NL,y={nly})"
+        )));
+    }
+    let n_slices = np_y.div_ceil(hsl_rows) as usize;
+
+    // Baseline reachability — if even rp=0 + Q=15 (max quantization,
+    // no refinement) overshoots the budget, no (q_slices, rp) pair can
+    // fit. Probe before any outer-loop work so the error surfaces fast.
+    let cs_baseline = encode_planar_hsl_qslice_rp(
+        width,
+        height,
+        nc,
+        cpih,
+        nlx,
+        nly,
+        hsl,
+        &vec![15u8; n_slices],
+        0,
+        planes,
+    )?;
+    if cs_baseline.len() > target_bytes {
+        return Err(Error::invalid(format!(
+            "jpegxs joint picker: target_bytes={target_bytes} unreachable; rp=0 Q=15 emits {} bytes",
+            cs_baseline.len()
+        )));
+    }
+
+    // Outer loop on rp — walk upward keeping the last fitting (q_slices,
+    // rp) pair. For each rp, run the inner activity-driven q_slices
+    // picker; if it fits, promote; if it doesn't, stop (refinement is
+    // monotone non-decreasing in codestream length at fixed Q[p], so
+    // higher rp won't fit either).
+    let mut best_q = vec![15u8; n_slices];
+    let mut best_rp: u8 = 0;
+    for rp in 0..=rp_max {
+        match pick_q_slices_at_rp(
+            width,
+            height,
+            nc,
+            cpih,
+            nlx,
+            nly,
+            hsl,
+            rp,
+            target_bytes,
+            n_slices,
+            planes,
+        ) {
+            Ok(qs) => {
+                best_q = qs;
+                best_rp = rp;
+            }
+            Err(_) => break,
+        }
+    }
+    Ok((best_q, best_rp))
+}
+
+/// Round-224 inner picker — at a fixed `rp`, replays r212's three-pass
+/// `q_slices` search against `encode_planar_hsl_qslice_rp`. Returns
+/// `Err` if even `[15; n_slices]` overshoots at this `rp` (signal to
+/// the outer loop that higher `rp` cannot fit either).
+#[allow(clippy::too_many_arguments)]
+fn pick_q_slices_at_rp(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    hsl: u16,
+    rp: u8,
+    target_bytes: usize,
+    n_slices: usize,
+    planes: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    // Pass 1 — lossless probe.
+    let q_zero = vec![0u8; n_slices];
+    let cs_zero =
+        encode_planar_hsl_qslice_rp(width, height, nc, cpih, nlx, nly, hsl, &q_zero, rp, planes)?;
+    if cs_zero.len() <= target_bytes {
+        return Ok(q_zero);
+    }
+
+    // Pass 2 — uniform-Q bisect over 1..=15.
+    let mut lo: u8 = 1;
+    let mut hi: u8 = 15;
+    let mut best_uniform_q: Option<u8> = None;
+    let mut best_uniform_len: usize = usize::MAX;
+    while lo <= hi {
+        let mid = (lo + hi) / 2;
+        let qv = vec![mid; n_slices];
+        let cs =
+            encode_planar_hsl_qslice_rp(width, height, nc, cpih, nlx, nly, hsl, &qv, rp, planes)?;
+        if cs.len() <= target_bytes {
+            best_uniform_q = Some(mid);
+            best_uniform_len = cs.len();
+            if mid == 0 {
+                break;
+            }
+            hi = mid - 1;
+        } else {
+            if mid == 15 {
+                break;
+            }
+            lo = mid + 1;
+        }
+    }
+    let uniform_q = match best_uniform_q {
+        Some(q) => q,
+        None => {
+            // Q=15 at this rp overshoots → signal outer loop to stop.
+            return Err(Error::invalid(format!(
+                "jpegxs joint picker (rp={rp}): target_bytes={target_bytes} unreachable; Q=15 overshoots"
+            )));
+        }
+    };
+
+    if n_slices == 1 {
+        return Ok(vec![uniform_q; 1]);
+    }
+
+    // Pass 3 — per-slice activity-driven relaxation.
+    let slice_row_ranges =
+        compute_slice_row_ranges(height, nly, hsl_rows_for(hsl, np_y_for(height, nly)));
+    debug_assert_eq!(slice_row_ranges.len(), n_slices);
+    let mut activity: Vec<(usize, u64)> = slice_row_ranges
+        .iter()
+        .enumerate()
+        .map(|(t, &(y0, y1))| (t, slice_activity(planes, width, y0, y1)))
+        .collect();
+    activity.sort_by_key(|&(_, a)| a);
+
+    let mut best = vec![uniform_q; n_slices];
+    let mut best_len = best_uniform_len;
+    loop {
+        let mut changed = false;
+        for &(t, _) in &activity {
+            if best[t] == 0 {
+                continue;
+            }
+            let mut trial = best.clone();
+            trial[t] -= 1;
+            let cs = encode_planar_hsl_qslice_rp(
+                width, height, nc, cpih, nlx, nly, hsl, &trial, rp, planes,
+            )?;
+            if cs.len() <= target_bytes {
+                best = trial;
+                best_len = cs.len();
+                changed = true;
+            }
+        }
+        let _ = best_len;
+        if !changed {
+            break;
+        }
+    }
+    Ok(best)
+}
+
+/// Round-224 helper — resolve the effective Hsl-in-precinct-rows the
+/// encoder uses internally (`Np,y` when caller passes `hsl == 0`).
+fn hsl_rows_for(hsl: u16, np_y: u32) -> u32 {
+    if hsl == 0 {
+        np_y
+    } else {
+        hsl as u32
+    }
+}
+
+/// Round-224 helper — Np,y = ⌈Hf / 2^NL,y⌉.
+fn np_y_for(height: u16, nly: u8) -> u32 {
+    let hp_pow = 1u32 << nly;
+    (height as u32).div_ceil(hp_pow)
+}
+
+/// Round-224 convenience wrapper — picks `(q_slices, rp)` against
+/// `target_bytes` and emits the codestream in one call.
+///
+/// Returns `(codestream, q_slices, rp)`. The codestream is guaranteed
+/// to satisfy `codestream.len() <= target_bytes` (otherwise the picker
+/// returns `target_bytes unreachable`). The `q_slices` and `rp` values
+/// are the ones returned by [`pick_q_slices_rp_for_target_bytes`];
+/// callers can persist them for reproducible re-encode.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_hsl_qslice_rp_target_bytes(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    hsl: u16,
+    target_bytes: usize,
+    planes: &[Vec<u8>],
+) -> Result<(Vec<u8>, Vec<u8>, u8)> {
+    let (q_slices, rp) = pick_q_slices_rp_for_target_bytes(
+        width,
+        height,
+        nc,
+        cpih,
+        nlx,
+        nly,
+        hsl,
+        target_bytes,
+        planes,
+    )?;
+    let cs = encode_planar_hsl_qslice_rp(
+        width, height, nc, cpih, nlx, nly, hsl, &q_slices, rp, planes,
+    )?;
+    Ok((cs, q_slices, rp))
+}
+
 /// Round-108 uniform-inverse-quantizer entry point (`Qpih = 1`).
 ///
 /// Same shape as [`encode_planar_lossy`] but sets the picture-header
@@ -10472,6 +10895,394 @@ mod tests {
         assert!(
             decode_codestream(&cs, None).is_ok(),
             "picked RGB+RCT R[p]={rp} q=2 must decode"
+        );
+    }
+
+    // === Round 224: joint per-slice Q[p] + R[p] encoder primitive ===
+
+    /// Round 224: when `q_slices` is a single repeated value and `rp = 0`,
+    /// the joint primitive must emit the same bytes as
+    /// `encode_planar_hsl_qslice` at the same `q_slices`.
+    #[test]
+    fn round224_joint_primitive_matches_hsl_qslice_rp_zero() {
+        let pixels = make_synthetic_32x32();
+        // 32×32 with NL,y=2 → Np,y = 32/4 = 8; hsl=4 → 2 slices.
+        let q_slices = vec![3u8, 3];
+        let baseline = encode_planar_hsl_qslice(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            4,
+            &q_slices,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("baseline hsl_qslice");
+        let joint = encode_planar_hsl_qslice_rp(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            4,
+            &q_slices,
+            0,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("joint at rp=0");
+        assert_eq!(
+            baseline, joint,
+            "rp=0 joint primitive byte-identical to hsl_qslice"
+        );
+    }
+
+    /// Round 224: when `hsl = 0`, `q_slices.len() == 1`, `rp > 0`, the
+    /// joint primitive must emit the same bytes as `encode_planar_rp`
+    /// at the same `q` and `rp`.
+    #[test]
+    fn round224_joint_primitive_matches_rp_when_single_slice() {
+        let pixels = make_synthetic_32x32();
+        let baseline = encode_planar_rp(32, 32, 1, 0, 2, 2, 2, 3, std::slice::from_ref(&pixels))
+            .expect("baseline encode_planar_rp");
+        let joint = encode_planar_hsl_qslice_rp(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            0,
+            &[2u8],
+            3,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("joint single slice rp=3");
+        assert_eq!(
+            baseline, joint,
+            "single-slice joint byte-identical to encode_planar_rp at same (q, rp)"
+        );
+    }
+
+    /// Round 224: at `q_slices = [0; n]` (lossless) refinement is a no-op,
+    /// so the joint primitive must self-roundtrip losslessly regardless
+    /// of `rp`.
+    #[test]
+    fn round224_joint_lossless_roundtrip_independent_of_rp() {
+        let pixels = make_synthetic_32x32();
+        let nbeta = n_beta(2, 2);
+        let nl = nbeta; // Nc = 1 → NL = Nβ
+        let rp_max = (nl - 1) as u8;
+        // 32×32 with NL,y=2 → Np,y = 8; hsl=4 → 2 slices matching [0, 0].
+        let cs = encode_planar_hsl_qslice_rp(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            4,
+            &[0u8, 0],
+            rp_max,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("joint q=0 rp=NL-1");
+        let img = decode_codestream(&cs, None).expect("decode joint q=0 rp=NL-1");
+        assert_eq!(
+            img.planes[0].data, pixels,
+            "lossless joint must roundtrip bit-exactly"
+        );
+    }
+
+    /// Round 224: the joint picker rejects `target_bytes = 0` before
+    /// any encode work.
+    #[test]
+    fn round224_joint_picker_rejects_zero_budget() {
+        let pixels = make_synthetic_32x32();
+        let err = pick_q_slices_rp_for_target_bytes(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            4,
+            0,
+            std::slice::from_ref(&pixels),
+        );
+        assert!(err.is_err(), "target_bytes = 0 must be rejected");
+    }
+
+    /// Round 224: when the budget comfortably accommodates the largest
+    /// candidate (`rp = NL-1` + `q_slices = [0; n]`, lossless slices and
+    /// maximum refinement, which is the largest stream this picker can
+    /// emit), the joint picker must return that maximum-refinement
+    /// configuration with lossless slices.
+    #[test]
+    fn round224_joint_picker_returns_max_rp_when_budget_is_huge() {
+        let pixels = make_synthetic_32x32();
+        let nbeta = n_beta(2, 2);
+        let nl = nbeta; // Nc = 1 → NL = Nβ
+        let rp_max = (nl - 1) as u8;
+        // 32×32 with NL,y=2 → Np,y = 8; hsl=4 → 2 slices.
+        let cs_loss = encode_planar_hsl_qslice_rp(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            4,
+            &[0u8, 0],
+            rp_max,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("max-cost candidate");
+        // Use a budget at least as big as the max-cost candidate.
+        let (q_picked, rp_picked) = pick_q_slices_rp_for_target_bytes(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            4,
+            cs_loss.len() + 1024,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("huge-budget picker");
+        assert_eq!(
+            q_picked,
+            vec![0u8, 0],
+            "huge budget → lossless slices ([0; n])"
+        );
+        assert_eq!(
+            rp_picked, rp_max,
+            "huge budget → maximum refinement R[p]=NL-1"
+        );
+    }
+
+    /// Round 224: when even `rp = 0` + `Q = 15` overshoots, the joint
+    /// picker errors with the unreachable-budget message.
+    #[test]
+    fn round224_joint_picker_errors_when_budget_unreachable() {
+        let pixels = make_synthetic_32x32();
+        // Tiny budget — even the worst-case truncated stream is bigger
+        // than 8 bytes (SOC + CAP + PIH alone exceed that), so this is a
+        // guaranteed overshoot.
+        let err = pick_q_slices_rp_for_target_bytes(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            4,
+            8,
+            std::slice::from_ref(&pixels),
+        );
+        let msg = format!("{:?}", err);
+        assert!(err.is_err(), "tiny budget must error");
+        assert!(
+            msg.contains("unreachable"),
+            "error must mention 'unreachable', got {}",
+            msg
+        );
+    }
+
+    /// Round 224: the joint picker's output must always fit the budget
+    /// (when one fits at all). Tested at a tight mid-range budget on the
+    /// 32×32 luma fixture.
+    #[test]
+    fn round224_joint_picker_output_fits_budget() {
+        let pixels = make_synthetic_32x32();
+        // 32×32 with NL,y=2 → Np,y = 8; hsl=4 → 2 slices.
+        let cs_zero_zero = encode_planar_hsl_qslice_rp(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            4,
+            &[0u8, 0],
+            0,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("zero/zero baseline");
+        // Budget = halfway between baseline and 2× baseline (a realistic
+        // bit budget for a live workflow that wants some refinement but
+        // not full lossless).
+        let budget = cs_zero_zero.len() * 3 / 2;
+        let (q_picked, rp_picked) = pick_q_slices_rp_for_target_bytes(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            4,
+            budget,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("joint picker at mid budget");
+        let cs = encode_planar_hsl_qslice_rp(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            4,
+            &q_picked,
+            rp_picked,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("encode at picked (q, rp)");
+        assert!(
+            cs.len() <= budget,
+            "picker output {} must fit budget {}",
+            cs.len(),
+            budget
+        );
+    }
+
+    /// Round 224: the convenience wrapper
+    /// `encode_planar_hsl_qslice_rp_target_bytes` returns the same bytes
+    /// as a manual picker + encode pair.
+    #[test]
+    fn round224_joint_target_bytes_wrapper_matches_manual_pair() {
+        let pixels = make_synthetic_32x32();
+        let cs_zero_zero = encode_planar_hsl_qslice_rp(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            4,
+            &[0u8, 0],
+            0,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("zero/zero baseline");
+        let budget = cs_zero_zero.len() * 2;
+        let (cs_w, q_w, rp_w) = encode_planar_hsl_qslice_rp_target_bytes(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            4,
+            budget,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("wrapper");
+        let (q_m, rp_m) = pick_q_slices_rp_for_target_bytes(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            4,
+            budget,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("manual picker");
+        assert_eq!(q_w, q_m, "wrapper and manual picker pick the same q_slices");
+        assert_eq!(rp_w, rp_m, "wrapper and manual picker pick the same rp");
+        let cs_m = encode_planar_hsl_qslice_rp(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            4,
+            &q_m,
+            rp_m,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("manual encode");
+        assert_eq!(cs_w, cs_m, "wrapper bytes == manual-pair bytes");
+        assert!(cs_w.len() <= budget, "wrapper output must fit budget");
+    }
+
+    /// Round 224: the joint picker works on the RGB + RCT (`Cpih = 1`)
+    /// path — confirming the picker is colour-transform agnostic.
+    #[test]
+    fn round224_joint_picker_works_for_rgb_rct() {
+        let rgb = make_synthetic_rgb_32x32();
+        let mut r = vec![0u8; 32 * 32];
+        let mut g = vec![0u8; 32 * 32];
+        let mut b = vec![0u8; 32 * 32];
+        for i in 0..32 * 32 {
+            r[i] = rgb[i * 3];
+            g[i] = rgb[i * 3 + 1];
+            b[i] = rgb[i * 3 + 2];
+        }
+        let planes = [r, g, b];
+        let cs_zero_zero =
+            encode_planar_hsl_qslice_rp(32, 32, 3, 1, 2, 2, 4, &[0u8, 0], 0, &planes)
+                .expect("RGB+RCT zero/zero baseline");
+        let budget = cs_zero_zero.len() * 3 / 2;
+        let (cs, q_picked, rp_picked) =
+            encode_planar_hsl_qslice_rp_target_bytes(32, 32, 3, 1, 2, 2, 4, budget, &planes)
+                .expect("RGB+RCT joint picker");
+        assert!(cs.len() <= budget, "RGB+RCT picker output must fit budget");
+        let img = decode_codestream(&cs, None).expect("decode RGB+RCT joint picker output");
+        assert_eq!(
+            img.planes.len(),
+            3,
+            "RGB+RCT joint picker output must decode to 3 planes (q={:?}, rp={rp_picked})",
+            q_picked
+        );
+    }
+
+    /// Round 224: composition sanity — at a budget the single-axis
+    /// pickers find easy to fit but where R[p] alone gives no headroom,
+    /// the joint picker must out-fit or equal the rp picker (refinement
+    /// transfers bits within bands; per-slice Q can globally reduce
+    /// bytes).
+    #[test]
+    fn round224_joint_picker_at_least_as_good_as_rp_alone() {
+        let pixels = make_synthetic_32x32();
+        // Mid-range budget where rp picker finds a non-zero answer at
+        // q=2. Use single-slice (hsl=0, q_slices.len()==1) so the joint
+        // picker is directly comparable to the rp picker.
+        let nbeta = n_beta(2, 2);
+        let nl = nbeta; // Nc = 1 → NL = Nβ
+        let rp_max = (nl - 1) as u8;
+        let cs_max = encode_planar_rp(32, 32, 1, 0, 2, 2, 2, rp_max, std::slice::from_ref(&pixels))
+            .expect("rp=NL-1 baseline at q=2");
+        let budget = cs_max.len();
+        let rp_picked_alone =
+            pick_rp_for_target_bytes(32, 32, 1, 0, 2, 2, 2, budget, std::slice::from_ref(&pixels))
+                .expect("rp-only picker");
+        let (_q_joint, rp_joint) = pick_q_slices_rp_for_target_bytes(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            0,
+            budget,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("joint picker single-slice");
+        // The joint picker can at minimum match the rp-only picker
+        // (q_slices = [2], rp = same) since that path is reachable; it
+        // can also reach lower q + same/higher rp. So joint rp must be
+        // >= rp_alone (joint picks the largest fitting refinement after
+        // potentially lowering q from 2 toward 0).
+        assert!(
+            rp_joint >= rp_picked_alone,
+            "joint picker (rp={rp_joint}) must reach at least as much refinement as rp-only ({rp_picked_alone})"
         );
     }
 }
