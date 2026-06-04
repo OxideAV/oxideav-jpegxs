@@ -1,5 +1,115 @@
 # Changelog
 
+## Unreleased — round 230 (high-bit-depth widening of the joint primitive, encoder side)
+
+Closes the round-224 "Out-of-scope (next round)" tail: the
+high-bit-depth widening of the joint per-slice `Q[p]` + precinct
+refinement `R[p]` primitive at `bd = B[i] ∈ 9..=16`. The round-224
+note observed that `encode_planar_inner_bd` already plumbs all four
+parameters (`hsl`, `q_slices`, `rp`, `bd`) through to the precinct
+emitter, so the round-230 widening is the public-API plumbing around
+the `u16`-LE per-plane format inherited from rounds 118 / 133 / 151
+plus a `u16`-aware slice-activity metric for the picker's relaxation
+pass.
+
+Bit depth is orthogonal to both rate levers:
+
+* The forward quantizer (Annex D.4 Table D.3) runs on `i32` wavelet
+  coefficients regardless of `B[i]`.
+* The Annex C.6.2 Table C.10 refinement term
+  `r = (P[b] < R[p]) ? 1 : 0` operates on the band priority `P[b]`
+  and the precinct's `R[p]` — neither carries `B[i]`.
+* The reversible RCT (Annex F.3, `Cpih = 1`) is bit-depth agnostic
+  on the operand window `c < 3`.
+
+So the only bit-depth-dependent pieces remain the DC level shift
+`1 << (bd − 1)` (Annex G.3 inverse) and the two-bytes-per-sample
+plane packing — both inherited from rounds 118 / 133 / 151.
+
+* `encode_planar_hsl_qslice_rp_highbd(width, height, nc, cpih, nlx,
+  nly, bd, hsl, q_slices, rp, &[Vec<u16>]) -> Result<Vec<u8>>` —
+  high-bit-depth joint primitive. Validates `bd ∈ 9..=16` and
+  `cpih ∈ {0, 1}`, validates the per-plane `width * height` sample
+  count and the `0..=2^bd − 1` nominal range, packs each plane to
+  `to_le_bytes()` form and dispatches to `encode_planar_inner_bd` with
+  `Bw = bd`, `Fq = 8` if any slice quantizes else `0`, `Cw = 0`,
+  `Sd = 0`, `Fs = 0`, `Qpih = 0`. The codestream uses the same
+  precinct `Q[p]` / `R[p]` layout as the 8-bit joint primitive.
+* `pick_q_slices_rp_for_target_bytes_highbd(width, height, nc, cpih,
+  nlx, nly, bd, hsl, target_bytes, &[Vec<u16>]) -> Result<(Vec<u8>, u8)>`
+  — high-bit-depth picker. Two-axis nested search: outer loop on `rp`
+  walks from `0` up to `NL − 1` keeping the last fitting solution;
+  inner loop replays r212's lossless probe → uniform-`Q` bisect →
+  activity-driven per-slice relaxation against the round-230
+  high-bit-depth primitive. Promotion stops as soon as the inner
+  search at `rp+1` fails (refinement is monotone non-decreasing in
+  codestream length at fixed `Q[p]`). Baseline reachability: if even
+  `rp = 0` + `q_slices = [15; n]` overshoots, errors with
+  `target_bytes unreachable; rp=0 Q=15 emits N bytes`.
+  `target_bytes == 0` rejected. Every measurement is a real
+  `encode_planar_hsl_qslice_rp_highbd` call — no internal model of
+  the entropy coder, no oracle, no external library.
+* The picker's per-slice relaxation pass uses a new
+  `slice_activity_u16` helper rather than reusing the byte-plane
+  variant on the packed `to_le_bytes()` form: a high-bit-depth `u16`
+  picture's spatial structure lives in the original sample values, so
+  computing the L1 row-to-row first-difference on the original `u16`
+  planes is the right metric (the byte-packed form would mix the low
+  and high bytes of adjacent rows into the activity sum and bias the
+  relaxation toward arbitrary slices).
+* `encode_planar_hsl_qslice_rp_target_bytes_highbd(.., target_bytes,
+  &[Vec<u16>]) -> Result<(Vec<u8>, Vec<u8>, u8)>` — convenience
+  wrapper returning `(codestream, q_slices, rp)`. The codestream is
+  byte-identical to a follow-up
+  `encode_planar_hsl_qslice_rp_highbd(.., q_slices, rp, ..)` call, so
+  callers can persist `(q_slices, rp)` for reproducible re-encode.
+* Scope: 4:4:4 (`sx[i] = sy[i] = 1` for `i < nc`), `Cpih ∈ {0, 1}`
+  (no transform / reversible RCT), `Cw = 0` (single precinct
+  column), `Sd = 0` (no CWD suppression), `Fs = 0` (joint signs),
+  `Qpih = 0` (deadzone), `bd ∈ 9..=16`. Star-Tetrix (`Cpih = 3`) and
+  NLT pre-distortion intersect the joint primitive on a future
+  round.
+
+12 new tests (359 → 371 total):
+* `round230_joint_highbd_lossless_roundtrip_independent_of_rp` —
+  `q_slices = [0; n]` at any `rp` self-roundtrips bit-exactly through
+  the decoder at 10-bit.
+* `round230_joint_highbd_rp_zero_single_slice_matches_highbd_lossy`
+  — single-slice + `rp = 0` joint output byte-identical to
+  `encode_planar_highbd_lossy` at the same `q`.
+* `round230_joint_highbd_lossy_compresses_smaller_than_lossless` —
+  `q_slices = [3, 3]` stream strictly smaller than `[0, 0]` at the
+  same bit depth (the deadzone truncation is biting).
+* `round230_joint_highbd_10bit_luma_psnr_q1_floor` — 10-bit q=1 PSNR
+  ≥ 40 dB through the joint primitive.
+* `round230_joint_highbd_mixed_q_slices_12bit_psnr_floor` — mixed
+  `Q[p] = [0, 3]` at 12-bit holds ≥ 30 dB PSNR.
+* `round230_joint_highbd_picker_rejects_zero_budget` —
+  `target_bytes = 0` rejected before any encode work.
+* `round230_joint_highbd_picker_returns_max_rp_when_budget_is_huge` —
+  huge budget selects max-refinement + lossless slices.
+* `round230_joint_highbd_picker_errors_when_budget_unreachable` —
+  tiny budget triggers the `unreachable` error.
+* `round230_joint_highbd_picker_output_fits_budget` — mid-range
+  budget produces an output `<= target_bytes`.
+* `round230_joint_highbd_target_bytes_wrapper_matches_manual_pair`
+  — wrapper output byte-identical to manual re-encode at picked
+  pair.
+* `round230_joint_highbd_rgb_rct_lossless_roundtrip` — 10-bit
+  3-component RGB + RCT (`Cpih = 1`) self-roundtrips bit-exactly at
+  `q_slices = [0; n]` and any `rp`.
+* `round230_joint_highbd_rejects_bd8_and_cpih3` — `bd = 8` and
+  `Cpih = 3` rejected on the high-bit-depth joint primitive (use the
+  8-bit joint primitive or wait for the Star-Tetrix follow-up).
+
+Out-of-scope (next round): a Star-Tetrix-aware high-bit-depth joint
+primitive (`Cpih = 3` requires the 4-component CFA plane layout and
+CTS / CRG markers — the joint picker would also need to know about
+the Star-Tetrix gain table); high-bit-depth chroma sub-sampling on
+the joint primitive (`encode_planar_subsampled_highbd_lossy` already
+exposes the per-component `(sx, sy)` lossy path, and the joint
+primitive could be widened similarly).
+
 ## Unreleased — round 224 (joint per-slice `Q[p]` + `R[p]` rate-budget picker, encoder side)
 
 Closes the round-218 "next round" tail: the **joint** picker that

@@ -2413,6 +2413,444 @@ pub fn encode_planar_hsl_qslice_rp_target_bytes(
     Ok((cs, q_slices, rp))
 }
 
+/// Round-230 high-bit-depth widening of the round-224 joint primitive:
+/// per-slice `Q[p]` (Annex C.2 Table C.1 lifted to per-slice in round
+/// 206) **plus** precinct refinement `R[p]` (Annex C.2 Table C.1 +
+/// Annex C.6.2 Table C.10) on a single encode call, at component bit
+/// depth `bd = B[i] ∈ 9..=16` (`u16`-LE plane format inherited from
+/// rounds 118 / 133 / 151).
+///
+/// The two rate levers are orthogonal on the bitstream — per-slice
+/// `Q[p]` lives in each precinct's `Q` byte and `R[p]` lives in each
+/// precinct's `R` byte — so any `(q_slices, rp)` pair is spec-compliant.
+/// Bit depth is also orthogonal to both levers because the forward
+/// quantizer (Annex D.4) and the refinement term `r = (P[b] < R[p]) ?
+/// 1 : 0` (Annex C.6.2 Table C.10) both run on `i32` wavelet
+/// coefficients independent of `B[i]`; the only bit-depth-dependent
+/// pieces are the DC level shift `1 << (bd − 1)` (Annex G.3 inverse)
+/// and the two-bytes-per-sample `u16`-LE plane packing.
+///
+/// The codestream uses `Bw = B[i] = bd` and `Fq = 8` whenever any slice
+/// quantizes (`q_slices.iter().any(|&v| v > 0)`); `Fq = 0` when every
+/// slice is lossless. All-equal `q_slices` + `rp = 0` is byte-identical
+/// to a hypothetical `encode_planar_hsl_qslice_highbd` at that `q_slices`
+/// (the round-206 high-bit-depth form, not separately exposed —
+/// callers wanting that surface pass `rp = 0`); single-entry +
+/// `hsl = 0` + `rp > 0` is byte-identical to a hypothetical
+/// `encode_planar_rp_highbd` at the same `(q, rp)`; `q_slices = [0; n]`
+/// with any `rp` is byte-identical to the lossless `rp = 0` stream
+/// (refinement is a no-op when `T` is already at its `0` floor).
+///
+/// **Plane format:** each `planes[i]` carries `width * height`
+/// little-endian `u16` samples in `0..=2^bd − 1` (samples above that
+/// are an encoder error). The decoder returns the reconstructed plane
+/// in the matching two-bytes-per-sample [`crate::image::JpegXsPlane`]
+/// layout when `B[i] > 8`.
+///
+/// **Scope:** 4:4:4 (`sx[i] = sy[i] = 1` for `i < nc`), `Cpih ∈ {0, 1}`
+/// (no transform / reversible RCT, Annex F.3 — bit-depth agnostic),
+/// `Cw = 0` (single precinct column), `Sd = 0` (no CWD suppression),
+/// `Fs = 0` (joint signs), `Qpih = 0` (deadzone inverse quantizer),
+/// `bd ∈ 9..=16`. Star-Tetrix (`Cpih = 3`) and NLT pre-distortion are
+/// not exposed here — they intersect with the joint primitive on a
+/// future round.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_hsl_qslice_rp_highbd(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    bd: u8,
+    hsl: u16,
+    q_slices: &[u8],
+    rp: u8,
+    planes: &[Vec<u16>],
+) -> Result<Vec<u8>> {
+    if !(9..=16).contains(&bd) {
+        return Err(Error::Unsupported(format!(
+            "jpegxs encoder: encode_planar_hsl_qslice_rp_highbd requires B[i] in 9..=16, got {bd} (use encode_planar_hsl_qslice_rp for 8-bit)"
+        )));
+    }
+    if cpih != 0 && cpih != 1 {
+        return Err(Error::Unsupported(format!(
+            "jpegxs encoder: encode_planar_hsl_qslice_rp_highbd supports Cpih in {{0, 1}}, got {cpih}"
+        )));
+    }
+    let max_sample: u16 = ((1u32 << bd) - 1) as u16;
+    // Pack each plane to little-endian u16 bytes (the EncodeConfig
+    // bit_depth > 8 plane format), validating the nominal range first.
+    let mut byte_planes: Vec<Vec<u8>> = Vec::with_capacity(planes.len());
+    for (i, p) in planes.iter().enumerate() {
+        let want = (width as usize) * (height as usize);
+        if p.len() != want {
+            return Err(Error::invalid(format!(
+                "jpegxs encoder: plane {i} sample count {} != Wf*Hf {} (4:4:4)",
+                p.len(),
+                want,
+            )));
+        }
+        let mut bytes = Vec::with_capacity(p.len() * 2);
+        for &s in p {
+            if s > max_sample {
+                return Err(Error::invalid(format!(
+                    "jpegxs encoder: plane {i} sample {s} exceeds B[i]={bd} max {max_sample}"
+                )));
+            }
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        byte_planes.push(bytes);
+    }
+    let sx = vec![1u8; nc as usize];
+    let sy = vec![1u8; nc as usize];
+    let q_pic = q_slices.iter().copied().max().unwrap_or(0);
+    let fq = if q_slices.iter().any(|&v| v > 0) {
+        8
+    } else {
+        0
+    };
+    encode_planar_inner_bd(
+        width,
+        height,
+        nc,
+        bd,
+        cpih,
+        nlx,
+        nly,
+        fq,
+        q_pic,
+        &sx,
+        &sy,
+        0,
+        0,
+        0,
+        0,
+        None,
+        Vec::new(),
+        0,   // cw: single precinct column
+        0,   // sd: no CWD suppression
+        0,   // fs: signs jointly with data (Fs=0)
+        hsl, // hsl: slice height in precinct rows
+        0,   // qpih: deadzone inverse quantizer (Qpih=0)
+        rp,  // rp: precinct refinement R[p]
+        q_slices.to_vec(),
+        &byte_planes,
+    )
+}
+
+/// Round-230 high-bit-depth widening of the round-224 joint rate-
+/// budget picker. Composes the round-218 `R[p]` linear scan with
+/// r212's three-pass per-slice `Q[p]` strategy, driving the round-230
+/// high-bit-depth joint primitive [`encode_planar_hsl_qslice_rp_highbd`]
+/// at component bit depth `bd ∈ 9..=16`.
+///
+/// **Strategy** — identical two-axis nested search as
+/// [`pick_q_slices_rp_for_target_bytes`]: outer loop on `rp` walks from
+/// `0` up to `NL − 1` keeping the last fitting solution; inner loop
+/// reuses r212's lossless probe → uniform-`Q` bisect → activity-driven
+/// per-slice relaxation against the high-bit-depth joint primitive.
+/// Promotion stops as soon as the inner search at `rp+1` fails
+/// (refinement is monotone non-decreasing in codestream length at
+/// fixed `Q[p]`, so higher `rp` cannot fit either).
+///
+/// **Baseline reachability** — if even `rp = 0` + `q_slices = [15; n]`
+/// overshoots, errors with `target_bytes unreachable; rp=0 Q=15 emits
+/// N bytes` (no choice of `(q_slices, rp)` can fit at this bit depth).
+/// `target_bytes == 0` rejected.
+///
+/// Every measurement is a real
+/// [`encode_planar_hsl_qslice_rp_highbd`] call — no internal model of
+/// the entropy coder, no oracle, no external library. The per-slice
+/// activity metric is computed on the original `u16` planes
+/// (`Σ |row[r+1][c] − row[r][c]|` summed across every plane inside
+/// each slice's image-row range) rather than the byte-packed form, so
+/// the high-bit-depth content's spatial structure drives the
+/// relaxation rather than the low-byte / high-byte interleave.
+///
+/// **Scope** mirrors [`encode_planar_hsl_qslice_rp_highbd`] exactly.
+#[allow(clippy::too_many_arguments)]
+pub fn pick_q_slices_rp_for_target_bytes_highbd(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    bd: u8,
+    hsl: u16,
+    target_bytes: usize,
+    planes: &[Vec<u16>],
+) -> Result<(Vec<u8>, u8)> {
+    if target_bytes == 0 {
+        return Err(Error::invalid(
+            "jpegxs joint picker (highbd): target_bytes must be > 0".to_string(),
+        ));
+    }
+    if !(9..=16).contains(&bd) {
+        return Err(Error::Unsupported(format!(
+            "jpegxs joint picker (highbd): requires B[i] in 9..=16, got {bd}"
+        )));
+    }
+    if cpih != 0 && cpih != 1 {
+        return Err(Error::Unsupported(format!(
+            "jpegxs joint picker (highbd): supports Cpih in {{0, 1}}, got {cpih}"
+        )));
+    }
+    // NL = Nc × Nβ for the 4:4:4 / Sd = 0 surface.
+    let nbeta = n_beta(nlx, nly);
+    let nl = (nc as u32) * nbeta;
+    if nl == 0 {
+        return Err(Error::invalid(format!(
+            "jpegxs joint picker (highbd): NL=0 (nc={nc}, NL,x={nlx}, NL,y={nly})"
+        )));
+    }
+    let rp_max = (nl - 1).min(u8::MAX as u32) as u8;
+
+    // Slice count — mirrors r224's picker.
+    let hp_pow = 1u32 << nly;
+    let np_y = (height as u32).div_ceil(hp_pow);
+    let hsl_rows = if hsl == 0 { np_y } else { hsl as u32 };
+    if hsl_rows == 0 {
+        return Err(Error::invalid(format!(
+            "jpegxs joint picker (highbd): Hsl={hsl} resolves to zero precinct rows per slice (height={height}, NL,y={nly})"
+        )));
+    }
+    let n_slices = np_y.div_ceil(hsl_rows) as usize;
+
+    // Baseline reachability — if even rp=0 + Q=15 (max quantization,
+    // no refinement) overshoots the budget, no (q_slices, rp) pair can
+    // fit. Probe before any outer-loop work so the error surfaces fast.
+    let cs_baseline = encode_planar_hsl_qslice_rp_highbd(
+        width,
+        height,
+        nc,
+        cpih,
+        nlx,
+        nly,
+        bd,
+        hsl,
+        &vec![15u8; n_slices],
+        0,
+        planes,
+    )?;
+    if cs_baseline.len() > target_bytes {
+        return Err(Error::invalid(format!(
+            "jpegxs joint picker (highbd): target_bytes={target_bytes} unreachable; rp=0 Q=15 emits {} bytes",
+            cs_baseline.len()
+        )));
+    }
+
+    // Outer loop on rp — walk upward keeping the last fitting (q_slices,
+    // rp) pair. For each rp, run the inner activity-driven q_slices
+    // picker; if it fits, promote; if it doesn't, stop.
+    let mut best_q = vec![15u8; n_slices];
+    let mut best_rp: u8 = 0;
+    for rp in 0..=rp_max {
+        match pick_q_slices_at_rp_highbd(
+            width,
+            height,
+            nc,
+            cpih,
+            nlx,
+            nly,
+            bd,
+            hsl,
+            rp,
+            target_bytes,
+            n_slices,
+            planes,
+        ) {
+            Ok(qs) => {
+                best_q = qs;
+                best_rp = rp;
+            }
+            Err(_) => break,
+        }
+    }
+    Ok((best_q, best_rp))
+}
+
+/// Round-230 inner picker — at a fixed `rp`, replays r212's three-pass
+/// `q_slices` search against
+/// [`encode_planar_hsl_qslice_rp_highbd`] using the `u16` plane
+/// activity metric. Returns `Err` if even `[15; n_slices]` overshoots
+/// at this `rp` (signal to the outer loop that higher `rp` cannot fit
+/// either).
+#[allow(clippy::too_many_arguments)]
+fn pick_q_slices_at_rp_highbd(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    bd: u8,
+    hsl: u16,
+    rp: u8,
+    target_bytes: usize,
+    n_slices: usize,
+    planes: &[Vec<u16>],
+) -> Result<Vec<u8>> {
+    // Pass 1 — lossless probe.
+    let q_zero = vec![0u8; n_slices];
+    let cs_zero = encode_planar_hsl_qslice_rp_highbd(
+        width, height, nc, cpih, nlx, nly, bd, hsl, &q_zero, rp, planes,
+    )?;
+    if cs_zero.len() <= target_bytes {
+        return Ok(q_zero);
+    }
+
+    // Pass 2 — uniform-Q bisect over 1..=15.
+    let mut lo: u8 = 1;
+    let mut hi: u8 = 15;
+    let mut best_uniform_q: Option<u8> = None;
+    let mut best_uniform_len: usize = usize::MAX;
+    while lo <= hi {
+        let mid = (lo + hi) / 2;
+        let qv = vec![mid; n_slices];
+        let cs = encode_planar_hsl_qslice_rp_highbd(
+            width, height, nc, cpih, nlx, nly, bd, hsl, &qv, rp, planes,
+        )?;
+        if cs.len() <= target_bytes {
+            best_uniform_q = Some(mid);
+            best_uniform_len = cs.len();
+            if mid == 0 {
+                break;
+            }
+            hi = mid - 1;
+        } else {
+            if mid == 15 {
+                break;
+            }
+            lo = mid + 1;
+        }
+    }
+    let uniform_q = match best_uniform_q {
+        Some(q) => q,
+        None => {
+            // Q=15 at this rp overshoots → signal outer loop to stop.
+            return Err(Error::invalid(format!(
+                "jpegxs joint picker (highbd, rp={rp}): target_bytes={target_bytes} unreachable; Q=15 overshoots"
+            )));
+        }
+    };
+
+    if n_slices == 1 {
+        return Ok(vec![uniform_q; 1]);
+    }
+
+    // Pass 3 — per-slice activity-driven relaxation on `u16` planes.
+    let slice_row_ranges =
+        compute_slice_row_ranges(height, nly, hsl_rows_for(hsl, np_y_for(height, nly)));
+    debug_assert_eq!(slice_row_ranges.len(), n_slices);
+    let mut activity: Vec<(usize, u64)> = slice_row_ranges
+        .iter()
+        .enumerate()
+        .map(|(t, &(y0, y1))| (t, slice_activity_u16(planes, width, y0, y1)))
+        .collect();
+    activity.sort_by_key(|&(_, a)| a);
+
+    let mut best = vec![uniform_q; n_slices];
+    let mut best_len = best_uniform_len;
+    loop {
+        let mut changed = false;
+        for &(t, _) in &activity {
+            if best[t] == 0 {
+                continue;
+            }
+            let mut trial = best.clone();
+            trial[t] -= 1;
+            let cs = encode_planar_hsl_qslice_rp_highbd(
+                width, height, nc, cpih, nlx, nly, bd, hsl, &trial, rp, planes,
+            )?;
+            if cs.len() <= target_bytes {
+                best = trial;
+                best_len = cs.len();
+                changed = true;
+            }
+        }
+        let _ = best_len;
+        if !changed {
+            break;
+        }
+    }
+    Ok(best)
+}
+
+/// Round-230 high-bit-depth slice-activity helper. Mirrors
+/// [`slice_activity`] but operates on `u16` planes so the spatial
+/// metric reflects the original sample magnitudes rather than the
+/// low-byte / high-byte interleave of a `to_le_bytes()` packing.
+fn slice_activity_u16(planes: &[Vec<u16>], width: u16, y0: u32, y1: u32) -> u64 {
+    let w = width as usize;
+    if w == 0 || y1 <= y0 + 1 {
+        return 0;
+    }
+    let mut acc: u64 = 0;
+    for plane in planes {
+        if plane.is_empty() || plane.len() < w {
+            continue;
+        }
+        let plane_rows = plane.len() / w;
+        let r0 = (y0 as usize).min(plane_rows);
+        let r1 = (y1 as usize).min(plane_rows);
+        if r1 <= r0 + 1 {
+            continue;
+        }
+        for r in r0..r1 - 1 {
+            let cur = &plane[r * w..(r + 1) * w];
+            let nxt = &plane[(r + 1) * w..(r + 2) * w];
+            for c in 0..w {
+                acc += (cur[c] as i32 - nxt[c] as i32).unsigned_abs() as u64;
+            }
+        }
+    }
+    acc
+}
+
+/// Round-230 high-bit-depth convenience wrapper — picks
+/// `(q_slices, rp)` against `target_bytes` and emits the codestream in
+/// one call at component bit depth `bd ∈ 9..=16`.
+///
+/// Returns `(codestream, q_slices, rp)`. The codestream is guaranteed
+/// to satisfy `codestream.len() <= target_bytes` (otherwise the picker
+/// returns `target_bytes unreachable`). The `q_slices` and `rp` values
+/// are the ones returned by
+/// [`pick_q_slices_rp_for_target_bytes_highbd`]; callers can persist
+/// them for reproducible re-encode through
+/// [`encode_planar_hsl_qslice_rp_highbd`].
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_hsl_qslice_rp_target_bytes_highbd(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    bd: u8,
+    hsl: u16,
+    target_bytes: usize,
+    planes: &[Vec<u16>],
+) -> Result<(Vec<u8>, Vec<u8>, u8)> {
+    let (q_slices, rp) = pick_q_slices_rp_for_target_bytes_highbd(
+        width,
+        height,
+        nc,
+        cpih,
+        nlx,
+        nly,
+        bd,
+        hsl,
+        target_bytes,
+        planes,
+    )?;
+    let cs = encode_planar_hsl_qslice_rp_highbd(
+        width, height, nc, cpih, nlx, nly, bd, hsl, &q_slices, rp, planes,
+    )?;
+    Ok((cs, q_slices, rp))
+}
+
 /// Round-108 uniform-inverse-quantizer entry point (`Qpih = 1`).
 ///
 /// Same shape as [`encode_planar_lossy`] but sets the picture-header
@@ -11283,6 +11721,455 @@ mod tests {
         assert!(
             rp_joint >= rp_picked_alone,
             "joint picker (rp={rp_joint}) must reach at least as much refinement as rp-only ({rp_picked_alone})"
+        );
+    }
+
+    // === Round 230: high-bit-depth widening of the joint primitive =======
+
+    /// Round 230: at `q_slices = [0; n]` (lossless) refinement is a no-op,
+    /// so the high-bit-depth joint primitive must self-roundtrip
+    /// bit-exactly regardless of `rp` at any `bd ∈ 9..=16`.
+    #[test]
+    fn round230_joint_highbd_lossless_roundtrip_independent_of_rp() {
+        let src = make_synthetic_highbd(32, 32, 10);
+        let nbeta = n_beta(2, 2);
+        let nl = nbeta;
+        let rp_max = (nl - 1) as u8;
+        // 32×32 with NL,y=2 → Np,y = 8; hsl=4 → 2 slices matching [0, 0].
+        let cs = encode_planar_hsl_qslice_rp_highbd(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            10,
+            4,
+            &[0u8, 0],
+            rp_max,
+            std::slice::from_ref(&src),
+        )
+        .expect("joint highbd q=0 rp=NL-1");
+        let img = decode_codestream(&cs, None).expect("decode highbd joint q=0 rp=NL-1");
+        assert_eq!(img.bit_depth, 10, "PIH Bw must be 10");
+        assert_eq!(
+            plane_u16(&img.planes[0].data),
+            src,
+            "lossless joint highbd must roundtrip bit-exactly"
+        );
+    }
+
+    /// Round 230: at `rp = 0` the high-bit-depth joint primitive emits
+    /// exactly the same lossy bytes as the round-133 lossy entry point
+    /// (`encode_planar_highbd_lossy`) on a single-slice 4:4:4 setup with
+    /// matching `q`. Confirms `rp = 0` is the no-refinement default at
+    /// high bit depth.
+    #[test]
+    fn round230_joint_highbd_rp_zero_single_slice_matches_highbd_lossy() {
+        let src = make_synthetic_highbd(32, 32, 12);
+        // Single slice (hsl=0) + q_slices = [3] should equal
+        // encode_planar_highbd_lossy at q=3, since both pin Cpih=0, Cw=0,
+        // Sd=0, Fs=0, Qpih=0, rp=0.
+        let baseline =
+            encode_planar_highbd_lossy(32, 32, 1, 0, 2, 2, 12, 3, std::slice::from_ref(&src))
+                .expect("baseline highbd lossy q=3");
+        let joint = encode_planar_hsl_qslice_rp_highbd(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            12,
+            0,
+            &[3u8],
+            0,
+            std::slice::from_ref(&src),
+        )
+        .expect("joint highbd single-slice rp=0 q=3");
+        assert_eq!(
+            baseline, joint,
+            "single-slice rp=0 joint highbd byte-identical to encode_planar_highbd_lossy"
+        );
+    }
+
+    /// Round 230: the joint highbd primitive must produce a lossy stream
+    /// strictly smaller than the lossless one at the same bit depth (the
+    /// per-band deadzone truncation must be biting at `q > 0`).
+    #[test]
+    fn round230_joint_highbd_lossy_compresses_smaller_than_lossless() {
+        let src = make_synthetic_highbd(32, 32, 12);
+        let lossless = encode_planar_hsl_qslice_rp_highbd(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            12,
+            4,
+            &[0u8, 0],
+            0,
+            std::slice::from_ref(&src),
+        )
+        .expect("lossless joint highbd");
+        let lossy = encode_planar_hsl_qslice_rp_highbd(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            12,
+            4,
+            &[3u8, 3],
+            0,
+            std::slice::from_ref(&src),
+        )
+        .expect("lossy joint highbd q=3");
+        assert!(
+            lossy.len() < lossless.len(),
+            "q=3 stream ({}) must be smaller than lossless ({})",
+            lossy.len(),
+            lossless.len()
+        );
+    }
+
+    /// Round 230: the joint highbd primitive must preserve a high PSNR
+    /// floor at near-lossless quantization on a 10-bit luma fixture
+    /// (mirrors the round-133 `highbd_lossy_10bit_luma_psnr_q1` shape but
+    /// goes through the round-230 joint entry point).
+    #[test]
+    fn round230_joint_highbd_10bit_luma_psnr_q1_floor() {
+        let src = make_synthetic_highbd(32, 32, 10);
+        let cs = encode_planar_hsl_qslice_rp_highbd(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            10,
+            4,
+            &[1u8, 1],
+            0,
+            std::slice::from_ref(&src),
+        )
+        .expect("joint highbd 10-bit q=1");
+        let img = decode_codestream(&cs, None).expect("decode joint highbd 10-bit q=1");
+        let rec = plane_u16(&img.planes[0].data);
+        let p = psnr_u16(&src, &rec, 10);
+        assert!(
+            p >= 40.0,
+            "10-bit joint q=1 PSNR {p:.2} dB must be >= 40 dB"
+        );
+    }
+
+    /// Round 230: the joint highbd primitive accepts mixed per-slice
+    /// quantization values and preserves a reasonable PSNR floor even on
+    /// a 12-bit picture with `Q[p] = [0, 3]` (one lossless slice, one
+    /// quantized) — sanity that the per-slice mechanism survives bit-
+    /// depth widening.
+    #[test]
+    fn round230_joint_highbd_mixed_q_slices_12bit_psnr_floor() {
+        let src = make_synthetic_highbd(32, 32, 12);
+        let cs = encode_planar_hsl_qslice_rp_highbd(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            12,
+            4,
+            &[0u8, 3],
+            0,
+            std::slice::from_ref(&src),
+        )
+        .expect("joint highbd 12-bit mixed q");
+        let img = decode_codestream(&cs, None).expect("decode joint highbd 12-bit mixed q");
+        let rec = plane_u16(&img.planes[0].data);
+        let p = psnr_u16(&src, &rec, 12);
+        // [0, 3] mix at NL=2/2 is well within the 30 dB floor we hold on
+        // 12-bit q=2 (the lossless half raises the average vs uniform q=3).
+        assert!(
+            p >= 30.0,
+            "12-bit joint Q=[0,3] PSNR {p:.2} dB must be >= 30 dB"
+        );
+    }
+
+    /// Round 230: the joint highbd picker rejects `target_bytes = 0`
+    /// before any encode work.
+    #[test]
+    fn round230_joint_highbd_picker_rejects_zero_budget() {
+        let src = make_synthetic_highbd(32, 32, 10);
+        let err = pick_q_slices_rp_for_target_bytes_highbd(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            10,
+            4,
+            0,
+            std::slice::from_ref(&src),
+        );
+        assert!(err.is_err(), "target_bytes = 0 must be rejected");
+    }
+
+    /// Round 230: when the budget comfortably accommodates the largest
+    /// candidate (lossless slices + maximum refinement), the joint
+    /// highbd picker must return that maximum-refinement configuration.
+    #[test]
+    fn round230_joint_highbd_picker_returns_max_rp_when_budget_is_huge() {
+        let src = make_synthetic_highbd(32, 32, 10);
+        let nbeta = n_beta(2, 2);
+        let nl = nbeta;
+        let rp_max = (nl - 1) as u8;
+        let cs_loss = encode_planar_hsl_qslice_rp_highbd(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            10,
+            4,
+            &[0u8, 0],
+            rp_max,
+            std::slice::from_ref(&src),
+        )
+        .expect("max-cost highbd candidate");
+        let (q_picked, rp_picked) = pick_q_slices_rp_for_target_bytes_highbd(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            10,
+            4,
+            cs_loss.len() + 1024,
+            std::slice::from_ref(&src),
+        )
+        .expect("huge-budget highbd picker");
+        assert_eq!(
+            q_picked,
+            vec![0u8, 0],
+            "huge budget → lossless slices ([0; n])"
+        );
+        assert_eq!(
+            rp_picked, rp_max,
+            "huge budget → maximum refinement R[p]=NL-1"
+        );
+    }
+
+    /// Round 230: when even `rp = 0` + `Q = 15` overshoots, the joint
+    /// highbd picker errors with the unreachable-budget message.
+    #[test]
+    fn round230_joint_highbd_picker_errors_when_budget_unreachable() {
+        let src = make_synthetic_highbd(32, 32, 12);
+        // Tiny budget — SOC + CAP + PIH + CDT + WGT alone exceed 8 bytes,
+        // so this is a guaranteed overshoot even at Q=15.
+        let err = pick_q_slices_rp_for_target_bytes_highbd(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            12,
+            4,
+            8,
+            std::slice::from_ref(&src),
+        );
+        assert!(err.is_err(), "target_bytes = 8 must be unreachable");
+    }
+
+    /// Round 230: at a mid-range budget the joint highbd picker must
+    /// emit a codestream whose length actually fits the budget.
+    #[test]
+    fn round230_joint_highbd_picker_output_fits_budget() {
+        let src = make_synthetic_highbd(32, 32, 10);
+        // Compute the lossless rp=0 size as an upper bound, then aim for
+        // ~60% of it as a tight-but-reachable budget.
+        let cs_lossless = encode_planar_hsl_qslice_rp_highbd(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            10,
+            4,
+            &[0u8, 0],
+            0,
+            std::slice::from_ref(&src),
+        )
+        .expect("lossless reference");
+        let budget = cs_lossless.len() * 6 / 10;
+        let (q_picked, rp_picked) = pick_q_slices_rp_for_target_bytes_highbd(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            10,
+            4,
+            budget,
+            std::slice::from_ref(&src),
+        )
+        .expect("mid-budget highbd picker");
+        let cs = encode_planar_hsl_qslice_rp_highbd(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            10,
+            4,
+            &q_picked,
+            rp_picked,
+            std::slice::from_ref(&src),
+        )
+        .expect("re-encode picked highbd");
+        assert!(
+            cs.len() <= budget,
+            "picked highbd codestream {} must fit budget {}",
+            cs.len(),
+            budget
+        );
+    }
+
+    /// Round 230: the high-bit-depth target-bytes wrapper must produce a
+    /// codestream byte-identical to a follow-up
+    /// `encode_planar_hsl_qslice_rp_highbd(.., q_slices, rp, ..)` at the
+    /// `(q_slices, rp)` the picker returned. Persisting the pair allows
+    /// reproducible re-encode through the primitive.
+    #[test]
+    fn round230_joint_highbd_target_bytes_wrapper_matches_manual_pair() {
+        let src = make_synthetic_highbd(32, 32, 10);
+        let cs_lossless = encode_planar_hsl_qslice_rp_highbd(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            10,
+            4,
+            &[0u8, 0],
+            0,
+            std::slice::from_ref(&src),
+        )
+        .expect("lossless reference");
+        let budget = cs_lossless.len() * 7 / 10;
+        let (cs_wrapper, q_picked, rp_picked) = encode_planar_hsl_qslice_rp_target_bytes_highbd(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            10,
+            4,
+            budget,
+            std::slice::from_ref(&src),
+        )
+        .expect("highbd target-bytes wrapper");
+        let cs_manual = encode_planar_hsl_qslice_rp_highbd(
+            32,
+            32,
+            1,
+            0,
+            2,
+            2,
+            10,
+            4,
+            &q_picked,
+            rp_picked,
+            std::slice::from_ref(&src),
+        )
+        .expect("manual re-encode at picked pair");
+        assert_eq!(
+            cs_wrapper, cs_manual,
+            "wrapper output must be byte-identical to manual re-encode"
+        );
+    }
+
+    /// Round 230: the high-bit-depth joint primitive composes with the
+    /// reversible RCT (`Cpih = 1`, 3-component 4:4:4) — the colour
+    /// transform is bit-depth agnostic per Annex F.3, so a 10-bit RGB
+    /// fixture must self-roundtrip losslessly at `q_slices = [0; n]`
+    /// regardless of `rp`.
+    #[test]
+    fn round230_joint_highbd_rgb_rct_lossless_roundtrip() {
+        let r = make_synthetic_highbd(32, 32, 10);
+        let mut g = make_synthetic_highbd(32, 32, 10);
+        let mut b = make_synthetic_highbd(32, 32, 10);
+        for v in g.iter_mut() {
+            *v = (*v + 121) & 0x3ff;
+        }
+        for v in b.iter_mut() {
+            *v = (v.wrapping_mul(3).wrapping_add(7)) & 0x3ff;
+        }
+        let planes = vec![r.clone(), g.clone(), b.clone()];
+        let nbeta = n_beta(2, 2);
+        let nl = 3 * nbeta;
+        let rp_max = (nl - 1) as u8;
+        let cs = encode_planar_hsl_qslice_rp_highbd(
+            32,
+            32,
+            3,
+            1,
+            2,
+            2,
+            10,
+            4,
+            &[0u8, 0],
+            rp_max,
+            &planes,
+        )
+        .expect("joint highbd 10-bit RGB+RCT lossless rp=NL-1");
+        let img = decode_codestream(&cs, None).expect("decode joint highbd 10-bit RGB+RCT");
+        for (i, orig) in [&r, &g, &b].iter().enumerate() {
+            let rec = plane_u16(&img.planes[i].data);
+            assert_eq!(rec, **orig, "component {i} must roundtrip bit-exactly");
+        }
+    }
+
+    /// Round 230: `bd = 8` is rejected (the caller should use the 8-bit
+    /// joint primitive `encode_planar_hsl_qslice_rp`).
+    #[test]
+    fn round230_joint_highbd_rejects_bd8_and_cpih3() {
+        let src = vec![0u16; 16 * 16];
+        // bd = 8 routes through the 8-bit joint primitive.
+        assert!(
+            encode_planar_hsl_qslice_rp_highbd(
+                16,
+                16,
+                1,
+                0,
+                1,
+                1,
+                8,
+                0,
+                &[0u8],
+                0,
+                std::slice::from_ref(&src),
+            )
+            .is_err(),
+            "bd=8 must be rejected"
+        );
+        // Cpih = 3 (Star-Tetrix) not exposed on this path.
+        let planes = vec![vec![0u16; 16]; 4];
+        assert!(
+            encode_planar_hsl_qslice_rp_highbd(4, 4, 4, 3, 1, 1, 10, 0, &[0u8], 0, &planes,)
+                .is_err(),
+            "Cpih=3 must be rejected on the joint highbd primitive"
         );
     }
 }
