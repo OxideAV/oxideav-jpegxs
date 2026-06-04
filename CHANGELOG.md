@@ -1,6 +1,73 @@
 # Changelog
 
-## Unreleased — round 230 (high-bit-depth widening of the joint primitive, encoder side)
+## Unreleased — round 233 (per-precinct `Q[p]` override, encoder side)
+
+Lifts the round-206 per-slice `Q[p]` mechanism (one `Q[p]` per slice
+in top-down `Yslh` order) to the spec-natural per-precinct form of
+Annex C.2 Table C.1, where `Q[p]` is indexed by precinct `p`. Round
+206 took `q` from picture-level (round 3) to one per slice; round 233
+takes it the rest of the way — one `Q[p]` per precinct.
+
+The bitstream-wire impact is exactly the per-precinct `Q` byte in
+each precinct's header (Annex C.2 Table C.1). The decoder reads
+`Q[p]` per precinct (`parse_precinct_header` + `precinct_truncation`)
+since the early rounds, so no decoder change is needed — the per-
+precinct override is a pure encoder rate-allocation lever.
+
+* `encode_planar_qpr(width, height, nc, cpih, nlx, nly, q_precincts,
+  &[Vec<u8>]) -> Result<Vec<u8>>` — round-233 per-precinct `Q[p]`
+  override entry point. `q_precincts` is indexed in raster scan order
+  with the precinct at row `py`, column `px` at position
+  `py * Np,x + px`; length must equal `Np,y × Np,x` where
+  `Np,y = ⌈Hf / 2^NL,y⌉`. Each entry is in `0..=15` (the band-
+  truncation `T[p,b] = clamp(Q[p] − G[b] − r, 0, 15)` math is
+  identical, only the source of `Q[p]` changes). `Fq` is
+  auto-selected: `0` (lossless) when every entry is `0`, else `8`
+  (regular per Table A.8 — required for any non-zero `Q[p]`).
+* `EncodeConfig` gains a `q_precincts: Vec<u8>` field. Empty → every
+  precinct inherits its slice's `Q[p]` (from `q_slices`) or the
+  picture-level `q` when both are empty — preserves byte-identical
+  output for every existing callsite. Non-empty validates length =
+  `Np,y × Np,x` and each entry `≤ 15` (and `> 0` requires `Fq = 8`).
+* `precinct_cfg_for(cfg, py, px, np_x)` helper layers on top of
+  `slice_cfg_for(cfg, t)` inside `write_slice`: per-precinct override
+  wins where it's non-empty, then per-slice, then picture-level `q`.
+
+**Composition behaviour** (the four byte-identity properties — every
+combination has a test against its expected baseline):
+
+* `q_precincts = [0; n]` is byte-identical to `encode_planar` (every
+  precinct lossless reduces to the picture-level lossless stream).
+* `q_precincts = [q; n]` (every precinct same `Q[p]`) is byte-
+  identical to `encode_planar_lossy` at that single `q` (the per-
+  precinct override resolves to a no-op when `q_precincts[idx]`
+  equals `cfg.q`, the picture-level fallback).
+* Mixed `q_precincts` produces a strictly larger codestream than
+  `[15; n]` whenever any entry is `< 15` (lower `Q[p]` retains more
+  magnitude bitplanes).
+* Composes with the reversible RCT (`Cpih = 1`, Annex F.3 — bit-
+  depth agnostic operand window `c < 3`) and Star-Tetrix (`Cpih = 3`,
+  Annex F.5 — `i32` integer linear combinations on the wavelet-
+  domain coefficients, Q-agnostic on the lifting). 4-component CFA
+  `Cpih = 3` self-roundtrips losslessly at `q_precincts = [0; n]`.
+
+**Scope:** 4:4:4 (`sx[i] = sy[i] = 1` for `i < nc`),
+`Cpih ∈ {0, 1, 3}`, `Cw = 0` (single precinct column → `Np,x = 1`,
+so `q_precincts` reduces to one entry per precinct row), `Hsl = 0`
+(single slice), `Sd = 0`, `Fs = 0`, `Qpih = 0`, `B[i] = 8`.
+High-bit-depth widening, multi-column (`Cw > 0`) and the
+`Hsl > 0` × `q_precincts` cross-product (each slice carrying its own
+sub-array of per-precinct overrides) intersect with the lever on
+future rounds.
+
+Tests: +9 (380 total). Covers lossless byte-identity, uniform-Q
+byte-identity to `encode_planar_lossy`, mixed-Q PSNR ≥ 30 dB +
+round-trip, the per-precinct `Q[p]` byte surfacing on the wire,
+length / range rejection, RCT + Star-Tetrix lossless self-
+roundtrip, and the "lower Q keeps more bits" rate-allocation
+property against a uniform-max-Q baseline.
+
+## Round 230 (high-bit-depth widening of the joint primitive, encoder side)
 
 Closes the round-224 "Out-of-scope (next round)" tail: the
 high-bit-depth widening of the joint per-slice `Q[p]` + precinct
