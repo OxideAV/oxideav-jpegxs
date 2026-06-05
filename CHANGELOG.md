@@ -1,5 +1,82 @@
 # Changelog
 
+## Unreleased — round 239 (per-precinct `R[p]` override, encoder side)
+
+Lifts the round-115 picture-wide `R[p]` mechanism (Annex C.2 Table C.1,
+the precinct-refinement byte) to the spec-natural per-precinct form
+where `R[p]` is indexed by precinct `p`. Round 233 took `Q[p]` from
+picture-level to per-precinct; round 239 takes the second precinct-
+header rate lever the same distance — one `R[p]` per precinct.
+
+The bitstream-wire impact is exactly the per-precinct `R` byte in
+each precinct's header (Annex C.2 Table C.1). The decoder reads
+`R[p]` per precinct (`parse_precinct_header` + `precinct_truncation`)
+since round 115, so no decoder change is needed — the per-precinct
+override is a pure encoder rate-allocation lever, symmetric with the
+round-233 `Q[p]` override.
+
+* `encode_planar_rpr(width, height, nc, cpih, nlx, nly, r_precincts,
+  &[Vec<u8>]) -> Result<Vec<u8>>` — round-239 per-precinct `R[p]`
+  override entry point. `r_precincts` is indexed in raster scan order
+  with the precinct at row `py`, column `px` at position
+  `py * Np,x + px`; length must equal `Np,y × Np,x` where
+  `Np,y = ⌈Hf / 2^NL,y⌉`. Each entry is in `0..=NL − 1` where
+  `NL = (Nc − Sd) × Nβ + Sd` is the total band count (Annex B.6 NL
+  definition; at the round-239 `Sd = 0` scope `NL = Nc × Nβ`).
+* `EncodeConfig` gains an `r_precincts: Vec<u8>` field. Empty → every
+  precinct inherits the picture-level `rp` (round-115 behaviour) —
+  preserves byte-identical output for every existing callsite.
+  Non-empty validates length = `Np,y × Np,x` and each entry `≤ NL − 1`.
+* The existing `precinct_cfg_for(cfg, py, px, np_x)` helper, which the
+  round-233 work introduced to overlay per-precinct `Q[p]`, is
+  extended to also overlay per-precinct `R[p]` — the helper now clones
+  the cfg when either `q_precincts` or `r_precincts` resolves to a
+  value differing from the outer cfg. Both per-precinct vectors compose
+  cleanly: the precinct sees its own `(Q[p], R[p])` pair at the same
+  emission site.
+
+**Composition behaviour:**
+
+* `r_precincts = [0; n]` is byte-identical to `encode_planar` at the
+  same geometry (every precinct's `R[p] = 0` reduces to the picture-
+  level lossless stream).
+* Picture-wide `q = 0` is pinned by `encode_planar_rpr`: the
+  Annex C.6.2 Table C.10 truncation
+  `T[p, b] = clamp(Q[p] − G[b] − r, 0, 15)` floors at the `0` clamp
+  regardless of `r`, so any `r_precincts` pattern emits the same data
+  sub-packet bytes (the wire-level change is the per-precinct `R[p]`
+  byte alone). The lever exposes the precinct-header field without
+  yet engaging it as a rate-distortion lever — that requires a
+  future `encode_planar_qpr_rpr` cross-product at `q > 0`.
+* The picture-header chain (PIH `Hsl = 0` single slice; CDT 8-bit
+  `B[i] = 8`; WGT carries the per-band gains and priorities) is
+  identical to the round-115 `encode_planar_rp` output.
+
+**Scope:** 4:4:4 (`sx[i] = sy[i] = 1` for `i < nc`),
+`Cpih ∈ {0, 1, 3}`, `Cw = 0` (single precinct column → `Np,x = 1`,
+so `r_precincts` reduces to one entry per precinct row), `Hsl = 0`
+(single slice), `Sd = 0`, `Fs = 0`, `Qpih = 0`, `B[i] = 8`.
+
+Tests: +3 (383 total).
+* `round239_rpr_all_zero_matches_encode_planar_lossless` — every
+  precinct at `R[p] = 0` reproduces the `encode_planar` baseline
+  byte-for-byte at NL=2/2, 32×32 luma.
+* `round239_rpr_wire_carries_per_precinct_r` — every precinct's
+  header byte 4 (`R[p]`, the round-115 byte position) carries the
+  caller's value; the decoder round-trips a 32×32 luma at NL=1/1
+  with a mixed `R[p] ∈ 0..=3` pattern across 16 precincts.
+* `round239_rpr_rejects_wrong_length_and_out_of_range` — wrong
+  `r_precincts.len()` (expected `Np,y × Np,x`) and any entry exceeding
+  `NL − 1` are rejected with `JpegXsError::Invalid` before any
+  encode work runs.
+
+Out-of-scope (next round): the `q > 0` × `r_precincts` cross-product
+(`encode_planar_qpr_rpr`) carrying both per-precinct vectors so
+`R[p]` becomes an active rate-distortion lever — granting one extra
+retained bitplane to the `R[p]` lowest-index bands on a per-precinct
+basis. Multi-column (`Cw > 0`) and multi-slice (`Hsl > 0`) per-
+precinct overrides also intersect on a future round.
+
 ## Unreleased — round 233 (per-precinct `Q[p]` override, encoder side)
 
 Lifts the round-206 per-slice `Q[p]` mechanism (one `Q[p]` per slice

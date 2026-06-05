@@ -248,6 +248,23 @@ struct EncodeConfig {
     /// is needed — this is a pure encoder rate-allocation lever. The
     /// bitstream-wire impact is only the per-precinct `Q` byte.
     q_precincts: Vec<u8>,
+    /// Per-precinct `R[p]` overrides (round 239 — precinct-level refinement
+    /// budgeting, the spec-natural form of Annex C.2 Table C.1 where
+    /// `R[p]` is indexed by precinct `p`). Empty → every precinct
+    /// inherits the picture-level `rp`. Non-empty must hold exactly one
+    /// entry per precinct (i.e. `Np,y × Np,x` values, in raster scan
+    /// order with the precinct at `(py, px)` at index `py * Np,x + px`),
+    /// with each value in `0..=NL-1` where `NL = (Nc - Sd)·Nβ + Sd`.
+    ///
+    /// Round 115 fixed `R[p]` picture-wide; round 239 lifts it to per
+    /// precinct. The precinct header carries the per-precinct value for
+    /// every precinct (Annex C.2 Table C.1).
+    ///
+    /// The decoder reads `R[p]` per precinct (`precinct_truncation` in
+    /// the entropy module) since round 115, so no decoder change is
+    /// needed — this is a pure encoder rate-allocation lever. The
+    /// bitstream-wire impact is only the per-precinct `R` byte.
+    r_precincts: Vec<u8>,
 }
 
 impl EncodeConfig {
@@ -600,6 +617,41 @@ impl EncodeConfig {
                 }
             }
         }
+        // Round 239 — per-precinct R overrides (Annex C.2 Table C.1; R[p]
+        // is indexed by precinct p, mirroring the round-233 lift of Q[p]).
+        // Validate length matches Np,y × Np,x (raster scan, py * Np,x + px)
+        // and each R[p] is in `0..=NL - 1` (Annex C.2 Table C.1 range).
+        if !self.r_precincts.is_empty() {
+            let hp_pow = 1u32 << self.nly;
+            let np_y = (self.height as u32).div_ceil(hp_pow);
+            let max_sx = self.sx.iter().copied().max().unwrap_or(1) as u32;
+            let cs_w: u32 = if self.cw == 0 {
+                self.width as u32
+            } else {
+                8u32 * (self.cw as u32) * max_sx * (1u32 << self.nlx)
+            };
+            let np_x = (self.width as u32).div_ceil(cs_w);
+            let expected = (np_y as usize) * (np_x as usize);
+            if self.r_precincts.len() != expected {
+                return Err(Error::invalid(format!(
+                    "jpegxs encoder: r_precincts length {} != precinct count {} (Np,y={}, Np,x={})",
+                    self.r_precincts.len(),
+                    expected,
+                    np_y,
+                    np_x
+                )));
+            }
+            let nbeta = n_beta(self.nlx, self.nly);
+            let nl = (self.nc - self.sd) as u32 * nbeta + self.sd as u32;
+            let max_rp = nl.saturating_sub(1);
+            for (p, &rp) in self.r_precincts.iter().enumerate() {
+                if (rp as u32) > max_rp {
+                    return Err(Error::invalid(format!(
+                        "jpegxs encoder: r_precincts[{p}] = {rp} exceeds NL-1={max_rp} (NL={nl} bands, Annex C.2 Table C.1)"
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -883,6 +935,7 @@ pub fn encode_planar_star_tetrix_highbd(
         0,          // rp = 0 (no refinement)
         Vec::new(), // q_slices: single picture-level q
         Vec::new(), // q_precincts: no per-precinct override
+        Vec::new(), // r_precincts: no per-precinct R[p] override
         &byte_planes,
     )
 }
@@ -1003,6 +1056,7 @@ pub fn encode_planar_star_tetrix_highbd_lossy(
         0,          // rp = 0 (no refinement)
         Vec::new(), // q_slices: single picture-level q
         Vec::new(), // q_precincts: no per-precinct override
+        Vec::new(), // r_precincts: no per-precinct R[p] override
         &byte_planes,
     )
 }
@@ -1115,6 +1169,7 @@ pub fn encode_planar_highbd(
         0,          // rp = 0 (no refinement)
         Vec::new(), // q_slices: single picture-level q
         Vec::new(), // q_precincts: no per-precinct override
+        Vec::new(), // r_precincts: no per-precinct R[p] override
         &byte_planes,
     )
 }
@@ -1213,6 +1268,7 @@ pub fn encode_planar_highbd_lossy(
         0,          // rp = 0 (no refinement)
         Vec::new(), // q_slices: single picture-level q
         Vec::new(), // q_precincts: no per-precinct override
+        Vec::new(), // r_precincts: no per-precinct R[p] override
         &byte_planes,
     )
 }
@@ -1325,6 +1381,7 @@ pub fn encode_planar_subsampled_highbd(
         0,          // rp = 0 (no refinement)
         Vec::new(), // q_slices: single picture-level q
         Vec::new(), // q_precincts: no per-precinct override
+        Vec::new(), // r_precincts: no per-precinct R[p] override
         &byte_planes,
     )
 }
@@ -1432,6 +1489,7 @@ pub fn encode_planar_subsampled_highbd_lossy(
         0,          // rp = 0 (no refinement)
         Vec::new(), // q_slices: single picture-level q
         Vec::new(), // q_precincts: no per-precinct override
+        Vec::new(), // r_precincts: no per-precinct R[p] override
         &byte_planes,
     )
 }
@@ -1500,6 +1558,7 @@ pub fn encode_planar_hsl(
         0,          // rp: no precinct refinement (R[p] = 0)
         Vec::new(), // q_slices: single picture-level q
         Vec::new(), // q_precincts: no per-precinct override
+        Vec::new(), // r_precincts: no per-precinct R[p] override
         planes,
     )
 }
@@ -1592,6 +1651,7 @@ pub fn encode_planar_hsl_qslice(
         0,   // rp: no precinct refinement (R[p] = 0)
         q_slices.to_vec(),
         Vec::new(), // q_precincts: no per-precinct override
+        Vec::new(), // r_precincts: no per-precinct R[p] override
         planes,
     )
 }
@@ -1696,6 +1756,99 @@ pub fn encode_planar_qpr(
         0,          // rp: no precinct refinement (R[p] = 0)
         Vec::new(), // q_slices: no per-slice override
         q_precincts.to_vec(),
+        Vec::new(), // r_precincts: no per-precinct R[p] override
+        planes,
+    )
+}
+
+/// Round-239 per-precinct `R[p]` override (precinct-level refinement
+/// budgeting, Annex C.2 Table C.1 in its spec-natural form where `R[p]`
+/// is indexed by precinct `p`).
+///
+/// Round 115 fixed `R[p]` picture-wide via [`encode_planar_rp`]; round
+/// 239 lifts it the rest of the way — one `R[p]` per precinct, in raster
+/// scan order with the precinct at `(py, px)` at index `py * Np,x + px`
+/// where `Np,y = ⌈Hf / 2^NL,y⌉` and `Np,x = 1` at `Cw = 0`.
+///
+/// `r_precincts.len()` must equal `Np,y × Np,x` (here `Np,y` because
+/// `Cw = 0`). Each entry is in `0..=NL - 1` where `NL = Nc × Nβ` is the
+/// total band count (Annex B.6 NL definition with `Sd = 0`). Out-of-range
+/// entries are rejected with [`crate::JpegXsError::Invalid`].
+///
+/// **Wire impact:** the per-precinct `R` byte (precinct header field
+/// `R[p]`, Annex C.2 Table C.1) carries the override. The decoder reads
+/// `R[p]` per precinct (`parse_precinct_header` + `precinct_truncation`)
+/// since round 115, so no decoder change is needed — this is a pure
+/// encoder rate-allocation lever. Output is byte-identical to
+/// [`encode_planar`] when every `r_precincts[p]` is `0`
+/// (refinement is a lossless no-op at the picture-wide `q = 0` this
+/// entry point pins), and byte-identical to [`encode_planar_rp`] when
+/// every entry is the same non-zero value (the per-precinct override
+/// resolves to a no-op when `r_precincts[p]` equals the picture-level
+/// fallback).
+///
+/// **Composition with `q`:** the picture-wide `q` is `0` (lossless), so
+/// `T[p, b] = clamp(Q − G[b] − r, 0, 15) = clamp(0 − G[b] − r, 0, 15)`
+/// is already at its `0` floor regardless of `r`. The refinement bit
+/// therefore changes nothing on the wire — `r_precincts = [0; n]`,
+/// `[k; n]` for any `k`, and any mixed `r_precincts` all emit the same
+/// codestream at `q = 0`. To exercise per-precinct `R[p]` as a
+/// rate-distortion lever, combine with `q > 0` (a future
+/// `encode_planar_qpr_rpr` cross-product would carry both vectors).
+///
+/// **Scope:** 4:4:4 (`sx[i] = sy[i] = 1` for `i < nc`),
+/// `Cpih ∈ {0, 1, 3}` — no transform / reversible RCT / Star-Tetrix,
+/// `Cw = 0` (single precinct column), `Hsl = 0` (single slice),
+/// `Sd = 0` (no CWD suppression), `Fs = 0`, `Qpih = 0`, `B[i] = 8`.
+///
+/// **Errors:** wrong-length `r_precincts` (must equal
+/// `Np,y × Np,x = Np,y` at `Cw = 0`); any entry exceeding `NL − 1`; plus
+/// the standard [`EncodeConfig::validate`] errors (`cpih` / `nlx` /
+/// `nly` / plane sizes).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_rpr(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    r_precincts: &[u8],
+    planes: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    let sx = vec![1u8; nc as usize];
+    let sy = vec![1u8; nc as usize];
+    // Picture-wide q = 0 (lossless). Annex C.6.2 Table C.10:
+    // T[p, b] = clamp(Q[p] − G[b] − r, 0, 15); at Q = 0 every clamp
+    // floors regardless of r, so this entry point exposes the wire-
+    // level R[p] byte without changing the data sub-packet bytes.
+    // Fq = 0 stays the natural lossless mode.
+    encode_planar_inner_nlt(
+        width,
+        height,
+        nc,
+        cpih,
+        nlx,
+        nly,
+        0,
+        0,
+        &sx,
+        &sy,
+        0,
+        0,
+        0,
+        0,
+        None,
+        Vec::new(),
+        0,          // cw: single precinct column
+        0,          // sd: no CWD suppression
+        0,          // fs: signs jointly with data (Fs=0)
+        0,          // hsl: single slice (Hsl = Np,y)
+        0,          // qpih: deadzone inverse quantizer (Qpih=0)
+        0,          // rp: picture-level R[p] override stays the default
+        Vec::new(), // q_slices: no per-slice override
+        Vec::new(), // q_precincts: no per-precinct override
+        r_precincts.to_vec(),
         planes,
     )
 }
@@ -2266,6 +2419,7 @@ pub fn encode_planar_hsl_qslice_rp(
         rp,  // rp: precinct refinement R[p]
         q_slices.to_vec(),
         Vec::new(), // q_precincts: no per-precinct override
+        Vec::new(), // r_precincts: no per-precinct R[p] override
         planes,
     )
 }
@@ -2707,6 +2861,7 @@ pub fn encode_planar_hsl_qslice_rp_highbd(
         rp,  // rp: precinct refinement R[p]
         q_slices.to_vec(),
         Vec::new(), // q_precincts: no per-precinct override
+        Vec::new(), // r_precincts: no per-precinct R[p] override
         &byte_planes,
     )
 }
@@ -3086,6 +3241,7 @@ pub fn encode_planar_qpih(
         0,          // rp: no precinct refinement (R[p] = 0)
         Vec::new(), // q_slices: single picture-level q
         Vec::new(), // q_precincts: no per-precinct override
+        Vec::new(), // r_precincts: no per-precinct R[p] override
         planes,
     )
 }
@@ -3165,6 +3321,7 @@ pub fn encode_planar_rp(
         rp,         // rp: precinct refinement R[p]
         Vec::new(), // q_slices: single picture-level q
         Vec::new(), // q_precincts: no per-precinct override
+        Vec::new(), // r_precincts: no per-precinct R[p] override
         planes,
     )
 }
@@ -3224,6 +3381,7 @@ pub fn encode_planar_fs1(
         0,          // rp: no precinct refinement (R[p] = 0)
         Vec::new(), // q_slices: single picture-level q
         Vec::new(), // q_precincts: no per-precinct override
+        Vec::new(), // r_precincts: no per-precinct R[p] override
         planes,
     )
 }
@@ -3285,6 +3443,7 @@ pub fn encode_planar_cw(
         0,          // rp: no precinct refinement (R[p] = 0)
         Vec::new(), // q_slices: single picture-level q
         Vec::new(), // q_precincts: no per-precinct override
+        Vec::new(), // r_precincts: no per-precinct R[p] override
         planes,
     )
 }
@@ -3338,6 +3497,7 @@ pub fn encode_planar_sd(
         0,          // rp: no precinct refinement (R[p] = 0)
         Vec::new(), // q_slices: single picture-level q
         Vec::new(), // q_precincts: no per-precinct override
+        Vec::new(), // r_precincts: no per-precinct R[p] override
         planes,
     )
 }
@@ -3394,6 +3554,7 @@ pub fn encode_planar_sd_rct(
         0,          // rp: no precinct refinement (R[p] = 0)
         Vec::new(), // q_slices: single picture-level q
         Vec::new(), // q_precincts: no per-precinct override
+        Vec::new(), // r_precincts: no per-precinct R[p] override
         planes,
     )
 }
@@ -3452,6 +3613,7 @@ pub fn encode_planar_sd_star_tetrix(
         0,          // rp: no precinct refinement (R[p] = 0)
         Vec::new(), // q_slices: single picture-level q
         Vec::new(), // q_precincts: no per-precinct override
+        Vec::new(), // r_precincts: no per-precinct R[p] override
         planes,
     )
 }
@@ -3533,6 +3695,7 @@ pub fn encode_planar_nlt_quadratic(
         0,          // rp: no precinct refinement (R[p] = 0)
         Vec::new(), // q_slices: single picture-level q
         Vec::new(), // q_precincts: no per-precinct override
+        Vec::new(), // r_precincts: no per-precinct R[p] override
         planes,
     )
 }
@@ -3612,6 +3775,7 @@ pub fn encode_planar_nlt_extended(
         0,          // rp: no precinct refinement (R[p] = 0)
         Vec::new(), // q_slices: single picture-level q
         Vec::new(), // q_precincts: no per-precinct override
+        Vec::new(), // r_precincts: no per-precinct R[p] override
         planes,
     )
 }
@@ -3719,6 +3883,7 @@ pub fn encode_planar_nlt_quadratic_highbd(
         0,          // rp = 0 (no precinct refinement)
         Vec::new(), // q_slices: single picture-level q
         Vec::new(), // q_precincts: no per-precinct override
+        Vec::new(), // r_precincts: no per-precinct R[p] override
         &byte_planes,
     )
 }
@@ -3839,6 +4004,7 @@ pub fn encode_planar_nlt_extended_highbd(
         0,          // rp = 0 (no precinct refinement)
         Vec::new(), // q_slices: single picture-level q
         Vec::new(), // q_precincts: no per-precinct override
+        Vec::new(), // r_precincts: no per-precinct R[p] override
         &byte_planes,
     )
 }
@@ -3886,6 +4052,7 @@ fn encode_planar_inner(
         0,          // rp: no precinct refinement (R[p] = 0)
         Vec::new(), // q_slices: single picture-level q
         Vec::new(), // q_precincts: no per-precinct override
+        Vec::new(), // r_precincts: no per-precinct R[p] override
         planes,
     )
 }
@@ -3917,6 +4084,7 @@ fn encode_planar_inner_nlt(
     rp: u8,
     q_slices: Vec<u8>,
     q_precincts: Vec<u8>,
+    r_precincts: Vec<u8>,
     planes: &[Vec<u8>],
 ) -> Result<Vec<u8>> {
     // 8-bit path: B[i] = 8, Bw = 8 (or 18 with NLT pre-distortion).
@@ -3946,6 +4114,7 @@ fn encode_planar_inner_nlt(
         rp,
         q_slices,
         q_precincts,
+        r_precincts,
         planes,
     )
 }
@@ -3988,6 +4157,7 @@ fn encode_planar_inner_bd(
     rp: u8,
     q_slices: Vec<u8>,
     q_precincts: Vec<u8>,
+    r_precincts: Vec<u8>,
     planes: &[Vec<u8>],
 ) -> Result<Vec<u8>> {
     if !(8..=16).contains(&bd) {
@@ -4050,6 +4220,7 @@ fn encode_planar_inner_bd(
         hsl,
         q_slices,
         q_precincts,
+        r_precincts,
     };
     cfg.validate()?;
     // Build per-band gains and priorities after validation so beta_key /
@@ -4271,16 +4442,25 @@ fn slice_cfg_for(cfg: &EncodeConfig, t: usize) -> Option<EncodeConfig> {
 /// per precinct and reconstructs the matching `T[p,b]` without any
 /// signalling change beyond the per-precinct `Q` byte.
 fn precinct_cfg_for(cfg: &EncodeConfig, py: usize, px: usize, np_x: usize) -> Option<EncodeConfig> {
-    if cfg.q_precincts.is_empty() {
+    let has_q = !cfg.q_precincts.is_empty();
+    let has_r = !cfg.r_precincts.is_empty();
+    if !has_q && !has_r {
         return None;
     }
     let idx = py * np_x + px;
-    let qp = cfg.q_precincts[idx];
-    if qp == cfg.q {
+    // Round 233 — per-precinct Q[p]. Resolves to the slice-level / picture-
+    // level Q when `q_precincts` is empty.
+    let qp = if has_q { cfg.q_precincts[idx] } else { cfg.q };
+    // Round 239 — per-precinct R[p]. Resolves to the picture-level R when
+    // `r_precincts` is empty (preserves byte-identical output for the
+    // round-233 / round-115 callers).
+    let rp = if has_r { cfg.r_precincts[idx] } else { cfg.rp };
+    if qp == cfg.q && rp == cfg.rp {
         return None;
     }
     let mut cloned = cfg.clone();
     cloned.q = qp;
+    cloned.rp = rp;
     Some(cloned)
 }
 
@@ -8720,6 +8900,7 @@ mod tests {
             0,          // rp
             Vec::new(), // q_slices: single picture-level q
             Vec::new(), // q_precincts: no per-precinct override
+            Vec::new(), // r_precincts: no per-precinct R[p] override
             &[y_plane.clone(), u_plane.clone(), v_plane.clone()],
         )
         .expect("encode 64x8 4:2:2 Cw=1 NL=1/1");
@@ -9186,6 +9367,7 @@ mod tests {
             0,          // rp
             Vec::new(), // q_slices: single picture-level q
             Vec::new(), // q_precincts: no per-precinct override
+            Vec::new(), // r_precincts: no per-precinct R[p] override
             std::slice::from_ref(&pixels),
         );
         assert!(result.is_err(), "Fs=2 (reserved) must be rejected");
@@ -10086,6 +10268,7 @@ mod tests {
             0,          // rp
             Vec::new(), // q_slices: single picture-level q
             Vec::new(), // q_precincts: no per-precinct override
+            Vec::new(), // r_precincts: no per-precinct R[p] override
             std::slice::from_ref(&pixels),
         );
         assert!(result.is_err(), "Qpih=2 (reserved) must be rejected");
@@ -10228,6 +10411,7 @@ mod tests {
             0,          // rp
             Vec::new(), // q_slices: single picture-level q
             Vec::new(), // q_precincts: no per-precinct override
+            Vec::new(), // r_precincts: no per-precinct R[p] override
             std::slice::from_ref(&pixels),
         )
         .expect("encode Qpih=1 Fs=1 luma lossless");
@@ -12761,6 +12945,134 @@ mod tests {
             "mixed (q=0 in 3 precincts) {} B must exceed max-Q baseline {} B",
             cs_mixed.len(),
             cs_max_q.len()
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Round 239 — per-precinct R[p] override (Annex C.2 Table C.1)
+    // ---------------------------------------------------------------
+
+    /// `r_precincts = [0; n]` (every precinct refines none) is byte-
+    /// identical to `encode_planar` at the same geometry — the round-239
+    /// lever is a pure no-op when every precinct picks the same `R[p] = 0`.
+    /// This also confirms the new code path threads through the existing
+    /// `encode_planar` callsites without altering the lossless wire form.
+    #[test]
+    fn round239_rpr_all_zero_matches_encode_planar_lossless() {
+        let w = 32usize;
+        let h = 32usize;
+        let pixels = round103_grad(w, h);
+        let baseline = encode_planar(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("baseline lossless encode");
+        // NL,y = 2 → Hp = 4, Np,y = 8; Cw = 0 → Np,x = 1 → 8 precincts.
+        let rpr = vec![0u8; 8];
+        let cs = encode_planar_rpr(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            &rpr,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("all-zero r_precincts encode");
+        assert_eq!(
+            cs, baseline,
+            "all-zero r_precincts must be byte-identical to encode_planar"
+        );
+    }
+
+    /// Each precinct's header byte 4 (`R[p]`) carries the per-precinct
+    /// value the caller asked for. NL=1/1 single-component → Np,y = 16
+    /// precincts at h=32. The first precinct's header sits at the slice
+    /// data offset; its byte 4 must equal `r_precincts[0]`. The decoder
+    /// round-trips the picture (q=0 ⇒ lossless regardless of R[p]).
+    #[test]
+    fn round239_rpr_wire_carries_per_precinct_r() {
+        let w = 32usize;
+        let h = 32usize;
+        let pixels = round103_grad(w, h);
+        // NL=1/1 → Np,y = 16 precincts. NL = Nc × Nβ = 1 × 4 = 4 bands,
+        // so R[p] ∈ 0..=3.
+        let r_pattern: [u8; 16] = [0, 1, 2, 3, 0, 1, 2, 3, 3, 2, 1, 0, 0, 1, 2, 3];
+        let cs = encode_planar_rpr(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            1,
+            1,
+            &r_pattern,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("rpr wire encode");
+        let parsed = crate::codestream::parse(&cs).expect("parse");
+        assert_eq!(parsed.slices.len(), 1, "expected 1 slice (Hsl=0)");
+        let slice = &parsed.slices[0];
+        assert!(
+            slice.data_length >= 5,
+            "slice payload too small to hold a precinct header"
+        );
+        // Byte 3 = Q[p], byte 4 = R[p] per the precinct header layout.
+        let r_byte_first = cs[slice.data_offset + 4];
+        assert_eq!(
+            r_byte_first, r_pattern[0],
+            "first precinct R[p] must equal r_precincts[0]"
+        );
+        // Round-trip: q=0 floors every T[p,b] so this is lossless.
+        let img = decode_codestream(&cs, None).expect("decode rpr stream");
+        assert_eq!(
+            img.planes[0].data, pixels,
+            "q=0 + per-precinct R[p] must round-trip losslessly"
+        );
+    }
+
+    /// Wrong-length `r_precincts` is rejected (must equal `Np,y × Np,x`).
+    /// Also: an entry exceeding `NL - 1` is rejected (here NL = Nc × Nβ
+    /// = 1 × 7 = 7 at NL,x = NL,y = 2, so max R[p] = 6).
+    #[test]
+    fn round239_rpr_rejects_wrong_length_and_out_of_range() {
+        let w = 32usize;
+        let h = 32usize;
+        let pixels = round103_grad(w, h);
+        // NL=2/2 → Np,y = 8 precincts at Cw=0, so length must be 8.
+        let bad_len = encode_planar_rpr(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            &[0, 1, 2],
+            std::slice::from_ref(&pixels),
+        );
+        assert!(
+            bad_len.is_err(),
+            "wrong r_precincts length must be rejected"
+        );
+        // NL,x = NL,y = 2 → Nβ = 7 → NL = 7 → max R[p] = 6.
+        let bad_range = encode_planar_rpr(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            &[0, 0, 0, 0, 0, 0, 0, 7],
+            std::slice::from_ref(&pixels),
+        );
+        assert!(
+            bad_range.is_err(),
+            "r_precincts entry > NL-1 must be rejected"
         );
     }
 }
