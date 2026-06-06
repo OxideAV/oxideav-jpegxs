@@ -1,5 +1,98 @@
 # Changelog
 
+## Unreleased — round 242 (joint per-precinct `Q[p] × R[p]` override, encoder side)
+
+Closes the round-239 "Out-of-scope (next round)" tail: the joint
+per-precinct `Q[p] × R[p]` cross-product. Round 233 lifted
+picture-level `q` to one `Q[p]` per precinct ([`encode_planar_qpr`]);
+round 239 lifted picture-level `R[p]` to one per precinct
+([`encode_planar_rpr`]). Both lived on the same precinct-header pair
+(Annex C.2 Table C.1 — `Q[p]` is precinct-header byte 3, `R[p]` is
+byte 4), and the in-place overlay helper `precinct_cfg_for` already
+composed them cleanly. Round 242 is the public entry point that
+surfaces both vectors to the caller at the same time, so `R[p]`
+becomes an active rate-distortion lever where the round-239
+`q = 0` pin had left it as a wire-only no-op.
+
+The bitstream-wire impact is the per-precinct `Q` byte AND the
+per-precinct `R` byte in each precinct header. The decoder reads both
+per precinct (`parse_precinct_header` + `precinct_truncation`) since
+the early rounds, so no decoder change is needed — round 242 is pure
+encoder rate-allocation plumbing.
+
+* `encode_planar_qpr_rpr(width, height, nc, cpih, nlx, nly,
+  q_precincts, r_precincts, &[Vec<u8>]) -> Result<Vec<u8>>` — round-242
+  joint per-precinct entry point. Both vectors are indexed in raster
+  scan order with the precinct at row `py`, column `px` at position
+  `py * Np,x + px`. Each must be empty-or-length `Np,y × Np,x`, where
+  `Np,y = ⌈Hf / 2^NL,y⌉` and `Np,x = 1` at `Cw = 0`. At least one of
+  the two must be non-empty — the both-empty path is `encode_planar`.
+* Each `q_precincts[p]` in `0..=15` (Annex C.6.2 Table C.10 `T` clamp
+  range). Each `r_precincts[p]` in `0..=NL − 1` where
+  `NL = Nc × Nβ` (Annex B.6 `NL` definition at `Sd = 0`).
+* `Fq` is auto-selected (`8` whenever any `q_precincts[p] > 0`, else
+  `0`) — same rule as `encode_planar_qpr`, preserves the
+  byte-identical-to-`encode_planar` all-zero reduction.
+* The picture-level fallbacks the precinct overlay compares against
+  are picked so a uniform vector resolves to a no-op:
+  `cfg.q = max(q_precincts)` and `cfg.rp = max(r_precincts)` — when
+  every entry equals its picked-max, the per-precinct branch in
+  `precinct_cfg_for` returns `None` and the codestream reduces to the
+  picture-level form.
+
+**Why this is the active lever:** Annex C.6.2 Table C.10 truncation
+is `T[p, b] = clamp(Q[p] − G[b] − r, 0, 15)` with `r = (P[b] < R[p]) ?
+1 : 0`. At the round-239 picture-wide `Q = 0` floor every clamp
+landed at zero regardless of `r`, so per-precinct `R[p]` only
+surfaced in the precinct header and not in the data sub-packet bytes.
+With `q_precincts[p] > 0` the clamp is no longer floored, and a
+non-zero `r_precincts[p]` subtracts `1` from `T[p, b]` on the `R[p]`
+lowest-index bands — one *extra retained* magnitude bitplane per
+affected band per precinct. PSNR consequently rises on the
+alternating-`R = 3` pattern at uniform `Q = 4` strictly above the
+same-`Q` R-off baseline.
+
+**Composition behaviour:**
+
+* `q_precincts = [0; n]` + `r_precincts = [0; n]` is byte-identical
+  to `encode_planar` at the same geometry (both levers collapse to
+  no-op).
+* `q_precincts = [0; n]` + any `r_precincts = R` is byte-identical
+  to `encode_planar_rpr(R)` — the `Q = 0` floor restores round 239's
+  wire-only `R[p]` behaviour exactly.
+* Picture-level chain (PIH `Hsl = 0` single slice; CDT 8-bit `B[i] =
+  8`; WGT carries the per-band gains and priorities) is identical to
+  the round-233 / round-239 outputs.
+
+**Scope:** 4:4:4 (`sx[i] = sy[i] = 1` for `i < nc`),
+`Cpih ∈ {0, 1, 3}`, `Cw = 0` (single precinct column → `Np,x = 1`),
+`Hsl = 0` (single slice), `Sd = 0`, `Fs = 0`, `Qpih = 0`, `B[i] = 8`.
+
+Tests: +5 (388 total).
+* `round242_qpr_rpr_both_zero_matches_encode_planar_lossless` — both
+  vectors all-zero reproduces the `encode_planar` baseline
+  byte-for-byte at NL=2/2, 32×32 luma.
+* `round242_qpr_rpr_r_active_at_q_gt_0` — at uniform `Q[p] = 4`,
+  alternating `R[p] = 3` raises PSNR strictly above the same-`Q`
+  `R[p] = 0` baseline on the 64×64 luma ramp (round 239's
+  `q = 0` no-op pin is lifted).
+* `round242_qpr_rpr_wire_carries_q_and_r` — the first precinct's
+  header bytes 3 (`Q[p]`) and 4 (`R[p]`) carry the caller's values
+  on a 16-precinct NL=1/1 32×32 luma encode; round-trips through the
+  decoder with PSNR ≥ 20 dB.
+* `round242_qpr_rpr_q_zero_matches_rpr` — `q_precincts = [0; n]` +
+  any `r_precincts = R` is byte-identical to `encode_planar_rpr(R)`
+  at NL=2/2 (round-239 reduction pin).
+* `round242_qpr_rpr_rejects_empty_and_out_of_range` — calling with
+  both vectors empty is rejected (the both-empty path is
+  `encode_planar`); `q_precincts[p] > 15` and `r_precincts[p] > NL −
+  1` are rejected by `EncodeConfig::validate` before any encode work
+  runs.
+
+Out-of-scope (next round): high-bit-depth widening of the joint
+primitive at `bd = B[i] ∈ 9..=16`, `Cw > 0` multi-column, and
+`Hsl > 0` multi-slice × per-precinct intersections.
+
 ## Unreleased — round 239 (per-precinct `R[p]` override, encoder side)
 
 Lifts the round-115 picture-wide `R[p]` mechanism (Annex C.2 Table C.1,

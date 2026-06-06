@@ -1853,6 +1853,125 @@ pub fn encode_planar_rpr(
     )
 }
 
+/// Round-242 joint per-precinct `Q[p] × R[p]` override (the
+/// cross-product the round-233 / round-239 changelogs flagged as the
+/// next step).
+///
+/// Round 233 ([`encode_planar_qpr`]) lifted picture-level `q` to one
+/// `Q[p]` per precinct. Round 239 ([`encode_planar_rpr`]) lifted
+/// picture-level `R[p]` to one per precinct. Both lived on the same
+/// precinct-header pair (Annex C.2 Table C.1 — `Q[p]` is precinct-header
+/// byte 3, `R[p]` is precinct-header byte 4), and the in-place overlay
+/// helper `precinct_cfg_for` already composed them cleanly. Round 242
+/// is the public entry point that surfaces both vectors to the caller
+/// at the same time, so `R[p]` becomes an active rate-distortion lever
+/// where the round-239 `q = 0` pin had left it as a wire-only no-op.
+///
+/// **Why this is the active lever:** Annex C.6.2 Table C.10
+/// truncation is `T[p, b] = clamp(Q[p] − G[b] − r, 0, 15)`. At the
+/// round-239 picture-wide `Q = 0` floor every clamp landed at zero
+/// regardless of `r`, so the per-precinct `R[p]` only surfaced in the
+/// precinct header and not in the data sub-packet bytes. With
+/// `q_precincts[p] > 0` the clamp is no longer floored, and a
+/// non-zero `r_precincts[p]` actively raises `T[p, b]` for the `R[p]`
+/// lowest-band indices — one extra magnitude-bit truncated per
+/// affected band per precinct. This is the rate-distortion lever the
+/// previous two rounds wired up to.
+///
+/// `q_precincts.len()` and `r_precincts.len()` must both equal
+/// `Np,y × Np,x` (here `Np,y` because `Cw = 0`). At least one of the
+/// two vectors must be non-empty — calling with both empty is the
+/// existing [`encode_planar`] entry point.
+///
+/// * Each `q_precincts[p]` is in `0..=15` (Annex C.6.2 Table C.10 `T`
+///   clamp range).
+/// * Each `r_precincts[p]` is in `0..=NL − 1` where
+///   `NL = Nc × Nβ` (Annex B.6 `NL` definition at `Sd = 0`).
+///
+/// The `Fq` flag is `8` whenever any `q_precincts[p] > 0` (same rule
+/// as [`encode_planar_qpr`]) and `0` otherwise (the all-zero / empty-
+/// `q_precincts` reduction restores byte-identical output to
+/// [`encode_planar_rpr`] for the same `r_precincts`, or to
+/// [`encode_planar`] when both vectors are zeros).
+///
+/// The picture-level fallbacks the precinct overlay helper compares
+/// against are picked so a uniform vector resolves to a no-op:
+/// `cfg.q = max(q_precincts)` and `cfg.rp = max(r_precincts)` — when
+/// every entry equals its own picked-max, the per-precinct branch in
+/// `precinct_cfg_for` returns `None` (no per-precinct clone needed)
+/// and the codestream reduces to the picture-level form.
+///
+/// **Scope:** 4:4:4 (`sx[i] = sy[i] = 1` for `i < nc`),
+/// `Cpih ∈ {0, 1, 3}` — no transform / reversible RCT / Star-Tetrix,
+/// `Cw = 0` (single precinct column), `Hsl = 0` (single slice),
+/// `Sd = 0` (no CWD suppression), `Fs = 0`, `Qpih = 0`, `B[i] = 8`.
+///
+/// **Errors:** wrong-length `q_precincts` or `r_precincts` (each must
+/// equal `Np,y × Np,x = Np,y` at `Cw = 0`); any `q_precincts[p] > 15`;
+/// any `r_precincts[p] > NL − 1`; both vectors empty; plus the
+/// standard [`EncodeConfig::validate`] errors (`cpih` / `nlx` / `nly`
+/// / plane sizes).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_qpr_rpr(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    q_precincts: &[u8],
+    r_precincts: &[u8],
+    planes: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    if q_precincts.is_empty() && r_precincts.is_empty() {
+        return Err(Error::invalid(
+            "jpegxs encoder: encode_planar_qpr_rpr needs at least one of \
+             q_precincts / r_precincts non-empty (call encode_planar for \
+             the no-override path)",
+        ));
+    }
+    let sx = vec![1u8; nc as usize];
+    let sy = vec![1u8; nc as usize];
+    // Picture-level fallbacks: `max(...)` so a uniform vector reduces
+    // to a no-op inside `precinct_cfg_for`.
+    let q_pic = q_precincts.iter().copied().max().unwrap_or(0);
+    let rp_pic = r_precincts.iter().copied().max().unwrap_or(0);
+    // Fq=8 whenever any precinct quantizes (matches encode_planar_qpr).
+    let fq = if q_precincts.iter().any(|&v| v > 0) {
+        8
+    } else {
+        0
+    };
+    encode_planar_inner_nlt(
+        width,
+        height,
+        nc,
+        cpih,
+        nlx,
+        nly,
+        fq,
+        q_pic,
+        &sx,
+        &sy,
+        0,
+        0,
+        0,
+        0,
+        None,
+        Vec::new(),
+        0, // cw: single precinct column
+        0, // sd: no CWD suppression
+        0, // fs: signs jointly with data (Fs=0)
+        0, // hsl: single slice (Hsl = Np,y)
+        0, // qpih: deadzone inverse quantizer (Qpih=0)
+        rp_pic,
+        Vec::new(), // q_slices: no per-slice override
+        q_precincts.to_vec(),
+        r_precincts.to_vec(),
+        planes,
+    )
+}
+
 /// Round-212 rate-budget driven per-slice `Q[p]` picker.
 ///
 /// Given a target byte budget, returns a `q_slices` vector — one
@@ -13074,5 +13193,262 @@ mod tests {
             bad_range.is_err(),
             "r_precincts entry > NL-1 must be rejected"
         );
+    }
+
+    /// Round 242 — both vectors all-zero is byte-identical to the
+    /// lossless `encode_planar` baseline (the cross-product reduces to
+    /// the no-override path: every precinct sees Q[p]=0, R[p]=0, and
+    /// Annex C.6.2 Table C.10 truncation lands at the zero floor).
+    #[test]
+    fn round242_qpr_rpr_both_zero_matches_encode_planar_lossless() {
+        let w = 32usize;
+        let h = 32usize;
+        let pixels = round103_grad(w, h);
+        let baseline = encode_planar(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("baseline lossless encode");
+        // NL,y = 2 → Np,y = 8 precincts at Cw = 0.
+        let qpr = vec![0u8; 8];
+        let rpr = vec![0u8; 8];
+        let cs = encode_planar_qpr_rpr(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            &qpr,
+            &rpr,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("all-zero qpr+rpr encode");
+        assert_eq!(
+            cs, baseline,
+            "all-zero q_precincts + r_precincts must be byte-identical to encode_planar"
+        );
+    }
+
+    /// Round 242 — non-zero `r_precincts` actively *lowers* `T[p, b]`
+    /// when paired with `q > 0`, granting one extra retained bitplane
+    /// to the `R[p]` lowest-index bands per precinct. Annex C.6.2
+    /// Table C.10 truncation is
+    /// `T[p, b] = clamp(Q[p] − G[b] − r, 0, 15)` with
+    /// `r = (P[b] < R[p]) ? 1 : 0`; at `Q = 4` the clamp is no longer
+    /// floored at zero, so subtracting `r = 1` reduces `T` by 1 on the
+    /// `R[p]` lowest-index bands — that is, one *more* magnitude bit
+    /// retained on those bands per precinct. This *raises*
+    /// reconstruction PSNR strictly above the R-off baseline at the
+    /// same uniform Q — proving R[p] is engaged as a rate-distortion
+    /// lever beyond the round-239 wire-only pin.
+    ///
+    /// We deliberately do not assert on codestream length: per-precinct
+    /// entropy coder state (Annex C.4 packet-header bytes per
+    /// precinct, plus group prefix) means the size delta from one
+    /// extra retained bitplane on a subset of precincts is
+    /// content-dependent; PSNR is the authoritative quality-side
+    /// signal.
+    #[test]
+    fn round242_qpr_rpr_r_active_at_q_gt_0() {
+        let w = 64usize;
+        let h = 64usize;
+        let pixels = round103_grad(w, h);
+        // NL=2/2 → Np,y = 16 precincts at Cw=0. NL = 1 × 7 = 7 (Nβ = 7
+        // at nlx=nly=2), so R[p] ∈ 0..=6.
+        let q_uniform = vec![4u8; 16];
+        let r_off = vec![0u8; 16];
+        let cs_q_only = encode_planar_qpr_rpr(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            &q_uniform,
+            &r_off,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("Q-only encode");
+        let mut r_pattern = vec![0u8; 16];
+        // Hit alternating precincts with R[p] = 3 (refines the 3
+        // lowest-index bands in those precincts).
+        for (i, r) in r_pattern.iter_mut().enumerate() {
+            if i % 2 == 0 {
+                *r = 3;
+            }
+        }
+        let cs_q_and_r = encode_planar_qpr_rpr(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            &q_uniform,
+            &r_pattern,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("Q+R encode");
+        let img_q = decode_codestream(&cs_q_only, None).expect("decode Q-only");
+        let img_qr = decode_codestream(&cs_q_and_r, None).expect("decode Q+R");
+        let psnr_q = psnr(&pixels, &img_q.planes[0].data);
+        let psnr_qr = psnr(&pixels, &img_qr.planes[0].data);
+        assert!(
+            psnr_qr > psnr_q,
+            "extra R[p] refinement must raise PSNR (Q+R {psnr_qr:.2} dB <= Q-only {psnr_q:.2} dB) — R[p] is not engaged"
+        );
+        // Sanity: both reconstructions stay above a coarse PSNR floor.
+        assert!(
+            psnr_q >= 20.0,
+            "Q=4 baseline reconstruction below 20 dB floor ({psnr_q:.2} dB)"
+        );
+    }
+
+    /// Round 242 — both per-precinct bytes surface on the wire at the
+    /// first precinct (Annex C.2 Table C.1: byte 3 = `Q[p]`, byte 4 =
+    /// `R[p]`). The decoder reads them and round-trips correctly.
+    #[test]
+    fn round242_qpr_rpr_wire_carries_q_and_r() {
+        let w = 32usize;
+        let h = 32usize;
+        let pixels = round103_grad(w, h);
+        // NL=1/1 → Np,y = 16 precincts. NL = 1 × 4 = 4 bands, so R[p]
+        // ∈ 0..=3.
+        let q_pattern: [u8; 16] = [4, 1, 2, 3, 4, 1, 2, 3, 4, 3, 2, 1, 4, 1, 2, 3];
+        let r_pattern: [u8; 16] = [3, 0, 1, 2, 3, 0, 1, 2, 3, 2, 1, 0, 3, 0, 1, 2];
+        let cs = encode_planar_qpr_rpr(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            1,
+            1,
+            &q_pattern,
+            &r_pattern,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("qpr+rpr wire encode");
+        let parsed = crate::codestream::parse(&cs).expect("parse");
+        assert_eq!(parsed.slices.len(), 1, "expected 1 slice (Hsl=0)");
+        let slice = &parsed.slices[0];
+        assert!(
+            slice.data_length >= 5,
+            "slice payload too small to hold a precinct header"
+        );
+        let q_byte_first = cs[slice.data_offset + 3];
+        let r_byte_first = cs[slice.data_offset + 4];
+        assert_eq!(
+            q_byte_first, q_pattern[0],
+            "first precinct Q[p] must equal q_precincts[0]"
+        );
+        assert_eq!(
+            r_byte_first, r_pattern[0],
+            "first precinct R[p] must equal r_precincts[0]"
+        );
+        let img = decode_codestream(&cs, None).expect("decode qpr+rpr");
+        let p = psnr(&pixels, &img.planes[0].data);
+        assert!(p >= 20.0, "qpr+rpr PSNR {p:.2} dB < 20 dB floor");
+    }
+
+    /// Round 242 — when `q_precincts` is all-zero (lossless precincts
+    /// everywhere) the cross-product reduces to the round-239
+    /// `encode_planar_rpr` byte-for-byte regardless of `r_precincts`
+    /// (Annex C.6.2 Table C.10 floors at `Q = 0`). This pins the
+    /// reduction back to the round-239 entry point and proves the
+    /// fall-through path is intact.
+    #[test]
+    fn round242_qpr_rpr_q_zero_matches_rpr() {
+        let w = 32usize;
+        let h = 32usize;
+        let pixels = round103_grad(w, h);
+        // NL=2/2 → Np,y = 8 precincts at Cw=0.
+        let qpr = vec![0u8; 8];
+        let r_pattern: [u8; 8] = [0, 1, 2, 3, 4, 5, 6, 0];
+        let cs_qpr_rpr = encode_planar_qpr_rpr(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            &qpr,
+            &r_pattern,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("qpr=0 + rpr encode");
+        let cs_rpr = encode_planar_rpr(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            &r_pattern,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("rpr-only encode");
+        assert_eq!(
+            cs_qpr_rpr, cs_rpr,
+            "q_precincts = [0; n] + r_precincts = R must reduce to encode_planar_rpr(R)"
+        );
+    }
+
+    /// Round 242 — calling with both vectors empty is the rejected
+    /// no-override case (the public no-override path is
+    /// `encode_planar`). Out-of-range entries in either vector are
+    /// also rejected (delegated to the same `EncodeConfig::validate`
+    /// guards that the round-233 / round-239 entry points use).
+    #[test]
+    fn round242_qpr_rpr_rejects_empty_and_out_of_range() {
+        let w = 32usize;
+        let h = 32usize;
+        let pixels = round103_grad(w, h);
+        let both_empty = encode_planar_qpr_rpr(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            &[],
+            &[],
+            std::slice::from_ref(&pixels),
+        );
+        assert!(
+            both_empty.is_err(),
+            "encode_planar_qpr_rpr with both vectors empty must be rejected"
+        );
+        // NL=2/2 → Np,y = 8 precincts. q entry > 15 must be rejected.
+        let bad_q = encode_planar_qpr_rpr(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            &[16, 0, 0, 0, 0, 0, 0, 0],
+            &[0u8; 8],
+            std::slice::from_ref(&pixels),
+        );
+        assert!(bad_q.is_err(), "q_precincts entry > 15 must be rejected");
+        // NL = 1 × 7 = 7 → max R[p] = 6.
+        let bad_r = encode_planar_qpr_rpr(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            &[2u8; 8],
+            &[0, 0, 0, 0, 0, 0, 0, 7],
+            std::slice::from_ref(&pixels),
+        );
+        assert!(bad_r.is_err(), "r_precincts entry > NL-1 must be rejected");
     }
 }
