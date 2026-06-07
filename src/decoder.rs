@@ -25,8 +25,7 @@
 
 use crate::codestream;
 use crate::colour_transform::{inverse_rct, inverse_star_tetrix};
-use crate::crg::{cfa_pattern_type, parse_crg};
-use crate::cts::parse_cts;
+use crate::crg::cfa_pattern_type;
 use crate::dequant::dequantize_precinct;
 use crate::dwt::{inverse_2d, inverse_cascade_2d};
 use crate::entropy::packet_body::PrecinctState;
@@ -36,7 +35,7 @@ use crate::entropy::{
 };
 use crate::error::{JpegXsError as Error, Result};
 use crate::image::{JpegXsImage, JpegXsPlane as VideoPlane};
-use crate::output::{apply_output_scaling, parse_nlt};
+use crate::output::apply_output_scaling;
 use crate::slice_walker::{PicturePlan, PrecinctPlan};
 
 /// Decode a single JPEG XS codestream into a [`JpegXsImage`].
@@ -73,11 +72,9 @@ pub(crate) fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<JpegXsIm
         }
     }
 
-    // Parse optional NLT body (Annex A.4.6).
-    let nlt = match cs.nlt.as_deref() {
-        Some(body) => Some(parse_nlt(body)?),
-        None => None,
-    };
+    // Parse optional NLT body (Annex A.4.6) through the typed
+    // [`codestream::Codestream::nlt`] accessor.
+    let nlt = cs.nlt()?;
 
     let (plan, _weights) = crate::slice_walker::build_plan_sd(&pih, &cdt, &wgt, sd)?;
 
@@ -208,16 +205,15 @@ pub(crate) fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<JpegXsIm
         // CRG marker (CFA pattern type) per Annex F.5 / Tables F.9 /
         // F.10. The codestream parser already enforced "Cpih=3 → CTS
         // present", but CRG is also mandatory in this case (§A.4.9).
-        let cts_body = cs
-            .cts
-            .as_deref()
+        // We route both through the typed
+        // [`codestream::Codestream::cts`] / `crg` accessors so the
+        // body-level field checks live in exactly one place.
+        let cts = cs
+            .cts()?
             .ok_or_else(|| Error::invalid("jpegxs Cpih=3: CTS marker required (A.4.8)"))?;
-        let cts = parse_cts(cts_body)?;
-        let crg_body = cs
-            .crg
-            .as_deref()
+        let crg = cs
+            .crg()?
             .ok_or_else(|| Error::invalid("jpegxs Cpih=3: CRG marker required (A.4.9)"))?;
-        let crg = parse_crg(crg_body, pih.nc)?;
         let ct = cfa_pattern_type(&crg).ok_or_else(|| {
             Error::invalid(
                 "jpegxs Cpih=3: CRG entries do not match a Table F.9 CFA pattern (RGGB/BGGR/GRBG/GBRG)",

@@ -93,6 +93,7 @@ pub use encoder::{
 pub use error::{JpegXsError, Result};
 pub use image::{JpegXsImage, JpegXsPlane};
 pub use markers::Marker;
+pub use output::{parse_nlt, NltParams};
 pub use picture_header::PictureHeader;
 pub use probe::{probe, JpegXsFileInfo};
 pub use profile::{

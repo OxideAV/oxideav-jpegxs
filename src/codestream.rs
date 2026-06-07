@@ -17,7 +17,10 @@ use crate::error::{JpegXsError as Error, Result};
 
 use crate::capabilities::{parse_capabilities_lossy, Capabilities};
 use crate::component_table::{self, ComponentTable};
+use crate::crg::{parse_crg, CrgMarker};
+use crate::cts::{parse_cts, CtsMarker};
 use crate::markers::Marker;
+use crate::output::{parse_nlt, NltParams};
 use crate::picture_header::{self, PictureHeader};
 use crate::slice_header::{self, SliceHeader};
 
@@ -71,6 +74,56 @@ impl Codestream {
     /// use [`crate::capabilities::parse_capabilities`].
     pub fn capabilities(&self) -> Capabilities {
         parse_capabilities_lossy(&self.cap)
+    }
+
+    /// Decode the optional CTS marker body into a strongly-typed
+    /// [`CtsMarker`] (Annex A.4.8, Tables A.19 / A.20).
+    ///
+    /// Returns `Ok(None)` if the codestream carried no CTS segment
+    /// (legal for `Cpih ∈ {0, 1, 2}`); returns `Ok(Some(cts))` with
+    /// the parsed `Cf` / `e1` / `e2` fields when CTS was present.
+    /// Body-level errors (reserved nibble non-zero, `Cf` outside
+    /// `{0, 3}`, `e1` / `e2` exceeding 3) surface as `Err(_)` — the
+    /// top-level marker-chain parser only enforces ordering and the
+    /// "Cpih=3 ⇒ CTS present" rule, not the field-level constraints
+    /// from §A.4.8.
+    pub fn cts(&self) -> Result<Option<CtsMarker>> {
+        match self.cts.as_deref() {
+            None => Ok(None),
+            Some(body) => parse_cts(body).map(Some),
+        }
+    }
+
+    /// Decode the optional CRG marker body into a strongly-typed
+    /// [`CrgMarker`] (Annex A.4.9, Table A.21).
+    ///
+    /// Returns `Ok(None)` if no CRG segment was present; returns
+    /// `Ok(Some(crg))` with one [`crate::crg::CrgEntry`] per
+    /// component when present. Body-level errors (wrong byte count
+    /// for `4 * Nc`) surface as `Err(_)`. The component count is
+    /// taken from the codestream's `pih.nc`.
+    pub fn crg(&self) -> Result<Option<CrgMarker>> {
+        match self.crg.as_deref() {
+            None => Ok(None),
+            Some(body) => parse_crg(body, self.pih.nc).map(Some),
+        }
+    }
+
+    /// Decode the optional NLT marker body into a strongly-typed
+    /// [`NltParams`] (Annex A.4.6, Table A.16).
+    ///
+    /// Returns `Ok(None)` when no NLT segment was present (decoder
+    /// uses the linear Annex G.3 output path); returns
+    /// `Ok(Some(NltParams::Quadratic { dco }))` for `Tnlt = 1` or
+    /// `Ok(Some(NltParams::Extended { t1, t2, e }))` for
+    /// `Tnlt = 2`. Body-level errors (wrong body length for the
+    /// declared `Tnlt`, unknown `Tnlt`, out-of-range exponent /
+    /// thresholds) surface as `Err(_)`.
+    pub fn nlt(&self) -> Result<Option<NltParams>> {
+        match self.nlt.as_deref() {
+            None => Ok(None),
+            Some(body) => parse_nlt(body).map(Some),
+        }
     }
 }
 
@@ -696,5 +749,184 @@ mod tests {
         buf.extend_from_slice(&[0xff, 0x11]);
         let cs = parse(&buf).expect("cap parse");
         assert_eq!(cs.cap, vec![0xc0]);
+    }
+
+    /// Append a CTS marker (Lcts=4, 2-byte body) to `buf`. Caller
+    /// supplies `cf`, `e1`, `e2` exactly as they should land on the
+    /// wire (Reserved nibble is forced to zero).
+    fn push_cts(buf: &mut Vec<u8>, cf: u8, e1: u8, e2: u8) {
+        buf.extend_from_slice(&[0xff, 0x18]);
+        buf.extend_from_slice(&4u16.to_be_bytes());
+        buf.push(cf & 0x0f);
+        buf.push(((e1 & 0x0f) << 4) | (e2 & 0x0f));
+    }
+
+    /// Append a CRG marker for `nc` components with `(x, y)` per entry.
+    fn push_crg(buf: &mut Vec<u8>, entries: &[(u16, u16)]) {
+        let lcrg = (2 + 4 * entries.len()) as u16;
+        buf.extend_from_slice(&[0xff, 0x19]);
+        buf.extend_from_slice(&lcrg.to_be_bytes());
+        for (x, y) in entries {
+            buf.extend_from_slice(&x.to_be_bytes());
+            buf.extend_from_slice(&y.to_be_bytes());
+        }
+    }
+
+    /// Append a `Tnlt = 1` NLT marker carrying `dco` in the σ:α
+    /// packed-u16 form (Annex A.4.6 Table A.16).
+    fn push_nlt_quadratic(buf: &mut Vec<u8>, dco: i32) {
+        buf.extend_from_slice(&[0xff, 0x16]);
+        buf.extend_from_slice(&5u16.to_be_bytes()); // Lnlt
+        buf.push(1);
+        let (sigma, alpha) = if dco < 0 {
+            (1u16, (dco + (1 << 15)) as u16)
+        } else {
+            (0u16, dco as u16)
+        };
+        let packed = (sigma << 15) | (alpha & 0x7fff);
+        buf.extend_from_slice(&packed.to_be_bytes());
+    }
+
+    /// Builds a minimal Star-Tetrix-capable 4-component codestream
+    /// (Cpih=3, Nc=4) with CTS + CRG present. Used by typed-accessor
+    /// tests below.
+    fn build_star_tetrix_codestream() -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0xff, 0x10]);
+        buf.extend_from_slice(&[0xff, 0x50]);
+        buf.extend_from_slice(&2u16.to_be_bytes());
+        buf.extend_from_slice(&[0xff, 0x12]);
+        buf.extend_from_slice(&26u16.to_be_bytes());
+        buf.extend_from_slice(&build_pih_body(4, 4, 3, 3));
+        buf.extend_from_slice(&[0xff, 0x13]);
+        buf.extend_from_slice(&((2 * 4 + 2) as u16).to_be_bytes());
+        for _ in 0..4 {
+            buf.extend_from_slice(&[8, 0x11]);
+        }
+        buf.extend_from_slice(&[0xff, 0x14]);
+        buf.extend_from_slice(&2u16.to_be_bytes());
+        // RGGB CRG: (0,0), (32768,0), (0,32768), (32768,32768).
+        push_crg(&mut buf, &[(0, 0), (32768, 0), (0, 32768), (32768, 32768)]);
+        // CTS: Cf = 3 (in-line), e1 = 1, e2 = 2.
+        push_cts(&mut buf, 3, 1, 2);
+        buf.extend_from_slice(&[0xff, 0x20]);
+        buf.extend_from_slice(&4u16.to_be_bytes());
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        buf.extend_from_slice(&[0xff, 0x11]);
+        buf
+    }
+
+    #[test]
+    fn cts_method_returns_none_when_absent() {
+        let buf = build_tiny_codestream();
+        let cs = parse(&buf).expect("tiny parse");
+        assert!(cs.cts.is_none());
+        let typed = cs.cts().expect("typed cts() OK");
+        assert!(typed.is_none());
+    }
+
+    #[test]
+    fn cts_method_decodes_body() {
+        let buf = build_star_tetrix_codestream();
+        let cs = parse(&buf).expect("star-tetrix parse");
+        let cts = cs.cts().expect("typed cts() OK").expect("CTS present");
+        assert_eq!(cts.cf, crate::cts::CtsExtent::InLine);
+        assert_eq!(cts.cf.cf(), 3);
+        assert_eq!(cts.e1, 1);
+        assert_eq!(cts.e2, 2);
+    }
+
+    #[test]
+    fn cts_method_surfaces_body_errors() {
+        // Build a Cpih ∈ {0, 1, 2} codestream that carries an
+        // (illegal-content) CTS so the parser keeps the body in
+        // `cs.cts` without rejecting it. Use Cpih=2 (YCgCo, not
+        // gated by the parser's Star-Tetrix-CTS-required check).
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0xff, 0x10]);
+        buf.extend_from_slice(&[0xff, 0x50]);
+        buf.extend_from_slice(&2u16.to_be_bytes());
+        buf.extend_from_slice(&[0xff, 0x12]);
+        buf.extend_from_slice(&26u16.to_be_bytes());
+        buf.extend_from_slice(&build_pih_body(1, 4, 3, 0));
+        buf.extend_from_slice(&[0xff, 0x13]);
+        buf.extend_from_slice(&4u16.to_be_bytes());
+        buf.extend_from_slice(&[8, 0x11]);
+        buf.extend_from_slice(&[0xff, 0x14]);
+        buf.extend_from_slice(&2u16.to_be_bytes());
+        // Reserved nibble forced non-zero (illegal per §A.4.8).
+        buf.extend_from_slice(&[0xff, 0x18]);
+        buf.extend_from_slice(&4u16.to_be_bytes());
+        buf.push(0x10); // Reserved=1, Cf=0
+        buf.push(0x00);
+        buf.extend_from_slice(&[0xff, 0x20]);
+        buf.extend_from_slice(&4u16.to_be_bytes());
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        buf.extend_from_slice(&[0xff, 0x11]);
+        let cs = parse(&buf).expect("parse OK (top-level CTS body is opaque)");
+        let err = cs.cts().expect_err("typed cts() should reject Reserved!=0");
+        assert!(
+            format!("{err}").contains("Reserved"),
+            "expected Reserved-nibble error, got {err}"
+        );
+    }
+
+    #[test]
+    fn crg_method_returns_none_when_absent() {
+        let buf = build_tiny_codestream();
+        let cs = parse(&buf).expect("tiny parse");
+        assert!(cs.crg.is_none());
+        let typed = cs.crg().expect("typed crg() OK");
+        assert!(typed.is_none());
+    }
+
+    #[test]
+    fn crg_method_decodes_rggb_body() {
+        let buf = build_star_tetrix_codestream();
+        let cs = parse(&buf).expect("star-tetrix parse");
+        let crg = cs.crg().expect("typed crg() OK").expect("CRG present");
+        assert_eq!(crg.entries.len(), 4);
+        assert_eq!(crg.entries[0].x_crg, 0);
+        assert_eq!(crg.entries[0].y_crg, 0);
+        assert_eq!(crg.entries[1].x_crg, 32768);
+        assert_eq!(crg.entries[3].y_crg, 32768);
+        let ct = crate::crg::cfa_pattern_type(&crg).expect("RGGB → Ct = 0");
+        assert_eq!(ct, 0);
+    }
+
+    #[test]
+    fn nlt_method_returns_none_when_absent() {
+        let buf = build_tiny_codestream();
+        let cs = parse(&buf).expect("tiny parse");
+        assert!(cs.nlt.is_none());
+        let typed = cs.nlt().expect("typed nlt() OK");
+        assert!(typed.is_none());
+    }
+
+    #[test]
+    fn nlt_method_decodes_quadratic_body() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0xff, 0x10]);
+        buf.extend_from_slice(&[0xff, 0x50]);
+        buf.extend_from_slice(&2u16.to_be_bytes());
+        buf.extend_from_slice(&[0xff, 0x12]);
+        buf.extend_from_slice(&26u16.to_be_bytes());
+        buf.extend_from_slice(&build_pih_body(1, 4, 3, 0));
+        buf.extend_from_slice(&[0xff, 0x13]);
+        buf.extend_from_slice(&4u16.to_be_bytes());
+        buf.extend_from_slice(&[8, 0x11]);
+        buf.extend_from_slice(&[0xff, 0x14]);
+        buf.extend_from_slice(&2u16.to_be_bytes());
+        push_nlt_quadratic(&mut buf, -1234);
+        buf.extend_from_slice(&[0xff, 0x20]);
+        buf.extend_from_slice(&4u16.to_be_bytes());
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        buf.extend_from_slice(&[0xff, 0x11]);
+        let cs = parse(&buf).expect("nlt-quadratic parse");
+        let nlt = cs.nlt().expect("typed nlt() OK").expect("NLT present");
+        match nlt {
+            crate::output::NltParams::Quadratic { dco } => assert_eq!(dco, -1234),
+            other => panic!("expected Quadratic, got {other:?}"),
+        }
     }
 }

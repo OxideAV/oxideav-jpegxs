@@ -1,5 +1,68 @@
 # Changelog
 
+## Unreleased — round 251 (typed `Codestream::cts` / `Codestream::crg` / `Codestream::nlt` accessors)
+
+Decoder-side ergonomic surface: three typed accessors on
+[`Codestream`] mirror the existing
+[`Codestream::capabilities`] pattern (decode an optional raw
+marker body into a strongly-typed view, surface body-level errors
+as `Result`).
+
+* `Codestream::cts() -> Result<Option<CtsMarker>>` — runs the
+  existing [`parse_cts`] (§A.4.8, Tables A.19 / A.20) against
+  `self.cts.as_deref()`. Returns `Ok(None)` when no CTS segment
+  was present (legal for `Cpih ∈ {0, 1, 2}`), `Ok(Some(cts))`
+  with the parsed `Cf` / `e1` / `e2` fields when CTS was present,
+  and surfaces body-level errors (reserved nibble non-zero, `Cf`
+  outside `{0, 3}`, `e1` / `e2` exceeding 3) as `Err(_)`. The
+  top-level marker-chain parser only enforces ordering and the
+  "Cpih=3 ⇒ CTS present" rule, not the field-level constraints.
+* `Codestream::crg() -> Result<Option<CrgMarker>>` — runs
+  [`parse_crg`] (§A.4.9, Table A.21) against the optional CRG
+  body, passing `self.pih.nc` as the component count. Returns
+  `Ok(None)` when absent, `Ok(Some(crg))` with one
+  [`CrgEntry`] per component otherwise. Body-level errors (wrong
+  byte count for `4 * Nc`) surface as `Err(_)`.
+* `Codestream::nlt() -> Result<Option<NltParams>>` — runs
+  [`parse_nlt`] (§A.4.6, Table A.16) against the optional NLT
+  body. Returns `Ok(None)` when absent (decoder uses the linear
+  Annex G.3 output path), `Ok(Some(NltParams::Quadratic { dco }))`
+  for `Tnlt = 1` or `Ok(Some(NltParams::Extended { t1, t2, e }))`
+  for `Tnlt = 2`. Body-level errors (wrong body length for the
+  declared `Tnlt`, unknown `Tnlt`, out-of-range exponent /
+  thresholds) surface as `Err(_)`.
+
+[`NltParams`] / [`parse_nlt`] are now re-exported from the crate
+root (previously only reachable through `output::`).
+
+The decoder's [`decode_codestream`] is refactored to route through
+the new typed accessors instead of re-parsing the raw bodies:
+* The NLT body path drops the explicit `parse_nlt` match on
+  `cs.nlt.as_deref()` and uses `cs.nlt()?` directly.
+* The Star-Tetrix branch (`Cpih == 3`) drops the `parse_cts` /
+  `parse_crg` re-parses of `cs.cts` / `cs.crg` and uses `cs.cts()?
+  .ok_or_else(...)` / `cs.crg()?.ok_or_else(...)`. The
+  `Cpih=3 ⇒ CTS/CRG present` requirement and the "CRG must
+  describe one of the four Table F.9 CFA arrangements" check
+  still fire from the decoder.
+
+The accessors are non-allocating relative to the existing wire
+format: each one borrows `self.{cts,crg,nlt}.as_deref()` and the
+parsed view is owned by the caller. They eliminate the
+double-decode pattern (`Codestream` had already validated the
+length envelope at marker-chain parse time; the typed accessor
+finishes the job by running the field-level body parser on the
+borrowed bytes).
+
+Scope: decoder-side public API only. No bitstream-wire change,
+no encoder change. Test count 401 (was 394 at round 245). New
+tests cover the present / absent / body-error matrix for each
+accessor (RGGB CRG via the [`cfa_pattern_type`] round-trip,
+Tnlt = 1 `dco = -1234` quadratic NLT, Cf = 3 / e1 = 1 / e2 = 2
+in-line CTS, and a reserved-nibble-non-zero CTS body wired into
+a Cpih = 0 codestream so the top-level parser keeps it while the
+typed accessor rejects it).
+
 ## Unreleased — round 245 (rate-budget driven per-precinct `(Q[p], R[p])` picker, encoder side)
 
 Closes the round-242 "caller must pick the vectors manually"
