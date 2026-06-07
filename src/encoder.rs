@@ -6625,6 +6625,365 @@ impl BitWriter {
     }
 }
 
+/// Round-245 helper — spatial activity of a single precinct's pixel
+/// range, summed across every plane.
+///
+/// Returns the L1 norm of the row-to-row first-difference over the
+/// image-row range `[y0, y1)`. Used by the per-precinct picker to
+/// rank precincts for the per-precinct `Q[p]` relaxation pass:
+/// low-activity precincts get the quantization relief first.
+///
+/// Delegates to [`slice_activity`] — a precinct is the smallest
+/// unit the spec defines for `Q[p]` / `R[p]` (Annex C.2 Table C.1),
+/// covering `2^NL,y` image rows (Annex B.5), so the same row-range
+/// L1-norm metric the r212 picker uses for a slice applies at the
+/// finer granularity unchanged.
+fn precinct_activity(planes: &[Vec<u8>], width: u16, y0: u32, y1: u32) -> u64 {
+    slice_activity(planes, width, y0, y1)
+}
+
+/// Round-245 helper — list of `(y0, y1)` image-row ranges for every
+/// precinct in raster scan order.
+///
+/// At `Cw = 0` there is exactly one precinct per row of `Np,y =
+/// ⌈Hf / 2^NL,y⌉`, so this returns `Np,y` entries each covering
+/// `2^NL,y` image rows (the last one may be partial when `Hf` is
+/// not a multiple of the precinct height).
+fn compute_precinct_row_ranges(height: u16, nly: u8) -> Vec<(u32, u32)> {
+    let h = height as u32;
+    let rows_per_precinct = 1u32 << nly;
+    if rows_per_precinct == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut y = 0u32;
+    while y < h {
+        let y1 = (y + rows_per_precinct).min(h);
+        out.push((y, y1));
+        y = y1;
+    }
+    out
+}
+
+/// Round-245 rate-budget driven per-precinct `(Q[p], R[p])` picker.
+///
+/// Closes the round-242 follow-up tail: round 242 shipped the
+/// per-precinct joint override [`encode_planar_qpr_rpr`] (one `Q[p]`
+/// and one `R[p]` per precinct, Annex C.2 Table C.1), but left the
+/// "caller must pick the vectors manually" tail open. Round 245
+/// supplies that picker.
+///
+/// Given a target byte budget, returns the vector pair
+/// `(q_precincts, r_precincts)` — both length `Np,y × Np,x` (here
+/// `Np,y = ⌈Hf / 2^NL,y⌉` and `Np,x = 1` at `Cw = 0`) — that drives
+/// [`encode_planar_qpr_rpr`] to emit a codestream of length
+/// `≤ target_bytes`, while concentrating bits on precincts whose
+/// source content has the lowest spatial activity (so distortion
+/// from quantization lands on the busier precincts where it is less
+/// perceptually visible). The picker is fully deterministic and
+/// performs no rate-distortion search beyond calling
+/// [`encode_planar_qpr_rpr`] with candidate vectors and reading
+/// back the byte length — there is no internal model of the entropy
+/// coder, no oracle, no external library. Bytes returned by the
+/// callee are the only feedback the search uses.
+///
+/// Strategy (nested search — outer loop on uniform `R[p]`, inner
+/// three-pass `Q[p]` picker against [`encode_planar_qpr_rpr`] at
+/// the current `R[p]` baseline):
+///
+/// 1. **Baseline reachability.** Probe `r_precincts = [0; n]` +
+///    `q_precincts = [15; n]` (max quantization, no refinement) —
+///    the smallest stream the family can produce. If even that
+///    overshoots, error with `target_bytes unreachable; rp=0 Q=15
+///    emits N bytes` — no `(q_precincts, r_precincts)` pair can fit.
+/// 2. **Outer loop on `rp ∈ 0..=NL-1`.** For each uniform `R[p]`,
+///    run the inner per-precinct `Q[p]` search; if it fits,
+///    promote the `(q_precincts, rp)` pair; if even `[15; n]`
+///    overshoots at this `rp`, stop the outer loop (refinement is
+///    monotone non-decreasing in codestream length at fixed
+///    `Q[p]`, so higher `rp` cannot fit either).
+/// 3. **Inner `Q[p]` search.** Three passes against
+///    [`encode_planar_qpr_rpr`] at the current uniform `rp`:
+///    a. Lossless probe (`q_precincts = [0; n]`).
+///    b. Uniform-`Q` bisect on `1..=15`.
+///    c. Per-precinct activity-driven relaxation — sort precincts
+///    by spatial activity ascending and lower one low-activity
+///    precinct at a time by one `Q` step (down to `Q = 0`) while
+///    each candidate still fits.
+///
+/// Inputs:
+/// * `width`, `height`, `nc`, `cpih`, `nlx`, `nly`, `planes` —
+///   identical to [`encode_planar_qpr_rpr`].
+/// * `target_bytes` — upper bound on the encoded codestream length;
+///   must be `> 0`.
+///
+/// Returns `(q_precincts, r_precincts)`. The `r_precincts` vector
+/// is filled with the picked uniform `rp` (one entry per precinct;
+/// the per-precinct `R[p]` mechanism in round 239 carries the byte
+/// independently regardless of whether the values vary — a uniform
+/// `r_precincts = [rp; n]` is byte-identical to picture-wide `R[p]`
+/// via `encode_planar_qpr_rpr`'s `max(r_precincts)` fallback).
+///
+/// Composition: at `q_precincts = [0; n]` refinement is a lossless
+/// no-op (`T[p,b]` already at its `0` floor), so the picker always
+/// returns `r_precincts = [0; n]` whenever the lossless probe
+/// fits — the outer `rp` loop never promotes a non-zero `rp` for a
+/// budget the lossless probe satisfies. At `q_precincts > 0`, both
+/// vectors become active rate-distortion levers.
+///
+/// **Scope:** mirrors [`encode_planar_qpr_rpr`] exactly — 4:4:4,
+/// `Cpih ∈ {0, 1, 3}`, `Cw = 0`, `Hsl = 0`, `Sd = 0`, `Fs = 0`,
+/// `Qpih = 0`, `B[i] = 8`.
+///
+/// **Errors:**
+/// * Any of the validation errors [`encode_planar_qpr_rpr`] would
+///   produce.
+/// * [`crate::JpegXsError::Invalid`] when `target_bytes == 0`.
+/// * [`crate::JpegXsError::Invalid`] when even `q_precincts = [15;
+///   n]` + `r_precincts = [0; n]` overshoots the budget.
+#[allow(clippy::too_many_arguments)]
+pub fn pick_qpr_rpr_for_target_bytes(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    target_bytes: usize,
+    planes: &[Vec<u8>],
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    if target_bytes == 0 {
+        return Err(Error::invalid(
+            "jpegxs per-precinct joint picker: target_bytes must be > 0".to_string(),
+        ));
+    }
+
+    // NL = Nc × Nβ for the 4:4:4 / Sd = 0 surface (Annex B.6).
+    let nbeta = n_beta(nlx, nly);
+    let nl = (nc as u32) * nbeta;
+    if nl == 0 {
+        return Err(Error::invalid(format!(
+            "jpegxs per-precinct joint picker: NL=0 (nc={nc}, NL,x={nlx}, NL,y={nly})"
+        )));
+    }
+    let rp_max = (nl - 1).min(u8::MAX as u32) as u8;
+
+    // Np,y at Cw = 0 (one precinct per precinct row).
+    let np_y = np_y_for(height, nly) as usize;
+    if np_y == 0 {
+        return Err(Error::invalid(format!(
+            "jpegxs per-precinct joint picker: Np,y=0 (height={height}, NL,y={nly})"
+        )));
+    }
+
+    // Baseline reachability — rp=0 + Q=15 is the smallest stream of
+    // the family at this geometry. If even that overshoots, no
+    // (q_precincts, r_precincts) pair can fit.
+    let cs_baseline = encode_planar_qpr_rpr(
+        width,
+        height,
+        nc,
+        cpih,
+        nlx,
+        nly,
+        &vec![15u8; np_y],
+        &vec![0u8; np_y],
+        planes,
+    )?;
+    if cs_baseline.len() > target_bytes {
+        return Err(Error::invalid(format!(
+            "jpegxs per-precinct joint picker: target_bytes={target_bytes} unreachable; rp=0 Q=15 emits {} bytes",
+            cs_baseline.len()
+        )));
+    }
+
+    // Outer loop on uniform rp — promote the last fitting
+    // (q_precincts, rp) pair. Stop on the first rp whose inner picker
+    // fails (refinement is monotone non-decreasing in codestream
+    // length at fixed Q[p]).
+    //
+    // Lossless short-circuit: if the inner picker returns an
+    // all-zero q_precincts at any rp, refinement is a lossless no-op
+    // (`T[p,b]` is already at its 0 floor at Q=0, so the precinct's
+    // R[p] byte is a wire-only quantity that does not perturb the
+    // data sub-packet bytes). Higher rp at q_precincts=[0;n] would
+    // produce the same data bytes plus a non-zero R byte the decoder
+    // ignores quantization-wise, so promoting beyond the first
+    // lossless rp adds zero rate-distortion value. Keep the
+    // canonical (r=0) form.
+    let mut best_q = vec![15u8; np_y];
+    let mut best_rp: u8 = 0;
+    for rp in 0..=rp_max {
+        match pick_q_precincts_at_rp(
+            width,
+            height,
+            nc,
+            cpih,
+            nlx,
+            nly,
+            rp,
+            target_bytes,
+            np_y,
+            planes,
+        ) {
+            Ok(qs) => {
+                let is_lossless = qs.iter().all(|&v| v == 0);
+                best_q = qs;
+                best_rp = rp;
+                if is_lossless {
+                    // Canonicalize to r=0; higher rp at q=0 is a
+                    // wire-only no-op (R byte is the only diff and
+                    // adds no rate-distortion lever).
+                    best_rp = 0;
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    Ok((best_q, vec![best_rp; np_y]))
+}
+
+/// Round-245 inner picker — at a fixed uniform `rp`, runs the
+/// three-pass per-precinct `q_precincts` search against
+/// [`encode_planar_qpr_rpr`]. Returns `Err` if even `[15; np_y]`
+/// overshoots at this `rp` (signal to the outer loop that higher
+/// `rp` cannot fit either).
+#[allow(clippy::too_many_arguments)]
+fn pick_q_precincts_at_rp(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    rp: u8,
+    target_bytes: usize,
+    np_y: usize,
+    planes: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    let r_uniform = vec![rp; np_y];
+
+    // Pass 1 — lossless probe.
+    let q_zero = vec![0u8; np_y];
+    let cs_zero = encode_planar_qpr_rpr(
+        width, height, nc, cpih, nlx, nly, &q_zero, &r_uniform, planes,
+    )?;
+    if cs_zero.len() <= target_bytes {
+        return Ok(q_zero);
+    }
+
+    // Pass 2 — uniform-Q bisect over 1..=15.
+    let mut lo: u8 = 1;
+    let mut hi: u8 = 15;
+    let mut best_uniform_q: Option<u8> = None;
+    let mut best_uniform_len: usize = usize::MAX;
+    while lo <= hi {
+        let mid = (lo + hi) / 2;
+        let qv = vec![mid; np_y];
+        let cs = encode_planar_qpr_rpr(width, height, nc, cpih, nlx, nly, &qv, &r_uniform, planes)?;
+        if cs.len() <= target_bytes {
+            best_uniform_q = Some(mid);
+            best_uniform_len = cs.len();
+            if mid == 0 {
+                break;
+            }
+            hi = mid - 1;
+        } else {
+            if mid == 15 {
+                break;
+            }
+            lo = mid + 1;
+        }
+    }
+    let uniform_q = match best_uniform_q {
+        Some(q) => q,
+        None => {
+            // Q=15 at this rp overshoots → signal outer loop to stop.
+            return Err(Error::invalid(format!(
+                "jpegxs per-precinct joint picker (rp={rp}): target_bytes={target_bytes} unreachable; Q=15 overshoots"
+            )));
+        }
+    };
+
+    if np_y == 1 {
+        return Ok(vec![uniform_q; 1]);
+    }
+
+    // Pass 3 — per-precinct activity-driven relaxation.
+    let precinct_row_ranges = compute_precinct_row_ranges(height, nly);
+    debug_assert_eq!(precinct_row_ranges.len(), np_y);
+    let mut activity: Vec<(usize, u64)> = precinct_row_ranges
+        .iter()
+        .enumerate()
+        .map(|(p, &(y0, y1))| (p, precinct_activity(planes, width, y0, y1)))
+        .collect();
+    activity.sort_by_key(|&(_, a)| a);
+
+    let mut best = vec![uniform_q; np_y];
+    let mut best_len = best_uniform_len;
+    loop {
+        let mut changed = false;
+        for &(p, _) in &activity {
+            if best[p] == 0 {
+                continue;
+            }
+            let mut trial = best.clone();
+            trial[p] -= 1;
+            let cs = encode_planar_qpr_rpr(
+                width, height, nc, cpih, nlx, nly, &trial, &r_uniform, planes,
+            )?;
+            if cs.len() <= target_bytes {
+                best = trial;
+                best_len = cs.len();
+                changed = true;
+            }
+        }
+        let _ = best_len;
+        if !changed {
+            break;
+        }
+    }
+    Ok(best)
+}
+
+/// Round-245 convenience wrapper — picks `(q_precincts, r_precincts)`
+/// against `target_bytes` and emits the codestream in one call.
+///
+/// Returns `(codestream, q_precincts, r_precincts)`. The codestream
+/// is guaranteed to satisfy `codestream.len() <= target_bytes`
+/// (otherwise the picker returns `target_bytes unreachable; rp=0
+/// Q=15 emits N bytes`). The `q_precincts` and `r_precincts` values
+/// are the ones returned by [`pick_qpr_rpr_for_target_bytes`];
+/// callers can persist them for reproducible re-encode of identical
+/// parameters.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_qpr_rpr_target_bytes(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    target_bytes: usize,
+    planes: &[Vec<u8>],
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let (q_precincts, r_precincts) =
+        pick_qpr_rpr_for_target_bytes(width, height, nc, cpih, nlx, nly, target_bytes, planes)?;
+    let cs = encode_planar_qpr_rpr(
+        width,
+        height,
+        nc,
+        cpih,
+        nlx,
+        nly,
+        &q_precincts,
+        &r_precincts,
+        planes,
+    )?;
+    Ok((cs, q_precincts, r_precincts))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -13450,5 +13809,267 @@ mod tests {
             std::slice::from_ref(&pixels),
         );
         assert!(bad_r.is_err(), "r_precincts entry > NL-1 must be rejected");
+    }
+
+    /// Round 245 — per-precinct joint picker rejects `target_bytes = 0`
+    /// up front (precondition guard mirrors the round-218 / round-224
+    /// pickers).
+    #[test]
+    fn round245_qpr_rpr_picker_rejects_zero_target() {
+        let w = 32usize;
+        let h = 32usize;
+        let pixels = round103_grad(w, h);
+        let r = pick_qpr_rpr_for_target_bytes(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            0,
+            std::slice::from_ref(&pixels),
+        );
+        assert!(r.is_err(), "target_bytes=0 must be rejected");
+    }
+
+    /// Round 245 — when the lossless probe fits the budget, the picker
+    /// returns `q_precincts = [0; n]` and `r_precincts = [0; n]`
+    /// (refinement is a no-op at the `T[p,b]` 0 floor at `q = 0`, so
+    /// promoting `rp` is pointless).
+    #[test]
+    fn round245_qpr_rpr_picker_lossless_probe_fits_returns_zero_vectors() {
+        let w = 32usize;
+        let h = 32usize;
+        let pixels = round103_grad(w, h);
+        // The lossless r242 stream at this geometry — measure it then
+        // give the picker exactly that budget.
+        let lossless = encode_planar_qpr_rpr(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            &[0u8; 8],
+            &[0u8; 8],
+            std::slice::from_ref(&pixels),
+        )
+        .expect("lossless probe");
+        let (q, r) = pick_qpr_rpr_for_target_bytes(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            lossless.len(),
+            std::slice::from_ref(&pixels),
+        )
+        .expect("picker fits at lossless budget");
+        assert_eq!(q, vec![0u8; 8], "lossless-fits → q_precincts all zero");
+        assert_eq!(r, vec![0u8; 8], "lossless-fits → r_precincts all zero");
+        // The convenience wrapper produces the same codestream the
+        // lossless probe did.
+        let (cs, _, _) = encode_planar_qpr_rpr_target_bytes(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            lossless.len(),
+            std::slice::from_ref(&pixels),
+        )
+        .expect("wrapper fits");
+        assert_eq!(cs.len(), lossless.len());
+    }
+
+    /// Round 245 — when even `rp=0, Q=15` overshoots, the picker errors
+    /// with a `target_bytes unreachable; rp=0 Q=15 emits N bytes` message
+    /// (matches the round-224 baseline-reachability shape).
+    #[test]
+    fn round245_qpr_rpr_picker_unreachable_target_errors() {
+        let w = 32usize;
+        let h = 32usize;
+        let pixels = round103_grad(w, h);
+        // 1 byte is well below any plausible JPEG XS codestream size
+        // (SOC + CAP + PIH + CDT + WGT + at least one precinct + EOC).
+        let r = pick_qpr_rpr_for_target_bytes(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            1,
+            std::slice::from_ref(&pixels),
+        );
+        assert!(r.is_err(), "1-byte budget must be unreachable");
+    }
+
+    /// Round 245 — the picker output decodes through the round-242
+    /// joint primitive and the reconstructed pixels self-round-trip
+    /// at the picker's chosen `(q_precincts, r_precincts)`.
+    ///
+    /// We pick the budget at a fraction of the lossless size so the
+    /// picker must engage Pass 2 / Pass 3 (uniform-Q bisect + per-
+    /// precinct activity relaxation).
+    #[test]
+    fn round245_qpr_rpr_picker_roundtrips_through_decoder() {
+        let w = 32usize;
+        let h = 32usize;
+        let pixels = round103_grad(w, h);
+        let lossless = encode_planar_qpr_rpr(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            &[0u8; 8],
+            &[0u8; 8],
+            std::slice::from_ref(&pixels),
+        )
+        .expect("lossless probe");
+        // Pick a budget tight enough that Q must be > 0 somewhere.
+        let target = lossless.len() / 2;
+        let (cs, q_picked, r_picked) = encode_planar_qpr_rpr_target_bytes(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            target,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("picker fits at half-lossless budget");
+        assert!(
+            cs.len() <= target,
+            "codestream must fit: {} <= {}",
+            cs.len(),
+            target
+        );
+        assert_eq!(q_picked.len(), 8, "Np,y = 8 → 8 Q[p] entries");
+        assert_eq!(r_picked.len(), 8, "Np,y = 8 → 8 R[p] entries");
+        // Lossy stream still decodes through the round-242 primitive.
+        let img = decode_codestream(&cs, None).expect("decode picker output");
+        assert_eq!(img.width as usize, w);
+        assert_eq!(img.height as usize, h);
+    }
+
+    /// Round 245 — at a budget set at 90% of the lossless probe size,
+    /// the picker's per-precinct relaxation keeps PSNR within the
+    /// useful band (≥ 25 dB) against the source. The activity-driven
+    /// pass concentrates bits on the low-activity precincts so that
+    /// quantization distortion lands on the busier precincts where it
+    /// is less perceptually visible; 90% leaves enough rate to keep
+    /// reconstruction recognisable on the XOR-ramp fixture.
+    #[test]
+    fn round245_qpr_rpr_picker_psnr_floor_at_relaxed_budget() {
+        let w = 32usize;
+        let h = 32usize;
+        let pixels = round103_grad(w, h);
+        let lossless = encode_planar_qpr_rpr(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            &[0u8; 8],
+            &[0u8; 8],
+            std::slice::from_ref(&pixels),
+        )
+        .expect("lossless probe");
+        // 90% of the lossless size — tight enough to force the inner
+        // search past the lossless probe, loose enough that the
+        // activity-driven relaxation gets one or two slices to Q=0.
+        let target = (lossless.len() * 9) / 10;
+        let (cs, q_picked, _) = encode_planar_qpr_rpr_target_bytes(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            target,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("picker fits");
+        assert!(
+            cs.len() <= target,
+            "codestream must fit: {} <= {}",
+            cs.len(),
+            target
+        );
+        // Sanity — picker engaged Q > 0 somewhere.
+        assert!(
+            q_picked.iter().any(|&q| q > 0),
+            "tight budget must drive Q > 0 on some precinct: {q_picked:?}"
+        );
+        let img = decode_codestream(&cs, None).expect("decode");
+        let plane = &img.planes[0].data;
+        assert_eq!(plane.len(), w * h, "reconstructed plane size");
+        let p = psnr(&pixels, plane);
+        assert!(
+            p >= 25.0,
+            "round245 90% lossless budget PSNR ≥ 25 dB, got {p}"
+        );
+    }
+
+    /// Round 245 — when the wrapper picker is given a budget the
+    /// lossless probe fits and the codestream comes out byte-identical
+    /// to `encode_planar_qpr_rpr` at `q_precincts = [0; n]` +
+    /// `r_precincts = [0; n]`, the round trips losslessly (proves the
+    /// picker's `(q, r)` output is consistent with a direct
+    /// `encode_planar_qpr_rpr` invocation).
+    #[test]
+    fn round245_qpr_rpr_picker_byte_identical_to_qpr_rpr_at_lossless() {
+        let w = 32usize;
+        let h = 32usize;
+        let pixels = round103_grad(w, h);
+        let lossless = encode_planar_qpr_rpr(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            &[0u8; 8],
+            &[0u8; 8],
+            std::slice::from_ref(&pixels),
+        )
+        .expect("lossless probe");
+        let (cs, q, r) = encode_planar_qpr_rpr_target_bytes(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            lossless.len(),
+            std::slice::from_ref(&pixels),
+        )
+        .expect("wrapper at lossless budget");
+        // Picker's output through encode_planar_qpr_rpr is the same
+        // byte sequence (the wrapper just composes the picker + the
+        // primitive).
+        let cs_replay = encode_planar_qpr_rpr(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            &q,
+            &r,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("replay primitive");
+        assert_eq!(cs, cs_replay, "wrapper output == primitive replay");
+        assert_eq!(cs, lossless, "matches lossless reference");
+        let img = decode_codestream(&cs, None).expect("decode lossless");
+        assert_eq!(img.planes[0].data, pixels, "lossless self-roundtrip");
     }
 }

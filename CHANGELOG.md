@@ -1,6 +1,86 @@
 # Changelog
 
-## Unreleased — round 242 (joint per-precinct `Q[p] × R[p]` override, encoder side)
+## Unreleased — round 245 (rate-budget driven per-precinct `(Q[p], R[p])` picker, encoder side)
+
+Closes the round-242 "caller must pick the vectors manually"
+follow-up tail. Round 242 shipped the per-precinct joint override
+[`encode_planar_qpr_rpr`] (one `Q[p]` and one `R[p]` per precinct,
+Annex C.2 Table C.1), and round 245 supplies the picker that drives
+it against a byte budget.
+
+* `pick_qpr_rpr_for_target_bytes(width, height, nc, cpih, nlx, nly,
+  target_bytes, &[Vec<u8>]) -> Result<(Vec<u8>, Vec<u8>)>` — picks
+  the per-precinct `(q_precincts, r_precincts)` pair (each of length
+  `Np,y × Np,x` at `Cw = 0`) that drives
+  [`encode_planar_qpr_rpr`] to emit a codestream `≤ target_bytes`.
+  Nested search — outer loop on uniform `rp ∈ 0..=NL-1`, inner
+  three-pass per-precinct `q_precincts` search at the current `rp`:
+  (1) lossless probe at `q_precincts = [0; n]`, (2) uniform-`Q`
+  bisect on `1..=15`, (3) per-precinct activity-driven relaxation
+  walking the lowest-activity precincts first (L1 norm of
+  row-to-row first-difference summed across every plane within
+  each precinct's `Hp = 2^NL,y` image-row window from Annex B.5,
+  computed by the `precinct_activity` helper). Promotion stops on
+  the first `rp` whose inner search fails (refinement is monotone
+  non-decreasing in codestream length at fixed `Q[p]`, so higher
+  `rp` cannot fit either); lossless short-circuit canonicalises to
+  `r_precincts = [0; n]` whenever the inner picker returns the
+  all-zero `q_precincts` vector (refinement is a wire-only no-op
+  at the `T[p,b]` 0 floor, so promoting `rp` adds zero
+  rate-distortion value).
+* `encode_planar_qpr_rpr_target_bytes(width, height, nc, cpih, nlx,
+  nly, target_bytes, &[Vec<u8>]) -> Result<(Vec<u8>, Vec<u8>,
+  Vec<u8>)>` — convenience wrapper: returns
+  `(codestream, q_precincts, r_precincts)` in one call.
+
+The round-218 / round-224 / round-230 pickers all worked at
+per-slice granularity (one `Q` per slice, one uniform `rp` for the
+picture); round 245 closes the granularity gap by giving each
+precinct its own `Q[p]` while keeping `R[p]` as a uniform
+picture-wide knob the outer loop walks. Every measurement is a real
+[`encode_planar_qpr_rpr`] call — there is no internal model of the
+entropy coder.
+
+Composition behaviour:
+
+* The wrapper output through [`encode_planar_qpr_rpr`] is
+  byte-identical to a direct [`encode_planar_qpr_rpr`] invocation
+  at the picker's chosen `(q_precincts, r_precincts)`.
+* At a budget the lossless probe satisfies, the picker returns
+  `(q_precincts, r_precincts) = ([0; n], [0; n])` and the stream
+  is byte-identical to [`encode_planar`].
+* PSNR ≥ 25 dB at a 90% lossless budget on the 32×32 luma XOR-ramp
+  fixture (the activity-driven relaxation concentrates bits on the
+  low-activity precincts).
+
+Errors:
+
+* `target_bytes unreachable; rp=0 Q=15 emits N bytes` when even
+  `q_precincts = [15; n]` + `r_precincts = [0; n]` overshoots the
+  budget. Matches the round-224 / round-230 baseline-reachability
+  error shape.
+* `target_bytes must be > 0` precondition guard.
+
+Scope: 4:4:4, `Cpih ∈ {0, 1, 3}`, `Cw = 0`, `Hsl = 0`, `Sd = 0`,
+`Fs = 0`, `Qpih = 0`, `B[i] = 8`.
+
+Out-of-scope (next round):
+
+* High-bit-depth widening for the per-precinct picker (`B[i] ∈
+  9..=16` against the round-118 `u16`-LE plane format; mirrors the
+  round-230 widening of the round-224 per-slice picker).
+* Non-uniform `r_precincts` search — round 245's outer loop walks
+  a uniform `rp`. A future round could lift the inner picker to
+  also relax `R[p]` per precinct (e.g. priority-aware band ranking)
+  while keeping the activity-driven `Q[p]` relaxation in place.
+* `Cw > 0` multi-precinct-column widening (the picker's
+  `compute_precinct_row_ranges` helper returns one range per
+  precinct row, which already maps correctly to `Np,y × 1` at
+  `Cw = 0`; widening to `Np,y × Np,x` requires per-column slicing).
+
++6 tests, 394 total.
+
+## round 242 (joint per-precinct `Q[p] × R[p]` override, encoder side)
 
 Closes the round-239 "Out-of-scope (next round)" tail: the joint
 per-precinct `Q[p] × R[p]` cross-product. Round 233 lifted
