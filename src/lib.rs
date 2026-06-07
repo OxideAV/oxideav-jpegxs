@@ -101,6 +101,7 @@ pub use profile::{
     ColumnMode, Level, Profile, ProfileLimits, QpihAllowed, Sublevel,
 };
 pub use slice_header::SliceHeader;
+pub use slice_walker::{parse_wgt, BandWeight};
 
 /// Public codec id string. Matches the aggregator feature name `jpegxs`.
 pub const CODEC_ID_STR: &str = "jpegxs";

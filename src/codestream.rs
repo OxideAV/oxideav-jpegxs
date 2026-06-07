@@ -23,6 +23,7 @@ use crate::markers::Marker;
 use crate::output::{parse_nlt, NltParams};
 use crate::picture_header::{self, PictureHeader};
 use crate::slice_header::{self, SliceHeader};
+use crate::slice_walker::{parse_wgt, BandWeight};
 
 /// Records one (SLH, entropy-coded body) slice in the codestream.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,6 +125,38 @@ impl Codestream {
             None => Ok(None),
             Some(body) => parse_nlt(body).map(Some),
         }
+    }
+
+    /// Decode the mandatory WGT marker body into a strongly-typed
+    /// `Vec<BandWeight>` (Annex A.4.11, Table A.24).
+    ///
+    /// The WGT body is a flat sequence of `(G[b], P[b])` byte pairs,
+    /// one pair per *existing* band (Table A.24's `if (b'x[b])`
+    /// guard). The full mapping from pair index to band id requires
+    /// the picture / component geometry and the optional CWD
+    /// `Sd` value, which the slice walker resolves at decode time;
+    /// the typed accessor here is geometry-independent and only
+    /// enforces the body-level constraints:
+    ///
+    /// * total length is a multiple of two (each pair is two
+    ///   bytes),
+    /// * each `G[b]` is at most 15 (Annex A.4.11 hard cap).
+    ///
+    /// The order of the returned vector matches the on-wire order;
+    /// pair `k` corresponds to the `k`-th existing band in the
+    /// walker's iteration order, not to the flat band id `b`.
+    /// Higher-level field errors (e.g. mismatch between
+    /// `existing-band-count` and the carried pair count under a
+    /// specific geometry) are caught at slice-walker construction.
+    pub fn wgt(&self) -> Result<Vec<BandWeight>> {
+        if self.wgt.len() % 2 != 0 {
+            return Err(Error::invalid(format!(
+                "jpegxs WGT body length {} is not a multiple of 2 \
+                 (Annex A.4.11 Table A.24: (G[b], P[b]) byte pairs)",
+                self.wgt.len()
+            )));
+        }
+        parse_wgt(&self.wgt, self.wgt.len() / 2)
     }
 }
 
@@ -901,6 +934,118 @@ mod tests {
         assert!(cs.nlt.is_none());
         let typed = cs.nlt().expect("typed nlt() OK");
         assert!(typed.is_none());
+    }
+
+    #[test]
+    fn wgt_method_returns_empty_for_zero_band_codestream() {
+        // build_tiny_codestream uses Lwgt=2 (i.e. empty body): the
+        // 4×3 single-component image at NL=1/1 has bx[β,i] geometry
+        // but the hand-built fixture leaves the body empty so the
+        // accessor sees a zero-pair body. Verify that's still well-
+        // formed at the marker-body level (geometry mismatch is
+        // caught by the slice walker, not here).
+        let buf = build_tiny_codestream();
+        let cs = parse(&buf).expect("tiny parse");
+        assert!(cs.wgt.is_empty());
+        let typed = cs.wgt().expect("typed wgt() OK on empty body");
+        assert!(typed.is_empty());
+    }
+
+    #[test]
+    fn wgt_method_decodes_pair_body() {
+        // Build a codestream whose WGT carries two (G[b], P[b]) pairs:
+        // (gain=2, priority=0) and (gain=15, priority=3). Verify the
+        // typed accessor returns them in wire order.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0xff, 0x10]);
+        buf.extend_from_slice(&[0xff, 0x50]);
+        buf.extend_from_slice(&2u16.to_be_bytes());
+        buf.extend_from_slice(&[0xff, 0x12]);
+        buf.extend_from_slice(&26u16.to_be_bytes());
+        buf.extend_from_slice(&build_pih_body(1, 4, 3, 0));
+        buf.extend_from_slice(&[0xff, 0x13]);
+        buf.extend_from_slice(&4u16.to_be_bytes());
+        buf.extend_from_slice(&[8, 0x11]);
+        // WGT — Lwgt = 2 + 4 = 6, body = 4 bytes (two pairs).
+        buf.extend_from_slice(&[0xff, 0x14]);
+        buf.extend_from_slice(&6u16.to_be_bytes());
+        buf.extend_from_slice(&[2, 0, 15, 3]);
+        buf.extend_from_slice(&[0xff, 0x20]);
+        buf.extend_from_slice(&4u16.to_be_bytes());
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        buf.extend_from_slice(&[0xff, 0x11]);
+        let cs = parse(&buf).expect("wgt-pairs parse");
+        let weights = cs.wgt().expect("typed wgt() OK");
+        assert_eq!(weights.len(), 2);
+        assert_eq!(weights[0].gain, 2);
+        assert_eq!(weights[0].priority, 0);
+        assert_eq!(weights[1].gain, 15);
+        assert_eq!(weights[1].priority, 3);
+    }
+
+    #[test]
+    fn wgt_method_surfaces_odd_length_body() {
+        // Codestream whose WGT body has an odd length (3 bytes).
+        // The top-level marker-chain parser accepts any byte sequence
+        // for the WGT body; the typed accessor enforces the pair-
+        // length constraint.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0xff, 0x10]);
+        buf.extend_from_slice(&[0xff, 0x50]);
+        buf.extend_from_slice(&2u16.to_be_bytes());
+        buf.extend_from_slice(&[0xff, 0x12]);
+        buf.extend_from_slice(&26u16.to_be_bytes());
+        buf.extend_from_slice(&build_pih_body(1, 4, 3, 0));
+        buf.extend_from_slice(&[0xff, 0x13]);
+        buf.extend_from_slice(&4u16.to_be_bytes());
+        buf.extend_from_slice(&[8, 0x11]);
+        // WGT — Lwgt = 2 + 3 = 5, body = 3 bytes (odd → invalid).
+        buf.extend_from_slice(&[0xff, 0x14]);
+        buf.extend_from_slice(&5u16.to_be_bytes());
+        buf.extend_from_slice(&[2, 0, 4]);
+        buf.extend_from_slice(&[0xff, 0x20]);
+        buf.extend_from_slice(&4u16.to_be_bytes());
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        buf.extend_from_slice(&[0xff, 0x11]);
+        let cs = parse(&buf).expect("parse keeps odd-length WGT body");
+        let err = cs
+            .wgt()
+            .expect_err("typed wgt() should reject odd-length body");
+        assert!(
+            format!("{err}").contains("multiple of 2"),
+            "expected multiple-of-2 error, got {err}"
+        );
+    }
+
+    #[test]
+    fn wgt_method_surfaces_oversized_gain() {
+        // Codestream whose WGT body carries gain=16 (>15, illegal per
+        // §A.4.11). The pair-count parity is fine so the parity check
+        // does not fire; the per-pair gain-cap check must catch it.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0xff, 0x10]);
+        buf.extend_from_slice(&[0xff, 0x50]);
+        buf.extend_from_slice(&2u16.to_be_bytes());
+        buf.extend_from_slice(&[0xff, 0x12]);
+        buf.extend_from_slice(&26u16.to_be_bytes());
+        buf.extend_from_slice(&build_pih_body(1, 4, 3, 0));
+        buf.extend_from_slice(&[0xff, 0x13]);
+        buf.extend_from_slice(&4u16.to_be_bytes());
+        buf.extend_from_slice(&[8, 0x11]);
+        // WGT — Lwgt = 2 + 2 = 4, body = 2 bytes (one pair, gain=16).
+        buf.extend_from_slice(&[0xff, 0x14]);
+        buf.extend_from_slice(&4u16.to_be_bytes());
+        buf.extend_from_slice(&[16, 0]);
+        buf.extend_from_slice(&[0xff, 0x20]);
+        buf.extend_from_slice(&4u16.to_be_bytes());
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        buf.extend_from_slice(&[0xff, 0x11]);
+        let cs = parse(&buf).expect("parse keeps oversized-gain WGT body");
+        let err = cs.wgt().expect_err("typed wgt() should reject gain > 15");
+        assert!(
+            format!("{err}").contains("exceeds"),
+            "expected gain-cap error, got {err}"
+        );
     }
 
     #[test]

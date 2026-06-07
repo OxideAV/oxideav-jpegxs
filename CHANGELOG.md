@@ -1,5 +1,59 @@
 # Changelog
 
+## Unreleased — round 254 (typed `Codestream::wgt` accessor)
+
+Decoder-side ergonomic surface: a fourth typed accessor on
+[`Codestream`] continues the round-251 pattern (decode a raw
+marker body into a strongly-typed view, surface body-level
+errors as `Result`).
+
+* `Codestream::wgt() -> Result<Vec<BandWeight>>` — decodes the
+  mandatory WGT marker body (§A.4.11, Table A.24) into a flat
+  vector of `(gain, priority)` pairs in on-wire order. Routes
+  through the existing [`parse_wgt`] body parser with
+  `n_pairs = body.len() / 2`. Body-level errors surface as
+  `Err(_)`:
+  * total body length not a multiple of two (each pair is
+    two bytes),
+  * any `G[b] > 15` (Annex A.4.11 hard cap).
+
+Geometry independence: the typed accessor does not bind the
+returned pair count to the picture / component geometry. The
+mapping from pair index to flat band id `b` requires `Np,y`,
+`Nβ`, `Nc`, the per-component `bx[β,i]` existence flags, and
+the optional CWD `Sd` value; the slice walker resolves that
+mapping (and catches a count mismatch against the WGT body) at
+decode time. The accessor's contract is the on-wire pair list,
+not the band-indexed weights array — the same separation of
+concerns that `Codestream::cts()` / `crg()` / `nlt()` already
+follow with respect to the higher-level decode pipeline.
+
+[`BandWeight`] and [`parse_wgt`] are now re-exported from the
+crate root (previously only reachable through
+`slice_walker::`).
+
+Scope: decoder-side public API only. No bitstream-wire change,
+no encoder change, no behaviour change to existing
+`decode_codestream` paths. Test count 405 (was 401 at round
+251). Four new tests cover the empty / pair-decoded /
+odd-length / oversized-gain matrix:
+* `wgt_method_returns_empty_for_zero_band_codestream` — the
+  hand-built tiny 4×3 single-component fixture carries
+  `Lwgt = 2` (zero-pair body); the accessor returns an empty
+  `Vec` rather than erroring (geometry mismatch is the slice
+  walker's job).
+* `wgt_method_decodes_pair_body` — two-pair body
+  `[2, 0, 15, 3]` round-trips to
+  `[BandWeight { gain: 2, priority: 0 }, BandWeight { gain: 15,
+  priority: 3 }]` in wire order.
+* `wgt_method_surfaces_odd_length_body` — three-byte body
+  `[2, 0, 4]` surfaces a "multiple of 2" error from the typed
+  accessor (the top-level marker-chain parser accepts any
+  byte sequence as the WGT body).
+* `wgt_method_surfaces_oversized_gain` — two-byte body
+  `[16, 0]` surfaces a gain-cap error (gain = 16 > 15 ⇒ illegal
+  per §A.4.11).
+
 ## Unreleased — round 251 (typed `Codestream::cts` / `Codestream::crg` / `Codestream::nlt` accessors)
 
 Decoder-side ergonomic surface: three typed accessors on
