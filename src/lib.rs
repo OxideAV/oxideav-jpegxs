@@ -53,6 +53,7 @@ pub mod colour_transform;
 pub mod component_table;
 pub mod crg;
 pub mod cts;
+pub mod cwd;
 pub mod decoder;
 pub mod dequant;
 pub mod dwt;
@@ -79,6 +80,7 @@ pub use codestream::{Codestream, Slice};
 pub use component_table::{Component, ComponentTable};
 pub use crg::{cfa_pattern_type, parse_crg, CrgEntry, CrgMarker};
 pub use cts::{parse_cts, CtsExtent, CtsMarker};
+pub use cwd::{parse_cwd, CwdMarker};
 pub use encoder::{
     encode_image, encode_luma_8bit, encode_planar_cw, encode_planar_hsl_qslice,
     encode_planar_hsl_qslice_rp, encode_planar_hsl_qslice_rp_highbd,

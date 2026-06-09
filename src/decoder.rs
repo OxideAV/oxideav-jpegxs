@@ -52,9 +52,10 @@ pub(crate) fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<JpegXsIm
             pih.qpih
         )));
     }
-    // CWD body is validated by the codestream parser; here we just
-    // read off the Sd field (None → Sd = 0).
-    let sd: u8 = cs.cwd_sd.unwrap_or(0);
+    // CWD body is validated by the codestream parser; here we route
+    // the Sd lookup through the typed [`codestream::Codestream::cwd`]
+    // accessor (Annex A.4.7 Table A.18). Absent CWD → Sd = 0.
+    let sd: u8 = cs.cwd()?.map(|c| c.sd).unwrap_or(0);
     // Annex F.2 hard requirements.
     if pih.cpih == 1 {
         if pih.nc < 3 {

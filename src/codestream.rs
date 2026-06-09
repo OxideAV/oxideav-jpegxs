@@ -19,6 +19,7 @@ use crate::capabilities::{parse_capabilities_lossy, Capabilities};
 use crate::component_table::{self, ComponentTable};
 use crate::crg::{parse_crg, CrgMarker};
 use crate::cts::{parse_cts, CtsMarker};
+use crate::cwd::{parse_cwd, CwdMarker};
 use crate::markers::Marker;
 use crate::output::{parse_nlt, NltParams};
 use crate::picture_header::{self, PictureHeader};
@@ -124,6 +125,27 @@ impl Codestream {
         match self.nlt.as_deref() {
             None => Ok(None),
             Some(body) => parse_nlt(body).map(Some),
+        }
+    }
+
+    /// Decode the optional CWD marker body into a strongly-typed
+    /// [`CwdMarker`] (Annex A.4.7, Table A.18).
+    ///
+    /// Returns `Ok(None)` when no CWD segment was present (decoder
+    /// treats this as `Sd = 0`, i.e. no components suppressed from the
+    /// wavelet decomposition); returns `Ok(Some(cwd))` with the parsed
+    /// `Sd` field when CWD was present. Body-level errors (wrong body
+    /// length, `Sd = 0`) surface as `Err(_)`. The geometry-level
+    /// constraints (`Nc > 3` to permit the marker at all, `Sd <= Nc-1`)
+    /// require the picture-header `Nc` and are already enforced by the
+    /// top-level marker-chain parser; this accessor mirrors the
+    /// round-251 / round-254 [`Self::cts`] / [`Self::wgt`] pattern as
+    /// the next narrow typed-primitive step over the raw `cwd` byte
+    /// buffer.
+    pub fn cwd(&self) -> Result<Option<CwdMarker>> {
+        match self.cwd.as_deref() {
+            None => Ok(None),
+            Some(body) => parse_cwd(body).map(Some),
         }
     }
 
@@ -1046,6 +1068,85 @@ mod tests {
             format!("{err}").contains("exceeds"),
             "expected gain-cap error, got {err}"
         );
+    }
+
+    #[test]
+    fn cwd_method_returns_none_when_absent() {
+        let buf = build_tiny_codestream();
+        let cs = parse(&buf).expect("tiny parse");
+        assert!(cs.cwd.is_none());
+        assert!(cs.cwd_sd.is_none());
+        let typed = cs.cwd().expect("typed cwd() OK");
+        assert!(typed.is_none());
+    }
+
+    #[test]
+    fn cwd_method_decodes_sd_body() {
+        // Build a 4-component, Cpih=0 codestream carrying CWD with
+        // Sd=1. Top-level parser keeps the body byte alive in
+        // `cs.cwd`; the typed accessor decodes it as a strongly-typed
+        // `CwdMarker { sd: 1 }`.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0xff, 0x10]);
+        buf.extend_from_slice(&[0xff, 0x50]);
+        buf.extend_from_slice(&2u16.to_be_bytes());
+        buf.extend_from_slice(&[0xff, 0x12]);
+        buf.extend_from_slice(&26u16.to_be_bytes());
+        buf.extend_from_slice(&build_pih_body(4, 4, 3, 0));
+        buf.extend_from_slice(&[0xff, 0x13]);
+        buf.extend_from_slice(&((2 * 4 + 2) as u16).to_be_bytes());
+        for _ in 0..4 {
+            buf.extend_from_slice(&[8, 0x11]);
+        }
+        buf.extend_from_slice(&[0xff, 0x14]);
+        buf.extend_from_slice(&2u16.to_be_bytes());
+        // CWD — Lcwd = 3, body = [Sd = 1].
+        buf.extend_from_slice(&[0xff, 0x17]);
+        buf.extend_from_slice(&3u16.to_be_bytes());
+        buf.push(1);
+        buf.extend_from_slice(&[0xff, 0x20]);
+        buf.extend_from_slice(&4u16.to_be_bytes());
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        buf.extend_from_slice(&[0xff, 0x11]);
+        let cs = parse(&buf).expect("cwd parse");
+        assert_eq!(cs.cwd.as_deref(), Some(&[1u8][..]));
+        assert_eq!(cs.cwd_sd, Some(1));
+        let cwd = cs.cwd().expect("typed cwd() OK").expect("CWD present");
+        assert_eq!(cwd.sd, 1);
+    }
+
+    #[test]
+    fn cwd_method_agrees_with_raw_sd_field() {
+        // For every valid Sd in 1..=Nc-1 the typed accessor must
+        // return the same value as the codestream's `cwd_sd` raw
+        // field. Use Nc = 5 so Sd may legitimately walk 1..=4.
+        for sd in 1u8..=4 {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&[0xff, 0x10]);
+            buf.extend_from_slice(&[0xff, 0x50]);
+            buf.extend_from_slice(&2u16.to_be_bytes());
+            buf.extend_from_slice(&[0xff, 0x12]);
+            buf.extend_from_slice(&26u16.to_be_bytes());
+            buf.extend_from_slice(&build_pih_body(5, 4, 3, 0));
+            buf.extend_from_slice(&[0xff, 0x13]);
+            buf.extend_from_slice(&((2 * 5 + 2) as u16).to_be_bytes());
+            for _ in 0..5 {
+                buf.extend_from_slice(&[8, 0x11]);
+            }
+            buf.extend_from_slice(&[0xff, 0x14]);
+            buf.extend_from_slice(&2u16.to_be_bytes());
+            buf.extend_from_slice(&[0xff, 0x17]);
+            buf.extend_from_slice(&3u16.to_be_bytes());
+            buf.push(sd);
+            buf.extend_from_slice(&[0xff, 0x20]);
+            buf.extend_from_slice(&4u16.to_be_bytes());
+            buf.extend_from_slice(&0u16.to_be_bytes());
+            buf.extend_from_slice(&[0xff, 0x11]);
+            let cs = parse(&buf).expect("cwd parse");
+            let typed = cs.cwd().expect("typed cwd() OK").expect("CWD present");
+            assert_eq!(typed.sd, sd);
+            assert_eq!(cs.cwd_sd, Some(sd));
+        }
     }
 
     #[test]

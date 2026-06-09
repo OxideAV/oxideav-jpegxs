@@ -1,6 +1,47 @@
 # Changelog
 
-## Unreleased — round 254 (typed `Codestream::wgt` accessor)
+## Unreleased — round 266 (typed `Codestream::cwd` accessor)
+
+Decoder-side ergonomic surface: a fifth typed accessor on
+[`Codestream`] continues the round-251 / round-254 pattern
+(decode a raw marker body into a strongly-typed view, surface
+body-level errors as `Result`).
+
+* New `cwd` module (`src/cwd.rs`) defining
+  `CwdMarker { sd: u8 }` + `parse_cwd(body) -> Result<CwdMarker>`
+  for the Component Wavelet Decomposition marker (§A.4.7,
+  Table A.18). Body-level parser enforces the constraints
+  observable from the CWD body alone:
+  * `body.len() == 1` — the marker carries exactly one byte
+    after the `Lcwd` length field.
+  * `Sd != 0` — `Sd = 0` is the no-suppression default and
+    the spec forbids emitting CWD in that case
+    (`Sd ∈ 1..=Nc-1`).
+  The geometry-dependent upper bound `Sd ≤ Nc-1` and the
+  forbidden-unless-`Nc>3` rule require the picture-header
+  `Nc` and stay at the codestream marker-chain parser (already
+  enforced since the early rounds).
+* `Codestream::cwd() -> Result<Option<CwdMarker>>` —
+  decodes the optional CWD marker body into the strongly-typed
+  view. Returns `Ok(None)` when no CWD segment was present
+  (decoder treats this as `Sd = 0`); returns `Ok(Some(cwd))`
+  with the parsed `Sd` field when present. Mirrors the
+  round-251 [`Codestream::cts`] / `crg` / `nlt` shape and the
+  round-254 `wgt` shape: borrow `self.cwd.as_deref()`, run the
+  body-level parser, surface field-level errors as `Err(_)`.
+* `CwdMarker` and `parse_cwd` are re-exported from the crate
+  root.
+* The decoder's CWD lookup now routes through the typed
+  accessor (`cs.cwd()?.map(|c| c.sd).unwrap_or(0)`) instead of
+  the raw `cs.cwd_sd` byte field — the existing accessor stays
+  for backward compatibility, but the typed view becomes the
+  preferred entry point (matches the round-251 NLT decoder
+  routing pattern).
+
++7 tests (4 body-level in `cwd::tests`, 3 codestream-level in
+`codestream::tests`), 412 total.
+
+## Round 254 (typed `Codestream::wgt` accessor)
 
 Decoder-side ergonomic surface: a fourth typed accessor on
 [`Codestream`] continues the round-251 pattern (decode a raw
