@@ -16,6 +16,7 @@
 use crate::error::{JpegXsError as Error, Result};
 
 use crate::capabilities::{parse_capabilities_lossy, Capabilities};
+use crate::com::{parse_com, ComMarker};
 use crate::component_table::{self, ComponentTable};
 use crate::crg::{parse_crg, CrgMarker};
 use crate::cts::{parse_cts, CtsMarker};
@@ -179,6 +180,23 @@ impl Codestream {
             )));
         }
         parse_wgt(&self.wgt, self.wgt.len() / 2)
+    }
+
+    /// Decode every COM (extension) marker body into a strongly-typed
+    /// [`ComMarker`] (Annex A.4.10, Tables A.22 / A.23).
+    ///
+    /// Zero or more extension marker segments may be present; the
+    /// returned vector preserves their on-wire order. Each entry carries
+    /// the big-endian `Tcom` type field and the variable `Dcom` payload.
+    /// Body-level errors (a body too short to hold the two-byte `Tcom`
+    /// field) surface as `Err(_)`. Reserved `Tcom` values are *not*
+    /// rejected — an extension marker is advisory metadata and a
+    /// conforming decoder skips unknown extension types, so a reserved
+    /// `Tcom` is surfaced verbatim rather than as an error. Mirrors the
+    /// round-251 / round-254 / round-266 typed-accessor pattern over the
+    /// raw `com` byte buffers.
+    pub fn com(&self) -> Result<Vec<ComMarker>> {
+        self.com.iter().map(|body| parse_com(body)).collect()
     }
 }
 
@@ -1067,6 +1085,95 @@ mod tests {
         assert!(
             format!("{err}").contains("exceeds"),
             "expected gain-cap error, got {err}"
+        );
+    }
+
+    #[test]
+    fn com_method_returns_empty_when_absent() {
+        let buf = build_tiny_codestream();
+        let cs = parse(&buf).expect("tiny parse");
+        assert!(cs.com.is_empty());
+        let typed = cs.com().expect("typed com() OK");
+        assert!(typed.is_empty());
+    }
+
+    #[test]
+    fn com_method_decodes_two_segments() {
+        // Codestream carrying two COM segments: an encoder-vendor type
+        // (Tcom=0x0000, Dcom="hi") and a vendor-specific type
+        // (Tcom=0x8042, Dcom=[0xab]). The typed accessor decodes both in
+        // on-wire order into strongly-typed views.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0xff, 0x10]);
+        buf.extend_from_slice(&[0xff, 0x50]);
+        buf.extend_from_slice(&2u16.to_be_bytes());
+        buf.extend_from_slice(&[0xff, 0x12]);
+        buf.extend_from_slice(&26u16.to_be_bytes());
+        buf.extend_from_slice(&build_pih_body(1, 4, 3, 0));
+        buf.extend_from_slice(&[0xff, 0x13]);
+        buf.extend_from_slice(&4u16.to_be_bytes());
+        buf.extend_from_slice(&[8, 0x11]);
+        buf.extend_from_slice(&[0xff, 0x14]);
+        buf.extend_from_slice(&2u16.to_be_bytes());
+        // COM #1 — Lcom = 2 + 2 + 2 = 6, Tcom=0x0000, Dcom="hi".
+        buf.extend_from_slice(&[0xff, 0x15]);
+        buf.extend_from_slice(&6u16.to_be_bytes());
+        buf.extend_from_slice(&0x0000u16.to_be_bytes());
+        buf.extend_from_slice(b"hi");
+        // COM #2 — Lcom = 2 + 2 + 1 = 5, Tcom=0x8042, Dcom=[0xab].
+        buf.extend_from_slice(&[0xff, 0x15]);
+        buf.extend_from_slice(&5u16.to_be_bytes());
+        buf.extend_from_slice(&0x8042u16.to_be_bytes());
+        buf.push(0xab);
+        buf.extend_from_slice(&[0xff, 0x20]);
+        buf.extend_from_slice(&4u16.to_be_bytes());
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        buf.extend_from_slice(&[0xff, 0x11]);
+
+        let cs = parse(&buf).expect("two-COM parse");
+        let coms = cs.com().expect("typed com() OK");
+        assert_eq!(coms.len(), 2);
+        assert_eq!(coms[0].tcom, crate::com::TCOM_ENCODER_VENDOR);
+        assert_eq!(coms[0].dcom, b"hi");
+        assert!(coms[0].is_encoder_vendor());
+        assert_eq!(coms[1].tcom, 0x8042);
+        assert_eq!(coms[1].dcom, vec![0xab]);
+        assert!(coms[1].is_vendor_specific());
+    }
+
+    #[test]
+    fn com_method_surfaces_short_body() {
+        // A COM body carrying only one byte cannot hold the two-byte
+        // Tcom field; the top-level marker-chain parser keeps the raw
+        // body alive, and the typed accessor must reject it.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0xff, 0x10]);
+        buf.extend_from_slice(&[0xff, 0x50]);
+        buf.extend_from_slice(&2u16.to_be_bytes());
+        buf.extend_from_slice(&[0xff, 0x12]);
+        buf.extend_from_slice(&26u16.to_be_bytes());
+        buf.extend_from_slice(&build_pih_body(1, 4, 3, 0));
+        buf.extend_from_slice(&[0xff, 0x13]);
+        buf.extend_from_slice(&4u16.to_be_bytes());
+        buf.extend_from_slice(&[8, 0x11]);
+        buf.extend_from_slice(&[0xff, 0x14]);
+        buf.extend_from_slice(&2u16.to_be_bytes());
+        // COM — Lcom = 2 + 1 = 3, body = one byte (too short for Tcom).
+        buf.extend_from_slice(&[0xff, 0x15]);
+        buf.extend_from_slice(&3u16.to_be_bytes());
+        buf.push(0x42);
+        buf.extend_from_slice(&[0xff, 0x20]);
+        buf.extend_from_slice(&4u16.to_be_bytes());
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        buf.extend_from_slice(&[0xff, 0x11]);
+
+        let cs = parse(&buf).expect("parse keeps short COM body");
+        let err = cs
+            .com()
+            .expect_err("typed com() should reject a body shorter than Tcom");
+        assert!(
+            format!("{err}").contains("Tcom"),
+            "expected Tcom-length error, got {err}"
         );
     }
 

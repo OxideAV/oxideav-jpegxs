@@ -1,6 +1,49 @@
 # Changelog
 
-## Unreleased — round 266 (typed `Codestream::cwd` accessor)
+## Unreleased — round 273 (typed `Codestream::com` accessor)
+
+Decoder-side ergonomic surface: a sixth typed accessor on
+[`Codestream`] continues the round-251 / round-254 / round-266
+pattern (decode a raw marker body into a strongly-typed view,
+surface body-level errors as `Result`). This one covers the COM
+extension marker — the last header marker that was still exposed
+only as a raw `Vec<Vec<u8>>` byte buffer.
+
+* New `com` module (`src/com.rs`) defining
+  `ComMarker { tcom: u16, dcom: Vec<u8> }` +
+  `parse_com(body) -> Result<ComMarker>` for the Extension marker
+  (§A.4.10, Tables A.22 / A.23). The COM body after the `Lcom`
+  length field is a big-endian `Tcom` `u(16)` (the extension type)
+  followed by the variable `Dcom` user-defined data (which may be
+  empty). The body-level parser enforces only what the body itself
+  observes:
+  * `body.len() >= 2` — the body must carry the mandatory two-byte
+    `Tcom` field (`Lcom >= 4`, of which two bytes are the length
+    field, leaving at least the two `Tcom` bytes in the body).
+  Reserved `Tcom` values (the "all other values" row of Table A.23)
+  are surfaced verbatim, *not* rejected: an extension marker is
+  advisory metadata and a conforming decoder skips unknown
+  extension types, so a reserved-range `Tcom` is a
+  tolerate-and-pass-through case rather than a malformed body.
+* `ComMarker` convenience predicates `is_encoder_vendor()` /
+  `is_copyright()` / `is_vendor_specific()` classify `Tcom` against
+  the Table A.23 rows (`0x0000` encoder vendor, `0x0001` copyright
+  statement, `0x8000`–`0xffff` vendor-specific). The
+  `TCOM_ENCODER_VENDOR` / `TCOM_COPYRIGHT` /
+  `TCOM_VENDOR_SPECIFIC_MIN` constants are re-exported from the
+  crate root alongside `ComMarker` / `parse_com`.
+* `Codestream::com() -> Result<Vec<ComMarker>>` — decodes every
+  COM segment body into the strongly-typed view, preserving on-wire
+  order. Returns `Ok(Vec::new())` when no COM segment was present;
+  body-level errors (a body too short to hold `Tcom`) surface as
+  `Err(_)`. Mirrors the round-251 `cts` / `crg` / `nlt`, round-254
+  `wgt`, and round-266 `cwd` shape: iterate `self.com`, run the
+  body-level parser per segment, collect.
+
++11 tests (8 body-level in `com::tests`, 3 codestream-level in
+`codestream::tests`), 423 total.
+
+## Round 266 (typed `Codestream::cwd` accessor)
 
 Decoder-side ergonomic surface: a fifth typed accessor on
 [`Codestream`] continues the round-251 / round-254 pattern

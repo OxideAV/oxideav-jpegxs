@@ -50,6 +50,7 @@
 pub mod capabilities;
 pub mod codestream;
 pub mod colour_transform;
+pub mod com;
 pub mod component_table;
 pub mod crg;
 pub mod cts;
@@ -77,6 +78,9 @@ pub use registry::{__oxideav_entry, make_decoder, register, register_codecs, reg
 
 pub use capabilities::{parse_capabilities, parse_capabilities_lossy, Capabilities};
 pub use codestream::{Codestream, Slice};
+pub use com::{
+    parse_com, ComMarker, TCOM_COPYRIGHT, TCOM_ENCODER_VENDOR, TCOM_VENDOR_SPECIFIC_MIN,
+};
 pub use component_table::{Component, ComponentTable};
 pub use crg::{cfa_pattern_type, parse_crg, CrgEntry, CrgMarker};
 pub use cts::{parse_cts, CtsExtent, CtsMarker};
