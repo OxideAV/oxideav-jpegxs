@@ -93,8 +93,8 @@ pub(crate) fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<JpegXsIm
     let mut samples: Vec<Vec<i32>> = Vec::with_capacity(plan.nc as usize);
     let mut comp_dims: Vec<(usize, usize)> = Vec::with_capacity(plan.nc as usize);
     for c in &cdt.components {
-        let wc = wf / (c.sx as usize);
-        let hc = hf / (c.sy as usize);
+        let wc = wf.div_ceil(c.sx as usize);
+        let hc = hf.div_ceil(c.sy as usize);
         samples.push(vec![0i32; wc * hc]);
         comp_dims.push((wc, hc));
     }
@@ -116,8 +116,8 @@ pub(crate) fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<JpegXsIm
                 gathered.push(Vec::new());
                 continue;
             }
-            let wc = wf / (c.sx as usize);
-            let hc = hf / (c.sy as usize);
+            let wc = wf.div_ceil(c.sx as usize);
+            let hc = hf.div_ceil(c.sy as usize);
             let nlx_i = pih.nlx;
             // For sub-sampled components in multi-level we mirror the
             // single-level path: drop vertical levels by log2(sy[i]).
@@ -172,8 +172,8 @@ pub(crate) fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<JpegXsIm
             if (i as u8) >= plan.nc - plan.sd {
                 continue;
             }
-            let wc = wf / (c.sx as usize);
-            let hc = hf / (c.sy as usize);
+            let wc = wf.div_ceil(c.sx as usize);
+            let hc = hf.div_ceil(c.sy as usize);
             let nlx_i = pih.nlx;
             let nly_i = pih.nly.saturating_sub(match c.sy {
                 1 => 0,
@@ -417,8 +417,8 @@ fn gather_precinct(
             // Picture-level band dimensions for chroma's *local* β — the
             // chroma plane decomposed at NL,x / N'L,y[i] produces a band
             // sized (pic_bw × pic_bh) in chroma's grid.
-            let wc = (pih.wf as usize) / (c.sx as usize);
-            let hc = (pih.hf as usize) / (sy_i as usize);
+            let wc = (pih.wf as usize).div_ceil(c.sx as usize);
+            let hc = (pih.hf as usize).div_ceil(sy_i as usize);
             let (pic_bw, pic_bh) = band_dims(wc, hc, pih.nlx, nly_i, local_beta);
             let band_cols_per_uniform_precinct: usize = {
                 let cs = plan.cs as usize;
@@ -670,9 +670,9 @@ fn synthesise_precinct(
         let comp = cdt.components[i];
         let sx_i = comp.sx as usize;
         let sy_i = comp.sy as usize;
-        let wc_i = (pih.wf as usize) / sx_i;
-        let _hc_i = (pih.hf as usize) / sy_i;
-        let wp_i = wp / sx_i; // per-component precinct width
+        let wc_i = (pih.wf as usize).div_ceil(sx_i);
+        let _hc_i = (pih.hf as usize).div_ceil(sy_i);
+        let wp_i = wp.div_ceil(sx_i); // per-component precinct width
         let hp_i = hp / sy_i; // per-component precinct height
 
         // Gather band-id of each (β, i) pair via the band index formula
@@ -766,7 +766,7 @@ fn synthesise_precinct(
                 let mut out = vec![0i32; wp_i * hp_i];
                 inverse_2d(wp_i, hp_i, &ll_p, &hl_p, &lh_p, &hh_p, &mut out)?;
                 let row_offset = py * hp_i;
-                let hf_rows = pih.hf as usize / sy_i;
+                let hf_rows = (pih.hf as usize).div_ceil(sy_i);
                 for line in 0..hp_i {
                     let target_row = row_offset + line;
                     if target_row >= hf_rows {

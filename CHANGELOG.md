@@ -1,5 +1,97 @@
 # Changelog
 
+## Unreleased — round 282 (§B.1 odd-dimension sub-sampled planes + significance-coding conformance)
+
+Decoder-side gap close in two parts, both grounded in ISO/IEC
+21122-1:2022 and pinned by encoder→decoder roundtrips.
+
+### §B.1 ceiling geometry — odd picture dimensions with sub-sampling
+
+§B.1 defines the per-component plane as
+
+```
+Wc[i] = ⌈Wf / sx[i]⌉      Hc[i] = ⌈Hf / sy[i]⌉
+```
+
+(samples populate sampling-grid positions `0, sx, 2·sx, …` below
+`Wf`). The implementation floored both divisions — the decoder
+mis-sized chroma planes on any conforming stream with odd `Wf` / `Hf`
+and 4:2:2 / 4:2:0 sampling, and the encoder rejected such pictures
+outright ("width not divisible by component i sx").
+
+* `slice_walker::build_plan_sd` — picture-level `Wc` / `Hc` and the
+  per-precinct `wc_p = ⌈Wp / sx[i]⌉` now use the ceiling.
+* `decoder::decode_codestream` — sample-buffer dims, gather-path band
+  dims, streaming-path `wc_i` / `wp_i`, and the `hf_rows` clip all
+  moved to the ceiling.
+* `encoder` — the `EncodeConfig::validate` divisibility rejection is
+  removed; plane-length validation (8-bit, high-bit-depth, and both
+  sub-sampled variants), the cascade and streaming component dims,
+  and the band-slice extraction all use the ceiling. The streaming
+  path's per-precinct row range upper bound is `⌈y1 / sy⌉`.
+* `Wpb[p,b] = 0` packets: a rightmost precinct column too narrow to
+  own any of a band's columns still **emits its packet** (and the
+  entry contributes zero bits to every sub-packet) — Annex B.7
+  Table B.4's inclusion test is line presence, not band width. The
+  encoder previously dropped the entry (and with it any packet whose
+  entries were all zero-width), desynchronising the decoder, which
+  correctly still expects the packet header.
+
+### Significance-coding conformance (Tables C.5 / C.13 / C.14)
+
+* **Wire `Z`-bit polarity** — Table C.5: the significance sub-packet
+  bit "identifies whether all code groups in the significance group
+  are insignificant", i.e. `Z = 1` ⇒ insignificant, and Tables C.13 /
+  C.14 decode the VLC residual when `Z == 0`. Both our encoder and
+  decoder used the inverted polarity (self-consistent, so
+  self-roundtrips passed, but the wire was non-conforming). Both
+  sides are flipped; the absent-significance default is now `Z = 0`.
+* **Vertical-prediction × significance emission** — Table C.13
+  reconstructs an insignificant group as `M = mtop + Δm` with
+  `Δm = 0` at `Rm = 0` (so `M = max(Mtop, T)`), and Table C.8
+  includes data for **any** group with `M > T`. The encoder flagged a
+  group insignificant whenever every `M ≤ T`, ignoring the predictor
+  — when the line above carried a high-magnitude group, the decoder
+  reconstructed `M = Mtop > T` and read sign + magnitude bits the
+  encoder never wrote (`read_bit past end of buffer`). The encoder
+  now keeps such groups significant (the VLC carries the true
+  negative residual instead), which is both conforming and
+  rate-cheaper than emitting padding bitplanes. This was the
+  long-standing cause of content-dependent roundtrip failures on the
+  high-bit-depth path (large coefficient magnitudes make the
+  vpred+sig form win the picker), independent of this round's
+  geometry work.
+
+Tests: +10 (423 → 433).
+
+* `r282_odd_width_422_lossless_round_trip` — 65×16 4:2:2 NL=2/2,
+  chroma `Wc = ⌈65/2⌉ = 33`.
+* `r282_odd_dims_420_lossless_round_trip` — 65×17 4:2:0, chroma
+  33×9.
+* `r282_odd_dims_420_nl3_lossless_round_trip` — 33×33 4:2:0 NL=3/3
+  (crosses the round-190 picture-β proxy-depth permutation).
+* `r282_odd_dims_streaming_nl1_lossless_round_trip` — 65×{16,17}
+  4:2:2 / 4:2:0 at NL=1/1 (the streaming per-precinct synthesis
+  path).
+* `r282_odd_dims_420_lossy_q2_psnr` — 65×17 4:2:0 q=2 holds ≥ 30 dB
+  on every (ceil-sized) plane.
+* `r282_odd_width_422_highbd_lossless_round_trip` — 10-bit 65×16
+  4:2:2 `u16`-LE roundtrip.
+* `r282_odd_width_422_cw1_lossless_round_trip` — 65×16 4:2:2 with
+  `Cw = 1` → `Np,x = 3`; the last precinct column is one image
+  column wide (`Wpb = 0` for the high-pass bands — the empty-packet
+  emission pin).
+* `r282_floor_sized_plane_rejected` — a floor-sized chroma plane
+  (the pre-282 convention) is rejected with a plane-length error.
+* `r282_vpred_sig_zero_group_below_active_round_trip` — 17×8 10-bit
+  NL=2/2 luma with full-range values: an all-zero code group directly
+  below a high-magnitude group; failed with `read_bit past end of
+  buffer` before the Table C.13 emission fix.
+* `r282_sig_subpacket_z_polarity_per_table_c5` — wire-level pin:
+  the significance sub-packet carries `Z = 0` for the significant
+  group and `Z = 1` for the all-insignificant group (one decoder-side
+  unit test updated to the same polarity).
+
 ## Unreleased — round 273 (typed `Codestream::com` accessor)
 
 Decoder-side ergonomic surface: a sixth typed accessor on

@@ -158,13 +158,15 @@ pub fn decode_packet_body(
                         .insert((entry.band, entry.line, j as u32), z);
                 }
             } else {
-                // No significance information for this band+line; treat
-                // every group as "significant" for downstream gating.
+                // No significance information for this band+line. Per
+                // Table C.5 a Z bit of 1 flags the significance group
+                // as all-insignificant, so the neutral default is
+                // Z = 0 ("significant" — bitplane counts are VLC-coded).
                 let ns = geom.ns(bi) as usize;
                 for j in 0..ns {
                     prev_state
                         .sig_flags
-                        .insert((entry.band, entry.line, j as u32), 1);
+                        .insert((entry.band, entry.line, j as u32), 0);
                 }
             }
             // Drop unused: line_index isn't needed here; it's used by
@@ -225,22 +227,22 @@ pub fn decode_packet_body(
                 for g in 0..ncg {
                     let sig_group = g / geom.ss as usize;
                     let z = if (dpb & 2) != 0 {
-                        // Significance coding enabled.
+                        // Significance coding enabled. Z = 1 flags the
+                        // group as all-insignificant (Table C.5).
                         prev_state
                             .sig_flags
                             .get(&(entry.band, entry.line, sig_group as u32))
                             .copied()
-                            .unwrap_or(1)
+                            .unwrap_or(0)
                     } else {
-                        1
+                        0
                     };
-                    let delta_m = if (dpb & 2) == 0 || z != 0 {
+                    let delta_m = if (dpb & 2) == 0 || z == 0 {
                         vlc(&mut reader, mtop, t)?
                     } else {
-                        // Insignificant group → Δm = 0 (Table C.14
-                        // explicitly sets Δm = 0; the comment that
-                        // bitplane count = T is satisfied because
-                        // mtop = T).
+                        // Insignificant group (Z = 1) → Δm = 0
+                        // (Table C.14 explicitly sets Δm = 0; the
+                        // bitplane count = T because mtop = T).
                         0
                     };
                     let m = mtop + delta_m;
@@ -266,17 +268,19 @@ pub fn decode_packet_body(
                 for g in 0..ncg {
                     let sig_group = g / geom.ss as usize;
                     let z = if (dpb & 2) != 0 {
+                        // Z = 1 flags the group as all-insignificant
+                        // (Table C.5).
                         prev_state
                             .sig_flags
                             .get(&(entry.band, entry.line, sig_group as u32))
                             .copied()
-                            .unwrap_or(1)
+                            .unwrap_or(0)
                     } else {
-                        1
+                        0
                     };
                     let m_above = coef.m[prev_line_index * ncg + g] as i32;
                     let mtop = m_above.max(teff);
-                    let delta_m = if (dpb & 2) == 0 || z != 0 {
+                    let delta_m = if (dpb & 2) == 0 || z == 0 {
                         vlc(&mut reader, mtop, t)?
                     } else if geom.rm == 0 {
                         0
@@ -693,17 +697,15 @@ mod tests {
             d: vec![0b10], // significance enabled, no prediction
             header_bytes: 0,
         };
-        // Significance sub-packet: 1 bit = 0 (insignificant). Padded
-        // to a byte → 1 byte 0x00.
+        // Significance sub-packet: 1 bit = 1 (Z = 1 flags the whole
+        // significance group as all-insignificant per Table C.5).
+        // Padded to a byte → 1 byte 0x80 (MSB-first).
         // Bitplane-count sub-packet: 0 bits used (Δm=0 inferred for
-        // every group, which gives M = mtop = T = 0). Padded to 1
-        // byte (Lcnt must be ≥ 1 in practice for the sub-packet's
-        // padding byte — actually no, when no bits are written the
-        // padding round-up gives 0 bytes, so Lcnt=0 is legal).
-        // Significance sub-packet = 0x00 (one bit = 0, padded).
-        // Lcnt = 0 → no bytes.
+        // every group, which gives M = mtop = T = 0). When no bits
+        // are written the padding round-up gives 0 bytes, so Lcnt=0
+        // is legal.
         // Ldat = 0 → no data bytes (M=0 ≤ T=0 for every group).
-        let body: Vec<u8> = vec![0x00];
+        let body: Vec<u8> = vec![0x80];
 
         let packet = PacketHeader {
             dr: 0,

@@ -434,22 +434,11 @@ impl EncodeConfig {
                 )));
             }
         }
-        // Picture dimensions must be divisible by sx / sy on each
-        // component (otherwise per-component plane size is undefined).
-        for (i, (&sx, &sy)) in self.sx.iter().zip(self.sy.iter()).enumerate() {
-            if (self.width as u32) % (sx as u32) != 0 {
-                return Err(Error::invalid(format!(
-                    "jpegxs encoder: width {} not divisible by component {i} sx={sx}",
-                    self.width
-                )));
-            }
-            if (self.height as u32) % (sy as u32) != 0 {
-                return Err(Error::invalid(format!(
-                    "jpegxs encoder: height {} not divisible by component {i} sy={sy}",
-                    self.height
-                )));
-            }
-        }
+        // Picture dimensions need NOT be divisible by sx / sy: §B.1
+        // defines the per-component plane as Wc[i] = ⌈Wf / sx[i]⌉ ×
+        // Hc[i] = ⌈Hf / sy[i]⌉ (samples populate sampling-grid
+        // positions 0, sx, 2·sx, … below Wf), so odd picture
+        // dimensions are legal with sub-sampled components.
         // Sd > 0 (CWD, Annex A.4.7 Table A.18). Requires Nc>3 and every
         // suppressed component must have sx=sy=1.
         if self.sd != 0 {
@@ -1278,7 +1267,7 @@ pub fn encode_planar_highbd_lossy(
 /// Widens [`encode_planar_highbd`] from 4:4:4-only to arbitrary per-
 /// component `(sx[i], sy[i]) ∈ {1, 2}` sub-sampling at component bit
 /// depth `bd ∈ 9..=16`. Same plane format as the round-118 lossless
-/// path: each `planes[i]` carries `(width / sx[i]) * (height / sy[i])`
+/// path: each `planes[i]` carries `⌈width / sx[i]⌉ * ⌈height / sy[i]⌉`
 /// little-endian `u16` samples in `0..=2^bd - 1`. The codestream uses
 /// `Bw = B[i] = bd` and `Fq = 0` (the lossless choice of Table A.8);
 /// the DC level shift is `1 << (bd - 1)` per the Annex G.3 inverse, so
@@ -1334,7 +1323,8 @@ pub fn encode_planar_subsampled_highbd(
     // per-component sub-sampled dimensions first.
     let mut byte_planes: Vec<Vec<u8>> = Vec::with_capacity(planes.len());
     for (i, p) in planes.iter().enumerate() {
-        let want = (width as usize / sx[i] as usize) * (height as usize / sy[i] as usize);
+        let want =
+            (width as usize).div_ceil(sx[i] as usize) * (height as usize).div_ceil(sy[i] as usize);
         if p.len() != want {
             return Err(Error::invalid(format!(
                 "jpegxs encoder: plane {i} sample count {} != Wc*Hc {} (sx={}, sy={})",
@@ -1442,7 +1432,8 @@ pub fn encode_planar_subsampled_highbd_lossy(
     let max_sample: u16 = ((1u32 << bd) - 1) as u16;
     let mut byte_planes: Vec<Vec<u8>> = Vec::with_capacity(planes.len());
     for (i, p) in planes.iter().enumerate() {
-        let want = (width as usize / sx[i] as usize) * (height as usize / sy[i] as usize);
+        let want =
+            (width as usize).div_ceil(sx[i] as usize) * (height as usize).div_ceil(sy[i] as usize);
         if p.len() != want {
             return Err(Error::invalid(format!(
                 "jpegxs encoder: plane {i} sample count {} != Wc*Hc {} (sx={}, sy={})",
@@ -3738,7 +3729,9 @@ pub fn encode_planar_sd_star_tetrix(
 }
 
 /// Sub-sampled (4:2:2 / 4:2:0) entry point. Each `planes[i]` has length
-/// `(width / sx[i]) * (height / sy[i])`. `q = 0` for lossless, `q > 0`
+/// `⌈width / sx[i]⌉ * ⌈height / sy[i]⌉` (§B.1 ceiling — odd picture
+/// dimensions are legal with sub-sampled components). `q = 0` for
+/// lossless, `q > 0`
 /// engages Fq=8 lossy mode.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_planar_subsampled(
@@ -3914,7 +3907,7 @@ pub fn encode_planar_nlt_extended(
 /// Plane format follows the round-118 high-bit-depth convention:
 /// `planes[i]` is the component's samples as little-endian `u16`
 /// values in `0..=2^bd − 1` (matching [`crate::image::JpegXsPlane`]),
-/// `(width / sx[i]) × (height / sy[i])` samples per plane with
+/// `⌈width / sx[i]⌉ × ⌈height / sy[i]⌉` samples per plane (§B.1) with
 /// `sx[i] = sy[i] = 1` (4:4:4 only on this path). `cpih ∈ {0, 1}`:
 /// no transform or reversible RCT (Annex F.3 — bit-depth agnostic;
 /// the RCT operand window `c < 3` applies identically to high bit
@@ -4024,7 +4017,7 @@ pub fn encode_planar_nlt_quadratic_highbd(
 /// Plane format follows the round-118 high-bit-depth convention:
 /// `planes[i]` is the component's samples as little-endian `u16`
 /// values in `0..=2^bd − 1` (matching [`crate::image::JpegXsPlane`]),
-/// `(width / sx[i]) × (height / sy[i])` samples per plane with
+/// `⌈width / sx[i]⌉ × ⌈height / sy[i]⌉` samples per plane (§B.1) with
 /// `sx[i] = sy[i] = 1` (4:4:4 only on this path). `cpih ∈ {0, 1}`:
 /// no transform or reversible RCT (Annex F.3 — bit-depth agnostic;
 /// the RCT operand window `c < 3` applies identically to high bit
@@ -4363,8 +4356,8 @@ fn encode_planar_inner_bd(
     // B[i] > 8 (round 118 high-bit-depth plane format).
     let bps: usize = if cfg.bit_depth > 8 { 2 } else { 1 };
     for (i, p) in planes.iter().enumerate() {
-        let wc = (width as usize) / (cfg.sx[i] as usize);
-        let hc = (height as usize) / (cfg.sy[i] as usize);
+        let wc = (width as usize).div_ceil(cfg.sx[i] as usize);
+        let hc = (height as usize).div_ceil(cfg.sy[i] as usize);
         let want = wc * hc * bps;
         if p.len() != want {
             return Err(Error::invalid(format!(
@@ -5114,8 +5107,8 @@ fn write_slice(out: &mut Vec<u8>, cfg: &EncodeConfig, planes_u8: &[Vec<u8>]) -> 
                 bands_per_comp.push(Vec::new());
                 continue;
             }
-            let wc = w / (cfg.sx[i] as usize);
-            let hc = h / (cfg.sy[i] as usize);
+            let wc = w.div_ceil(cfg.sx[i] as usize);
+            let hc = h.div_ceil(cfg.sy[i] as usize);
             let nly_i = cfg.nly.saturating_sub(match cfg.sy[i] {
                 1 => 0,
                 2 => 1,
@@ -5232,8 +5225,8 @@ fn encode_precinct_single_level(
     for (i, plane) in comp_planes.iter().enumerate().take(nc) {
         let sx_i = cfg.sx[i] as usize;
         let sy_i = cfg.sy[i] as usize;
-        let wc = w / sx_i;
-        let hc = h_full / sy_i;
+        let wc = w.div_ceil(sx_i);
+        let hc = h_full.div_ceil(sy_i);
         let hp_i = hp_pow / sy_i;
         let nly_i = cfg.nly.saturating_sub(match cfg.sy[i] {
             1 => 0,
@@ -5244,7 +5237,7 @@ fn encode_precinct_single_level(
 
         // Per-precinct strip rows for this component.
         let y0_i = y0 / sy_i;
-        let y1_i = (y1 / sy_i).min(hc);
+        let y1_i = y1.div_ceil(sy_i).min(hc);
         let hp_real_i = y1_i.saturating_sub(y0_i);
         let mut strip: Vec<i32> = Vec::with_capacity(wc * hp_i);
         for y in y0_i..y1_i {
@@ -5533,8 +5526,8 @@ fn encode_precinct_cascade(
     let mut slices: Vec<Slice> = Vec::with_capacity(((nbeta_pic as usize) * n_decomposed) + sd_u);
     for beta in 0..nbeta_pic {
         for (i, &nly_comp) in nly_i.iter().enumerate().take(n_decomposed) {
-            let wc = w / (cfg.sx[i] as usize);
-            let hc = h / (cfg.sy[i] as usize);
+            let wc = w.div_ceil(cfg.sx[i] as usize);
+            let hc = h.div_ceil(cfg.sy[i] as usize);
             // Existence per Annex B.4: bx[β,i] = 0 when this picture-β
             // slot has no equivalent in component i's DWT.
             let Some(local_beta) =
@@ -5690,8 +5683,15 @@ fn encode_precinct_cascade(
         if line_off >= s.lines {
             return None;
         }
+        // Wpb[p,b] = 0 (a rightmost precinct column too narrow to own
+        // any of this band's columns) still contributes an ENTRY to its
+        // packet: per Annex B.7 Table B.4 the inclusion test is about
+        // line presence, and the Ncg = 0 group count just makes every
+        // sub-packet contribution empty. Dropping the entry (and with
+        // it a packet whose entries are all zero-width) would desync
+        // the decoder, which still expects the packet header.
         if s.wpb == 0 {
-            return None;
+            return Some(Vec::new());
         }
         if s.comp_i >= n_decomposed {
             // Sd suppressed: comp_planes is sized at Wf*Hf for sx=sy=1.
@@ -6346,10 +6346,15 @@ fn build_packet_body_with_m(
     // A significance group j covers code groups [j*Ss .. (j+1)*Ss).
     // The group is significant (Z[j]=1) iff any M[g] > T within it.
     let sig_flags_per_entry: Vec<Vec<bool>> = if use_sig {
+        let vert_predecessor = match &mode {
+            BitplaneMode::Vlc(VlcKind::VertPredSig { predecessor }) => Some(predecessor),
+            _ => None,
+        };
         m_per_entry
             .iter()
             .zip(entries.iter())
-            .map(|(m_per_group, entry)| {
+            .enumerate()
+            .map(|(entry_idx, (m_per_group, entry))| {
                 let ncg = m_per_group.len();
                 let t = entry.t;
                 let ns = ncg.div_ceil(ss_u);
@@ -6357,7 +6362,26 @@ fn build_packet_body_with_m(
                     .map(|j| {
                         let g0 = j * ss_u;
                         let g1 = (g0 + ss_u).min(ncg);
-                        m_per_group[g0..g1].iter().any(|&m| m > t)
+                        if m_per_group[g0..g1].iter().any(|&m| m > t) {
+                            return true;
+                        }
+                        // Vertical prediction (Table C.13): an
+                        // insignificant group reconstructs as
+                        // M = mtop = max(Mtop, T) with Δm = 0 (Rm = 0),
+                        // and the data sub-packet includes any group
+                        // with M > T (Table C.8). Flagging a group
+                        // insignificant while a predictor exceeds T
+                        // would therefore inflate the reconstructed M
+                        // above the emitted data — keep such groups
+                        // significant so the VLC carries the true
+                        // (negative) residual instead.
+                        if let Some(pred) = vert_predecessor {
+                            let pred_m = &pred[entry_idx];
+                            if pred_m[g0..g1.min(pred_m.len())].iter().any(|&m| m > t) {
+                                return true;
+                            }
+                        }
+                        false
                     })
                     .collect()
             })
@@ -6370,8 +6394,13 @@ fn build_packet_body_with_m(
     // in the same order as the bitplane-count sub-packet.
     if use_sig {
         for sig_flags in &sig_flags_per_entry {
-            for &z in sig_flags {
-                sig_writer.write_bit(if z { 1 } else { 0 });
+            for &significant in sig_flags {
+                // Table C.5: the Z bit identifies whether ALL code
+                // groups in the significance group are insignificant —
+                // Z = 1 ⇒ insignificant, Z = 0 ⇒ significant
+                // (Tables C.13 / C.14 decode the VLC residual when
+                // Z == 0).
+                sig_writer.write_bit(if significant { 0 } else { 1 });
             }
         }
         sig_writer.align_to_byte();
@@ -9417,6 +9446,336 @@ mod tests {
         let cs_b = encode_planar(32, 32, 1, 0, 2, 2, std::slice::from_ref(&pixels))
             .expect("encode_planar");
         assert_eq!(cs_a, cs_b, "Cw=0 must match encode_planar bit-for-bit");
+    }
+
+    // === Round 282: odd-dimension subsampled planes (§B.1 ceiling) =========
+
+    /// §B.1 fixture builder: per-component planes sized
+    /// `⌈w / sx[i]⌉ × ⌈h / sy[i]⌉` with deterministic synthetic content.
+    fn r282_planes(w: usize, h: usize, sx: &[u8], sy: &[u8]) -> Vec<Vec<u8>> {
+        (0..sx.len())
+            .map(|i| {
+                let n = w.div_ceil(sx[i] as usize) * h.div_ceil(sy[i] as usize);
+                (0..n).map(|k| ((k * 7 + i * 13 + 3) % 256) as u8).collect()
+            })
+            .collect()
+    }
+
+    /// Odd picture width with 4:2:2 chroma: Wc = ⌈65 / 2⌉ = 33 per
+    /// §B.1 (samples populate grid columns 0, 2, …, 64). Lossless
+    /// self-roundtrip through the public sub-sampled entry point.
+    #[test]
+    fn r282_odd_width_422_lossless_round_trip() {
+        let (w, h) = (65usize, 16usize);
+        let sx = [1u8, 2, 2];
+        let sy = [1u8, 1, 1];
+        let planes = r282_planes(w, h, &sx, &sy);
+        let cs = encode_planar_subsampled(w as u16, h as u16, 3, 0, 2, 2, 0, &sx, &sy, &planes)
+            .expect("encode 65x16 4:2:2 NL=2/2");
+        let img = decode_codestream(&cs, None).expect("decode 65x16 4:2:2");
+        for (i, p) in planes.iter().enumerate() {
+            assert_eq!(&img.planes[i].data, p, "plane {i} lossless roundtrip");
+        }
+        assert_eq!(img.planes[1].data.len(), 33 * 16, "chroma Wc = ceil(65/2)");
+    }
+
+    /// Odd width AND odd height with 4:2:0 chroma: chroma plane is
+    /// ⌈65 / 2⌉ × ⌈17 / 2⌉ = 33 × 9 per §B.1. Lossless self-roundtrip.
+    #[test]
+    fn r282_odd_dims_420_lossless_round_trip() {
+        let (w, h) = (65usize, 17usize);
+        let sx = [1u8, 2, 2];
+        let sy = [1u8, 2, 2];
+        let planes = r282_planes(w, h, &sx, &sy);
+        let cs = encode_planar_subsampled(w as u16, h as u16, 3, 0, 2, 2, 0, &sx, &sy, &planes)
+            .expect("encode 65x17 4:2:0 NL=2/2");
+        let img = decode_codestream(&cs, None).expect("decode 65x17 4:2:0");
+        for (i, p) in planes.iter().enumerate() {
+            assert_eq!(&img.planes[i].data, p, "plane {i} lossless roundtrip");
+        }
+        assert_eq!(
+            img.planes[1].data.len(),
+            33 * 9,
+            "chroma ceil(65/2) x ceil(17/2)"
+        );
+    }
+
+    /// Odd dims at NL=3/3 4:2:0 — crosses the §B.1 ceiling dims with
+    /// the round-190 picture-β proxy-depth permutation (chroma
+    /// N'L,y = 2 while the picture codes NL,y = 3).
+    #[test]
+    fn r282_odd_dims_420_nl3_lossless_round_trip() {
+        let (w, h) = (33usize, 33usize);
+        let sx = [1u8, 2, 2];
+        let sy = [1u8, 2, 2];
+        let planes = r282_planes(w, h, &sx, &sy);
+        let cs = encode_planar_subsampled(w as u16, h as u16, 3, 0, 3, 3, 0, &sx, &sy, &planes)
+            .expect("encode 33x33 4:2:0 NL=3/3");
+        let img = decode_codestream(&cs, None).expect("decode 33x33 4:2:0 NL=3/3");
+        for (i, p) in planes.iter().enumerate() {
+            assert_eq!(&img.planes[i].data, p, "plane {i} lossless roundtrip");
+        }
+        assert_eq!(
+            img.planes[1].data.len(),
+            17 * 17,
+            "chroma ceil(33/2) squared"
+        );
+    }
+
+    /// Odd dims through the NL=1/1 streaming per-precinct synthesis
+    /// path (the decoder fast path that bypasses the picture-level
+    /// gather): 4:2:2 odd width + 4:2:0 odd width and height.
+    #[test]
+    fn r282_odd_dims_streaming_nl1_lossless_round_trip() {
+        for (h, sy_c, label) in [(16usize, 1u8, "4:2:2"), (17, 2, "4:2:0")] {
+            let w = 65usize;
+            let sx = [1u8, 2, 2];
+            let sy = [1u8, sy_c, sy_c];
+            let planes = r282_planes(w, h, &sx, &sy);
+            let cs = encode_planar_subsampled(w as u16, h as u16, 3, 0, 1, 1, 0, &sx, &sy, &planes)
+                .unwrap_or_else(|e| panic!("encode 65x{h} {label} NL=1/1: {e}"));
+            let img = decode_codestream(&cs, None)
+                .unwrap_or_else(|e| panic!("decode 65x{h} {label} NL=1/1: {e}"));
+            for (i, p) in planes.iter().enumerate() {
+                assert_eq!(
+                    &img.planes[i].data, p,
+                    "{label} plane {i} streaming roundtrip"
+                );
+            }
+        }
+    }
+
+    /// Odd-dim 4:2:0 at q=2 stays above the 30 dB PSNR floor on every
+    /// plane (the lossy pipeline reconstructs the ceil-sized planes).
+    #[test]
+    fn r282_odd_dims_420_lossy_q2_psnr() {
+        let (w, h) = (65usize, 17usize);
+        let sx = [1u8, 2, 2];
+        let sy = [1u8, 2, 2];
+        let planes: Vec<Vec<u8>> = (0..3)
+            .map(|i| {
+                let wc = w.div_ceil(sx[i] as usize);
+                let hc = h.div_ceil(sy[i] as usize);
+                let mut v = vec![0u8; wc * hc];
+                for y in 0..hc {
+                    for x in 0..wc {
+                        v[y * wc + x] = ((x * 2 + y * 3 + i * 31) % 200 + 20) as u8;
+                    }
+                }
+                v
+            })
+            .collect();
+        let cs = encode_planar_subsampled(w as u16, h as u16, 3, 0, 2, 2, 2, &sx, &sy, &planes)
+            .expect("encode 65x17 4:2:0 q=2");
+        let img = decode_codestream(&cs, None).expect("decode 65x17 4:2:0 q=2");
+        for (i, p) in planes.iter().enumerate() {
+            assert_eq!(img.planes[i].data.len(), p.len(), "plane {i} ceil-sized");
+            let db = psnr(p, &img.planes[i].data);
+            assert!(db >= 30.0, "plane {i} PSNR {db:.1} dB < 30 dB at q=2");
+        }
+    }
+
+    /// Vertical-prediction × significance regression (Table C.13 /
+    /// Table C.8): an all-zero code group directly below a
+    /// high-magnitude group reconstructs as `M = mtop` when its
+    /// significance group is flagged insignificant at `Rm = 0` — so
+    /// the encoder may only flag a group insignificant when the
+    /// predictor column is also at/below `T`, or the data sub-packet
+    /// desynchronises. This 17×8 10-bit fixture (full-range values →
+    /// the picker reaches the vpred+sig form) failed with
+    /// `read_bit past end of buffer` before the round-282 fix.
+    #[test]
+    fn r282_vpred_sig_zero_group_below_active_round_trip() {
+        let bd = 10u8;
+        let max = (1u32 << bd) - 1;
+        let (w, h) = (17usize, 8usize);
+        let plane: Vec<u16> = (0..w * h)
+            .map(|k| ((k as u32 * 11) % (max + 1)) as u16)
+            .collect();
+        let cs = encode_planar_highbd(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            2,
+            2,
+            bd,
+            std::slice::from_ref(&plane),
+        )
+        .expect("encode 17x8 10-bit NL=2/2");
+        let img = decode_codestream(&cs, None).expect("decode 17x8 10-bit");
+        let want: Vec<u8> = plane.iter().flat_map(|s| s.to_le_bytes()).collect();
+        assert_eq!(img.planes[0].data, want, "lossless roundtrip");
+    }
+
+    /// Significance sub-packet wire polarity (Table C.5): the Z bit
+    /// identifies whether ALL code groups in the significance group
+    /// are insignificant — Z = 1 ⇒ insignificant, Z = 0 ⇒
+    /// significant (Tables C.13 / C.14 decode the VLC residual when
+    /// Z == 0).
+    #[test]
+    fn r282_sig_subpacket_z_polarity_per_table_c5() {
+        // Two significance groups: entry 0 carries a significant
+        // group (M = 3 > T = 0), entry 1 an all-insignificant one
+        // (M = 0 = T). One entry per band line, Wpb = 4 → Ncg = 1 →
+        // Ns = 1 per entry.
+        let cfg = EncodeConfig {
+            width: 8,
+            height: 2,
+            nc: 1,
+            bit_depth: 8,
+            bw: 8,
+            ng: 4,
+            ss: 8,
+            br: 4,
+            nlx: 1,
+            nly: 0,
+            cpih: 0,
+            qpih: 0,
+            fs: 0,
+            fq: 0,
+            q: 0,
+            sx: vec![1],
+            sy: vec![1],
+            cts_e1: 0,
+            cts_e2: 0,
+            cts_cf: 0,
+            st_ct: 0,
+            nlt: None,
+            band_gains: vec![0],
+            band_priorities: vec![0],
+            rp: 0,
+            cw: 0,
+            sd: 0,
+            hsl: 0,
+            q_slices: Vec::new(),
+            q_precincts: Vec::new(),
+            r_precincts: Vec::new(),
+        };
+        let entries = vec![
+            PerBandEntry {
+                wpb: 4,
+                line: BandLineSlice::Direct(vec![5, -2, 0, 1]),
+                t: 0,
+            },
+            PerBandEntry {
+                wpb: 4,
+                line: BandLineSlice::Direct(vec![0, 0, 0, 0]),
+                t: 0,
+            },
+        ];
+        let m_per_entry: Vec<Vec<u8>> = entries
+            .iter()
+            .map(|e| compute_m_per_group(&cfg, e).expect("M"))
+            .collect();
+        assert!(m_per_entry[0][0] > 0 && m_per_entry[1][0] == 0);
+        let pkt = build_packet_body_with_m(
+            &cfg,
+            &entries,
+            &m_per_entry,
+            BitplaneMode::Vlc(VlcKind::NoPredSig),
+        )
+        .expect("build sig packet");
+        // Two Z bits, MSB-first: significant entry → 0, insignificant
+        // entry → 1 ⇒ 0b0100_0000 = 0x40.
+        assert_eq!(pkt.sig, vec![0x40], "Z polarity per Table C.5");
+    }
+
+    /// Odd width 4:2:2 on the high-bit-depth path (10-bit, `u16`-LE
+    /// planes): the §B.1 ceiling dims apply identically.
+    #[test]
+    fn r282_odd_width_422_highbd_lossless_round_trip() {
+        let (w, h) = (65usize, 16usize);
+        let bd = 10u8;
+        let sx = [1u8, 2, 2];
+        let sy = [1u8, 1, 1];
+        let max = (1u32 << bd) - 1;
+        let planes: Vec<Vec<u16>> = (0..3)
+            .map(|i| {
+                let n = w.div_ceil(sx[i] as usize) * h.div_ceil(sy[i] as usize);
+                (0..n)
+                    .map(|k| ((k as u32 * 11 + i as u32 * 401) % (max + 1)) as u16)
+                    .collect()
+            })
+            .collect();
+        let cs =
+            encode_planar_subsampled_highbd(w as u16, h as u16, 3, 0, 2, 2, bd, &sx, &sy, &planes)
+                .expect("encode 65x16 4:2:2 10-bit");
+        let img = decode_codestream(&cs, None).expect("decode 65x16 4:2:2 10-bit");
+        for (i, p) in planes.iter().enumerate() {
+            let want: Vec<u8> = p.iter().flat_map(|s| s.to_le_bytes()).collect();
+            assert_eq!(
+                img.planes[i].data, want,
+                "plane {i} u16-LE lossless roundtrip"
+            );
+        }
+    }
+
+    /// Odd width 4:2:2 with Cw=1 multi-column precincts at NL=1/1:
+    /// Cs = 8 × 1 × 2 × 2 = 32 → Np,x = ⌈65 / 32⌉ = 3, and the last
+    /// precinct column covers a single image column (chroma width
+    /// ⌈1 / 2⌉ = 1 per §B.1 applied to the precinct remainder).
+    #[test]
+    fn r282_odd_width_422_cw1_lossless_round_trip() {
+        let (w, h) = (65usize, 16usize);
+        let sx = vec![1u8, 2, 2];
+        let sy = vec![1u8, 1, 1];
+        let planes = r282_planes(w, h, &sx, &sy);
+        let cs = encode_planar_inner_nlt(
+            w as u16,
+            h as u16,
+            3,
+            0,
+            1,
+            1,
+            0,
+            0,
+            &sx,
+            &sy,
+            0,
+            0,
+            0,
+            0,
+            None,
+            Vec::new(),
+            1,          // cw → Cs = 32, Np,x = 3
+            0,          // sd
+            0,          // fs
+            0,          // hsl
+            0,          // qpih
+            0,          // rp
+            Vec::new(), // q_slices
+            Vec::new(), // q_precincts
+            Vec::new(), // r_precincts
+            &planes,
+        )
+        .expect("encode 65x16 4:2:2 Cw=1 NL=1/1");
+        let img = decode_codestream(&cs, None).expect("decode 65x16 4:2:2 Cw=1");
+        for (i, p) in planes.iter().enumerate() {
+            assert_eq!(&img.planes[i].data, p, "plane {i} Cw=1 odd-width roundtrip");
+        }
+    }
+
+    /// A floor-sized plane (the pre-282 convention) is rejected: §B.1
+    /// mandates the ceiling, so a 32-wide chroma plane for a 65-wide
+    /// 4:2:2 picture is a length mismatch.
+    #[test]
+    fn r282_floor_sized_plane_rejected() {
+        let (w, h) = (65usize, 16usize);
+        let sx = [1u8, 2, 2];
+        let sy = [1u8, 1, 1];
+        let planes = vec![
+            vec![0u8; w * h],
+            vec![0u8; (w / 2) * h], // floor: 32×16 — wrong per §B.1
+            vec![0u8; (w / 2) * h],
+        ];
+        let err = encode_planar_subsampled(w as u16, h as u16, 3, 0, 2, 2, 0, &sx, &sy, &planes)
+            .expect_err("floor-sized chroma plane must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("plane 1"),
+            "error must identify the offending plane: {msg}"
+        );
     }
 
     /// Round 9 (r91): Sd=1 with Nc=4, NL=2/2. Components 0..3 are

@@ -483,8 +483,8 @@ pub fn build_plan_sd(
         if (i as u32) >= n_decomposed {
             continue;
         }
-        let wc = wf / (comp.sx as u32);
-        let hc = hf / (comp.sy as u32);
+        let wc = wf.div_ceil(comp.sx as u32);
+        let hc = hf.div_ceil(comp.sy as u32);
         let nly_i = nly_per_component[i];
         for beta_pic in 0..nbeta {
             let idx = i * (nbeta as usize) + beta_pic as usize;
@@ -753,7 +753,7 @@ fn build_precinct_plan(
             // enumeration so the formula matches each component's own
             // DWT band dimensions.
             let wpb = if exists {
-                let wc_p = (wp / sx[i] as u32).max(1);
+                let wc_p = wp.div_ceil(sx[i] as u32).max(1);
                 if !tx_b {
                     if dx_b == 0 {
                         wc_p
