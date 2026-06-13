@@ -28,7 +28,7 @@ use crate::colour_transform::{inverse_rct, inverse_star_tetrix};
 use crate::crg::cfa_pattern_type;
 use crate::dequant::dequantize_precinct;
 use crate::dwt::{inverse_2d, inverse_cascade_2d};
-use crate::entropy::packet_body::PrecinctState;
+use crate::entropy::packet_body::{PrecinctState, PrecinctTop};
 use crate::entropy::{
     decode_packet_body, parse_packet_header, parse_precinct_header, precinct_truncation,
     BandCoefficients, PrecinctHeader,
@@ -274,7 +274,23 @@ fn decode_slice(
     mut gathered: Option<&mut Vec<Vec<Vec<i32>>>>,
 ) -> Result<()> {
     let mut cursor = 0usize;
+    // Vertical-prediction predecessor cache, one slot per precinct
+    // column `px = p mod Np,x` (Annex C.6.3 Table C.11: the predecessor
+    // of a top-line band is `M[p−Np,x,…]` / `T[p−Np,x,b]`, i.e. the
+    // precinct directly above in the same column). The cache is local to
+    // this slice, so vertical prediction never reaches across a slice
+    // boundary (§C.6.1 / §C.6.3) — a fresh `decode_slice` call starts
+    // with every column empty, matching the spec's per-slice
+    // independence requirement.
+    let np_x = plan.np_x.max(1) as usize;
+    let mut col_tops: Vec<Option<PrecinctTop>> = vec![None; np_x];
     for precinct_plan in &slice_plan.precincts {
+        let px = (precinct_plan.p % plan.np_x.max(1)) as usize;
+        // Clone the column predecessor so the immutable borrow of
+        // `col_tops` is released before we overwrite this column's slot
+        // at the end of the precinct. `PrecinctTop` is small (per-band
+        // last-line bitplane counts + truncation bytes).
+        let top_above = col_tops.get(px).and_then(|o| o.clone());
         let pdata = slice_data
             .get(cursor..)
             .ok_or_else(|| Error::invalid("jpegxs decoder: precinct cursor past slice end"))?;
@@ -314,9 +330,19 @@ fn decode_slice(
                 &packet_header,
                 packet_layout,
                 &mut state,
+                top_above.as_ref(),
             )?;
             entropy_cursor += dec.bytes_consumed;
         }
+
+        // Capture this precinct's vertical-prediction predecessor for
+        // the precinct directly below (same column) — Annex C.6.3
+        // Table C.11.
+        col_tops[px] = Some(PrecinctTop::capture(
+            &precinct_plan.geometry,
+            &precinct_header,
+            &state,
+        ));
 
         // Skip precinct filler bytes up to Lprc.
         cursor = entropy_end;

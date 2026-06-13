@@ -1,5 +1,55 @@
 # Changelog
 
+## Unreleased — round 286 (cross-precinct vertical-prediction decode, Annex C.6.3 Table C.11)
+
+Decoder gap close: the bitplane-count vertical-prediction VLC path
+(`D[p,b] & 1 == 1`, Annex C.6.5 Table C.13) now reconstructs the
+predictor at the **first line of a band in a precinct** from the
+precinct directly above, instead of rejecting it as "not implemented".
+
+Per ISO/IEC 21122-1:2022 Annex C.6.3 Table C.11, when `λ − sy <
+L0[p,b]` the predictor comes from precinct `p − Np,x`:
+
+* `Mtop[p,λ,b,g] = M[p−Np,x, L1[p,b]−sy, b, g]` — the bitplane counts
+  of the **last decoded line** of band `b` in the precinct above.
+* `Ttop[p,b] = T[p−Np,x, b]` — that precinct's per-band truncation
+  position, which feeds the effective truncation `teff =
+  max(T[p,b], Ttop)` and predictor `mtop = max(Mtop, teff)` (Table
+  C.13).
+
+Implementation:
+
+* `entropy::packet_body::PrecinctTop` — new predecessor struct
+  carrying per-band last-line bitplane counts (`last_m`) and per-band
+  truncation positions (`t`). `PrecinctTop::capture` builds it from a
+  just-decoded precinct. The walker emits `entry.line` in band-grid
+  units stepping by one (the spec image-grid `λ` divided by `sy[i]`),
+  so the spec's `L1[p,b]−sy` predecessor is the band's last stored
+  line `L1−1−L0`.
+* `decode_packet_body` gains an `Option<&PrecinctTop>` parameter. At a
+  first-line band it uses the predecessor's `Mtop`/`Ttop`; inside a
+  precinct it keeps the existing line-above predictor. A first-line
+  vertical-prediction packet with **no** predecessor is now a precise
+  malformed-codestream error — §C.6.1 / §C.6.3 forbid vertical
+  prediction at the topmost precinct of a slice, so this can only mean
+  a non-conforming stream rather than the previous blanket
+  "not implemented" refusal.
+* `decoder::decode_slice` maintains a per-precinct-column predecessor
+  cache (`Vec<Option<PrecinctTop>>` of length `Np,x`), populated after
+  each precinct and consumed by the precinct directly below in the
+  same column. The cache is local to `decode_slice`, so vertical
+  prediction never reaches across a slice boundary (matching §C.6.1's
+  per-slice independence requirement).
+
+Conformance: three hand-built `decode_packet_body` fixtures pin the
+Table C.11 predictor — a basic cross-precinct prediction
+(`Mtop=[2,0]`, `Ttop=0`), the `teff = max(T, Ttop)` interaction with a
+non-zero `Ttop=3`, and the malformed-stream rejection when `top =
+None`. No change to encoder output (our encoder is precinct-scoped and
+never selects cross-precinct vertical prediction); all existing
+multi-precinct-row lossless roundtrips continue to pass through the
+now-populated cache. +3 tests, 436 total.
+
 ## Unreleased — round 282 (§B.1 odd-dimension sub-sampled planes + significance-coding conformance)
 
 Decoder-side gap close in two parts, both grounded in ISO/IEC

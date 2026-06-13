@@ -18,8 +18,12 @@
 //!      `D & 2`.
 //!    * `D & 1 == 1` → vertical prediction VLC (Table C.13, §C.6.5).
 //!      Predictor uses `Mtop[p,λ,b,g]` from the previous line of the
-//!      same band in the same precinct. Significance gating per
-//!      `D & 2`.
+//!      same band. When the current line is the first line of the band
+//!      in the precinct (`λ − sy < L0[p,b]`), `Mtop` / `Ttop` come from
+//!      the precinct directly above (`p − Np,x`) via the [`PrecinctTop`]
+//!      predecessor the caller supplies (Annex C.6.3 Table C.11);
+//!      otherwise they come from the line above within the same
+//!      precinct. Significance gating per `D & 2`.
 //!
 //!    Padded to a byte boundary, then `Lcnt[p,s]` bytes total
 //!    (filler).
@@ -31,20 +35,20 @@
 //!    per non-zero `v[p,λ,b,Ng×g+k]`. Padded + filler to
 //!    `Lsgn[p,s]`.
 //!
-//! Round-3 limitations:
+//! Vertical-prediction predecessor:
 //!
-//! * **Vertical prediction across precincts is not yet supported.**
-//!   The slice walker (round 4) will own the per-precinct
-//!   `M[p_prev,L1[p,b]-sy,b,g]` cache. For now, vertical prediction
-//!   only works when the predecessor line `λ-sy` lies inside the
-//!   current precinct (i.e. `λ-sy >= L0[p,b]`). The spec already
-//!   guarantees vertical prediction is never selected for the topmost
-//!   line of the topmost precinct of a slice; the round-3 decoder
-//!   defensively errors out if a packet references a line whose
-//!   vertical predecessor escapes the precinct.
-//! * The vertical subsampling factor `sy[i]` is taken to be 1 for
-//!   round 3 (the single-component fixture has `sy = 1`). The walker
-//!   will pass real values through.
+//! * The caller passes an optional [`PrecinctTop`] holding the last
+//!   decoded band line's bitplane counts and the truncation positions
+//!   of the precinct directly above. The decoder uses it for the
+//!   first-line-of-band cross-precinct predictor (Table C.11). When the
+//!   predecessor is `None` and a vertical-prediction packet references a
+//!   first-line band, the codestream is malformed — §C.6.1 / §C.6.3
+//!   forbid vertical prediction at the topmost precinct of a slice.
+//! * `entry.line` is supplied by the walker in band-grid units stepping
+//!   by one (the spec image-grid line `λ` is divided by `sy[i]`), so the
+//!   intra-precinct predecessor step `sy` (Table C.11) is one band-grid
+//!   line and the last band line of the precinct above is its
+//!   `L1[p,b] − 1 − L0[p,b]` stored line.
 
 use crate::error::{JpegXsError as Error, Result};
 
@@ -111,6 +115,7 @@ pub fn decode_packet_body(
     packet: &PacketHeader,
     layout: &PacketLayout,
     prev_state: &mut PrecinctState,
+    top: Option<&PrecinctTop>,
 ) -> Result<PacketDecode> {
     let truncation = precinct_truncation(geom, precinct);
 
@@ -255,15 +260,41 @@ pub fn decode_packet_body(
                 }
             } else {
                 // Vertical prediction VLC, Table C.13.
-                if entry.line < band.l0 + sy {
-                    return Err(Error::invalid(
-                        "jpegxs entropy: round-3 vertical prediction across precincts is not implemented (round 4 slice walker)",
-                    ));
-                }
-                let prev_line_index = ((entry.line - sy) - band.l0) as usize;
-                // Ttop[p,b] = T[p,b] for predecessors inside the same
-                // precinct (Table C.11).
-                let ttop = t;
+                //
+                // `entry.line` is in band-grid units stepping by one
+                // (the walker converts the spec image-grid `λ` to
+                // `λ / sy[i]`), so the spec predecessor step `sy`
+                // (Table C.11) is one band-grid line here.
+                let first_line_of_band = entry.line < band.l0 + sy;
+                // Cross-precinct predictor (Table C.11, first branch):
+                // when the current line is the top line of the band in
+                // this precinct, `Mtop` / `Ttop` come from the precinct
+                // directly above (`p − Np,x`) — its last band line and
+                // its `T[p−Np,x,b]`. §C.6.1 / §C.6.3 forbid vertical
+                // prediction at the topmost precinct of a slice, so a
+                // missing predecessor here is a malformed codestream.
+                let xpred = if first_line_of_band {
+                    let pt = top.ok_or_else(|| {
+                        Error::invalid(
+                            "jpegxs entropy: vertical prediction selected at the top line of the topmost precinct of a slice (forbidden by ISO/IEC 21122-1 C.6.1/C.6.3)",
+                        )
+                    })?;
+                    Some(pt)
+                } else {
+                    None
+                };
+                let prev_line_index = if first_line_of_band {
+                    0usize
+                } else {
+                    ((entry.line - sy) - band.l0) as usize
+                };
+                // Ttop[p,b]: T[p,b] for predecessors inside the same
+                // precinct, T[p−Np,x,b] when predicting across the
+                // precinct boundary (Table C.11).
+                let ttop = match xpred {
+                    Some(pt) => *pt.t.get(bi).unwrap_or(&0) as i32,
+                    None => t,
+                };
                 let teff = t.max(ttop);
                 for g in 0..ncg {
                     let sig_group = g / geom.ss as usize;
@@ -278,7 +309,12 @@ pub fn decode_packet_body(
                     } else {
                         0
                     };
-                    let m_above = coef.m[prev_line_index * ncg + g] as i32;
+                    let m_above = match xpred {
+                        Some(pt) => {
+                            *pt.last_m.get(bi).and_then(|row| row.get(g)).unwrap_or(&0) as i32
+                        }
+                        None => coef.m[prev_line_index * ncg + g] as i32,
+                    };
                     let mtop = m_above.max(teff);
                     let delta_m = if (dpb & 2) == 0 || z == 0 {
                         vlc(&mut reader, mtop, t)?
@@ -436,6 +472,75 @@ pub struct PrecinctState {
     pub sig_flags: HashMap<(u16, u16, u32), u8>,
 }
 
+/// Vertical-prediction predecessor carried from the precinct directly
+/// above (same precinct column) into the precinct below.
+///
+/// Annex C.6.3 Table C.11: when a vertical-prediction packet is decoded
+/// at the top line of a band in precinct `p`
+/// (`λ − sy < L0[p,b]`), the bitplane-count predictor and the
+/// truncation-position predictor come from precinct `p − Np,x`:
+///
+/// * `Mtop[p,λ,b,g] = M[p−Np,x, L1[p,b]−sy, b, g]` — the bitplane
+///   counts of the **last line** of band `b` in the precinct above.
+/// * `Ttop[p,b] = T[p−Np,x, b]` — the truncation position of band `b`
+///   in the precinct above.
+///
+/// The codestream constraint in §C.6.1 / §C.6.3 forbids vertical
+/// prediction at the topmost lines of the topmost precinct of a slice
+/// or the image, so within a slice this predecessor always exists when
+/// it is referenced. The decoder builds one `PrecinctTop` per decoded
+/// precinct and caches it per precinct column for the row below.
+#[derive(Debug, Clone, Default)]
+pub struct PrecinctTop {
+    /// Per-band bitplane counts of the last decoded line of the band
+    /// (`M[p−Np,x, L1[p,b]−sy, b, g]`), indexed by band id then code
+    /// group `g`. Empty for non-existent bands.
+    pub last_m: Vec<Vec<u8>>,
+    /// Per-band truncation position `T[p−Np,x, b]`, indexed by band id.
+    pub t: Vec<u8>,
+}
+
+impl PrecinctTop {
+    /// Capture the vertical-prediction predecessor of a precinct that
+    /// has just been fully decoded into `state`, so the precinct
+    /// directly below (same column) can predict from it per Table C.11.
+    ///
+    /// For each band the last decoded line is `L1[p,b] − 1 − L0[p,b]`
+    /// in the band's local (band-grid) line indexing — the walker emits
+    /// `entry.line` in band-grid units stepping by one, so the spec's
+    /// `L1[p,b] − sy` image-grid predecessor reduces to the band's
+    /// last stored line. `T[p,b]` is the precinct's per-band
+    /// truncation position.
+    pub fn capture(
+        geom: &PrecinctGeometry,
+        precinct: &PrecinctHeader,
+        state: &PrecinctState,
+    ) -> Self {
+        let truncation = precinct_truncation(geom, precinct);
+        let mut last_m: Vec<Vec<u8>> = Vec::with_capacity(geom.bands.len());
+        for (bi, band) in geom.bands.iter().enumerate() {
+            if !band.exists || band.l1 <= band.l0 {
+                last_m.push(Vec::new());
+                continue;
+            }
+            let ncg = geom.ncg(bi) as usize;
+            let last_line = (band.l1 - band.l0 - 1) as usize;
+            let coef = state.coefficients.get(bi);
+            let row = match coef {
+                Some(c) if c.m.len() >= (last_line + 1) * ncg => {
+                    c.m[last_line * ncg..last_line * ncg + ncg].to_vec()
+                }
+                _ => vec![0u8; ncg],
+            };
+            last_m.push(row);
+        }
+        PrecinctTop {
+            last_m,
+            t: truncation,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -551,7 +656,7 @@ mod tests {
             header_bytes: 5,
         };
         let mut state = PrecinctState::default();
-        let dec = decode_packet_body(&body, &geom, &precinct, &packet, &layout, &mut state)
+        let dec = decode_packet_body(&body, &geom, &precinct, &packet, &layout, &mut state, None)
             .expect("packet body decode");
         // 0 (sig) + 2 (lcnt) + 5 (ldat) = 7 bytes consumed.
         assert_eq!(dec.bytes_consumed, 7);
@@ -642,7 +747,7 @@ mod tests {
             header_bytes: 5,
         };
         let mut state = PrecinctState::default();
-        let dec = decode_packet_body(&body, &geom, &precinct, &packet, &layout, &mut state)
+        let dec = decode_packet_body(&body, &geom, &precinct, &packet, &layout, &mut state, None)
             .expect("packet body decode (Fs=1)");
         // 0 (sig) + 2 + 3 + 1 = 6 bytes.
         assert_eq!(dec.bytes_consumed, 6);
@@ -716,7 +821,7 @@ mod tests {
             header_bytes: 5,
         };
         let mut state = PrecinctState::default();
-        let dec = decode_packet_body(&body, &geom, &precinct, &packet, &layout, &mut state)
+        let dec = decode_packet_body(&body, &geom, &precinct, &packet, &layout, &mut state, None)
             .expect("decode insignificant packet");
         assert_eq!(dec.bytes_consumed, 1);
         let band = &dec.bands[0];
@@ -772,7 +877,7 @@ mod tests {
             header_bytes: 5,
         };
         let mut state = PrecinctState::default();
-        let dec = decode_packet_body(&body, &geom, &precinct, &packet, &layout, &mut state)
+        let dec = decode_packet_body(&body, &geom, &precinct, &packet, &layout, &mut state, None)
             .expect("decode raw-mode packet");
         // No significance sub-packet bits consumed since Dr=1.
         assert_eq!(dec.bytes_consumed, 7);
@@ -780,5 +885,221 @@ mod tests {
         assert_eq!(band.m, vec![3, 0, 1, 2]);
         let expected_v = vec![5u32, 0, 7, 1, 0, 0, 0, 0, 1, 0, 1, 0, 3, 2, 1, 0];
         assert_eq!(band.v, expected_v);
+    }
+
+    /// Cross-precinct vertical prediction (Annex C.6.3 Table C.11):
+    /// `D[p,b] & 1 == 1` selected at the FIRST line of the band in the
+    /// precinct (`λ − sy < L0[p,b]`). The bitplane-count predictor
+    /// `Mtop[p,λ,b,g]` and the truncation predictor `Ttop[p,b]` come
+    /// from the precinct directly above (`p − Np,x`), supplied as a
+    /// [`PrecinctTop`].
+    ///
+    /// One band, `wpb = 8` → `Ncg = 2`. `T[p,b] = 0`, `Ttop = 0` so the
+    /// effective truncation `teff = 0`. The predecessor's last-line
+    /// counts are `Mtop = [2, 0]`. For each code group:
+    ///   g=0: `mtop = max(Mtop=2, teff=0) = 2`; θ = max(2−0)=2; VLC
+    ///        codeword "0" (xi=0) → Δm=0 → `M = 2`.
+    ///   g=1: `mtop = max(Mtop=0, teff=0) = 0`; θ=0; "0" → Δm=0 → M=0.
+    /// So `M = [2, 0]`. The bitplane-count sub-packet is "00" → 0x00,
+    /// `Lcnt = 1`.
+    ///
+    /// Data sub-packet: g=0 has `M=2 > T=0`, so `Ng=4` signs +
+    /// `(M−T)·Ng = 8` magnitude bits. Coefficients `[1, 0, 0, 0]`,
+    /// signs `[0,0,0,0]`:
+    ///   signs "0000"; plane 1 "0000"; plane 0 "1000" → 12 bits →
+    ///   0x00 0x80, `Ldat = 2`. g=1 (M=0) emits nothing.
+    #[test]
+    fn vertical_prediction_across_precincts() {
+        let geom = PrecinctGeometry {
+            bands: vec![BandGeometry {
+                wpb: 8,
+                gain: 0,
+                priority: 0,
+                l0: 0,
+                l1: 1,
+                exists: true,
+            }],
+            ng: 4,
+            ss: 8,
+            br: 4,
+            fs: 0,
+            rm: 0,
+            rl: 0,
+            lh: 0,
+            short_packet_header: true,
+        };
+        let layout = PacketLayout {
+            entries: vec![PacketEntry { band: 0, line: 0 }],
+        };
+        // D[0] = 1 → vertical prediction VLC.
+        let precinct = PrecinctHeader {
+            lprc: 1,
+            q: 0,
+            r: 0,
+            d: vec![1],
+            header_bytes: 0,
+        };
+        // Predecessor from the precinct directly above: last-line counts
+        // Mtop = [2, 0], Ttop = T[above,0] = 0.
+        let top = PrecinctTop {
+            last_m: vec![vec![2u8, 0]],
+            t: vec![0u8],
+        };
+
+        // Bitplane-count: "00" → 0x00 (Lcnt=1).
+        // Data: 0x00 0x80 (Ldat=2).
+        let body: Vec<u8> = vec![0x00, 0x00, 0x80];
+        let packet = PacketHeader {
+            dr: 0,
+            ldat: 2,
+            lcnt: 1,
+            lsgn: 0,
+            short_form: true,
+            header_bytes: 5,
+        };
+
+        let mut state = PrecinctState::default();
+        let dec = decode_packet_body(
+            &body,
+            &geom,
+            &precinct,
+            &packet,
+            &layout,
+            &mut state,
+            Some(&top),
+        )
+        .expect("cross-precinct vertical prediction decode");
+        assert_eq!(dec.bytes_consumed, 3);
+        let band = &dec.bands[0];
+        // M predicted from the precinct above: [2, 0].
+        assert_eq!(band.m, vec![2, 0]);
+        // Magnitudes: g=0 coefs [1,0,0,0]; g=1 all zero.
+        assert_eq!(band.v, vec![1u32, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    /// The effective truncation `teff = max(T[p,b], Ttop)` and the
+    /// predictor `mtop = max(Mtop, teff)` must both honour the
+    /// predecessor's `Ttop` (Table C.11 / C.13). Here `T[p,b] = 0` but
+    /// the precinct above had `Ttop = 3`, and `Mtop = [1, 0]`.
+    ///   g=0: teff = max(0, 3) = 3; mtop = max(1, 3) = 3; θ = max(3−0)=3;
+    ///        VLC "0" → Δm=0 → M = 3.
+    ///   g=1: teff = 3; mtop = max(0, 3) = 3; θ=3; "0" → Δm=0 → M = 3.
+    /// So `M = [3, 3]`. Count sub-packet "00" → 0x00, Lcnt=1.
+    /// Data: both groups have `M=3 > T=0` → each emits 4 signs +
+    /// 12 magnitude bits. Coefs all zero, signs all zero → 16 bits per
+    /// group, 32 bits total → 4 bytes 0x00 0x00 0x00 0x00, Ldat=4.
+    #[test]
+    fn vertical_prediction_across_precincts_with_ttop() {
+        let geom = PrecinctGeometry {
+            bands: vec![BandGeometry {
+                wpb: 8,
+                gain: 0,
+                priority: 0,
+                l0: 0,
+                l1: 1,
+                exists: true,
+            }],
+            ng: 4,
+            ss: 8,
+            br: 4,
+            fs: 0,
+            rm: 0,
+            rl: 0,
+            lh: 0,
+            short_packet_header: true,
+        };
+        let layout = PacketLayout {
+            entries: vec![PacketEntry { band: 0, line: 0 }],
+        };
+        let precinct = PrecinctHeader {
+            lprc: 1,
+            q: 0,
+            r: 0,
+            d: vec![1],
+            header_bytes: 0,
+        };
+        let top = PrecinctTop {
+            last_m: vec![vec![1u8, 0]],
+            t: vec![3u8],
+        };
+        // Count "00" → 0x00 (Lcnt=1). Data: 32 zero bits → 0x00*4 (Ldat=4).
+        let body: Vec<u8> = vec![0x00, 0x00, 0x00, 0x00, 0x00];
+        let packet = PacketHeader {
+            dr: 0,
+            ldat: 4,
+            lcnt: 1,
+            lsgn: 0,
+            short_form: true,
+            header_bytes: 5,
+        };
+        let mut state = PrecinctState::default();
+        let dec = decode_packet_body(
+            &body,
+            &geom,
+            &precinct,
+            &packet,
+            &layout,
+            &mut state,
+            Some(&top),
+        )
+        .expect("cross-precinct vertical prediction with Ttop");
+        assert_eq!(band_m(&dec), vec![3, 3]);
+    }
+
+    /// Vertical prediction selected at a first-line band with NO
+    /// predecessor (`top = None`) is a malformed codestream per §C.6.1 /
+    /// §C.6.3 (vertical prediction is forbidden at the topmost precinct
+    /// of a slice). The decoder must reject it rather than read garbage.
+    #[test]
+    fn vertical_prediction_first_line_without_predecessor_errors() {
+        let geom = PrecinctGeometry {
+            bands: vec![BandGeometry {
+                wpb: 8,
+                gain: 0,
+                priority: 0,
+                l0: 0,
+                l1: 1,
+                exists: true,
+            }],
+            ng: 4,
+            ss: 8,
+            br: 4,
+            fs: 0,
+            rm: 0,
+            rl: 0,
+            lh: 0,
+            short_packet_header: true,
+        };
+        let layout = PacketLayout {
+            entries: vec![PacketEntry { band: 0, line: 0 }],
+        };
+        let precinct = PrecinctHeader {
+            lprc: 1,
+            q: 0,
+            r: 0,
+            d: vec![1],
+            header_bytes: 0,
+        };
+        let body: Vec<u8> = vec![0x00, 0x00, 0x80];
+        let packet = PacketHeader {
+            dr: 0,
+            ldat: 2,
+            lcnt: 1,
+            lsgn: 0,
+            short_form: true,
+            header_bytes: 5,
+        };
+        let mut state = PrecinctState::default();
+        let err = decode_packet_body(&body, &geom, &precinct, &packet, &layout, &mut state, None)
+            .expect_err("first-line vertical prediction without predecessor must error");
+        assert!(
+            format!("{err}").contains("vertical prediction"),
+            "expected a vertical-prediction error, got: {err}"
+        );
+    }
+
+    /// Helper: read out the per-band bitplane counts of band 0's line 0.
+    fn band_m(dec: &PacketDecode) -> Vec<u8> {
+        dec.bands[0].m.clone()
     }
 }
