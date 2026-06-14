@@ -192,6 +192,141 @@ pub(crate) fn validate_packet_layout(layout: &PacketLayout, geom: &PrecinctGeome
     Ok(())
 }
 
+/// One packet's contribution to the precinct, as seen by the bitplane-
+/// count buffer-bound validity check (Annex C.5.3.4, Table C.6). The
+/// fields are exactly the per-packet quantities the algorithm reads:
+/// the bitplane-count subpacket byte count `Lcnt[p,s]` from the packet
+/// header, the raw-mode override flag `Dr[p,s]`, and the (band, line)
+/// inclusion list `I[p,b,λ,s]` of the packet.
+#[derive(Debug, Clone, Copy)]
+pub struct PacketBufferInfo<'a> {
+    /// `Lcnt[p,s]` — bitplane-count subpacket byte count (packet header).
+    pub lcnt: u32,
+    /// `Dr[p,s]` — raw-mode override flag (0 or 1).
+    pub dr: u8,
+    /// `I[p,b,λ,s]` — the (band, line) pairs this packet covers.
+    pub entries: &'a [PacketEntry],
+}
+
+/// `Lsig[p,s]` — the significance-subpacket byte count of one packet,
+/// inferred from the included bands (Annex C.5.3.2): one `Z` bit per
+/// significance group of every present (band, line) whose precinct mode
+/// has significance coding enabled (`D[p,b] & 2`) and that is not raw-
+/// overridden (`Dr[p,s] == 0`), rounded up to whole bytes.
+///
+/// The decoder never signals `Lsig` on the wire; it is derived here the
+/// same way the significance subpacket decoder in [`packet_body`]
+/// consumes its bits, so the byte count is exact.
+fn significance_subpacket_bytes(
+    geom: &PrecinctGeometry,
+    precinct: &PrecinctHeader,
+    pkt: &PacketBufferInfo<'_>,
+) -> u64 {
+    if pkt.dr != 0 {
+        return 0;
+    }
+    let mut bits: u64 = 0;
+    for entry in pkt.entries {
+        let bi = entry.band as usize;
+        if bi >= geom.bands.len() || !geom.bands[bi].exists {
+            continue;
+        }
+        if (precinct.d[bi] & 2) != 0 {
+            bits += geom.ns(bi) as u64;
+        }
+    }
+    bits.div_ceil(8)
+}
+
+/// Evaluate the bitplane-count buffer-size constraint of a precinct
+/// (ISO/IEC 21122-1:2022 Annex C.5.3.4, Table C.6 `is_encoding_valid`).
+///
+/// The standard bounds the buffer an encoder may spend on entropy-coded
+/// bitplane-count data by requiring that the coded size never exceed
+/// the size the same data would occupy in raw mode (`Br` bits per code
+/// group). The comparison is made per band when the picture-header
+/// `Rl` flag is 0 (band-based raw-mode switch, §C.5.3.2) and per packet
+/// when `Rl` is 1 (line/packet-based switch, §C.5.3.3).
+///
+/// This mirrors Table C.6's `valid` output: it returns `true` when the
+/// precinct's mode selection satisfies the bound and `false` otherwise.
+/// It is a **codestream-construction** constraint ("the codestream
+/// shall be constructed in such a way that…"), so it is exposed as a
+/// conformance predicate rather than a hard decode gate — a decoder
+/// that reserves the raw-mode buffer can still reconstruct a precinct
+/// that does not satisfy the bound (e.g. a degenerate all-zero picture
+/// whose tiny single-line bands each occupy a whole byte). Callers that
+/// want strict ISO conformance checking can reject `false`.
+///
+/// `packets` lists every non-empty packet of the precinct in wire
+/// order with its `Lcnt[p,s]`, `Dr[p,s]`, and inclusion list. `Lsig`
+/// is inferred via [`significance_subpacket_bytes`].
+#[must_use]
+pub fn bitplane_buffer_bound_satisfied(
+    geom: &PrecinctGeometry,
+    precinct: &PrecinctHeader,
+    packets: &[PacketBufferInfo<'_>],
+) -> bool {
+    let br = geom.br as u64;
+    let exists = |b: usize| b < geom.bands.len() && geom.bands[b].exists;
+    // Per-packet inferred significance-subpacket sizes (Lsig[p,s]).
+    let lsig: Vec<u64> = packets
+        .iter()
+        .map(|p| significance_subpacket_bytes(geom, precinct, p))
+        .collect();
+    // Br × Ncg[p,b'] summed over every band present in one packet.
+    let packet_raw_bits = |pkt: &PacketBufferInfo<'_>| -> u64 {
+        pkt.entries
+            .iter()
+            .filter(|e| exists(e.band as usize))
+            .map(|e| br * geom.ncg(e.band as usize) as u64)
+            .sum()
+    };
+
+    if geom.rl == 0 {
+        // §C.5.3.2 — band-based: for every band b, the summed coded size
+        // of the bitplane-count + significance subpackets covering b must
+        // not exceed the raw-mode size of every band sharing each of
+        // those packets+lines.
+        for (bi, band) in geom.bands.iter().enumerate() {
+            if !band.exists {
+                continue;
+            }
+            let mut bytesize: u64 = 0;
+            let mut rawsize_bits: u64 = 0;
+            for (si, pkt) in packets.iter().enumerate() {
+                // Lines of band b included in this packet.
+                let lines_of_b =
+                    pkt.entries.iter().filter(|e| e.band as usize == bi).count() as u64;
+                if lines_of_b == 0 {
+                    continue;
+                }
+                bytesize += lines_of_b * (pkt.lcnt as u64 + lsig[si]);
+                // For each such line, every band b' present in the same
+                // packet+line contributes Br × Ncg[p,b'] raw bits. The
+                // walker emits at most one (band, line) entry per band per
+                // packet, so summing over the packet's entries and scaling
+                // by band b's line count matches the nested b'/λ loops.
+                rawsize_bits += lines_of_b * packet_raw_bits(pkt);
+            }
+            if bytesize > rawsize_bits.div_ceil(8) {
+                return false;
+            }
+        }
+    } else {
+        // §C.5.3.3 — packet/line-based: for every packet s, the coded
+        // size (Lcnt + Lsig) must not exceed the raw-mode size of all
+        // bitplane counts that packet carries.
+        for (si, pkt) in packets.iter().enumerate() {
+            let bytesize = pkt.lcnt as u64 + lsig[si];
+            if bytesize > packet_raw_bits(pkt).div_ceil(8) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,5 +394,111 @@ mod tests {
             entries: vec![PacketEntry { band: 0, line: 5 }],
         };
         assert!(validate_packet_layout(&bad, &g).is_err());
+    }
+
+    // ---- Annex C.5.3.4 / Table C.6 buffer-bound predicate ----
+
+    fn hdr(d: Vec<u8>) -> PrecinctHeader {
+        PrecinctHeader {
+            lprc: 1,
+            q: 0,
+            r: 0,
+            d,
+            header_bytes: 6,
+        }
+    }
+
+    /// `Lsig[p,s]` is inferred per Annex C.5.3.2: one bit per
+    /// significance group of every present band whose mode enables
+    /// significance coding (`D & 2`) and is not raw-overridden,
+    /// rounded up to whole bytes.
+    #[test]
+    fn lsig_inference_counts_significance_groups() {
+        // Two bands, Wpb=64 → Ns = ceil(64/(4*8)) = 2 each.
+        let g = geom(vec![band(64, 0, 0), band(64, 0, 0)]);
+        let h = hdr(vec![0b10, 0b00]); // band 0 sig-on, band 1 sig-off
+        let pkt = PacketBufferInfo {
+            lcnt: 0,
+            dr: 0,
+            entries: &[
+                PacketEntry { band: 0, line: 0 },
+                PacketEntry { band: 1, line: 0 },
+            ],
+        };
+        // Only band 0 contributes Ns=2 bits → ceil(2/8) = 1 byte.
+        assert_eq!(significance_subpacket_bytes(&g, &h, &pkt), 1);
+        // Raw override (Dr=1) suppresses the significance subpacket.
+        let pkt_raw = PacketBufferInfo { dr: 1, ..pkt };
+        assert_eq!(significance_subpacket_bytes(&g, &h, &pkt_raw), 0);
+    }
+
+    /// Rl=0, single band with one line: coded Lcnt fitting the raw
+    /// bound passes; one byte over fails. Wpb=64 → Ncg=16, Br=4 →
+    /// raw = ceil(64/8) = 8 bytes.
+    #[test]
+    fn rl0_band_bound_pass_and_fail() {
+        let g = geom(vec![band(64, 0, 0)]); // rl=0, br=4
+        let h = hdr(vec![0b00]);
+        let mk = |lcnt: u32| PacketBufferInfo {
+            lcnt,
+            dr: 0,
+            entries: &[PacketEntry { band: 0, line: 0 }],
+        };
+        // raw_bits = 4 * 16 = 64 → 8 bytes. Lcnt=8 fits, 9 overflows.
+        assert!(bitplane_buffer_bound_satisfied(&g, &h, &[mk(8)]));
+        assert!(!bitplane_buffer_bound_satisfied(&g, &h, &[mk(9)]));
+    }
+
+    /// Rl=0 degenerate small band across two single-line packets: each
+    /// packet's Lcnt rounds up to a whole byte, so the coded size (2)
+    /// can exceed the contiguous raw bound (1) — Table C.6 reports the
+    /// precinct invalid, exactly the all-zero-tiny-picture case.
+    #[test]
+    fn rl0_tiny_band_two_lines_overshoots_raw_bound() {
+        // Wpb=2 → Ncg=1, Br=4. Band spans 2 lines.
+        let mut g = geom(vec![band(2, 0, 0)]);
+        g.bands[0].l1 = 2;
+        let h = hdr(vec![0b00]);
+        let p0 = PacketBufferInfo {
+            lcnt: 1,
+            dr: 0,
+            entries: &[PacketEntry { band: 0, line: 0 }],
+        };
+        let p1 = PacketBufferInfo {
+            lcnt: 1,
+            dr: 0,
+            entries: &[PacketEntry { band: 0, line: 1 }],
+        };
+        // bytesize = 2, rawsize_bits = 2 * (4*1) = 8 → 1 byte. 2 > 1.
+        assert!(!bitplane_buffer_bound_satisfied(&g, &h, &[p0, p1]));
+        // Grouping both lines into one packet (shared Lcnt=1) satisfies it.
+        let grouped = PacketBufferInfo {
+            lcnt: 1,
+            dr: 0,
+            entries: &[
+                PacketEntry { band: 0, line: 0 },
+                PacketEntry { band: 0, line: 1 },
+            ],
+        };
+        assert!(bitplane_buffer_bound_satisfied(&g, &h, &[grouped]));
+    }
+
+    /// Rl=1 is the per-packet form: the bound is checked packet-by-
+    /// packet without the cross-line summation, so a single-line tiny
+    /// band passes (1 coded byte vs 1 raw byte) where Rl=0 summed two.
+    #[test]
+    fn rl1_per_packet_bound() {
+        let mut g = geom(vec![band(2, 0, 0)]);
+        g.rl = 1;
+        let h = hdr(vec![0b00]);
+        let ok = PacketBufferInfo {
+            lcnt: 1,
+            dr: 0,
+            entries: &[PacketEntry { band: 0, line: 0 }],
+        };
+        // packet raw = ceil(4*1/8) = 1 byte; Lcnt=1 fits.
+        assert!(bitplane_buffer_bound_satisfied(&g, &h, &[ok]));
+        let over = PacketBufferInfo { lcnt: 2, ..ok };
+        assert!(!bitplane_buffer_bound_satisfied(&g, &h, &[over]));
     }
 }

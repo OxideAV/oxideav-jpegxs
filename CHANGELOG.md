@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased — round 295 (bitplane-count buffer-bound conformance predicate, Annex C.5.3.4 Table C.6)
+
+New decode-side conformance feature: the
+`entropy::bitplane_buffer_bound_satisfied(geom, precinct, packets)`
+predicate evaluates ISO/IEC 21122-1:2022 Annex C.5.3.4 (Table C.6,
+`is_encoding_valid`). The standard bounds the buffer an encoder may
+spend on entropy-coded bitplane-count data: the coded size of the
+bitplane-count + significance subpackets must not exceed the size the
+same data would occupy in raw mode (`Br` bits per code group). The
+comparison is band-based when the picture-header `Rl` flag is 0
+(§C.5.3.2) and packet-based when `Rl` is 1 (§C.5.3.3).
+
+* `significance_subpacket_bytes` infers `Lsig[p,s]` (Annex C.5.3.2):
+  one bit per significance group `Ns[p,b]` of every present band whose
+  mode enables significance coding (`D[p,b] & 2`) and that is not raw-
+  overridden (`Dr[p,s] == 0`), rounded up to whole bytes — matching
+  exactly the bits the significance subpacket decoder consumes, so the
+  size is exact without the encoder signalling it on the wire.
+* `PacketBufferInfo<'a> { lcnt, dr, entries }` carries one packet's
+  contribution (`Lcnt[p,s]`, `Dr[p,s]`, the `I[p,b,λ,s]` inclusion
+  list) as Table C.6 reads it.
+* The predicate returns Table C.6's `valid` indicator as a `bool`
+  rather than a hard decode-rejection: §C.5.3 frames the bound as a
+  **codestream-construction** constraint ("the codestream shall be
+  constructed in such a way that…"), and a decoder that reserves the
+  raw-mode buffer can still reconstruct a precinct that does not
+  satisfy it (e.g. a degenerate all-zero picture whose tiny single-
+  line bands each round up to a whole byte while the summed contiguous
+  raw bound is smaller). Strict-conformance callers reject `false`.
+
++4 entropy unit tests (Lsig inference, Rl=0 pass/fail, the degenerate
+tiny-band two-line overshoot + its grouped-packet remedy, Rl=1 per-
+packet form), 440 total. No change to the reconstruction path; all
+existing roundtrips decode byte-identically.
+
 ## Unreleased — round 286 (cross-precinct vertical-prediction decode, Annex C.6.3 Table C.11)
 
 Decoder gap close: the bitplane-count vertical-prediction VLC path
