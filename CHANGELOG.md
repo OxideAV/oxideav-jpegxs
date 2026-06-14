@@ -1,5 +1,47 @@
 # Changelog
 
+## Unreleased — round 308 (precinct-length Lprc[p] consistency predicate, Annex C.2 Table C.1)
+
+New decode-side conformance feature: the
+`entropy::precinct_filler_bytes(geom, precinct, packets)` predicate
+verifies that a precinct's `Lprc[p]` field (ISO/IEC 21122-1:2022
+Annex C.2, Table C.1) is consistent with the actual on-wire size of its
+packets, and returns the number of trailing filler bytes the field
+implies.
+
+Table C.1 defines `Lprc[p]` as the length of the precinct's entropy-coded
+data **including filler bytes**, counted "from the end of the precinct
+header of this precinct up to, but not including the first byte of the
+next precinct header, slice header or EOC". The precinct header bytes
+themselves are not counted; every packet header and subpacket is. The
+summed packet size is, per the packet syntax (Annex C.3, Table C.3) and
+the packet body (Table C.4), `Σ_s (header_bytes + Lsig[p,s] + Lcnt[p,s]
++ Ldat[p,s] + (Fs==1 ? Lsgn[p,s] : 0))`, where the un-signalled
+`Lsig[p,s]` is inferred via the same `significance_subpacket_bytes`
+routine the bitplane-buffer-bound predicate and the significance
+subpacket decoder both use (raw-mode packets with `Dr = 1` contribute
+zero `Lsig`).
+
+* `Lprc[p]` must be **at least** that sum; the difference is the count of
+  optional filler bytes the precinct ends with (Annex C.2: "the amount of
+  filler bytes following the precinct can be inferred from the `Lprc[p]`
+  field"). Returns `Ok(filler_bytes)` when the packets fit, or `Err(_)`
+  when the summed packet size exceeds `Lprc[p]` (a malformed codestream
+  whose declared length is too small to contain its own packets).
+* `PacketWireSize { header_bytes, lcnt, ldat, lsgn, dr, entries }`
+  carries each packet's wire-size inputs (5/7-byte short/long header,
+  the three signalled subpacket byte counts, the raw-mode flag, and the
+  inclusion list for `Lsig` inference). The sign subpacket counts only
+  when `Fs == 1` (Table C.4 omits it when sign coding is disabled).
+* The packet sizes are accumulated in `u64` so an adversarial set of
+  per-packet counts cannot overflow before the comparison against the
+  24-bit `Lprc[p]`.
+
+No reconstruction-path change; all existing roundtrips decode
+byte-identically. +4 entropy unit tests (exact-fit + padding + overflow,
+`Fs == 1` sign accounting, inferred-`Lsig` inclusion with raw-mode
+suppression, multi-packet summation); 446 tests total.
+
 ## Unreleased — round 302 (vlc loss-of-synchronisation guard, Annex C.7.1 Table C.15)
 
 Decode-side conformance fix to the elementary variable-length decoder

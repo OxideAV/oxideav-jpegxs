@@ -327,6 +327,107 @@ pub fn bitplane_buffer_bound_satisfied(
     true
 }
 
+/// One packet's on-wire size as seen by the precinct-length consistency
+/// check (Annex C.2 / Table C.1, with the packet syntax of Annex C.3 /
+/// Table C.3 and the packet body of Table C.4). The fields are exactly
+/// the per-packet quantities `Lprc[p]` accounts for: the byte count of
+/// the packet header itself (`header_bytes`, 5 short / 7 long per
+/// Table C.3), the bitplane-count subpacket byte count `Lcnt[p,s]`, the
+/// data subpacket byte count `Ldat[p,s]`, the sign subpacket byte count
+/// `Lsgn[p,s]` (present only when `Fs == 1`, Table C.4), the raw-mode
+/// override flag `Dr[p,s]`, and the (band, line) inclusion list
+/// `I[p,b,λ,s]` (from which the un-signalled `Lsig[p,s]` is inferred).
+#[derive(Debug, Clone, Copy)]
+pub struct PacketWireSize<'a> {
+    /// Bytes consumed by the packet header (5 short / 7 long, Table C.3).
+    pub header_bytes: u32,
+    /// `Lcnt[p,s]` — bitplane-count subpacket byte count (packet header).
+    pub lcnt: u32,
+    /// `Ldat[p,s]` — data subpacket byte count (packet header).
+    pub ldat: u32,
+    /// `Lsgn[p,s]` — sign subpacket byte count (packet header). Only
+    /// added to the precinct total when `Fs == 1` (Table C.4 includes
+    /// the sign subpacket only when sign coding is enabled).
+    pub lsgn: u32,
+    /// `Dr[p,s]` — raw-mode override flag (0 or 1). Suppresses the
+    /// inferred `Lsig[p,s]` contribution (a raw-mode packet has no
+    /// significance subpacket, Annex C.3).
+    pub dr: u8,
+    /// `I[p,b,λ,s]` — the (band, line) pairs this packet covers, used to
+    /// infer `Lsig[p,s]` via [`significance_subpacket_bytes`].
+    pub entries: &'a [PacketEntry],
+}
+
+/// Verify that a precinct's `Lprc[p]` field is consistent with the
+/// actual on-wire size of its packets (ISO/IEC 21122-1:2022 Annex C.2,
+/// Table C.1).
+///
+/// Table C.1 defines `Lprc[p]` as the length of the entropy-coded data
+/// of the precinct **including filler bytes**, counted "from the end of
+/// the precinct header of this precinct up to, but not including the
+/// first byte of the next precinct header, slice header or EOC". The
+/// precinct header bytes themselves are therefore *not* counted; every
+/// packet header and every subpacket *is*.
+///
+/// The total size occupied by the packets is, per the packet syntax
+/// (Annex C.3, Table C.3) and the packet body (Table C.4), the sum over
+/// packets `s` of:
+///
+/// * the packet header bytes (`header_bytes`, 5 short / 7 long),
+/// * the inferred significance subpacket size `Lsig[p,s]`
+///   ([`significance_subpacket_bytes`]) — un-signalled but reconstructed
+///   bit-for-bit the same way the decoder consumes it,
+/// * the bitplane-count subpacket size `Lcnt[p,s]`,
+/// * the data subpacket size `Ldat[p,s]`,
+/// * the sign subpacket size `Lsgn[p,s]`, but only when `Fs == 1`
+///   (Table C.4 omits the sign subpacket entirely when sign coding is
+///   disabled).
+///
+/// `Lprc[p]` must be **at least** that sum; the difference is the count
+/// of optional filler bytes the precinct ends with (Annex C.2: "the
+/// amount of filler bytes following the precinct can be inferred from
+/// the `Lprc[p]` field"). A decoder skips them.
+///
+/// Returns `Ok(filler_bytes)` — the number of trailing filler bytes the
+/// `Lprc[p]` field implies — when the packets fit, or `Err(_)` when the
+/// summed packet size exceeds `Lprc[p]` (a malformed / inconsistent
+/// codestream where `Lprc[p]` is too small to contain its own packets).
+/// The packet sizes are summed in `u64` so an adversarial set of
+/// per-packet counts cannot overflow the accumulator before the
+/// comparison against the 24-bit `Lprc[p]`.
+pub fn precinct_filler_bytes(
+    geom: &PrecinctGeometry,
+    precinct: &PrecinctHeader,
+    packets: &[PacketWireSize<'_>],
+) -> Result<u32> {
+    let fs_on = geom.fs == 1;
+    let mut total: u64 = 0;
+    for pkt in packets {
+        // Re-use the exact Lsig inference the bitplane-buffer-bound
+        // predicate and the significance subpacket decoder both use.
+        let buf_info = PacketBufferInfo {
+            lcnt: pkt.lcnt,
+            dr: pkt.dr,
+            entries: pkt.entries,
+        };
+        let lsig = significance_subpacket_bytes(geom, precinct, &buf_info);
+        total += pkt.header_bytes as u64;
+        total += lsig;
+        total += pkt.lcnt as u64;
+        total += pkt.ldat as u64;
+        if fs_on {
+            total += pkt.lsgn as u64;
+        }
+    }
+    let lprc = precinct.lprc as u64;
+    if total > lprc {
+        return Err(Error::invalid(format!(
+            "jpegxs entropy: precinct packets occupy {total} bytes but Lprc[p] = {lprc} (Annex C.2 Table C.1)"
+        )));
+    }
+    Ok((lprc - total) as u32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,5 +601,134 @@ mod tests {
         assert!(bitplane_buffer_bound_satisfied(&g, &h, &[ok]));
         let over = PacketBufferInfo { lcnt: 2, ..ok };
         assert!(!bitplane_buffer_bound_satisfied(&g, &h, &[over]));
+    }
+
+    // ---- Annex C.2 / Table C.1 precinct-length (Lprc[p]) consistency ----
+
+    /// A precinct header carrying a chosen `Lprc[p]` with no `D[p,b]`
+    /// significance coding (so the inferred `Lsig` is zero).
+    fn hdr_lprc(lprc: u32, d: Vec<u8>) -> PrecinctHeader {
+        PrecinctHeader {
+            lprc,
+            q: 0,
+            r: 0,
+            d,
+            header_bytes: 6,
+        }
+    }
+
+    /// One packet: 5-byte short header, Lcnt + Ldat fitting exactly, no
+    /// significance coding, no signs (Fs=0). The summed packet size must
+    /// equal header + Lcnt + Ldat and the predicate must report the
+    /// remaining Lprc bytes as filler.
+    #[test]
+    fn precinct_filler_exact_and_with_padding() {
+        let g = geom(vec![band(64, 0, 0)]); // fs = 0
+        let h = hdr_lprc(0, vec![0b00]); // lprc set per-case below
+        let pkt = PacketWireSize {
+            header_bytes: 5,
+            lcnt: 2,
+            ldat: 3,
+            lsgn: 9, // ignored: Fs = 0
+            dr: 0,
+            entries: &[PacketEntry { band: 0, line: 0 }],
+        };
+        // Packet occupies 5 + 2 + 3 = 10 bytes (Lsgn ignored, Fs=0).
+        // Lprc = 10 → zero filler.
+        let exact = PrecinctHeader {
+            lprc: 10,
+            ..h.clone()
+        };
+        assert_eq!(precinct_filler_bytes(&g, &exact, &[pkt]).unwrap(), 0);
+        // Lprc = 13 → three filler bytes.
+        let padded = PrecinctHeader {
+            lprc: 13,
+            ..h.clone()
+        };
+        assert_eq!(precinct_filler_bytes(&g, &padded, &[pkt]).unwrap(), 3);
+        // Lprc = 9 → packets overflow the declared length → error.
+        let toosmall = PrecinctHeader { lprc: 9, ..h };
+        assert!(precinct_filler_bytes(&g, &toosmall, &[pkt]).is_err());
+    }
+
+    /// When `Fs == 1` the sign subpacket counts toward the precinct
+    /// length; the same packet that fit at Fs=0 now needs Lsgn more
+    /// bytes.
+    #[test]
+    fn precinct_filler_counts_signs_only_when_fs1() {
+        let mut g = geom(vec![band(64, 0, 0)]);
+        g.fs = 1;
+        let pkt = PacketWireSize {
+            header_bytes: 5,
+            lcnt: 2,
+            ldat: 3,
+            lsgn: 4,
+            dr: 0,
+            entries: &[PacketEntry { band: 0, line: 0 }],
+        };
+        // Fs=1: 5 + 2 + 3 + 4 = 14 bytes. Lprc = 14 → zero filler.
+        let h = hdr_lprc(14, vec![0b00]);
+        assert_eq!(precinct_filler_bytes(&g, &h, &[pkt]).unwrap(), 0);
+        // Lprc = 13 (one short) → overflow.
+        let h_small = hdr_lprc(13, vec![0b00]);
+        assert!(precinct_filler_bytes(&g, &h_small, &[pkt]).is_err());
+    }
+
+    /// Significance coding (`D[p,b] & 2`) adds the inferred Lsig bytes
+    /// to the precinct total; a raw-mode packet (`Dr = 1`) suppresses
+    /// them, mirroring `significance_subpacket_bytes`.
+    #[test]
+    fn precinct_filler_includes_inferred_lsig() {
+        let g = geom(vec![band(64, 0, 0)]); // Ns = ceil(64/32) = 2
+        let h = hdr_lprc(0, vec![0b10]); // significance coding on
+        let sig = PacketWireSize {
+            header_bytes: 5,
+            lcnt: 1,
+            ldat: 1,
+            lsgn: 0,
+            dr: 0,
+            entries: &[PacketEntry { band: 0, line: 0 }],
+        };
+        // Lsig = ceil(Ns=2 / 8) = 1 byte → packet = 5 + 1 + 1 + 1 = 8.
+        let h8 = PrecinctHeader {
+            lprc: 8,
+            ..h.clone()
+        };
+        assert_eq!(precinct_filler_bytes(&g, &h8, &[sig]).unwrap(), 0);
+        // Raw override drops the Lsig byte → packet = 7, so Lprc=8 now
+        // leaves one filler byte.
+        let raw = PacketWireSize { dr: 1, ..sig };
+        let h8b = PrecinctHeader { lprc: 8, ..h };
+        assert_eq!(precinct_filler_bytes(&g, &h8b, &[raw]).unwrap(), 1);
+    }
+
+    /// Multiple packets sum; the filler is whatever Lprc has left over
+    /// past the combined packet sizes.
+    #[test]
+    fn precinct_filler_sums_multiple_packets() {
+        let mut g = geom(vec![band(64, 0, 0)]);
+        g.bands[0].l1 = 2;
+        let p0 = PacketWireSize {
+            header_bytes: 5,
+            lcnt: 1,
+            ldat: 2,
+            lsgn: 0,
+            dr: 0,
+            entries: &[PacketEntry { band: 0, line: 0 }],
+        };
+        let p1 = PacketWireSize {
+            header_bytes: 5,
+            lcnt: 1,
+            ldat: 4,
+            lsgn: 0,
+            dr: 0,
+            entries: &[PacketEntry { band: 0, line: 1 }],
+        };
+        // p0 = 8, p1 = 10 → 18 total. Lprc = 20 → 2 filler bytes.
+        let h = hdr_lprc(20, vec![0b00]);
+        assert_eq!(precinct_filler_bytes(&g, &h, &[p0, p1]).unwrap(), 2);
+        // Lprc = 17 → overflow.
+        let h_small = hdr_lprc(17, vec![0b00]);
+        assert!(precinct_filler_bytes(&g, &h_small, &[p0, p1]).is_err());
     }
 }
