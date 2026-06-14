@@ -137,8 +137,15 @@ impl<'a> BitReader<'a> {
 ///   → `x/2` (positive).
 /// * Else (`x == 0`) → 0.
 ///
-/// The standard caps `x` at 32 — any 33rd consecutive 1-bit is a
-/// hard error (the decoder has lost synchronisation).
+/// Table C.15's loop is `do { b; if (b) x++; } while (b && x < 32)`
+/// followed by `if (x >= 32) error()`. The loop therefore stops counting
+/// the moment `x` reaches 32 (the `x < 32` guard fails) **without
+/// consuming a further bit**, and `x >= 32` is then a hard
+/// loss-of-synchronisation error. The largest legal codeword is 31
+/// consecutive 1-bits closed by a 0 comma bit (`x == 31`); a 32nd
+/// consecutive 1-bit is the error condition, and the decoder must not
+/// read past it. Matching the spec exactly is what keeps the bit reader
+/// in lockstep with the source on a malformed stream.
 ///
 /// Returns the decoded signed value as `i32`.
 pub fn vlc(reader: &mut BitReader<'_>, r: i32, t: i32) -> Result<i32> {
@@ -146,21 +153,19 @@ pub fn vlc(reader: &mut BitReader<'_>, r: i32, t: i32) -> Result<i32> {
     let mut x: u32 = 0;
     loop {
         let b = reader.read_bit()?;
-        if b == 0 {
+        if b == 1 {
+            x += 1;
+        }
+        // `while (b && x < 32)` — stop on the comma bit (`b == 0`) or
+        // the instant the 32nd consecutive 1-bit lands (`x == 32`).
+        if b == 0 || x >= 32 {
             break;
         }
-        x += 1;
-        if x >= 32 {
-            // Read one more bit to confirm the 32nd 1-bit was indeed
-            // followed by a 0 (or another 1, which is the error).
-            let next = reader.read_bit()?;
-            if next == 1 {
-                return Err(Error::invalid(
-                    "jpegxs entropy: vlc decoder saw >32 consecutive 1-bits",
-                ));
-            }
-            break;
-        }
+    }
+    if x >= 32 {
+        return Err(Error::invalid(
+            "jpegxs entropy: vlc decoder saw 32 consecutive 1-bits (lost synchronisation, ISO/IEC 21122-1 Table C.15)",
+        ));
     }
     let xi = x as i32;
     if xi > 2 * theta {
@@ -250,7 +255,7 @@ mod tests {
 
     #[test]
     fn vlc_rejects_unsynchronised() {
-        // 33 consecutive 1-bits in the input must trigger an error.
+        // 40 consecutive 1-bits in the input must trigger an error.
         // We feed five 0xFF bytes (40 ones) then a 0 bit.
         let buf = [0xff, 0xff, 0xff, 0xff, 0xff, 0x00];
         let mut r = BitReader::new(&buf);
@@ -258,6 +263,40 @@ mod tests {
         assert!(
             res.is_err(),
             "expected error from too many 1-bits, got {res:?}"
+        );
+    }
+
+    #[test]
+    fn vlc_accepts_31_ones_then_comma() {
+        // Table C.15: the largest legal codeword is 31 consecutive
+        // 1-bits closed by a 0 comma bit → x = 31. With θ = 0 the unary
+        // sub-alphabet returns x - θ = 31. 31 ones + one 0 = 32 bits = 4
+        // bytes exactly: 0xFF 0xFF 0xFF 0xFE.
+        let buf = [0xff, 0xff, 0xff, 0xfe];
+        let mut r = BitReader::new(&buf);
+        assert_eq!(vlc(&mut r, 0, 0).unwrap(), 31);
+        // All four bytes consumed; the comma bit is the final (32nd) bit.
+        assert_eq!(r.bytes_consumed(), 4);
+    }
+
+    #[test]
+    fn vlc_errors_at_exactly_32_ones_without_overreading() {
+        // 32 consecutive 1-bits is the error threshold (`x >= 32`), and
+        // the spec loop stops the moment x reaches 32 — it must NOT read
+        // a 33rd bit. We feed exactly four 0xFF bytes (32 ones) and
+        // nothing more; an implementation that over-reads would hit a
+        // truncated-stream error first, masking the real condition. The
+        // returned error must be the loss-of-synchronisation one.
+        let buf = [0xff, 0xff, 0xff, 0xff];
+        let mut r = BitReader::new(&buf);
+        let res = vlc(&mut r, 0, 0);
+        assert!(res.is_err(), "32 ones must error, got {res:?}");
+        // Exactly the 32 one-bits (4 bytes) were consumed; the loop did
+        // not reach for a non-existent 33rd bit.
+        assert_eq!(
+            r.bytes_consumed(),
+            4,
+            "vlc must not read past the 32nd consecutive 1-bit"
         );
     }
 

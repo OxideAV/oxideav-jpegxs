@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased — round 302 (vlc loss-of-synchronisation guard, Annex C.7.1 Table C.15)
+
+Decode-side conformance fix to the elementary variable-length decoder
+`entropy::vlc(reader, r, t)` (ISO/IEC 21122-1:2022 Annex C.7.1,
+Table C.15). The unary-count loop is `do { b; if (b) x++; } while (b &&
+x < 32)` followed by `if (x >= 32) error()`: the loop stops counting the
+instant `x` reaches 32 (the `x < 32` guard fails) **without consuming a
+further bit**, and `x >= 32` is then the hard loss-of-synchronisation
+error. The previous implementation:
+
+* errored only on a **33rd** consecutive 1-bit (off-by-one against the
+  spec, which errors at the 32nd); and
+* read **one extra bit** past the 32nd 1-bit to "confirm" the comma,
+  desynchronising the bit reader from the source on a malformed stream
+  (the spec never reads that bit).
+
+The decoder now matches Table C.15 exactly: the largest legal codeword
+is 31 consecutive 1-bits closed by a 0 comma bit (`x == 31`); a 32nd
+consecutive 1-bit is the error condition and the reader does not advance
+past it. `vlc` is the primitive every bitplane-count residual
+(Tables C.13 / C.14) flows through, so the fix makes malformed-stream
+detection bit-exact across the whole entropy decode path.
+
+* +2 boundary unit tests: `vlc_accepts_31_ones_then_comma` (the maximal
+  legal codeword decodes to `x − θ = 31` and consumes exactly 4 bytes)
+  and `vlc_errors_at_exactly_32_ones_without_overreading` (32 ones with
+  no further input errors as loss-of-sync, consuming exactly 4 bytes —
+  an over-reading decoder would instead hit a truncated-stream error
+  and mask the real condition). Existing valid-alphabet and gross-case
+  (40-ones) tests are unchanged and still pass.
+
 ## Unreleased — round 295 (bitplane-count buffer-bound conformance predicate, Annex C.5.3.4 Table C.6)
 
 New decode-side conformance feature: the
