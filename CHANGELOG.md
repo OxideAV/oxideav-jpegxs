@@ -2282,6 +2282,34 @@ also passes 149 tests (was 140).
 
 ## Unreleased — encoder round 2 (multi-component RCT + multi-decomp + odd dims)
 
+## [0.0.7](https://github.com/OxideAV/oxideav-jpegxs/compare/v0.0.6...v0.0.7) - 2026-06-15
+
+### Other
+
+- round 309 — data-subpacket size Ldat[p,s] inference + consistency predicate (Annex C.5.4 Table C.8)
+- precinct-length Lprc[p] consistency predicate (Annex C.2 Table C.1)
+- vlc loss-of-synchronisation guard (Annex C.7.1 Table C.15)
+- bitplane-count buffer-bound conformance predicate (Annex C.5.3.4 Table C.6)
+- decode cross-precinct vertical prediction (Annex C.6.3 Table C.11)
+- decoder round 282: §B.1 odd-dimension sub-sampled planes + significance-coding conformance
+- decoder round 273: typed Codestream::com accessor
+- decoder round 266: typed Codestream::cwd accessor
+- decoder round 254: typed Codestream::wgt accessor
+- decoder round 251: typed Codestream::cts / crg / nlt accessors
+- encoder round 245: rate-budget driven per-precinct (Q[p], R[p]) picker
+- encoder round 242: joint per-precinct Q[p] × R[p] override
+- scrub README enumerated-denial sentences
+- encoder round 239: per-precinct R[p] override (Annex C.2 Table C.1)
+- encoder round 233: per-precinct Q[p] override (Annex C.2 Table C.1)
+- encoder round 230: high-bit-depth widening of the joint Q[p] + R[p] primitive
+- encoder round 224: joint per-slice Q[p] + R[p] rate-budget picker
+- round 218 — rate-budget driven R[p] picker
+- round-212 rate-budget driven Q[p] picker for the multi-slice path
+- encoder round 206: per-slice Q[p] override (slice-level rate budgeting)
+- encoder round 201: high-bit-depth Star-Tetrix lossy (Cpih=3, q>0)
+- encoder round 195: high-bit-depth Star-Tetrix (Cpih=3, B[i] in 9..=16)
+- encoder round 193: high-bit-depth NLT extended (Tnlt=2, Annex G.5)
+
 ## [0.0.6](https://github.com/OxideAV/oxideav-jpegxs/compare/v0.0.5...v0.0.6) - 2026-05-30
 
 ### Other
