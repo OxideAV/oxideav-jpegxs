@@ -1,5 +1,51 @@
 # Changelog
 
+## Unreleased — round 309 (data-subpacket size Ldat[p,s] inference + consistency predicate, Annex C.5.4 Table C.8)
+
+New decode-side conformance feature: the data subpacket of a packet
+(ISO/IEC 21122-1:2022 Annex C.5.4, Table C.8) carries no length on the
+wire other than the `Ldat[p,s]` field of the packet header, yet its exact
+bit count is fully determined by the decoded bitplane counts
+`M[p,λ,b,g]`, the per-band truncation positions `T[p,b]`, the sign-
+packing flag `Fs`, and the code-group size `Ng`. Round 309 infers it the
+same way the round-295 / round-308 predicates infer `Lsig[p,s]` —
+extending the round-308 `precinct_filler_bytes` story where `Ldat[p,s]`
+was previously taken as a *given* packet-header input rather than
+*inferred* from the precinct's coding state.
+
+* `entropy::infer_ldat(geom, precinct, pkt) -> u64` — the inferred
+  data-subpacket byte count. Per Table C.8, for every included
+  `(band, line)` entry and every code group `g` with
+  `M[p,λ,b,g] > T[p,b]`, the data subpacket carries `Ng` sign bits (only
+  when `Fs == 0` — when `Fs == 1` the signs ride the separate sign
+  subpacket of Table C.9) plus `Ng × (M[p,λ,b,g] − T[p,b])` magnitude
+  bits (the `M − T` retained bitplanes, `Ng` coefficients each). Code
+  groups with `M ≤ T` contribute nothing. The accumulated bits are
+  padded up to the next byte boundary (`pad(8)`), giving `Ldat[p,s]`
+  exclusive of any optional trailing filler bytes. Bits accumulate in
+  `u64` so an adversarial count set cannot overflow before the byte
+  rounding. The per-band `T[p,b]` is resolved from `Q[p]` / `R[p]` /
+  `D[p,b]` + WGT gains/priorities via the existing `precinct_truncation`.
+* `PacketDataInfo { entries, m }` carries the per-packet inputs:
+  the inclusion list `I[p,b,λ,s]` and the bitplane counts `M[p,λ,b,g]`
+  laid out one slice per entry (each slice length `Ncg[p,b]`, the same
+  `coef.m[line_index * ncg + g]` layout the decoder reads). Bands that
+  do not exist are skipped, matching the decode loop's
+  `if !band.exists { continue; }`.
+* `entropy::data_subpacket_filler_bytes(geom, precinct, pkt, ldat) ->
+  Result<u32>` — cross-checks a wire `Ldat[p,s]` against the inferred
+  minimum and returns the implied trailing-filler-byte count (Annex
+  C.5.4 NOTE: the filler count is inferred from the `Ldat[p,s]` field).
+  Mirrors round-308 `precinct_filler_bytes` at the data-subpacket level:
+  `Ok(filler_bytes)` when `ldat` covers the inferred data, `Err(_)` when
+  `ldat` is smaller than the bitplane counts require (a malformed /
+  inconsistent packet header).
+
+No reconstruction-path change; all existing roundtrips decode
+byte-identically. +5 entropy unit tests (Fs=0 sign+magnitude accounting,
+Fs=1 sign omission, truncation gating, the filler/overflow cross-check,
+multi-entry summation with an absent band skipped); 451 tests total.
+
 ## Unreleased — round 308 (precinct-length Lprc[p] consistency predicate, Annex C.2 Table C.1)
 
 New decode-side conformance feature: the

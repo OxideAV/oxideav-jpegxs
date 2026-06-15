@@ -358,6 +358,124 @@ pub struct PacketWireSize<'a> {
     pub entries: &'a [PacketEntry],
 }
 
+/// One packet's contribution to the data-subpacket size inference
+/// (Annex C.5.4, Table C.8). The data subpacket carries no length on the
+/// wire other than the `Ldat[p,s]` field of the packet header; its exact
+/// bit count is determined entirely by the decoded bitplane counts
+/// `M[p,λ,b,g]`, the per-band truncation positions `T[p,b]`, the sign-
+/// packing flag `Fs`, and the code-group size `Ng`. This struct carries
+/// the per-packet inputs Table C.8 reads.
+#[derive(Debug, Clone, Copy)]
+pub struct PacketDataInfo<'a> {
+    /// `I[p,b,λ,s]` — the (band, line) pairs this packet covers, in the
+    /// same order [`decode_packet_body`] walks them.
+    pub entries: &'a [PacketEntry],
+    /// `M[p,λ,b,g]` — the bitplane counts of every code group of every
+    /// entry, laid out one slice per `entries[i]`, each slice of length
+    /// `Ncg[p, entries[i].band]` (the same `coef.m[line_index * ncg + g]`
+    /// the decoder reads). `m[i]` aligns with `entries[i]`.
+    pub m: &'a [&'a [u8]],
+}
+
+/// `Ldat[p,s]` — the data-subpacket byte count of one packet, inferred
+/// from the bitplane counts and truncation positions (Annex C.5.4,
+/// Table C.8).
+///
+/// Per Table C.8, for every included (band, line) entry and every code
+/// group `g` with `M[p,λ,b,g] > T[p,b]`, the data subpacket carries:
+///
+/// * `Ng` sign bits — only when `Fs == 0` (signs ride the data subpacket
+///   rather than a separate sign subpacket), and
+/// * `Ng × (M[p,λ,b,g] − T[p,b])` magnitude bits (the `M − T` retained
+///   bitplanes, `Ng` coefficients each).
+///
+/// Code groups with `M ≤ T` contribute nothing (the magnitude is wholly
+/// quantized away). The accumulated bits are padded up to the next byte
+/// boundary (`pad(8)`), giving `Ldat[p,s]` exclusive of any optional
+/// trailing filler bytes — the same way [`decode_packet_body`] consumes
+/// the subpacket, so the count is exact.
+///
+/// `truncation` is the per-band `T[p,b]` array (one entry per band id),
+/// as produced by [`precinct_truncation`]. Bits accumulate in `u64` so
+/// an adversarial count set cannot overflow before the byte rounding.
+fn data_subpacket_bytes(
+    geom: &PrecinctGeometry,
+    truncation: &[u8],
+    pkt: &PacketDataInfo<'_>,
+) -> u64 {
+    let mut bits: u64 = 0;
+    for (entry, m_groups) in pkt.entries.iter().zip(pkt.m.iter()) {
+        let bi = entry.band as usize;
+        if bi >= geom.bands.len() || !geom.bands[bi].exists {
+            continue;
+        }
+        let t = truncation[bi] as u64;
+        let ncg = geom.ncg(bi) as usize;
+        for &m in m_groups.iter().take(ncg) {
+            let m = m as u64;
+            if m > t {
+                if geom.fs == 0 {
+                    bits += geom.ng as u64;
+                }
+                bits += (geom.ng as u64) * (m - t);
+            }
+        }
+    }
+    bits.div_ceil(8)
+}
+
+/// Infer the data-subpacket byte count `Ldat[p,s]` of one packet from
+/// its bitplane counts and the precinct's truncation positions
+/// (ISO/IEC 21122-1:2022 Annex C.5.4, Table C.8).
+///
+/// `precinct` supplies `Q[p]`, `R[p]`, and `D[p,b]`; the per-band
+/// truncation `T[p,b]` is computed from those plus the WGT gains /
+/// priorities in `geom` via [`precinct_truncation`]. See
+/// [`data_subpacket_bytes`] for the bit-accounting; this is the public
+/// entry point that resolves the truncation first.
+///
+/// The returned value is the byte-padded data-subpacket size **before**
+/// any optional trailing filler bytes (Annex C.5.4 NOTE: the filler
+/// count is inferred from the packet header's `Ldat[p,s]` field, i.e.
+/// `Ldat[p,s] − inferred_bytes`). A conforming `Ldat[p,s]` is therefore
+/// always **at least** this value.
+#[must_use]
+pub fn infer_ldat(
+    geom: &PrecinctGeometry,
+    precinct: &PrecinctHeader,
+    pkt: &PacketDataInfo<'_>,
+) -> u64 {
+    let truncation = precinct_truncation(geom, precinct);
+    data_subpacket_bytes(geom, &truncation, pkt)
+}
+
+/// Verify a packet's wire `Ldat[p,s]` field against the data-subpacket
+/// size inferred from its bitplane counts (Annex C.5.4, Table C.8) and
+/// return the implied trailing-filler-byte count.
+///
+/// Mirrors [`precinct_filler_bytes`] at the data-subpacket level: the
+/// `Ldat[p,s]` field of the packet header (Annex C.3, Table C.3) must be
+/// **at least** the inferred byte count, the difference being optional
+/// filler bytes the decoder skips (Annex C.5.4 NOTE). Returns
+/// `Ok(filler_bytes)` when `ldat` covers the inferred data, or `Err(_)`
+/// when `ldat` is smaller than the data the bitplane counts require (a
+/// malformed / inconsistent packet header).
+pub fn data_subpacket_filler_bytes(
+    geom: &PrecinctGeometry,
+    precinct: &PrecinctHeader,
+    pkt: &PacketDataInfo<'_>,
+    ldat: u32,
+) -> Result<u32> {
+    let inferred = infer_ldat(geom, precinct, pkt);
+    let ldat = ldat as u64;
+    if inferred > ldat {
+        return Err(Error::invalid(format!(
+            "jpegxs entropy: data subpacket needs {inferred} bytes but Ldat[p,s] = {ldat} (Annex C.5.4 Table C.8)"
+        )));
+    }
+    Ok((ldat - inferred) as u32)
+}
+
 /// Verify that a precinct's `Lprc[p]` field is consistent with the
 /// actual on-wire size of its packets (ISO/IEC 21122-1:2022 Annex C.2,
 /// Table C.1).
@@ -730,5 +848,121 @@ mod tests {
         // Lprc = 17 → overflow.
         let h_small = hdr_lprc(17, vec![0b00]);
         assert!(precinct_filler_bytes(&g, &h_small, &[p0, p1]).is_err());
+    }
+
+    // ---- Annex C.5.4 / Table C.8 data-subpacket size (Ldat[p,s]) ----
+
+    /// Fs=0: each significant code group (`M > T`) contributes `Ng` sign
+    /// bits + `Ng × (M − T)` magnitude bits; groups with `M ≤ T`
+    /// contribute nothing; the total is padded to a whole byte.
+    #[test]
+    fn ldat_inference_fs0_signs_and_magnitudes() {
+        // Wpb=8, Ng=4 → Ncg=2 code groups per line. Q=0/R=0/no gain →
+        // T[p,b] = 0 for the single band.
+        let g = geom(vec![band(8, 0, 0)]); // fs = 0, ng = 4
+        let h = hdr_lprc(0, vec![0b00]);
+        // Group 0: M=3 > T=0 → 4 sign + 4*3 = 12 magnitude = 16 bits.
+        // Group 1: M=0 ≤ T=0 → 0 bits.
+        // Total 16 bits → 2 bytes.
+        let m0: &[u8] = &[3, 0];
+        let pkt = PacketDataInfo {
+            entries: &[PacketEntry { band: 0, line: 0 }],
+            m: &[m0],
+        };
+        assert_eq!(infer_ldat(&g, &h, &pkt), 2);
+        // 17 bits would round to 3 bytes: bump group 1 to M=1 → +4 sign
+        // +4 magnitude = 8 bits, total 24 bits → 3 bytes.
+        let m1: &[u8] = &[3, 1];
+        let pkt1 = PacketDataInfo {
+            entries: &[PacketEntry { band: 0, line: 0 }],
+            m: &[m1],
+        };
+        assert_eq!(infer_ldat(&g, &h, &pkt1), 3);
+    }
+
+    /// Fs=1: the data subpacket omits the sign bits (they ride a separate
+    /// sign subpacket), so each significant group contributes only
+    /// `Ng × (M − T)` magnitude bits.
+    #[test]
+    fn ldat_inference_fs1_omits_signs() {
+        let mut g = geom(vec![band(8, 0, 0)]);
+        g.fs = 1;
+        let h = hdr_lprc(0, vec![0b00]);
+        // Group 0: M=3, T=0 → 4*3 = 12 magnitude bits (no signs).
+        // Group 1: M=0 → 0. Total 12 bits → 2 bytes.
+        let m: &[u8] = &[3, 0];
+        let pkt = PacketDataInfo {
+            entries: &[PacketEntry { band: 0, line: 0 }],
+            m: &[m],
+        };
+        assert_eq!(infer_ldat(&g, &h, &pkt), 2);
+    }
+
+    /// Truncation gates the magnitude bits: with `T[p,b] = 2` a group of
+    /// `M = 3` retains only one bitplane; a group of `M = 2` is wholly
+    /// truncated and emits nothing.
+    #[test]
+    fn ldat_inference_respects_truncation() {
+        // gain=0, priority=0; Q=5 → T = clamp(5-0-0,0,15) = 5. Make T
+        // land at 2 via Q=2.
+        let g = geom(vec![band(8, 0, 0)]); // fs = 0
+        let h = PrecinctHeader {
+            lprc: 0,
+            q: 2,
+            r: 0,
+            d: vec![0b00],
+            header_bytes: 6,
+        };
+        // T = 2. Group 0: M=3 > 2 → 4 sign + 4*(3-2) = 8 bits.
+        // Group 1: M=2 ≤ 2 → 0 bits. Total 8 bits → 1 byte.
+        let m: &[u8] = &[3, 2];
+        let pkt = PacketDataInfo {
+            entries: &[PacketEntry { band: 0, line: 0 }],
+            m: &[m],
+        };
+        assert_eq!(infer_ldat(&g, &h, &pkt), 1);
+    }
+
+    /// `data_subpacket_filler_bytes` cross-checks a wire `Ldat[p,s]`
+    /// against the inferred minimum and returns the implied filler bytes;
+    /// an `Ldat` smaller than the data the bitplane counts require errors.
+    #[test]
+    fn ldat_filler_and_overflow() {
+        let g = geom(vec![band(8, 0, 0)]); // fs = 0, T = 0
+        let h = hdr_lprc(0, vec![0b00]);
+        // Inferred = 2 bytes (the fs0 case above with m=[3,0]).
+        let m: &[u8] = &[3, 0];
+        let pkt = PacketDataInfo {
+            entries: &[PacketEntry { band: 0, line: 0 }],
+            m: &[m],
+        };
+        // Ldat = 2 → zero filler; Ldat = 5 → three filler; Ldat = 1 → err.
+        assert_eq!(data_subpacket_filler_bytes(&g, &h, &pkt, 2).unwrap(), 0);
+        assert_eq!(data_subpacket_filler_bytes(&g, &h, &pkt, 5).unwrap(), 3);
+        assert!(data_subpacket_filler_bytes(&g, &h, &pkt, 1).is_err());
+    }
+
+    /// Multiple entries sum, and a non-existent band is skipped (matching
+    /// the decode loop's `if !band.exists { continue; }`).
+    #[test]
+    fn ldat_inference_sums_entries_and_skips_absent_band() {
+        let mut g = geom(vec![band(8, 0, 0), band(8, 0, 0)]); // fs = 0
+        g.bands[1].exists = false; // absent band contributes nothing
+        let h = hdr_lprc(0, vec![0b00, 0b00]);
+        // Band 0, two lines: each m=[1,0] → group0 M=1>0 → 4 sign + 4 mag
+        // = 8 bits per line. Two lines → 16 bits → 2 bytes. Band 1 absent.
+        g.bands[0].l1 = 2;
+        let m_l0: &[u8] = &[1, 0];
+        let m_l1: &[u8] = &[1, 0];
+        let m_b1: &[u8] = &[15, 15]; // would be huge if it counted
+        let pkt = PacketDataInfo {
+            entries: &[
+                PacketEntry { band: 0, line: 0 },
+                PacketEntry { band: 0, line: 1 },
+                PacketEntry { band: 1, line: 0 },
+            ],
+            m: &[m_l0, m_l1, m_b1],
+        };
+        assert_eq!(infer_ldat(&g, &h, &pkt), 2);
     }
 }
