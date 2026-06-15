@@ -33,6 +33,11 @@ End-to-end decode of the multi-component subset:
   guard.
 - Annex G linear / quadratic / extended (NLT) output scaling.
 
+Every bitplane-count decode mode (raw, no-prediction, vertical
+prediction — Tables C.12 / C.13 / C.14) enforces the spec range
+`0 ≤ M[p,λ,b,g] ≤ (2^Br − 1)`, rejecting out-of-range counts in the
+variable-length-code paths as well as the raw path.
+
 The entropy path also exposes structural consistency predicates
 (precinct-length `Lprc[p]`, data-subpacket size `Ldat[p,s]`,
 buffer-bound conformance) used to validate codestream construction.

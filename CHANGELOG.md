@@ -1,6 +1,30 @@
 # Changelog
 
-## Unreleased — round 309 (data-subpacket size Ldat[p,s] inference + consistency predicate, Annex C.5.4 Table C.8)
+## Unreleased — round 315 (bitplane-count range conformance across all decode modes, Annex C.6.4/C.6.5/C.6.6 Tables C.12/C.13/C.14)
+
+Decode-side conformance fix: every bitplane-count decode mode must
+produce `0 ≤ M[p,λ,b,g] ≤ (2^Br − 1)`. Tables C.13 (vertical) and C.14
+(no-prediction) state this bound verbatim ("the codestream shall always
+be constructed in such a way that the bitplane counts M[p,λ,b,g] are
+between 0 and (2^Br − 1)"), and Table C.12 (raw) gives the same range in
+its `Values` column. Previously only the raw path enforced `2^Br − 1`;
+the two variable-length-code paths (no-prediction, vertical) merely
+clamped the decoded `M` to the byte range `0..=255`, silently accepting
+out-of-range counts a conformant decoder must reject.
+
+* `entropy::packet_body::decode_packet_body` now derives `m_max =
+  2^Br − 1` once per band (`Br` is the `u(4)` raw-coding field of the
+  picture header, Table A.7, with sole conformant value 4 → `m_max =
+  15`) and validates the decoded `M` against `0..=m_max` in all three
+  modes. The lower bound 0 also rejects an underflowing `mtop + Δm` in
+  the VLC paths, where `vlc()` can return a negative residual.
+* New test `nopred_vlc_bitplane_count_above_2pow_br_minus_1_rejected`:
+  a unary VLC codeword decoding to `M = 16` (one above the `Br = 4`
+  maximum) is now rejected as malformed.
+
+No public-API change; the encoder already keeps `M` within range.
+
+## Released as v0.0.7 — round 309 (data-subpacket size Ldat[p,s] inference + consistency predicate, Annex C.5.4 Table C.8)
 
 New decode-side conformance feature: the data subpacket of a packet
 (ISO/IEC 21122-1:2022 Annex C.5.4, Table C.8) carries no length on the

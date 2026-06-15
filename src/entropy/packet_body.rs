@@ -203,6 +203,20 @@ pub fn decode_packet_body(
             let dpb = precinct.d[bi];
             let coef = &mut prev_state.coefficients[bi];
 
+            // Bitplane-count upper bound 2^Br − 1. Tables C.12/C.13/C.14
+            // all require 0 ≤ M[p,λ,b,g] ≤ (2^Br − 1) regardless of the
+            // decode mode (raw / no-prediction / vertical). `Br` is a
+            // u(4) field whose only conformant value is 4 (Table A.7),
+            // so this caps M at 15, but the bound is computed from `Br`
+            // to stay exact for any future widening. The cap is `i32`
+            // so the VLC paths (which may produce a negative
+            // mtop + Δm) reject under- and over-flow uniformly.
+            let m_max: i32 = if geom.br >= 8 {
+                255
+            } else {
+                (1i32 << geom.br) - 1
+            };
+
             // Vertical predictor source line.
             // sy is taken to be 1 for round 3 (single-component
             // fixture). When λ - sy < L0, the predictor would come
@@ -211,20 +225,15 @@ pub fn decode_packet_body(
             let sy: u16 = 1;
 
             if packet.dr == 1 {
-                // Raw mode: Br bits per code group.
+                // Raw mode: Br bits per code group (Table C.12).
                 for g in 0..ncg {
-                    let m = reader.read_bits(geom.br)? as u8;
-                    let m_max = if geom.br >= 8 {
-                        255
-                    } else {
-                        (1u32 << geom.br) as u8 - 1
-                    };
+                    let m = reader.read_bits(geom.br)? as i32;
                     if m > m_max {
                         return Err(Error::invalid(format!(
-                            "jpegxs entropy: raw bitplane count {m} exceeds 2^Br - 1 = {m_max}"
+                            "jpegxs entropy: raw bitplane count {m} exceeds 2^Br - 1 = {m_max} (Table C.12)"
                         )));
                     }
-                    coef.m[line_index * ncg + g] = m;
+                    coef.m[line_index * ncg + g] = m as u8;
                 }
             } else if (dpb & 1) == 0 {
                 // No-prediction VLC, Table C.14.
@@ -251,9 +260,9 @@ pub fn decode_packet_body(
                         0
                     };
                     let m = mtop + delta_m;
-                    if !(0..=255).contains(&m) {
+                    if !(0..=m_max).contains(&m) {
                         return Err(Error::invalid(format!(
-                            "jpegxs entropy: decoded M[p,λ,b,g] = {m} out of byte range"
+                            "jpegxs entropy: decoded M[p,λ,b,g] = {m} outside 0..=2^Br-1 = {m_max} (Table C.14)"
                         )));
                     }
                     coef.m[line_index * ncg + g] = m as u8;
@@ -325,9 +334,9 @@ pub fn decode_packet_body(
                         t - mtop
                     };
                     let m = mtop + delta_m;
-                    if !(0..=255).contains(&m) {
+                    if !(0..=m_max).contains(&m) {
                         return Err(Error::invalid(format!(
-                            "jpegxs entropy: decoded vertical M[p,λ,b,g] = {m} out of byte range"
+                            "jpegxs entropy: decoded vertical M[p,λ,b,g] = {m} outside 0..=2^Br-1 = {m_max} (Table C.13)"
                         )));
                     }
                     coef.m[line_index * ncg + g] = m as u8;
@@ -885,6 +894,70 @@ mod tests {
         assert_eq!(band.m, vec![3, 0, 1, 2]);
         let expected_v = vec![5u32, 0, 7, 1, 0, 0, 0, 0, 1, 0, 1, 0, 3, 2, 1, 0];
         assert_eq!(band.v, expected_v);
+    }
+
+    /// A VLC-coded bitplane count that exceeds `2^Br − 1` must be
+    /// rejected. Tables C.13 and C.14 both require
+    /// `0 ≤ M[p,λ,b,g] ≤ (2^Br − 1)`; the raw path (Table C.12) already
+    /// enforced it, but the no-prediction / vertical VLC paths used to
+    /// only clamp to the byte range. With `Br = 4` the valid maximum is
+    /// 15, so a unary VLC codeword that decodes to `M = 16` is malformed.
+    ///
+    /// Geometry: 1 band, `wpb = 16` → `Ncg = 4`, `T = 0`, `D = 0`
+    /// (no prediction, no significance), `Dr = 0`. `vlc(mtop=0, T=0)`
+    /// is the unary alphabet returning the count of leading 1-bits, so
+    /// 16 ones followed by a 0 comma decodes the first code group to
+    /// `M = 16 > 15`.
+    #[test]
+    fn nopred_vlc_bitplane_count_above_2pow_br_minus_1_rejected() {
+        let geom = PrecinctGeometry {
+            bands: vec![BandGeometry {
+                wpb: 16,
+                gain: 0,
+                priority: 0,
+                l0: 0,
+                l1: 1,
+                exists: true,
+            }],
+            ng: 4,
+            ss: 8,
+            br: 4,
+            fs: 0,
+            rm: 0,
+            rl: 0,
+            lh: 0,
+            short_packet_header: true,
+        };
+        let layout = PacketLayout {
+            entries: vec![PacketEntry { band: 0, line: 0 }],
+        };
+        let precinct = PrecinctHeader {
+            lprc: 1,
+            q: 0,
+            r: 0,
+            d: vec![0], // no prediction, no significance
+            header_bytes: 0,
+        };
+        // Bitplane-count sub-packet: first code group is 16 unary ones
+        // then a 0 comma = "1111111111111111 0" (17 bits). Padded to
+        // 3 bytes: 0xFF 0xFF 0x00. Lcnt = 3.
+        let body: Vec<u8> = vec![0xFF, 0xFF, 0x00];
+        let packet = PacketHeader {
+            dr: 0,
+            ldat: 0,
+            lcnt: 3,
+            lsgn: 0,
+            short_form: true,
+            header_bytes: 5,
+        };
+        let mut state = PrecinctState::default();
+        let err = decode_packet_body(&body, &geom, &precinct, &packet, &layout, &mut state, None)
+            .expect_err("M = 16 must be rejected as out of 0..=2^Br-1");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("2^Br-1") && msg.contains("16"),
+            "unexpected error message: {msg}"
+        );
     }
 
     /// Cross-precinct vertical prediction (Annex C.6.3 Table C.11):
