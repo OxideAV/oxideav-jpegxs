@@ -476,6 +476,126 @@ pub fn data_subpacket_filler_bytes(
     Ok((ldat - inferred) as u32)
 }
 
+/// One packet's contribution to the sign-subpacket size inference
+/// (Annex C.5.5, Table C.9). The sign subpacket exists only when the
+/// picture-header sign-packing flag `Fs == 1` (Table A.11); it carries
+/// no length on the wire other than the `Lsgn[p,s]` field of the packet
+/// header, yet its exact bit count is fully determined by the decoded
+/// coefficient magnitudes `v[p,λ,b,x]`, the code-group size `Ng`, and
+/// the per-band coefficient count `Wpb[p,b]`. This struct carries the
+/// per-packet inputs Table C.9 reads.
+#[derive(Debug, Clone, Copy)]
+pub struct PacketSignInfo<'a> {
+    /// `I[p,b,λ,s]` — the (band, line) pairs this packet covers, in the
+    /// same order [`decode_packet_body`] walks them.
+    pub entries: &'a [PacketEntry],
+    /// `v[p,λ,b,x]` — the decoded quantization-index magnitudes of every
+    /// (band, line) entry, laid out one slice per `entries[i]`, each
+    /// slice indexed by the in-band coefficient position `x` (the same
+    /// `coef.v[line_offset + xpos]` layout the sign decoder reads).
+    /// `v[i]` aligns with `entries[i]`. A slice shorter than the band
+    /// width is treated as zero-padded (positions past its end carry no
+    /// sign bit, matching the decoder's `xpos >= wpb` skip).
+    pub v: &'a [&'a [u16]],
+}
+
+/// `Lsgn[p,s]` — the sign-subpacket byte count of one packet, inferred
+/// from the decoded coefficient magnitudes (Annex C.5.5, Table C.9).
+///
+/// Per Table C.9, the sign subpacket emits exactly **one sign bit per
+/// non-zero quantization-index magnitude** `v[p,λ,b,Ng×g+k] != 0`,
+/// iterating every member `k ∈ 0..Ng` of every code group
+/// `g ∈ 0..Ncg[p,b]` of every included `(band, line)` entry. Positions
+/// past the band width `Wpb[p,b]` carry no sign bit — they are the
+/// "meaningless coefficients near the right edge" of Table C.9 NOTE 2
+/// that the magnitude loop already skips (`xpos >= wpb`). The
+/// accumulated bits are padded up to the next byte boundary (`pad(8)`),
+/// giving `Lsgn[p,s]` exclusive of any optional trailing filler bytes —
+/// the same way [`decode_packet_body`]'s sign sub-packet loop consumes
+/// it, so the count is exact.
+///
+/// Bands that do not exist are skipped, matching the decode loop's
+/// `if !band.exists { continue; }`. Bits accumulate in `u64` so an
+/// adversarial coefficient set cannot overflow before the byte rounding.
+fn sign_subpacket_bytes(geom: &PrecinctGeometry, pkt: &PacketSignInfo<'_>) -> u64 {
+    let mut bits: u64 = 0;
+    for (entry, v_line) in pkt.entries.iter().zip(pkt.v.iter()) {
+        let bi = entry.band as usize;
+        if bi >= geom.bands.len() || !geom.bands[bi].exists {
+            continue;
+        }
+        let wpb = geom.bands[bi].wpb as usize;
+        let ncg = geom.ncg(bi) as usize;
+        let ng = geom.ng as usize;
+        for g in 0..ncg {
+            for k in 0..ng {
+                let xpos = g * ng + k;
+                if xpos >= wpb {
+                    continue;
+                }
+                // A short slice means the trailing coefficients are zero
+                // (no sign bit), matching the decoder's read of `v`.
+                if v_line.get(xpos).is_some_and(|&v| v != 0) {
+                    bits += 1;
+                }
+            }
+        }
+    }
+    bits.div_ceil(8)
+}
+
+/// Infer the sign-subpacket byte count `Lsgn[p,s]` of one packet from
+/// its decoded coefficient magnitudes (ISO/IEC 21122-1:2022 Annex C.5.5,
+/// Table C.9).
+///
+/// The sign subpacket is present only when `Fs == 1`; when `Fs == 0`
+/// the signs ride the data subpacket (counted by [`infer_ldat`]) and the
+/// sign subpacket does not exist, so this returns `0` in that case. See
+/// [`sign_subpacket_bytes`] for the bit-accounting.
+///
+/// The returned value is the byte-padded sign-subpacket size **before**
+/// any optional trailing filler bytes (Annex C.5.5 NOTE 1: the filler
+/// count is inferred from the packet header's `Lsgn[p,s]` field, i.e.
+/// `Lsgn[p,s] − inferred_bytes`). A conforming `Lsgn[p,s]` is therefore
+/// always **at least** this value.
+#[must_use]
+pub fn infer_lsgn(geom: &PrecinctGeometry, pkt: &PacketSignInfo<'_>) -> u64 {
+    if geom.fs != 1 {
+        return 0;
+    }
+    sign_subpacket_bytes(geom, pkt)
+}
+
+/// Verify a packet's wire `Lsgn[p,s]` field against the sign-subpacket
+/// size inferred from its decoded coefficient magnitudes (Annex C.5.5,
+/// Table C.9) and return the implied trailing-filler-byte count.
+///
+/// Mirrors [`data_subpacket_filler_bytes`] at the sign-subpacket level:
+/// the `Lsgn[p,s]` field of the packet header (Annex C.3, Table C.3)
+/// must be **at least** the inferred byte count, the difference being
+/// optional filler bytes the decoder skips (Annex C.5.5 NOTE 1).
+/// Returns `Ok(filler_bytes)` when `lsgn` covers the inferred data, or
+/// `Err(_)` when `lsgn` is smaller than the sign bits the coefficient
+/// magnitudes require (a malformed / inconsistent packet header).
+///
+/// When `Fs == 0` the sign subpacket does not exist; the inferred size
+/// is `0` and any `lsgn` is accepted as pure filler (Table C.4 omits the
+/// subpacket entirely, so the field is meaningless).
+pub fn sign_subpacket_filler_bytes(
+    geom: &PrecinctGeometry,
+    pkt: &PacketSignInfo<'_>,
+    lsgn: u32,
+) -> Result<u32> {
+    let inferred = infer_lsgn(geom, pkt);
+    let lsgn = lsgn as u64;
+    if inferred > lsgn {
+        return Err(Error::invalid(format!(
+            "jpegxs entropy: sign subpacket needs {inferred} bytes but Lsgn[p,s] = {lsgn} (Annex C.5.5 Table C.9)"
+        )));
+    }
+    Ok((lsgn - inferred) as u32)
+}
+
 /// Verify that a precinct's `Lprc[p]` field is consistent with the
 /// actual on-wire size of its packets (ISO/IEC 21122-1:2022 Annex C.2,
 /// Table C.1).
@@ -964,5 +1084,145 @@ mod tests {
             m: &[m_l0, m_l1, m_b1],
         };
         assert_eq!(infer_ldat(&g, &h, &pkt), 2);
+    }
+
+    // ---- Annex C.5.5 / Table C.9 sign-subpacket size (Lsgn[p,s]) ----
+
+    /// Fs=1: the sign subpacket emits exactly one bit per non-zero
+    /// coefficient magnitude over all `Ng × Ncg` in-band positions of
+    /// every included line, padded to a whole byte.
+    #[test]
+    fn lsgn_inference_one_bit_per_nonzero() {
+        // Wpb=8, Ng=4 → Ncg=2 code groups (8 positions). fs forced to 1.
+        let mut g = geom(vec![band(8, 0, 0)]);
+        g.fs = 1;
+        // Five non-zero magnitudes → 5 sign bits → 1 byte.
+        let v0: &[u16] = &[3, 0, 1, 2, 0, 7, 0, 4];
+        let pkt = PacketSignInfo {
+            entries: &[PacketEntry { band: 0, line: 0 }],
+            v: &[v0],
+        };
+        assert_eq!(infer_lsgn(&g, &pkt), 1);
+        // Nine non-zero across two lines → 9 bits → 2 bytes.
+        g.bands[0].l1 = 2;
+        let v_l0: &[u16] = &[1, 1, 1, 1, 1, 0, 0, 0]; // 5
+        let v_l1: &[u16] = &[1, 1, 1, 1, 0, 0, 0, 0]; // 4
+        let pkt2 = PacketSignInfo {
+            entries: &[
+                PacketEntry { band: 0, line: 0 },
+                PacketEntry { band: 0, line: 1 },
+            ],
+            v: &[v_l0, v_l1],
+        };
+        assert_eq!(infer_lsgn(&g, &pkt2), 2);
+    }
+
+    /// Fs=0: the sign subpacket does not exist (signs ride the data
+    /// subpacket), so the inferred size is always 0 regardless of the
+    /// coefficient magnitudes.
+    #[test]
+    fn lsgn_inference_zero_when_fs0() {
+        let g = geom(vec![band(8, 0, 0)]); // fs = 0
+        let v0: &[u16] = &[9, 9, 9, 9, 9, 9, 9, 9]; // all non-zero
+        let pkt = PacketSignInfo {
+            entries: &[PacketEntry { band: 0, line: 0 }],
+            v: &[v0],
+        };
+        assert_eq!(infer_lsgn(&g, &pkt), 0);
+    }
+
+    /// Positions past the band width `Wpb[p,b]` carry no sign bit — the
+    /// "meaningless coefficients near the right edge" of Table C.9 NOTE 2
+    /// that the sign loop skips (`xpos >= wpb`). Wpb=6 → Ncg=2 (8 slots),
+    /// but slots 6 and 7 are never signed.
+    #[test]
+    fn lsgn_inference_skips_past_band_width() {
+        let mut g = geom(vec![band(6, 0, 0)]);
+        g.fs = 1;
+        // Eight magnitudes supplied but only the first six are in-band.
+        // Positions 6 and 7 are non-zero yet must NOT contribute.
+        let v0: &[u16] = &[0, 0, 0, 0, 0, 1, 9, 9];
+        let pkt = PacketSignInfo {
+            entries: &[PacketEntry { band: 0, line: 0 }],
+            v: &[v0],
+        };
+        // Only position 5 is a non-zero in-band coefficient → 1 bit → 1 byte.
+        assert_eq!(infer_lsgn(&g, &pkt), 1);
+        // All-zero in-band → 0 bits → 0 bytes.
+        let v_zero: &[u16] = &[0, 0, 0, 0, 0, 0, 9, 9];
+        let pkt_zero = PacketSignInfo {
+            entries: &[PacketEntry { band: 0, line: 0 }],
+            v: &[v_zero],
+        };
+        assert_eq!(infer_lsgn(&g, &pkt_zero), 0);
+    }
+
+    /// A short `v` slice means the trailing coefficients are zero (no
+    /// sign bit), matching the decoder reading an absent coefficient as 0.
+    #[test]
+    fn lsgn_inference_short_slice_is_zero_padded() {
+        let mut g = geom(vec![band(8, 0, 0)]);
+        g.fs = 1;
+        // Only three magnitudes given; positions 3..8 are implicitly 0.
+        let v0: &[u16] = &[1, 0, 5];
+        let pkt = PacketSignInfo {
+            entries: &[PacketEntry { band: 0, line: 0 }],
+            v: &[v0],
+        };
+        // Two non-zero → 2 bits → 1 byte.
+        assert_eq!(infer_lsgn(&g, &pkt), 1);
+    }
+
+    /// Multiple entries sum, and a non-existent band is skipped (matching
+    /// the decode loop's `if !band.exists { continue; }`).
+    #[test]
+    fn lsgn_inference_sums_entries_and_skips_absent_band() {
+        let mut g = geom(vec![band(8, 0, 0), band(8, 0, 0)]);
+        g.fs = 1;
+        g.bands[1].exists = false; // absent band contributes nothing
+        let v_b0: &[u16] = &[1, 1, 1, 1, 0, 0, 0, 0]; // 4 non-zero
+        let v_b1: &[u16] = &[9, 9, 9, 9, 9, 9, 9, 9]; // would be 8 if counted
+        let pkt = PacketSignInfo {
+            entries: &[
+                PacketEntry { band: 0, line: 0 },
+                PacketEntry { band: 1, line: 0 },
+            ],
+            v: &[v_b0, v_b1],
+        };
+        // Only band 0's 4 non-zero count → 4 bits → 1 byte.
+        assert_eq!(infer_lsgn(&g, &pkt), 1);
+    }
+
+    /// `sign_subpacket_filler_bytes` cross-checks a wire `Lsgn[p,s]`
+    /// against the inferred minimum and returns the implied filler bytes;
+    /// an `Lsgn` smaller than the sign bits the magnitudes require errors.
+    #[test]
+    fn lsgn_filler_and_overflow() {
+        let mut g = geom(vec![band(8, 0, 0)]);
+        g.fs = 1;
+        // Five non-zero → inferred 1 byte.
+        let v0: &[u16] = &[3, 0, 1, 2, 0, 7, 0, 4];
+        let pkt = PacketSignInfo {
+            entries: &[PacketEntry { band: 0, line: 0 }],
+            v: &[v0],
+        };
+        // Lsgn = 1 → zero filler; Lsgn = 4 → three filler; Lsgn = 0 → err.
+        assert_eq!(sign_subpacket_filler_bytes(&g, &pkt, 1).unwrap(), 0);
+        assert_eq!(sign_subpacket_filler_bytes(&g, &pkt, 4).unwrap(), 3);
+        assert!(sign_subpacket_filler_bytes(&g, &pkt, 0).is_err());
+    }
+
+    /// Fs=0: the field is meaningless (subpacket omitted), so any wire
+    /// `Lsgn` is accepted as pure filler against an inferred size of 0.
+    #[test]
+    fn lsgn_filler_fs0_accepts_any_field() {
+        let g = geom(vec![band(8, 0, 0)]); // fs = 0
+        let v0: &[u16] = &[1, 1, 1, 1, 1, 1, 1, 1];
+        let pkt = PacketSignInfo {
+            entries: &[PacketEntry { band: 0, line: 0 }],
+            v: &[v0],
+        };
+        assert_eq!(sign_subpacket_filler_bytes(&g, &pkt, 0).unwrap(), 0);
+        assert_eq!(sign_subpacket_filler_bytes(&g, &pkt, 7).unwrap(), 7);
     }
 }

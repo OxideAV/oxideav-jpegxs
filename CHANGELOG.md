@@ -1,5 +1,55 @@
 # Changelog
 
+## Unreleased — round 319 (sign-subpacket size Lsgn[p,s] inference + consistency predicate, Annex C.5.5 Table C.9)
+
+New decode-side conformance feature: the sign subpacket of a packet
+(ISO/IEC 21122-1:2022 Annex C.5.5, Table C.9) is present only when the
+picture-header sign-packing flag `Fs == 1`, and carries no length on the
+wire other than the `Lsgn[p,s]` field of the packet header — yet its
+exact bit count is fully determined by the decoded coefficient
+magnitudes `v[p,λ,b,x]`, the code-group size `Ng`, and the per-band
+coefficient count `Wpb[p,b]`. Round 319 infers it the same way round 309
+inferred `Ldat[p,s]` (data subpacket) and round 295/308 inferred
+`Lsig[p,s]` (significance subpacket), completing the set: every
+subpacket byte count is now reconstructible from the precinct's coding
+state, so `Lsgn[p,s]` is no longer only a *given* packet-header input to
+the precinct-length predicate.
+
+* `entropy::infer_lsgn(geom, pkt) -> u64` — the inferred sign-subpacket
+  byte count. Per Table C.9 the sign subpacket emits exactly **one sign
+  bit per non-zero quantization-index magnitude** `v[p,λ,b,Ng×g+k] != 0`,
+  iterating every member `k ∈ 0..Ng` of every code group
+  `g ∈ 0..Ncg[p,b]` of every included `(band, line)` entry. Positions
+  past the band width `Wpb[p,b]` carry no sign bit — the "meaningless
+  coefficients near the right edge" of Table C.9 NOTE 2 that the
+  magnitude loop already skips (`xpos >= wpb`). The accumulated bits are
+  padded up to the next byte boundary (`pad(8)`), giving `Lsgn[p,s]`
+  exclusive of any optional trailing filler bytes. Returns `0` when
+  `Fs == 0` (the subpacket does not exist and signs ride the data
+  subpacket, counted by `infer_ldat`). Bits accumulate in `u64` so an
+  adversarial coefficient set cannot overflow before the byte rounding.
+* `PacketSignInfo { entries, v }` carries the per-packet inputs:
+  the inclusion list `I[p,b,λ,s]` and the decoded magnitudes
+  `v[p,λ,b,x]` laid out one slice per entry (the same
+  `coef.v[line_offset + xpos]` layout the sign decoder reads). A slice
+  shorter than the band width is treated as zero-padded — positions past
+  its end carry no sign bit, matching the decoder reading an absent
+  coefficient as 0. Bands that do not exist are skipped, matching the
+  decode loop's `if !band.exists { continue; }`.
+* `entropy::sign_subpacket_filler_bytes(geom, pkt, lsgn) -> Result<u32>`
+  — cross-checks a wire `Lsgn[p,s]` against the inferred minimum and
+  returns the implied trailing-filler-byte count, mirroring
+  `data_subpacket_filler_bytes`. A wire `Lsgn[p,s]` smaller than the
+  sign bits the magnitudes require is rejected as malformed. When
+  `Fs == 0` the inferred size is `0` and any field value is accepted as
+  pure filler (Table C.4 omits the subpacket entirely).
+* Seven new tests covering: one-bit-per-non-zero counting with byte
+  padding, `Fs == 0 → 0`, past-`Wpb` skip (Table C.9 NOTE 2), short-slice
+  zero-padding, multi-entry summation with absent-band skip, and the
+  filler/overflow cross-check in both `Fs` modes.
+
+No public-API removal; the decoder's sign sub-packet loop is unchanged.
+
 ## Unreleased — round 315 (bitplane-count range conformance across all decode modes, Annex C.6.4/C.6.5/C.6.6 Tables C.12/C.13/C.14)
 
 Decode-side conformance fix: every bitplane-count decode mode must

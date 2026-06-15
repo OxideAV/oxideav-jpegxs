@@ -40,7 +40,11 @@ variable-length-code paths as well as the raw path.
 
 The entropy path also exposes structural consistency predicates
 (precinct-length `Lprc[p]`, data-subpacket size `Ldat[p,s]`,
-buffer-bound conformance) used to validate codestream construction.
+sign-subpacket size `Lsgn[p,s]`, significance-subpacket size
+`Lsig[p,s]`, buffer-bound conformance) used to validate codestream
+construction. Every subpacket byte count is reconstructible from the
+precinct's coding state, so each can be cross-checked against — or
+inferred in place of — its packet-header field.
 
 ### Encoder
 
