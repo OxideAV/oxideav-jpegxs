@@ -916,6 +916,7 @@ pub fn encode_planar_star_tetrix_highbd(
         ct,
         None,
         Vec::new(),
+        Vec::new(),
         0,
         0,
         0,          // fs = 0
@@ -1037,6 +1038,7 @@ pub fn encode_planar_star_tetrix_highbd_lossy(
         ct,
         None,
         Vec::new(),
+        Vec::new(),
         0,
         0,
         0,          // fs = 0
@@ -1068,6 +1070,78 @@ pub fn encode_planar_lossy(
     let fq = if q == 0 { 0 } else { 8 };
     encode_planar_inner(
         width, height, nc, cpih, nlx, nly, fq, q, &sx, &sy, 0, 0, 0, 0, planes,
+    )
+}
+
+/// Lossy 4:4:4 encode driven by the **content-adaptive WGT weights** from
+/// ISO/IEC 21122-1:2022 Annex H (the PSNR-optimized `(G[b], P[b])` example
+/// tables, [`annex_h_weights`]) rather than the encoder's default plain
+/// gains + `P[b] = b` priorities.
+///
+/// Annex H supplies tables H.1 / H.2 / H.3 for the 4:4:4, RCT-enabled
+/// (`Cpih = 1`), 5-horizontal-level configurations with `NLy ∈ {0, 1, 2}`.
+/// For any other `(nc, cpih, nlx, nly)` the function falls back to the
+/// default-weights path of [`encode_planar_lossy`], so callers always get
+/// a valid codestream.
+///
+/// The supplied weights drive BOTH the WGT marker (Annex A.4.11) AND the
+/// forward truncation `T[p,b] = clamp(Q[p] − G[b] − r, 0, 15)` (Annex
+/// C.6.2 Table C.10, `r = (P[b] < R[p]) ? 1 : 0`), so the codestream
+/// round-trips through [`crate::decode_jpeg_xs`] — the decoder reads the
+/// identical `(G[b], P[b])` off the WGT segment and reconstructs the same
+/// per-band truncation positions. The richer gains (Annex H assigns up to
+/// `G = 4` to the deepest LL band, versus the default cap of 2) let the
+/// quantizer drop more low-frequency bitplanes where the eye is least
+/// sensitive, improving rate–distortion at a fixed `q`.
+///
+/// At `q = 0` (lossless) the weights are a no-op — every `T[p,b]` is
+/// already clamped to its `0` floor — so this entry point is only
+/// meaningful for `q ∈ 1..=15`.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_lossy_annex_h(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    q: u8,
+    planes: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    let Some((gains, priorities)) = annex_h_weights(nc, cpih, 0, nlx, nly) else {
+        return encode_planar_lossy(width, height, nc, cpih, nlx, nly, q, planes);
+    };
+    let sx = vec![1u8; nc as usize];
+    let sy = vec![1u8; nc as usize];
+    let fq = if q == 0 { 0 } else { 8 };
+    encode_planar_inner_nlt(
+        width,
+        height,
+        nc,
+        cpih,
+        nlx,
+        nly,
+        fq,
+        q,
+        &sx,
+        &sy,
+        0,
+        0,
+        0,
+        0,
+        None,
+        gains,
+        priorities,
+        0,          // cw: single precinct per row
+        0,          // sd: no suppressed components
+        0,          // fs: signs jointly with data
+        0,          // hsl: single slice
+        0,          // qpih: deadzone inverse quantizer
+        0,          // rp: no precinct refinement
+        Vec::new(), // q_slices
+        Vec::new(), // q_precincts
+        Vec::new(), // r_precincts
+        planes,
     )
 }
 
@@ -1149,6 +1223,7 @@ pub fn encode_planar_highbd(
         0,
         0,
         None,
+        Vec::new(),
         Vec::new(),
         0,
         0,
@@ -1248,6 +1323,7 @@ pub fn encode_planar_highbd_lossy(
         0,
         0,
         None,
+        Vec::new(),
         Vec::new(),
         0,
         0,
@@ -1363,6 +1439,7 @@ pub fn encode_planar_subsampled_highbd(
         0,
         None,
         Vec::new(),
+        Vec::new(),
         0,
         0,
         0,          // fs = 0
@@ -1472,6 +1549,7 @@ pub fn encode_planar_subsampled_highbd_lossy(
         0,
         None,
         Vec::new(),
+        Vec::new(),
         0,
         0,
         0,          // fs = 0
@@ -1540,6 +1618,7 @@ pub fn encode_planar_hsl(
         0,
         0,
         None,
+        Vec::new(),
         Vec::new(),
         0,          // cw: single precinct column
         0,          // sd: no CWD suppression
@@ -1633,6 +1712,7 @@ pub fn encode_planar_hsl_qslice(
         0,
         0,
         None,
+        Vec::new(),
         Vec::new(),
         0,   // cw: single precinct column
         0,   // sd: no CWD suppression
@@ -1739,6 +1819,7 @@ pub fn encode_planar_qpr(
         0,
         None,
         Vec::new(),
+        Vec::new(),
         0,          // cw: single precinct column
         0,          // sd: no CWD suppression
         0,          // fs: signs jointly with data (Fs=0)
@@ -1830,6 +1911,7 @@ pub fn encode_planar_rpr(
         0,
         0,
         None,
+        Vec::new(),
         Vec::new(),
         0,          // cw: single precinct column
         0,          // sd: no CWD suppression
@@ -1949,6 +2031,7 @@ pub fn encode_planar_qpr_rpr(
         0,
         0,
         None,
+        Vec::new(),
         Vec::new(),
         0, // cw: single precinct column
         0, // sd: no CWD suppression
@@ -2521,6 +2604,7 @@ pub fn encode_planar_hsl_qslice_rp(
         0,
         None,
         Vec::new(),
+        Vec::new(),
         0,   // cw: single precinct column
         0,   // sd: no CWD suppression
         0,   // fs: signs jointly with data (Fs=0)
@@ -2963,6 +3047,7 @@ pub fn encode_planar_hsl_qslice_rp_highbd(
         0,
         None,
         Vec::new(),
+        Vec::new(),
         0,   // cw: single precinct column
         0,   // sd: no CWD suppression
         0,   // fs: signs jointly with data (Fs=0)
@@ -3343,6 +3428,7 @@ pub fn encode_planar_qpih(
         0,
         None,
         Vec::new(),
+        Vec::new(),
         0,          // cw: single precinct column
         0,          // sd: no CWD suppression
         0,          // fs: signs jointly with data (Fs=0)
@@ -3423,6 +3509,7 @@ pub fn encode_planar_rp(
         0,
         None,
         Vec::new(),
+        Vec::new(),
         0,          // cw: single precinct column
         0,          // sd: no CWD suppression
         0,          // fs: signs jointly with data (Fs=0)
@@ -3482,6 +3569,7 @@ pub fn encode_planar_fs1(
         0,
         0,
         None,
+        Vec::new(),
         Vec::new(),
         0,          // cw
         0,          // sd
@@ -3545,6 +3633,7 @@ pub fn encode_planar_cw(
         0,
         None,
         Vec::new(),
+        Vec::new(),
         cw,
         0,
         0,          // fs: signs jointly with data (Fs=0)
@@ -3598,6 +3687,7 @@ pub fn encode_planar_sd(
         0,
         0,
         None,
+        Vec::new(),
         Vec::new(),
         0, // cw
         sd,
@@ -3655,6 +3745,7 @@ pub fn encode_planar_sd_rct(
         0,
         0,
         None,
+        Vec::new(),
         Vec::new(),
         0, // cw
         sd,
@@ -3714,6 +3805,7 @@ pub fn encode_planar_sd_star_tetrix(
         cf,
         ct,
         None,
+        Vec::new(),
         Vec::new(),
         0, // cw
         sd,
@@ -3798,6 +3890,7 @@ pub fn encode_planar_nlt_quadratic(
         0,
         0,
         Some(NltParams::Quadratic { dco }),
+        Vec::new(),
         Vec::new(), // band_gains built inside after validation
         0,
         0,
@@ -3878,6 +3971,7 @@ pub fn encode_planar_nlt_extended(
         0,
         0,
         Some(NltParams::Extended { t1, t2, e }),
+        Vec::new(),
         Vec::new(),
         0,
         0,
@@ -3986,6 +4080,7 @@ pub fn encode_planar_nlt_quadratic_highbd(
         0,
         0,
         Some(NltParams::Quadratic { dco }),
+        Vec::new(),
         Vec::new(),
         0,
         0,
@@ -4108,6 +4203,7 @@ pub fn encode_planar_nlt_extended_highbd(
         0,
         Some(NltParams::Extended { t1, t2, e }),
         Vec::new(),
+        Vec::new(),
         0,
         0,
         0,          // fs = 0 (joint signs)
@@ -4156,6 +4252,7 @@ fn encode_planar_inner(
         st_ct,
         None,
         Vec::new(),
+        Vec::new(),
         0,
         0,
         0,          // fs: signs jointly with data (Fs=0)
@@ -4188,6 +4285,7 @@ fn encode_planar_inner_nlt(
     st_ct: u8,
     nlt: Option<NltParams>,
     band_gains: Vec<u8>,
+    band_priorities: Vec<u8>,
     cw: u16,
     sd: u8,
     fs: u8,
@@ -4218,6 +4316,7 @@ fn encode_planar_inner_nlt(
         st_ct,
         nlt,
         band_gains,
+        band_priorities,
         cw,
         sd,
         fs,
@@ -4261,6 +4360,7 @@ fn encode_planar_inner_bd(
     st_ct: u8,
     nlt: Option<NltParams>,
     band_gains: Vec<u8>,
+    band_priorities: Vec<u8>,
     cw: u16,
     sd: u8,
     fs: u8,
@@ -4325,7 +4425,7 @@ fn encode_planar_inner_bd(
         st_ct,
         nlt,
         band_gains,
-        band_priorities: Vec::new(),
+        band_priorities,
         rp,
         cw,
         sd,
@@ -4336,10 +4436,22 @@ fn encode_planar_inner_bd(
     };
     cfg.validate()?;
     // Build per-band gains and priorities after validation so beta_key /
-    // band-index math runs with known-good (nlx >= nly) parameters.
+    // band-index math runs with known-good (nlx >= nly) parameters. A
+    // caller may instead supply a complete custom weights table (both
+    // `band_gains` AND `band_priorities` non-empty, e.g. the Annex H
+    // PSNR-optimized table from [`annex_h_weights`]); in that case it is
+    // threaded through verbatim — the WGT emission and the `custom_wgt`
+    // forward-truncation branch in [`write_slice`] then agree by
+    // construction. A non-empty `band_gains` with an empty
+    // `band_priorities` keeps the legacy `P[b] = b` priorities.
     let cfg = if cfg.band_gains.is_empty() {
         EncodeConfig {
             band_gains: build_band_gains_sd(nc, sd, nlx, nly, sx, sy),
+            band_priorities: build_band_priorities_sd(nc, sd, nlx, nly, sy),
+            ..cfg
+        }
+    } else if cfg.band_priorities.is_empty() {
+        EncodeConfig {
             band_priorities: build_band_priorities_sd(nc, sd, nlx, nly, sy),
             ..cfg
         }
@@ -4792,6 +4904,131 @@ fn build_band_priorities_sd(nc: u8, sd: u8, nlx: u8, nly: u8, sy: &[u8]) -> Vec<
         prios.push(b.min(255) as u8);
     }
     prios
+}
+
+/// Content-adaptive WGT weights from ISO/IEC 21122-1:2022 Annex H
+/// (informative) — the PSNR-optimized example `(G[b], P[b])` tables for
+/// the canonical 4:4:4, RCT-enabled (`Cpih = 1`), 5-horizontal-level
+/// configurations the encoder already supports.
+///
+/// Returns `Some((gains, priorities))` in band-index order `b = Nc×β + i`
+/// (the same `β`-major emission order `build_band_*_sd` and the WGT loop
+/// use) when `(nc, cpih, sd, nlx, nly)` matches a tabulated Annex H
+/// configuration, or `None` otherwise. The caller threads the returned
+/// vectors through [`EncodeConfig::band_gains`] / `band_priorities`, which
+/// drives both the WGT marker emission AND the forward truncation (see the
+/// `custom_wgt` branch in [`write_slice`]) so the codestream round-trips:
+/// the decoder reconstructs the identical `T[p,b] = clamp(Q[p] − G[b] − r,
+/// 0, 15)` (Annex C.6.2 Table C.10) from the `(G[b], P[b])` it reads back
+/// off the wire.
+///
+/// Per Annex A.4.11 these example tables were "optimized for PSNR
+/// performance of the encoder. Other choices are possible." Only the
+/// 4:4:4 RCT tables H.1 (`NLy = 0`), H.2 (`NLy = 1`) and H.3 (`NLy = 2`)
+/// are returned here; the 4:2:2 / 4:2:0 (H.4–H.8) and CFA star-tetrix
+/// (H.9–H.11) tables address subsampled / suppressed-band band layouts
+/// where the WGT emission slot ≠ band index, so they are deferred.
+pub(crate) fn annex_h_weights(
+    nc: u8,
+    cpih: u8,
+    sd: u8,
+    nlx: u8,
+    nly: u8,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    if nc != 3 || cpih != 1 || sd != 0 || nlx != 5 {
+        return None;
+    }
+    // Each entry is (G[b], P[b]) at band index b, transcribed from the
+    // ISO/IEC 21122-1:2022 Annex H tables (read from the spec PDF under
+    // docs/image/jpegxs/). Band order is b = Nc×β + i, i.e. the per-β
+    // triple (Y, Cb, Cr-after-RCT) the WGT loop emits.
+    let table: &[(u8, u8)] = match nly {
+        // Table H.1 — 4:4:4, RCT, 5 horizontal / 0 vertical levels (18 bands).
+        0 => &[
+            (3, 6),
+            (2, 8),
+            (2, 7),
+            (2, 1),
+            (1, 4),
+            (1, 5),
+            (2, 12),
+            (1, 14),
+            (1, 15),
+            (1, 0),
+            (0, 2),
+            (0, 3),
+            (1, 9),
+            (0, 11),
+            (0, 10),
+            (1, 13),
+            (0, 16),
+            (0, 17),
+        ],
+        // Table H.2 — 4:4:4, RCT, 5 horizontal / 1 vertical level (24 bands).
+        1 => &[
+            (4, 21),
+            (2, 1),
+            (2, 0),
+            (3, 15),
+            (2, 19),
+            (2, 18),
+            (2, 5),
+            (1, 9),
+            (1, 8),
+            (2, 14),
+            (1, 17),
+            (1, 16),
+            (1, 2),
+            (0, 4),
+            (0, 3),
+            (1, 7),
+            (0, 13),
+            (0, 11),
+            (1, 6),
+            (0, 12),
+            (0, 10),
+            (1, 20),
+            (0, 23),
+            (0, 22),
+        ],
+        // Table H.3 — 4:4:4, RCT, 5 horizontal / 2 vertical levels (30 bands).
+        2 => &[
+            (4, 12),
+            (3, 15),
+            (3, 14),
+            (3, 3),
+            (2, 11),
+            (2, 10),
+            (3, 24),
+            (2, 26),
+            (2, 27),
+            (2, 0),
+            (1, 4),
+            (1, 5),
+            (2, 18),
+            (1, 21),
+            (1, 20),
+            (2, 19),
+            (1, 23),
+            (1, 22),
+            (1, 13),
+            (0, 16),
+            (0, 17),
+            (1, 2),
+            (0, 9),
+            (0, 6),
+            (1, 1),
+            (0, 7),
+            (0, 8),
+            (1, 25),
+            (0, 28),
+            (0, 29),
+        ],
+        _ => return None,
+    };
+    let gains = table.iter().map(|&(g, _)| g).collect();
+    let priorities = table.iter().map(|&(_, p)| p).collect();
+    Some((gains, priorities))
 }
 
 /// Per-(β, i) band geometry needed by the encoder.
@@ -5643,6 +5880,23 @@ fn encode_precinct_cascade(
     // the encoder assigns `P[b] = b` (the true band index, Annex B.6), so
     // `r = (b < R[p]) ? 1 : 0`. R[p] = 0 disables refinement (r ≡ 0).
     let nd_u32 = n_decomposed as u32;
+    // When a content-adaptive weights table is supplied (e.g. the Annex H
+    // PSNR-optimized priorities, [`annex_h_weights`]), the forward
+    // truncation MUST consult the very `(G[b], P[b])` pair the WGT marker
+    // emits — otherwise the decoder, which reconstructs `T[p,b]` from WGT
+    // (Annex C.6.2 Table C.10), would disagree with the quantizer and the
+    // picture would not round-trip at `Q[p] > 0`. The weights vector is
+    // built in `β`-major emission order (`build_band_*_sd`), so for the
+    // canonical all-bands-exist 4:4:4 case its slot index equals the band
+    // index `b = (Nc - Sd)×β + i`. `count_existing_bands(cfg) == NL` in
+    // that case, so indexing by `band_index` is in range; whenever the
+    // table is absent or shorter than `NL` (subsampled configs, where the
+    // emission slot ≠ band index) the closure falls back to the
+    // geometry-derived gain and the `P[b] = b` priority below, preserving
+    // every prior round's behaviour.
+    let custom_wgt = !cfg.band_gains.is_empty()
+        && cfg.band_gains.len() == cfg.band_priorities.len()
+        && cfg.band_gains.len() as u32 == (nd_u32 * nbeta_pic + cfg.sd as u32);
     let t_for_band = |beta: u32, comp_i: usize| -> u8 {
         let band_index: u32 = if comp_i < n_decomposed {
             // Wavelet band: b = (Nc - Sd)×β_pic + i.
@@ -5651,6 +5905,15 @@ fn encode_precinct_cascade(
             // Sd suppressed-tail band: b = (Nc - Sd)×Nβ + (i - (Nc - Sd)).
             nd_u32 * nbeta_pic + (comp_i as u32 - nd_u32)
         };
+        if custom_wgt {
+            // Table-driven path: read the exact gain/priority emitted to
+            // WGT for this band index, so encoder and decoder compute the
+            // identical `T[p,b] = clamp(Q[p] - G[b] - r, 0, 15)`.
+            let g = cfg.band_gains[band_index as usize] as i32;
+            let p = cfg.band_priorities[band_index as usize] as u32;
+            let refine = if p < cfg.rp as u32 { 1i32 } else { 0 };
+            return (cfg.q as i32 - g - refine).clamp(0, 15) as u8;
+        }
         let refine = if band_index < cfg.rp as u32 { 1i32 } else { 0 };
         // Gain: suppressed-tail bands have no wavelet axes (G = 0); the
         // wavelet bands use the τx/τy high-pass count from beta_key, but
@@ -9399,6 +9662,7 @@ mod tests {
             0,
             None,
             Vec::new(),
+            Vec::new(),
             1,          // cw
             0,          // sd
             0,          // fs
@@ -9737,6 +10001,7 @@ mod tests {
             0,
             0,
             None,
+            Vec::new(),
             Vec::new(),
             1,          // cw → Cs = 32, Np,x = 3
             0,          // sd
@@ -10195,6 +10460,7 @@ mod tests {
             0,
             0,
             None,
+            Vec::new(),
             Vec::new(),
             0,          // cw
             0,          // sd
@@ -11097,6 +11363,7 @@ mod tests {
             0,
             None,
             Vec::new(),
+            Vec::new(),
             0,          // cw
             0,          // sd
             0,          // fs
@@ -11239,6 +11506,7 @@ mod tests {
             0,
             0,
             None,
+            Vec::new(),
             Vec::new(),
             0,          // cw
             0,          // sd
@@ -14430,5 +14698,116 @@ mod tests {
         assert_eq!(cs, lossless, "matches lossless reference");
         let img = decode_codestream(&cs, None).expect("decode lossless");
         assert_eq!(img.planes[0].data, pixels, "lossless self-roundtrip");
+    }
+
+    /// 64×64 RGB synthetic source for the Annex H content-adaptive WGT
+    /// tests — wide enough for the `NL,x = 5` decomposition the Annex H
+    /// tables target (2^5 = 32 ≤ 64).
+    fn make_synthetic_rgb_64x64() -> [Vec<u8>; 3] {
+        let (w, h) = (64usize, 64usize);
+        let mut r = vec![0u8; w * h];
+        let mut g = vec![0u8; w * h];
+        let mut b = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * w + x;
+                r[i] = (((x as i32) * 3 + (y as i32) * 2) % 256) as u8;
+                g[i] = (((y as i32) * 5 + (x as i32) * 3 + ((x ^ y) as i32 & 0x1f)) % 256) as u8;
+                b[i] = ((x ^ y) as u8).wrapping_mul(11).wrapping_add(40);
+            }
+        }
+        [r, g, b]
+    }
+
+    /// Round 323: the Annex H content-adaptive WGT encoder
+    /// ([`encode_planar_lossy_annex_h`]) must (a) emit the spec's
+    /// PSNR-optimized `(G[b], P[b])` pairs into the WGT marker, (b) drive
+    /// the forward truncation from those same weights so the codestream
+    /// round-trips through the decoder at a healthy PSNR floor, and (c)
+    /// produce a genuinely different codestream from the default plain
+    /// `P[b] = b` / capped-gain path. Exercised across all three
+    /// tabulated vertical depths (Tables H.1 / H.2 / H.3, NLy ∈ {0,1,2}).
+    #[test]
+    fn round323_annex_h_weights_roundtrip_and_differ_from_default() {
+        let planes = make_synthetic_rgb_64x64();
+        for nly in 0u8..=2 {
+            let (exp_g, exp_p) =
+                annex_h_weights(3, 1, 0, 5, nly).expect("Annex H table for 4:4:4 RCT NLx=5");
+
+            let cs = encode_planar_lossy_annex_h(64, 64, 3, 1, 5, nly, 4, &planes)
+                .unwrap_or_else(|e| panic!("Annex H encode NLy={nly} failed: {e:?}"));
+
+            // (a) WGT carries the Annex H pairs verbatim.
+            let parsed = crate::codestream::parse(&cs).expect("parse Annex H codestream");
+            let weights = parsed.wgt().expect("typed WGT view");
+            let got_g: Vec<u8> = weights.iter().map(|w| w.gain).collect();
+            let got_p: Vec<u8> = weights.iter().map(|w| w.priority).collect();
+            assert_eq!(got_g, exp_g, "NLy={nly}: WGT gains must match Annex H");
+            assert_eq!(got_p, exp_p, "NLy={nly}: WGT priorities must match Annex H");
+
+            // (b) Round-trips with a sane PSNR floor (encoder/decoder agree
+            // on T[p,b] derived from the shared weights table).
+            let img = decode_codestream(&cs, None).expect("decode Annex H codestream");
+            let mut src = Vec::with_capacity(64 * 64 * 3);
+            let mut rec = Vec::with_capacity(64 * 64 * 3);
+            for i in 0..64 * 64 {
+                for (plane, rec_plane) in planes.iter().zip(img.planes.iter()) {
+                    src.push(plane[i]);
+                    rec.push(rec_plane.data[i]);
+                }
+            }
+            let p = psnr(&src, &rec);
+            assert!(
+                p >= 25.0,
+                "NLy={nly}: Annex H q=4 PSNR {p:.2} dB below 25 dB floor"
+            );
+
+            // (c) Differs from the default-weights path (richer gains +
+            // reordered priorities change the truncation positions).
+            let default_cs = encode_planar_lossy(64, 64, 3, 1, 5, nly, 4, &planes)
+                .expect("default-weights encode");
+            assert_ne!(
+                cs, default_cs,
+                "NLy={nly}: Annex H stream must differ from default weights"
+            );
+        }
+    }
+
+    /// Round 323: at `q = 0` (lossless) the Annex H weights are a no-op for
+    /// the reconstructed samples — every `T[p,b]` is clamped to its `0`
+    /// floor — so the picture must self-roundtrip bit-exactly even though
+    /// the WGT still advertises the Annex H gains/priorities.
+    #[test]
+    fn round323_annex_h_weights_lossless_bit_exact() {
+        let planes = make_synthetic_rgb_64x64();
+        let cs = encode_planar_lossy_annex_h(64, 64, 3, 1, 5, 1, 0, &planes)
+            .expect("Annex H lossless encode");
+        let img = decode_codestream(&cs, None).expect("decode Annex H lossless");
+        for (c, (rec_plane, src_plane)) in img.planes.iter().zip(planes.iter()).enumerate() {
+            assert_eq!(
+                rec_plane.data, *src_plane,
+                "component {c} must self-roundtrip bit-exactly at q=0"
+            );
+        }
+    }
+
+    /// Round 323: a configuration outside the Annex H table set (4:4:4 RCT
+    /// but `NL,x = 2`) must fall back to the default-weights encoder and
+    /// produce byte-identical output to [`encode_planar_lossy`].
+    #[test]
+    fn round323_annex_h_falls_back_to_default_when_unmatched() {
+        let planes = make_synthetic_rgb_64x64();
+        assert!(
+            annex_h_weights(3, 1, 0, 2, 2).is_none(),
+            "no H table for NLx=2"
+        );
+        let fallback =
+            encode_planar_lossy_annex_h(64, 64, 3, 1, 2, 2, 4, &planes).expect("fallback encode");
+        let default_cs =
+            encode_planar_lossy(64, 64, 3, 1, 2, 2, 4, &planes).expect("default encode");
+        assert_eq!(
+            fallback, default_cs,
+            "unmatched config must be byte-identical to encode_planar_lossy"
+        );
     }
 }

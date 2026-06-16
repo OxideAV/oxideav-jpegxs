@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased — round 323 (content-adaptive WGT weights — Annex H PSNR-optimized tables H.1–H.3)
+
+New encoder feature: content-adaptive WGT weight assignment, replacing
+the long-standing default of plain band-index priorities `P[b] = b` and
+geometry-capped gains (LL=0 / HL=LH=1 / HH=2) for the canonical
+4:4:4 RCT configurations.
+
+* `encoder::annex_h_weights(nc, cpih, sd, nlx, nly) -> Option<(Vec<u8>,
+  Vec<u8>)>` — returns the ISO/IEC 21122-1:2022 Annex H (informative)
+  PSNR-optimized `(G[b], P[b])` example tables for 4:4:4, RCT-enabled
+  (`Cpih = 1`), `NL,x = 5` with `NL,y ∈ {0, 1, 2}` (Tables H.1 / H.2 /
+  H.3), in the WGT emission / band-index order `b = Nc×β + i`. Other
+  configurations return `None`.
+* `encoder::encode_planar_lossy_annex_h(width, height, nc, cpih, nlx,
+  nly, q, planes)` — public entry point that threads the Annex H table
+  through both the WGT marker (Annex A.4.11) **and** the forward
+  truncation `T[p,b] = clamp(Q[p] − G[b] − r, 0, 15)` (Annex C.6.2
+  Table C.10, `r = (P[b] < R[p]) ? 1 : 0`). Falls back to
+  `encode_planar_lossy` for any non-tabulated configuration.
+* The multi-level forward-truncation closure in `write_slice` gained a
+  `custom_wgt` branch: when a complete weights table (both `band_gains`
+  and `band_priorities` non-empty, length == `NL`) is supplied, it reads
+  the exact `(G[b], P[b])` emitted to WGT per band index, so the encoder
+  and decoder compute the identical `T[p,b]` and the codestream
+  round-trips at `Q[p] > 0`. Absent / partial tables keep every prior
+  round's behaviour (default gains + `P[b] = b`).
+* The inner `encode_planar_inner_bd` / `encode_planar_inner_nlt` carry a
+  new `band_priorities` parameter so a caller-supplied priority table is
+  no longer overwritten by the built-in `build_band_priorities_sd`.
+
+Tests: `round323_annex_h_weights_roundtrip_and_differ_from_default`
+(WGT verbatim + decode round-trip ≥ 25 dB + differs from default across
+`NL,y ∈ {0,1,2}`), `round323_annex_h_weights_lossless_bit_exact`,
+`round323_annex_h_falls_back_to_default_when_unmatched`.
+
 ## Unreleased — round 319 (sign-subpacket size Lsgn[p,s] inference + consistency predicate, Annex C.5.5 Table C.9)
 
 New decode-side conformance feature: the sign subpacket of a packet
