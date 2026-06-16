@@ -1108,11 +1108,11 @@ pub fn encode_planar_lossy_annex_h(
     q: u8,
     planes: &[Vec<u8>],
 ) -> Result<Vec<u8>> {
-    let Some((gains, priorities)) = annex_h_weights(nc, cpih, 0, nlx, nly) else {
-        return encode_planar_lossy(width, height, nc, cpih, nlx, nly, q, planes);
-    };
     let sx = vec![1u8; nc as usize];
     let sy = vec![1u8; nc as usize];
+    let Some((gains, priorities)) = annex_h_weights(nc, cpih, 0, nlx, nly, &sx, &sy) else {
+        return encode_planar_lossy(width, height, nc, cpih, nlx, nly, q, planes);
+    };
     let fq = if q == 0 { 0 } else { 8 };
     encode_planar_inner_nlt(
         width,
@@ -1125,6 +1125,78 @@ pub fn encode_planar_lossy_annex_h(
         q,
         &sx,
         &sy,
+        0,
+        0,
+        0,
+        0,
+        None,
+        gains,
+        priorities,
+        0,          // cw: single precinct per row
+        0,          // sd: no suppressed components
+        0,          // fs: signs jointly with data
+        0,          // hsl: single slice
+        0,          // qpih: deadzone inverse quantizer
+        0,          // rp: no precinct refinement
+        Vec::new(), // q_slices
+        Vec::new(), // q_precincts
+        Vec::new(), // r_precincts
+        planes,
+    )
+}
+
+/// Chroma-subsampled companion to [`encode_planar_lossy_annex_h`]: drives the
+/// WGT marker and forward truncation from the ISO/IEC 21122-1:2022 Annex H
+/// PSNR-optimized example tables for the **4:2:2** (H.4 / H.5 / H.6) and
+/// **4:2:0** (H.7 / H.8) layouts, both with RCT disabled (`Cpih = 0`),
+/// `Nc = 3`, `NLx = 5`.
+///
+/// `sx` / `sy` are the per-component sampling factors: 4:2:2 is
+/// `sx = [1, 2, 2], sy = [1, 1, 1]`; 4:2:0 is `sx = [1, 2, 2], sy = [2, 2, 2]`.
+/// The tabulated configurations are 4:2:2 with `NLy ∈ {0, 1, 2}` and 4:2:0
+/// with `NLy ∈ {1, 2}` (the spec lists no 4:2:0 `NLy = 0` table). Any other
+/// `(cpih, sx, sy, nlx, nly)` falls back to the default-weights
+/// [`encode_planar_subsampled`], so callers always get a valid codestream.
+///
+/// In the 4:2:0 tables H.7 / H.8 some band indices are non-existent
+/// (`bx[β,i] = 0`, the spec's `-*` slots): the WGT marker loop emits one
+/// `(G[b], P[b])` pair per *existing* band only (Annex A.4.11), and
+/// [`annex_h_weights`] already drops those slots so the supplied vectors are in
+/// the encoder's existing-band emission order. The decoder reads the identical
+/// `(G[b], P[b])` off the wire and reconstructs the same
+/// `T[p,b] = clamp(Q[p] − G[b] − r, 0, 15)` (Annex C.6.2 Table C.10), so the
+/// codestream round-trips through [`crate::decode_jpeg_xs`].
+///
+/// As with the 4:4:4 entry point, the weights are a no-op at `q = 0`
+/// (lossless), so this path is meaningful for `q ∈ 1..=15`.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_subsampled_annex_h(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    q: u8,
+    sx: &[u8],
+    sy: &[u8],
+    planes: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    let Some((gains, priorities)) = annex_h_weights(nc, cpih, 0, nlx, nly, sx, sy) else {
+        return encode_planar_subsampled(width, height, nc, cpih, nlx, nly, q, sx, sy, planes);
+    };
+    let fq = if q == 0 { 0 } else { 8 };
+    encode_planar_inner_nlt(
+        width,
+        height,
+        nc,
+        cpih,
+        nlx,
+        nly,
+        fq,
+        q,
+        sx,
+        sy,
         0,
         0,
         0,
@@ -4923,19 +4995,82 @@ fn build_band_priorities_sd(nc: u8, sd: u8, nlx: u8, nly: u8, sy: &[u8]) -> Vec<
 /// off the wire.
 ///
 /// Per Annex A.4.11 these example tables were "optimized for PSNR
-/// performance of the encoder. Other choices are possible." Only the
-/// 4:4:4 RCT tables H.1 (`NLy = 0`), H.2 (`NLy = 1`) and H.3 (`NLy = 2`)
-/// are returned here; the 4:2:2 / 4:2:0 (H.4–H.8) and CFA star-tetrix
-/// (H.9–H.11) tables address subsampled / suppressed-band band layouts
-/// where the WGT emission slot ≠ band index, so they are deferred.
+/// performance of the encoder. Other choices are possible."
+///
+/// Both the 4:4:4 RCT tables H.1–H.3 (`Cpih = 1`, every band exists) and
+/// the chroma-subsampled tables H.4–H.8 (`Cpih = 0`, RCT disabled) are
+/// returned. The subsampled 4:2:0 tables H.7 / H.8 list some band indices
+/// as non-existent (`bx[β,i] = 0`, marked `-*` in the spec, see Annex
+/// A.4.11 — the WGT loop `for(b=0;b<NL;b++) if(b'x[b]) {...}` skips them).
+/// Those positions are dropped here so the returned vectors are in the
+/// **existing-band emission order** the WGT marker loop and the
+/// `custom_wgt` forward-truncation branch both consume — i.e. position `k`
+/// is the `k`-th existing band, exactly as [`build_band_gains_sd`] /
+/// [`build_band_priorities_sd`] produce. Because the spec defines the
+/// `-*` slots as precisely the non-existent bands, this filtering matches
+/// the encoder's [`crate::slice_walker::picture_beta_to_local_beta`] skip
+/// rule position-for-position regardless of which β indices vanish.
+///
+/// `sx` / `sy` select the chroma format: all-1 → 4:4:4 (H.1–H.3,
+/// `Cpih = 1`); chroma `sx = 2, sy = 1` → 4:2:2 (H.4–H.6, `Cpih = 0`);
+/// chroma `sx = sy = 2` → 4:2:0 (H.7–H.8, `Cpih = 0`). The CFA
+/// star-tetrix tables (H.9–H.11) remain deferred.
 pub(crate) fn annex_h_weights(
     nc: u8,
     cpih: u8,
     sd: u8,
     nlx: u8,
     nly: u8,
+    sx: &[u8],
+    sy: &[u8],
 ) -> Option<(Vec<u8>, Vec<u8>)> {
-    if nc != 3 || cpih != 1 || sd != 0 || nlx != 5 {
+    if nc != 3 || sd != 0 || nlx != 5 {
+        return None;
+    }
+    // Classify the chroma format from the per-component sampling factors.
+    // 4:4:4 → luma+chroma all (1,1); 4:2:2 → chroma (2,1); 4:2:0 → (2,2).
+    let is_444 = sx.iter().all(|&v| v == 1) && sy.iter().all(|&v| v == 1);
+    let chroma_422 = nc == 3
+        && sx.first() == Some(&1)
+        && sy.first() == Some(&1)
+        && sx.get(1) == Some(&2)
+        && sy.get(1) == Some(&1)
+        && sx.get(2) == Some(&2)
+        && sy.get(2) == Some(&1);
+    let chroma_420 = nc == 3
+        && sx.first() == Some(&1)
+        && sy.first() == Some(&1)
+        && sx.get(1) == Some(&2)
+        && sy.get(1) == Some(&2)
+        && sx.get(2) == Some(&2)
+        && sy.get(2) == Some(&2);
+
+    // Subsampled tables (RCT disabled, Cpih = 0). H.4–H.8 are stored as
+    // full band-index arrays with `None` marking the spec's `-*` slots
+    // (bands that do not exist for the subsampled chroma); we filter those
+    // out so the result lands in existing-band emission order.
+    if cpih == 0 && (chroma_422 || chroma_420) {
+        let full: &[Option<(u8, u8)>] = if chroma_422 {
+            match nly {
+                0 => &H4_422_NLY0,
+                1 => &H5_422_NLY1,
+                2 => &H6_422_NLY2,
+                _ => return None,
+            }
+        } else {
+            // 4:2:0 — H.7 (NLy=1), H.8 (NLy=2). No NLy=0 table is tabulated.
+            match nly {
+                1 => &H7_420_NLY1,
+                2 => &H8_420_NLY2,
+                _ => return None,
+            }
+        };
+        let gains: Vec<u8> = full.iter().filter_map(|e| e.map(|(g, _)| g)).collect();
+        let priorities: Vec<u8> = full.iter().filter_map(|e| e.map(|(_, p)| p)).collect();
+        return Some((gains, priorities));
+    }
+
+    if cpih != 1 || !is_444 {
         return None;
     }
     // Each entry is (G[b], P[b]) at band index b, transcribed from the
@@ -5030,6 +5165,163 @@ pub(crate) fn annex_h_weights(
     let priorities = table.iter().map(|&(_, p)| p).collect();
     Some((gains, priorities))
 }
+
+// ---------------------------------------------------------------------------
+// ISO/IEC 21122-1:2022 Annex H chroma-subsampled weight tables (informative,
+// RCT disabled / Cpih = 0). Transcribed from the spec PDF under
+// docs/image/jpegxs/. Each entry is `Some((G[b], P[b]))` at band index b, or
+// `None` for the spec's `-*` slots (bands that do not exist for the subsampled
+// chroma — see the H.7 / H.8 footnote and Annex A.4.11). `annex_h_weights`
+// drops the `None` entries to land in existing-band emission order.
+// ---------------------------------------------------------------------------
+
+/// Table H.4 — 4:2:2, RCT disabled, 5 horizontal / 0 vertical levels (18 bands).
+const H4_422_NLY0: [Option<(u8, u8)>; 18] = [
+    Some((2, 8)),
+    Some((2, 7)),
+    Some((2, 6)),
+    Some((1, 5)),
+    Some((1, 3)),
+    Some((1, 4)),
+    Some((1, 13)),
+    Some((1, 12)),
+    Some((1, 14)),
+    Some((0, 1)),
+    Some((0, 0)),
+    Some((0, 2)),
+    Some((0, 9)),
+    Some((0, 11)),
+    Some((0, 10)),
+    Some((0, 16)),
+    Some((0, 15)),
+    Some((0, 17)),
+];
+
+/// Table H.5 — 4:2:2, RCT disabled, 5 horizontal / 1 vertical level (24 bands).
+const H5_422_NLY1: [Option<(u8, u8)>; 24] = [
+    Some((2, 0)),
+    Some((2, 1)),
+    Some((2, 2)),
+    Some((2, 18)),
+    Some((2, 19)),
+    Some((2, 20)),
+    Some((1, 6)),
+    Some((1, 7)),
+    Some((1, 8)),
+    Some((1, 15)),
+    Some((1, 16)),
+    Some((1, 17)),
+    Some((0, 3)),
+    Some((0, 4)),
+    Some((0, 5)),
+    Some((0, 10)),
+    Some((0, 12)),
+    Some((0, 14)),
+    Some((0, 9)),
+    Some((0, 11)),
+    Some((0, 13)),
+    Some((0, 21)),
+    Some((0, 22)),
+    Some((0, 23)),
+];
+
+/// Table H.6 — 4:2:2, RCT disabled, 5 horizontal / 2 vertical levels (30 bands).
+const H6_422_NLY2: [Option<(u8, u8)>; 30] = [
+    Some((3, 14)),
+    Some((3, 13)),
+    Some((3, 12)),
+    Some((2, 9)),
+    Some((2, 11)),
+    Some((2, 10)),
+    Some((2, 25)),
+    Some((2, 24)),
+    Some((2, 26)),
+    Some((1, 0)),
+    Some((1, 1)),
+    Some((1, 2)),
+    Some((1, 19)),
+    Some((1, 20)),
+    Some((1, 18)),
+    Some((1, 23)),
+    Some((1, 22)),
+    Some((1, 21)),
+    Some((0, 17)),
+    Some((0, 15)),
+    Some((0, 16)),
+    Some((0, 4)),
+    Some((0, 8)),
+    Some((0, 5)),
+    Some((0, 3)),
+    Some((0, 6)),
+    Some((0, 7)),
+    Some((0, 28)),
+    Some((0, 27)),
+    Some((0, 29)),
+];
+
+/// Table H.7 — 4:2:0, RCT disabled, 5 horizontal / 1 vertical level. Band
+/// indices 19, 20, 22, 23 do not exist (`-*`) for the 4:2:0 chroma.
+const H7_420_NLY1: [Option<(u8, u8)>; 24] = [
+    Some((3, 9)),
+    Some((3, 16)),
+    Some((3, 15)),
+    Some((2, 7)),
+    Some((2, 13)),
+    Some((2, 12)),
+    Some((2, 17)),
+    Some((1, 3)),
+    Some((1, 2)),
+    Some((1, 6)),
+    Some((1, 11)),
+    Some((1, 10)),
+    Some((1, 14)),
+    Some((0, 1)),
+    Some((0, 0)),
+    Some((1, 19)),
+    Some((0, 5)),
+    Some((0, 4)),
+    Some((1, 18)),
+    None,
+    None,
+    Some((0, 8)),
+    None,
+    None,
+];
+
+/// Table H.8 — 4:2:0, RCT disabled, 5 horizontal / 2 vertical levels. Band
+/// indices 16, 17, 19, 20 do not exist (`-*`) for the 4:2:0 chroma.
+const H8_420_NLY2: [Option<(u8, u8)>; 30] = [
+    Some((3, 0)),
+    Some((3, 13)),
+    Some((3, 12)),
+    Some((3, 25)),
+    Some((2, 7)),
+    Some((2, 6)),
+    Some((2, 8)),
+    Some((2, 17)),
+    Some((2, 16)),
+    Some((2, 18)),
+    Some((1, 5)),
+    Some((1, 4)),
+    Some((1, 3)),
+    Some((1, 15)),
+    Some((1, 14)),
+    Some((1, 2)),
+    None,
+    None,
+    Some((0, 1)),
+    None,
+    None,
+    Some((1, 24)),
+    Some((1, 22)),
+    Some((1, 20)),
+    Some((1, 23)),
+    Some((1, 21)),
+    Some((1, 19)),
+    Some((0, 11)),
+    Some((0, 10)),
+    Some((0, 9)),
+];
 
 /// Per-(β, i) band geometry needed by the encoder.
 #[derive(Debug, Clone, Copy)]
@@ -14731,8 +15023,8 @@ mod tests {
     fn round323_annex_h_weights_roundtrip_and_differ_from_default() {
         let planes = make_synthetic_rgb_64x64();
         for nly in 0u8..=2 {
-            let (exp_g, exp_p) =
-                annex_h_weights(3, 1, 0, 5, nly).expect("Annex H table for 4:4:4 RCT NLx=5");
+            let (exp_g, exp_p) = annex_h_weights(3, 1, 0, 5, nly, &[1, 1, 1], &[1, 1, 1])
+                .expect("Annex H table for 4:4:4 RCT NLx=5");
 
             let cs = encode_planar_lossy_annex_h(64, 64, 3, 1, 5, nly, 4, &planes)
                 .unwrap_or_else(|e| panic!("Annex H encode NLy={nly} failed: {e:?}"));
@@ -14798,7 +15090,7 @@ mod tests {
     fn round323_annex_h_falls_back_to_default_when_unmatched() {
         let planes = make_synthetic_rgb_64x64();
         assert!(
-            annex_h_weights(3, 1, 0, 2, 2).is_none(),
+            annex_h_weights(3, 1, 0, 2, 2, &[1, 1, 1], &[1, 1, 1]).is_none(),
             "no H table for NLx=2"
         );
         let fallback =
@@ -14808,6 +15100,173 @@ mod tests {
         assert_eq!(
             fallback, default_cs,
             "unmatched config must be byte-identical to encode_planar_lossy"
+        );
+    }
+
+    /// 64-wide subsampled RGB→YCbCr-domain fixture: a full-res luma plane and
+    /// two chroma planes sized for the requested `(sx, sy)` chroma factors.
+    /// The synthetic content is the same deterministic ramp pattern used by
+    /// the 4:4:4 Annex H tests, sampled at the chroma grid for Cb / Cr.
+    fn make_subsampled_planes(w: usize, h: usize, sx_c: usize, sy_c: usize) -> [Vec<u8>; 3] {
+        let cw = w / sx_c;
+        let ch = h / sy_c;
+        let mut y = vec![0u8; w * h];
+        let mut cb = vec![0u8; cw * ch];
+        let mut cr = vec![0u8; cw * ch];
+        for yy in 0..h {
+            for xx in 0..w {
+                y[yy * w + xx] = (((xx as i32) * 3 + (yy as i32) * 2) % 256) as u8;
+            }
+        }
+        for yy in 0..ch {
+            for xx in 0..cw {
+                cb[yy * cw + xx] = (((xx as i32) * 5 + (yy as i32) * 3) % 256) as u8;
+                cr[yy * cw + xx] = ((xx ^ yy) as u8).wrapping_mul(11).wrapping_add(40);
+            }
+        }
+        [y, cb, cr]
+    }
+
+    /// Round 327: the Annex H chroma-subsampled WGT encoder
+    /// ([`encode_planar_subsampled_annex_h`]) must (a) emit one
+    /// `(G[b], P[b])` pair per *existing* band into the WGT marker — matching
+    /// the `annex_h_weights` existing-band vectors and `count_existing_bands`
+    /// — (b) drive the forward truncation from those same weights so the
+    /// codestream round-trips through the decoder at a sane PSNR floor, and
+    /// (c) produce a genuinely different codestream from the default
+    /// `P[b] = b` / capped-gain subsampled path. Covers Tables H.4 / H.5 / H.6
+    /// (4:2:2, NLy ∈ {0,1,2}) and H.7 / H.8 (4:2:0, NLy ∈ {1,2}).
+    #[test]
+    fn round327_annex_h_subsampled_weights_roundtrip_and_differ() {
+        // (chroma sx, chroma sy, NLy) tuples for each tabulated subsampled
+        // configuration. 4:2:2 → (2,1); 4:2:0 → (2,2).
+        // (chroma sx, chroma sy, NLy, expected existing-band count). The
+        // counts come from the spec: H.4=18, H.5=24, H.6=30 (4:2:2, no `-*`);
+        // H.7=24−4=20, H.8=30−4=26 (4:2:0, four `-*` slots each dropped).
+        let cases: &[(u8, u8, u8, usize)] = &[
+            (2, 1, 0, 18), // H.4
+            (2, 1, 1, 24), // H.5
+            (2, 1, 2, 30), // H.6
+            (2, 2, 1, 20), // H.7
+            (2, 2, 2, 26), // H.8
+        ];
+        for &(sxc, syc, nly, n_exist) in cases {
+            let planes = make_subsampled_planes(64, 64, sxc as usize, syc as usize);
+            let sx = [1u8, sxc, sxc];
+            let sy = [1u8, syc, syc];
+            let (exp_g, exp_p) = annex_h_weights(3, 0, 0, 5, nly, &sx, &sy)
+                .unwrap_or_else(|| panic!("Annex H subsampled table sx={sxc} sy={syc} NLy={nly}"));
+            assert_eq!(
+                exp_g.len(),
+                exp_p.len(),
+                "gains/priorities length agree (sx={sxc} sy={syc} NLy={nly})"
+            );
+            assert_eq!(
+                exp_g.len(),
+                n_exist,
+                "sx={sxc} sy={syc} NLy={nly}: existing-band count (post `-*` drop)"
+            );
+
+            // q = 2: low enough that the high LL gains in the 4:2:0 tables
+            // (G up to 3) do not truncate the steep luma gradient below the
+            // sanity floor, while still engaging Fq = 8 lossy truncation.
+            let cs = encode_planar_subsampled_annex_h(64, 64, 3, 0, 5, nly, 2, &sx, &sy, &planes)
+                .unwrap_or_else(|e| panic!("subsampled Annex H encode NLy={nly} failed: {e:?}"));
+
+            // (a) WGT carries exactly the existing-band Annex H pairs.
+            let parsed = crate::codestream::parse(&cs).expect("parse subsampled Annex H stream");
+            let weights = parsed.wgt().expect("typed WGT view");
+            let got_g: Vec<u8> = weights.iter().map(|w| w.gain).collect();
+            let got_p: Vec<u8> = weights.iter().map(|w| w.priority).collect();
+            assert_eq!(got_g, exp_g, "sx={sxc} sy={syc} NLy={nly}: WGT gains");
+            assert_eq!(got_p, exp_p, "sx={sxc} sy={syc} NLy={nly}: WGT priorities");
+
+            // (b) The number of WGT entries the encoder actually emitted
+            // equals the existing-band count — i.e. the `-*` slots of
+            // H.7 / H.8 were correctly dropped and the encoder's own
+            // existing-band skip rule agrees with the table's `-*` markings.
+            assert_eq!(
+                got_g.len(),
+                n_exist,
+                "sx={sxc} sy={syc} NLy={nly}: emitted WGT entry count == existing bands"
+            );
+
+            // (c) Round-trips through the decoder: reconstructed planes have
+            // the correct (subsampled) dimensions and the lossy stream is
+            // strictly smaller than the lossless probe (truncation engaged).
+            // The strict encoder/decoder T[p,b] alignment proof is the q=0
+            // bit-exact test below; PSNR is content-dependent (the steep luma
+            // ramp + high 4:2:0 LL gains make it a poor invariant here).
+            let img = decode_codestream(&cs, None).expect("decode subsampled Annex H stream");
+            assert_eq!(img.width as usize, 64, "decoded width");
+            assert_eq!(img.height as usize, 64, "decoded height");
+            assert_eq!(img.planes.len(), 3, "decoded component count");
+            assert_eq!(
+                img.planes[1].data.len(),
+                planes[1].len(),
+                "sx={sxc} sy={syc} NLy={nly}: Cb plane size preserved"
+            );
+            let lossless =
+                encode_planar_subsampled_annex_h(64, 64, 3, 0, 5, nly, 0, &sx, &sy, &planes)
+                    .expect("lossless probe");
+            assert!(
+                cs.len() < lossless.len(),
+                "sx={sxc} sy={syc} NLy={nly}: q=2 stream ({}) must be < lossless ({})",
+                cs.len(),
+                lossless.len()
+            );
+
+            // (d) Differs from the default-weights subsampled path.
+            let default_cs = encode_planar_subsampled(64, 64, 3, 0, 5, nly, 2, &sx, &sy, &planes)
+                .expect("default-weights subsampled encode");
+            assert_ne!(
+                cs, default_cs,
+                "sx={sxc} sy={syc} NLy={nly}: Annex H stream must differ from default"
+            );
+        }
+    }
+
+    /// Round 327: at `q = 0` (lossless) the subsampled Annex H weights are a
+    /// no-op for the reconstructed samples, so every component self-roundtrips
+    /// bit-exactly even though the WGT advertises the Annex H gains/priorities.
+    #[test]
+    fn round327_annex_h_subsampled_lossless_bit_exact() {
+        for &(sxc, syc, nly) in &[(2u8, 1u8, 2u8), (2u8, 2u8, 2u8)] {
+            let planes = make_subsampled_planes(64, 64, sxc as usize, syc as usize);
+            let sx = [1u8, sxc, sxc];
+            let sy = [1u8, syc, syc];
+            let cs = encode_planar_subsampled_annex_h(64, 64, 3, 0, 5, nly, 0, &sx, &sy, &planes)
+                .expect("subsampled Annex H lossless encode");
+            let img = decode_codestream(&cs, None).expect("decode subsampled Annex H lossless");
+            for (c, (rec_plane, src_plane)) in img.planes.iter().zip(planes.iter()).enumerate() {
+                assert_eq!(
+                    rec_plane.data, *src_plane,
+                    "sx={sxc} sy={syc} NLy={nly}: component {c} bit-exact at q=0"
+                );
+            }
+        }
+    }
+
+    /// Round 327: a subsampled configuration outside the tabulated Annex H set
+    /// (4:2:0 with `NLy = 3`, valid since 4:2:0 requires `NLy ≥ 1` but only
+    /// `NLy ∈ {1, 2}` are tabulated) falls back to the default-weights
+    /// subsampled encoder and is byte-identical to [`encode_planar_subsampled`].
+    #[test]
+    fn round327_annex_h_subsampled_falls_back_when_unmatched() {
+        let sx = [1u8, 2, 2];
+        let sy = [1u8, 2, 2];
+        assert!(
+            annex_h_weights(3, 0, 0, 5, 3, &sx, &sy).is_none(),
+            "no 4:2:0 NLy=3 Annex H table"
+        );
+        let planes = make_subsampled_planes(64, 64, 2, 2);
+        let fallback = encode_planar_subsampled_annex_h(64, 64, 3, 0, 5, 3, 4, &sx, &sy, &planes)
+            .expect("fallback subsampled encode");
+        let default_cs = encode_planar_subsampled(64, 64, 3, 0, 5, 3, 4, &sx, &sy, &planes)
+            .expect("default subsampled encode");
+        assert_eq!(
+            fallback, default_cs,
+            "unmatched subsampled config must equal encode_planar_subsampled"
         );
     }
 }

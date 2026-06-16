@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased — round 327 (content-adaptive WGT weights — Annex H subsampled tables H.4–H.8)
+
+Extends the round-323 content-adaptive WGT path to the chroma-subsampled
+Annex H configurations (RCT disabled, `Cpih = 0`, `Nc = 3`, `NL,x = 5`).
+
+* `encoder::annex_h_weights` gained `sx` / `sy` parameters and now also
+  returns the ISO/IEC 21122-1:2022 Annex H subsampled tables: H.4 / H.5 /
+  H.6 (4:2:2, `NL,y ∈ {0, 1, 2}`) and H.7 / H.8 (4:2:0, `NL,y ∈ {1, 2}`).
+  The 4:2:0 tables list some band indices as non-existent (`bx[β,i] = 0`,
+  the spec's `-*` slots); those positions are dropped so the returned
+  `(gains, priorities)` vectors are in the encoder's existing-band
+  emission order (the WGT loop `for(b=0;b<NL;b++) if(b'x[b])` skips them,
+  Annex A.4.11). Because the spec defines `-*` as precisely the
+  non-existent bands, this filtering matches the encoder's
+  `slice_walker::picture_beta_to_local_beta` skip rule position-for-
+  position regardless of which β indices vanish.
+* `encoder::encode_planar_subsampled_annex_h(width, height, nc, cpih,
+  nlx, nly, q, sx, sy, planes)` — public entry point that threads the
+  subsampled Annex H weights through both the WGT marker and the forward
+  truncation `T[p,b] = clamp(Q[p] − G[b] − r, 0, 15)`, so the codestream
+  round-trips through `decode_jpeg_xs`. Falls back to
+  `encode_planar_subsampled` for any non-tabulated configuration.
+* Tests: WGT-readback + existing-band-count (post-`-*`-drop) checks for
+  all five tables, q=0 bit-exact self-roundtrip (the strict
+  encoder/decoder `T[p,b]` alignment proof), lossy-path roundtrip +
+  size-reduction, and the untabulated-config fallback.
+
 ## Unreleased — round 323 (content-adaptive WGT weights — Annex H PSNR-optimized tables H.1–H.3)
 
 New encoder feature: content-adaptive WGT weight assignment, replacing

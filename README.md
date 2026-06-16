@@ -60,8 +60,18 @@ the forward truncation `T[p,b] = clamp(Q[p] − G[b] − r, 0, 15)` from the
 ISO/IEC 21122-1:2022 Annex H PSNR-optimized `(G[b], P[b])` example tables
 (H.1 / H.2 / H.3 — 4:4:4, RCT, `NL,x = 5`, `NL,y ∈ {0, 1, 2}`), replacing
 the default plain band-index priorities `P[b] = b` with the spec's richer
-gains (LL up to `G = 4`) and reordered priorities. Configurations outside
-the tabulated set fall back to the default-weights path.
+gains (LL up to `G = 4`) and reordered priorities. The companion
+`encode_planar_subsampled_annex_h` entry point extends this to the
+**chroma-subsampled** Annex H tables: H.4 / H.5 / H.6 (4:2:2, RCT
+disabled, `NL,y ∈ {0, 1, 2}`) and H.7 / H.8 (4:2:0, RCT disabled,
+`NL,y ∈ {1, 2}`). For the 4:2:0 tables the spec marks some band indices as
+non-existent (`bx[β,i] = 0`, the `-*` slots); the encoder emits one
+`(G[b], P[b])` pair per *existing* band only (Annex A.4.11 WGT loop), and
+those `-*` positions are dropped so the supplied weights land in the
+encoder's existing-band emission order — matching the
+`picture_beta_to_local_beta` skip rule position-for-position.
+Configurations outside the tabulated set fall back to the default-weights
+path.
 
 ### Codestream parser
 
@@ -88,11 +98,12 @@ rate not observable from the codestream.
 ### Not yet covered
 
 - Bit depths above 16 (would need a `u32` plane format).
-- Content-adaptive WGT weights for the subsampled (4:2:2 / 4:2:0,
-  Annex H tables H.4–H.8) and CFA star-tetrix (H.9–H.11) layouts, where
-  the WGT emission slot no longer coincides with the band index; the
-  4:4:4 RCT tables (H.1–H.3) are wired up via
-  `encode_planar_lossy_annex_h`.
+- Content-adaptive WGT weights for the CFA star-tetrix layouts (Annex H
+  tables H.9–H.11), which split into separate `Cf = 0` / `Cf = 3`
+  gain/priority columns for the colour-filter-array components. The 4:4:4
+  RCT tables (H.1–H.3, `encode_planar_lossy_annex_h`) and the subsampled
+  4:2:2 / 4:2:0 tables (H.4–H.8, `encode_planar_subsampled_annex_h`,
+  including the `-*` non-existent-band handling) are wired up.
 
 ## Public API
 
@@ -108,10 +119,10 @@ let picture = oxideav_jpegxs::decode_jpeg_xs(bytes)?;
 
 Encoder entry points (in `oxideav_jpegxs::encoder`) cover single-luma,
 interleaved RGB, and generalised planar input, with `_lossy`,
-`_lossy_annex_h`, `_highbd`, `_subsampled`, `_star_tetrix`,
-`_nlt_quadratic`, `_nlt_extended`, `_hsl_qslice`, `_qpr_rpr`, and
-`*_target_bytes` variants for the feature axes above. See the module docs
-for the exact signatures and scope per entry point.
+`_lossy_annex_h`, `_subsampled_annex_h`, `_highbd`, `_subsampled`,
+`_star_tetrix`, `_nlt_quadratic`, `_nlt_extended`, `_hsl_qslice`,
+`_qpr_rpr`, and `*_target_bytes` variants for the feature axes above. See
+the module docs for the exact signatures and scope per entry point.
 
 The crate also registers a software decoder through the standard
 `oxideav-core` registry path.
