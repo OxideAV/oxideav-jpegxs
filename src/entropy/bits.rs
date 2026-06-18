@@ -183,6 +183,46 @@ pub fn vlc(reader: &mut BitReader<'_>, r: i32, t: i32) -> Result<i32> {
     }
 }
 
+/// Number of bits a single VLC codeword occupies on the wire for the
+/// signed value `value` under predictor parameter `theta = max(r - t, 0)`
+/// (ISO/IEC 21122-1:2022 Annex C, Table C.15). This is the exact inverse
+/// of [`vlc`]'s decode: a codeword is `x` consecutive 1-bits followed by
+/// a single 0 comma bit, so its length is `x + 1` bits, where `x` is the
+/// unary count [`vlc`] would have read to recover `value`.
+///
+/// The `value → x` map mirrors the encoder's forward VLC:
+///
+/// * `value > theta` → unary sub-alphabet, `x = value + theta`.
+/// * `0 < value <= theta` → signed-binary even codeword, `x = 2·value`.
+/// * `value == 0` → `x = 0` (a lone comma bit).
+/// * `-theta <= value < 0` → signed-binary odd codeword,
+///   `x = 2·(-value) − 1`.
+///
+/// A conforming codeword has `x <= 31` (Table C.15 errors at 32
+/// consecutive 1-bits); callers that build `value` from a decoded /
+/// bounded source therefore always land within range, but this helper
+/// itself imposes no upper clamp — it returns the exact `x + 1` for any
+/// `value >= -theta`.
+#[must_use]
+pub fn vlc_codeword_bits(value: i32, theta: i32) -> u64 {
+    debug_assert!(theta >= 0);
+    debug_assert!(
+        value >= -theta,
+        "VLC signed value {value} below -theta {theta}"
+    );
+    let x: u64 = if value > theta {
+        (value + theta) as u64
+    } else if value > 0 {
+        (2 * value) as u64
+    } else if value == 0 {
+        0
+    } else {
+        (2 * (-value) - 1) as u64
+    };
+    // x unary 1-bits + 1 comma 0-bit.
+    x + 1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,6 +349,52 @@ mod tests {
         r.align_to_byte();
         assert!(r.skip_bytes(1).is_ok());
         assert_eq!(r.read_bits(8).unwrap(), 0x34);
+    }
+
+    /// Build the MSB-first bit pattern for `x` consecutive 1-bits
+    /// followed by one 0 comma bit, returning the bytes and the total
+    /// bit length. This is the exact codeword [`vlc`] decodes.
+    fn vlc_codeword(x: u32) -> (Vec<u8>, usize) {
+        let total_bits = x as usize + 1;
+        let mut bytes = vec![0u8; total_bits.div_ceil(8)];
+        for i in 0..(x as usize) {
+            bytes[i / 8] |= 0x80 >> (i % 8);
+        }
+        // The comma 0-bit at position `x` is already 0.
+        (bytes, total_bits)
+    }
+
+    #[test]
+    fn vlc_codeword_bits_matches_decoder_consumption() {
+        // For a sweep of (r, t) predictor parameters and every decodable
+        // value, the bit length reported by `vlc_codeword_bits` must equal
+        // the number of bits `vlc` consumes decoding that value back.
+        for r in 0..=6i32 {
+            for t in 0..=r {
+                let theta = (r - t).max(0);
+                // Sweep x = unary count from 0..=20 (well below the 32
+                // error threshold), decode it, then re-derive its length.
+                for x in 0..=20u32 {
+                    let (buf, total_bits) = vlc_codeword(x);
+                    let mut reader = BitReader::new(&buf);
+                    let value = vlc(&mut reader, r, t).expect("decodes");
+                    // Bits the decoder actually walked: x ones + comma.
+                    assert_eq!(
+                        vlc_codeword_bits(value, theta),
+                        total_bits as u64,
+                        "r={r} t={t} theta={theta} x={x} value={value}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vlc_codeword_bits_zero_is_single_comma() {
+        // value == 0 → just the 0 comma bit → 1 bit, for any theta.
+        for theta in 0..=8 {
+            assert_eq!(vlc_codeword_bits(0, theta), 1);
+        }
     }
 
     #[test]

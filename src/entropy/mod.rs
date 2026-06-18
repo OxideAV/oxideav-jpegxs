@@ -35,7 +35,7 @@ pub mod packet_body;
 pub mod packet_header;
 pub mod precinct_header;
 
-pub use bits::{vlc, BitReader};
+pub use bits::{vlc, vlc_codeword_bits, BitReader};
 pub use packet_body::{decode_packet_body, BandCoefficients, PacketDecode, PrecinctTop};
 pub use packet_header::{parse_packet_header, PacketHeader};
 pub use precinct_header::{parse_precinct_header, PrecinctHeader};
@@ -596,6 +596,128 @@ pub fn sign_subpacket_filler_bytes(
     Ok((lsgn - inferred) as u32)
 }
 
+/// One packet's contribution to the bitplane-count-subpacket size
+/// inference (Annex C.6, Tables C.12 / C.13 / C.14). The bitplane-count
+/// subpacket carries no length on the wire other than the `Lcnt[p,s]`
+/// field of the packet header; its exact bit count is fixed by the
+/// per-packet raw-mode flag `Dr[p,s]` and — in the two VLC modes — the
+/// signed deltas `Δm` the count decoder reads back. This struct carries
+/// the per-packet inputs those tables consume.
+#[derive(Debug, Clone, Copy)]
+pub struct PacketCountInfo<'a> {
+    /// `Dr[p,s]` — raw-mode override flag (0 or 1). When `1`, the
+    /// subpacket is `Br` bits per code group with no VLC (Table C.12) and
+    /// `deltas` is ignored.
+    pub dr: u8,
+    /// `I[p,b,λ,s]` — the (band, line) pairs this packet covers, in the
+    /// same order [`decode_packet_body`] walks them.
+    pub entries: &'a [PacketEntry],
+    /// VLC deltas `Δm` actually coded for each entry, one slice per
+    /// `entries[i]`. Used only when `dr == 0`. Each element is the signed
+    /// delta the count VLC carried for that code group, or `None` for a
+    /// code group that emitted no codeword (a significance-coded group
+    /// with `Z == 1`, whose `Δm` is implied — Tables C.13 / C.14). A
+    /// slice shorter than `Ncg[p,b]` treats the trailing groups as `None`
+    /// (no codeword), matching the count decoder's read pattern.
+    /// `theta[i]` aligns with `deltas[i]`.
+    pub deltas: &'a [&'a [Option<i32>]],
+    /// `θ[p,b,λ,g] = max(mtop − T[p,b], 0)` — the predictor parameter the
+    /// count VLC used for each coded group, aligned with `deltas`. The
+    /// codeword length of `Δm` depends on `θ`, so the caller (which
+    /// reconstructs `mtop` during decode) supplies it. Only read when
+    /// `dr == 0`. A `None` delta ignores its `theta` slot.
+    pub theta: &'a [&'a [i32]],
+}
+
+/// `Lcnt[p,s]` — the bitplane-count-subpacket byte count of one packet,
+/// inferred from its decode mode (ISO/IEC 21122-1:2022 Annex C.6,
+/// Tables C.12 / C.13 / C.14).
+///
+/// The bitplane-count subpacket is the first subpacket of a packet body
+/// (Annex C.3, Table C.4). Two layouts are possible:
+///
+/// * **Raw mode** (`Dr[p,s] == 1`, Table C.12, §C.6.4): every code group
+///   of every included `(band, line)` entry is written as a fixed `Br`
+///   bits, with no prediction. The size is therefore
+///   `Σ Ncg[p,b] × Br` bits over the existing bands, independent of the
+///   decoded values.
+/// * **VLC modes** (`Dr[p,s] == 0`, Tables C.13 / C.14, §C.6.5 / §C.6.6):
+///   each coded code group emits one VLC codeword of length
+///   [`vlc_codeword_bits`]`(Δm, θ)`. A significance-coded group with
+///   `Z == 1` emits no codeword (its `Δm` is implied), represented by a
+///   `None` entry in `pkt.deltas`.
+///
+/// The accumulated bits are padded up to the next byte boundary
+/// (`pad(8)`), the same way [`decode_packet_body`]'s count subpacket
+/// `align_to_byte()` consumes them, so the byte count is exact. Bands
+/// that do not exist are skipped, matching the decode loop's
+/// `if !band.exists { continue; }`. Bits accumulate in `u64` so an
+/// adversarial input cannot overflow before the byte rounding.
+#[must_use]
+pub fn infer_lcnt(geom: &PrecinctGeometry, pkt: &PacketCountInfo<'_>) -> u64 {
+    let mut bits: u64 = 0;
+    if pkt.dr != 0 {
+        // Raw mode (Table C.12): Br bits per code group of every existing
+        // band, independent of the decoded values.
+        for entry in pkt.entries {
+            let bi = entry.band as usize;
+            if bi >= geom.bands.len() || !geom.bands[bi].exists {
+                continue;
+            }
+            bits += geom.ncg(bi) as u64 * geom.br as u64;
+        }
+        return bits.div_ceil(8);
+    }
+    // VLC modes (Tables C.13 / C.14): one codeword per coded group.
+    for (i, entry) in pkt.entries.iter().enumerate() {
+        let bi = entry.band as usize;
+        if bi >= geom.bands.len() || !geom.bands[bi].exists {
+            continue;
+        }
+        let ncg = geom.ncg(bi) as usize;
+        let d_line = pkt.deltas.get(i).copied().unwrap_or(&[]);
+        let t_line = pkt.theta.get(i).copied().unwrap_or(&[]);
+        for g in 0..ncg {
+            // A short slice (or an explicit None) means the group emitted
+            // no codeword (Z == 1, Δm implied), matching the decoder.
+            if let Some(Some(delta)) = d_line.get(g).copied() {
+                let theta = t_line.get(g).copied().unwrap_or(0);
+                bits += bits::vlc_codeword_bits(delta, theta);
+            }
+        }
+    }
+    bits.div_ceil(8)
+}
+
+/// Verify a packet's wire `Lcnt[p,s]` field against the bitplane-count-
+/// subpacket size inferred from its decode mode (Annex C.6, Tables C.12 /
+/// C.13 / C.14) and return the implied trailing-filler-byte count.
+///
+/// Mirrors [`data_subpacket_filler_bytes`] and
+/// [`sign_subpacket_filler_bytes`] at the bitplane-count-subpacket level:
+/// the `Lcnt[p,s]` field of the packet header (Annex C.3, Table C.3) must
+/// be **at least** the inferred byte count, the difference being optional
+/// filler bytes the decoder skips (the count subpacket's
+/// `total_consumed += lcnt` past `align_to_byte()` in
+/// [`decode_packet_body`]). Returns `Ok(filler_bytes)` when `lcnt` covers
+/// the inferred data, or `Err(_)` when `lcnt` is smaller than the
+/// codewords the decode mode requires (a malformed / inconsistent packet
+/// header).
+pub fn count_subpacket_filler_bytes(
+    geom: &PrecinctGeometry,
+    pkt: &PacketCountInfo<'_>,
+    lcnt: u32,
+) -> Result<u32> {
+    let inferred = infer_lcnt(geom, pkt);
+    let lcnt = lcnt as u64;
+    if inferred > lcnt {
+        return Err(Error::invalid(format!(
+            "jpegxs entropy: bitplane-count subpacket needs {inferred} bytes but Lcnt[p,s] = {lcnt} (Annex C.6 Tables C.12/C.13/C.14)"
+        )));
+    }
+    Ok((lcnt - inferred) as u32)
+}
+
 /// Verify that a precinct's `Lprc[p]` field is consistent with the
 /// actual on-wire size of its packets (ISO/IEC 21122-1:2022 Annex C.2,
 /// Table C.1).
@@ -1084,6 +1206,155 @@ mod tests {
             m: &[m_l0, m_l1, m_b1],
         };
         assert_eq!(infer_ldat(&g, &h, &pkt), 2);
+    }
+
+    // ---- Annex C.6 / Tables C.12-C.14 bitplane-count size (Lcnt[p,s]) ----
+
+    /// Raw mode (`Dr = 1`, Table C.12): the count subpacket is `Br` bits
+    /// per code group of every existing band, independent of the values.
+    #[test]
+    fn lcnt_inference_raw_mode_fixed_width() {
+        // Wpb=8, Ng=4 → Ncg=2 code groups. Br=4 → 2*4 = 8 bits → 1 byte.
+        let g = geom(vec![band(8, 0, 0)]); // br = 4
+        let pkt = PacketCountInfo {
+            dr: 1,
+            entries: &[PacketEntry { band: 0, line: 0 }],
+            deltas: &[],
+            theta: &[],
+        };
+        assert_eq!(infer_lcnt(&g, &pkt), 1);
+        // Wpb=12 → Ncg=3 → 3*4 = 12 bits → 2 bytes.
+        let g2 = geom(vec![band(12, 0, 0)]);
+        let pkt2 = PacketCountInfo {
+            dr: 1,
+            entries: &[PacketEntry { band: 0, line: 0 }],
+            deltas: &[],
+            theta: &[],
+        };
+        assert_eq!(infer_lcnt(&g2, &pkt2), 2);
+    }
+
+    /// VLC mode (`Dr = 0`): each coded group contributes one codeword of
+    /// length `vlc_codeword_bits(Δm, θ)`; `None` groups (Z = 1) emit none.
+    #[test]
+    fn lcnt_inference_vlc_mode_sums_codewords() {
+        // Wpb=8, Ng=4 → Ncg=2. Use θ=0 so codeword length is simple
+        // (value>θ → unary, x = value → length value+1).
+        // Δm=0 → 1 bit (lone comma). Δm=2, θ=0 → x = 2 → 3 bits.
+        // Total 4 bits → 1 byte.
+        let g = geom(vec![band(8, 0, 0)]);
+        let deltas: &[Option<i32>] = &[Some(0), Some(2)];
+        let theta: &[i32] = &[0, 0];
+        let pkt = PacketCountInfo {
+            dr: 0,
+            entries: &[PacketEntry { band: 0, line: 0 }],
+            deltas: &[deltas],
+            theta: &[theta],
+        };
+        assert_eq!(infer_lcnt(&g, &pkt), 1);
+        // Bump Δm of group 1 to 14 (θ=0 → x=14 → 15 bits) + group 0's 1 bit
+        // = 16 bits → 2 bytes.
+        let deltas2: &[Option<i32>] = &[Some(0), Some(14)];
+        let pkt2 = PacketCountInfo {
+            dr: 0,
+            entries: &[PacketEntry { band: 0, line: 0 }],
+            deltas: &[deltas2],
+            theta: &[theta],
+        };
+        assert_eq!(infer_lcnt(&g, &pkt2), 2);
+    }
+
+    /// A `None` delta (significance-coded group with Z = 1) and a slice
+    /// shorter than `Ncg` both count as "no codeword emitted".
+    #[test]
+    fn lcnt_inference_skips_uncoded_groups() {
+        let g = geom(vec![band(8, 0, 0)]); // Ncg = 2
+                                           // Group 0 coded (Δm=0 → 1 bit); group 1 is Z=1 → None → 0 bits.
+        let deltas: &[Option<i32>] = &[Some(0), None];
+        let theta: &[i32] = &[0, 0];
+        let pkt = PacketCountInfo {
+            dr: 0,
+            entries: &[PacketEntry { band: 0, line: 0 }],
+            deltas: &[deltas],
+            theta: &[theta],
+        };
+        // 1 bit → 1 byte.
+        assert_eq!(infer_lcnt(&g, &pkt), 1);
+        // A short slice (only group 0 present) treats group 1 as uncoded
+        // too → same 1 bit → 1 byte.
+        let short_deltas: &[Option<i32>] = &[Some(0)];
+        let pkt_short = PacketCountInfo {
+            dr: 0,
+            entries: &[PacketEntry { band: 0, line: 0 }],
+            deltas: &[short_deltas],
+            theta: &[theta],
+        };
+        assert_eq!(infer_lcnt(&g, &pkt_short), 1);
+    }
+
+    /// θ shifts the codeword length: with θ ≥ Δm the value rides the
+    /// signed-binary sub-alphabet (`x = 2·Δm`) instead of the unary one.
+    #[test]
+    fn lcnt_inference_uses_theta_predictor() {
+        let g = geom(vec![band(4, 0, 0)]); // Wpb=4, Ng=4 → Ncg=1
+                                           // Δm=3, θ=0 → unary: x = 3 → 4 bits.
+        let d_unary: &[Option<i32>] = &[Some(3)];
+        let t0: &[i32] = &[0];
+        let pkt_unary = PacketCountInfo {
+            dr: 0,
+            entries: &[PacketEntry { band: 0, line: 0 }],
+            deltas: &[d_unary],
+            theta: &[t0],
+        };
+        // 4 bits → 1 byte. (Verify the bit count via vlc_codeword_bits.)
+        assert_eq!(bits::vlc_codeword_bits(3, 0), 4);
+        assert_eq!(infer_lcnt(&g, &pkt_unary), 1);
+        // Δm=3, θ=5 → signed-binary even: x = 2*3 = 6 → 7 bits.
+        let t5: &[i32] = &[5];
+        let pkt_sb = PacketCountInfo {
+            dr: 0,
+            entries: &[PacketEntry { band: 0, line: 0 }],
+            deltas: &[d_unary],
+            theta: &[t5],
+        };
+        assert_eq!(bits::vlc_codeword_bits(3, 5), 7);
+        assert_eq!(infer_lcnt(&g, &pkt_sb), 1); // 7 bits still 1 byte
+    }
+
+    /// Non-existent bands are skipped; multiple entries sum.
+    #[test]
+    fn lcnt_inference_sums_entries_and_skips_absent_band() {
+        let mut g = geom(vec![band(8, 0, 0), band(8, 0, 0)]);
+        g.bands[1].exists = false;
+        // Raw mode: band 0 contributes 2*4 = 8 bits; band 1 absent → 0.
+        let pkt = PacketCountInfo {
+            dr: 1,
+            entries: &[
+                PacketEntry { band: 0, line: 0 },
+                PacketEntry { band: 1, line: 0 },
+            ],
+            deltas: &[],
+            theta: &[],
+        };
+        assert_eq!(infer_lcnt(&g, &pkt), 1); // 8 bits → 1 byte
+    }
+
+    /// `count_subpacket_filler_bytes` cross-checks a wire `Lcnt[p,s]`
+    /// against the inferred minimum and returns the implied filler bytes;
+    /// an `Lcnt` smaller than the decode mode requires errors.
+    #[test]
+    fn lcnt_filler_and_overflow() {
+        let g = geom(vec![band(8, 0, 0)]); // raw mode → 8 bits → 1 byte
+        let pkt = PacketCountInfo {
+            dr: 1,
+            entries: &[PacketEntry { band: 0, line: 0 }],
+            deltas: &[],
+            theta: &[],
+        };
+        // Lcnt = 1 → zero filler; Lcnt = 4 → three filler; Lcnt = 0 → err.
+        assert_eq!(count_subpacket_filler_bytes(&g, &pkt, 1).unwrap(), 0);
+        assert_eq!(count_subpacket_filler_bytes(&g, &pkt, 4).unwrap(), 3);
+        assert!(count_subpacket_filler_bytes(&g, &pkt, 0).is_err());
     }
 
     // ---- Annex C.5.5 / Table C.9 sign-subpacket size (Lsgn[p,s]) ----

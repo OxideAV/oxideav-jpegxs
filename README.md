@@ -39,12 +39,17 @@ prediction — Tables C.12 / C.13 / C.14) enforces the spec range
 variable-length-code paths as well as the raw path.
 
 The entropy path also exposes structural consistency predicates
-(precinct-length `Lprc[p]`, data-subpacket size `Ldat[p,s]`,
-sign-subpacket size `Lsgn[p,s]`, significance-subpacket size
-`Lsig[p,s]`, buffer-bound conformance) used to validate codestream
-construction. Every subpacket byte count is reconstructible from the
-precinct's coding state, so each can be cross-checked against — or
-inferred in place of — its packet-header field.
+(precinct-length `Lprc[p]`, bitplane-count-subpacket size `Lcnt[p,s]`,
+data-subpacket size `Ldat[p,s]`, sign-subpacket size `Lsgn[p,s]`,
+significance-subpacket size `Lsig[p,s]`, buffer-bound conformance) used
+to validate codestream construction. Every subpacket byte count is
+reconstructible from the precinct's coding state, so each can be
+cross-checked against — or inferred in place of — its packet-header
+field. The `Lcnt[p,s]` inference covers both layouts of the count
+subpacket: the raw mode (`Dr = 1`, `Br` bits per code group, Annex C.6.4
+Table C.12) and the two VLC modes (no-prediction / vertical, Tables
+C.14 / C.13), the latter summing per-codeword bit lengths via the exact
+inverse of the Table C.15 unary VLC.
 
 ### Encoder
 

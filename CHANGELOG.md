@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased — round 334 (bitplane-count-subpacket size `Lcnt[p,s]` inference + consistency predicate)
+
+Adds the bitplane-count subpacket to the family of subpacket-size
+consistency predicates (alongside `Lprc[p]`, `Ldat[p,s]`, `Lsgn[p,s]`,
+`Lsig[p,s]`), completing the set of signalled subpacket lengths a decoder
+can reconstruct and cross-check against the packet header (ISO/IEC
+21122-1:2022 Annex C.6, Tables C.12 / C.13 / C.14).
+
+* `entropy::bits::vlc_codeword_bits(value, theta)` — the exact inverse of
+  the Table C.15 unary VLC: the wire bit length (`x + 1`) of the codeword
+  decoding to signed `value` under predictor parameter
+  `theta = max(r − t, 0)`. Round-trip tested against `vlc`'s consumption
+  across a `(r, t)` × value sweep.
+* `entropy::PacketCountInfo` + `entropy::infer_lcnt(geom, pkt)` — infers
+  `Lcnt[p,s]` from the packet's decode mode. Raw mode (`Dr = 1`,
+  Table C.12) is `Σ Ncg[p,b] × Br` bits over existing bands, independent
+  of the values; the two VLC modes (`Dr = 0`, Tables C.13 / C.14) sum
+  `vlc_codeword_bits(Δm, θ)` over the coded code groups, with `None`
+  entries for significance-coded groups (`Z = 1`) that emit no codeword.
+  Byte-padded the same way `decode_packet_body`'s `align_to_byte()`
+  consumes the subpacket.
+* `entropy::count_subpacket_filler_bytes(geom, pkt, lcnt)` — cross-checks
+  a wire `Lcnt[p,s]` against the inferred minimum and returns the implied
+  trailing-filler-byte count, erroring when `lcnt` is smaller than the
+  decode mode requires (mirrors `data_subpacket_filler_bytes` /
+  `sign_subpacket_filler_bytes`).
+* +8 unit tests (2 for the VLC-length inverse, 6 for the `Lcnt`
+  inference + filler/overflow predicate).
+
 ## Unreleased — round 330 (content-adaptive WGT weights — Annex H CFA Star-Tetrix tables H.9–H.11)
 
 Completes the Annex H example-weight-table coverage with the CFA
