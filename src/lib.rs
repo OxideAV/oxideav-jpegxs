@@ -91,11 +91,11 @@ pub use encoder::{
     encode_planar_hsl_qslice_rp_target_bytes, encode_planar_hsl_qslice_rp_target_bytes_highbd,
     encode_planar_hsl_target_bytes, encode_planar_lossy_annex_h, encode_planar_qpr,
     encode_planar_qpr_rpr, encode_planar_qpr_rpr_target_bytes, encode_planar_rp_target_bytes,
-    encode_planar_rpr, encode_planar_star_tetrix_highbd_lossy, encode_planar_subsampled_annex_h,
-    encode_planar_subsampled_highbd, encode_planar_subsampled_highbd_lossy, encode_raw_luma,
-    pick_q_slices_for_target_bytes, pick_q_slices_rp_for_target_bytes,
-    pick_q_slices_rp_for_target_bytes_highbd, pick_qpr_rpr_for_target_bytes,
-    pick_rp_for_target_bytes,
+    encode_planar_rpr, encode_planar_star_tetrix_annex_h, encode_planar_star_tetrix_highbd_lossy,
+    encode_planar_subsampled_annex_h, encode_planar_subsampled_highbd,
+    encode_planar_subsampled_highbd_lossy, encode_raw_luma, pick_q_slices_for_target_bytes,
+    pick_q_slices_rp_for_target_bytes, pick_q_slices_rp_for_target_bytes_highbd,
+    pick_qpr_rpr_for_target_bytes, pick_rp_for_target_bytes,
 };
 pub use error::{JpegXsError, Result};
 pub use image::{JpegXsImage, JpegXsPlane};

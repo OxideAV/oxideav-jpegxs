@@ -462,23 +462,36 @@ impl EncodeConfig {
                     )));
                 }
             }
-            // Sd > 0 composes with Cpih ≠ 0 as long as the colour
-            // transform's operand window (c < 3 for Cpih=1, c < 4 for
-            // Cpih=3) does not overlap the CWD-suppressed tail
-            // (c ≥ Nc - Sd). Since Sd suppresses *trailing* components,
-            // the overlap constraint reduces to Nc - Sd >= operand_max.
-            // Round 95 (r93): lift the round-9 (r91) blanket Cpih=0
-            // restriction per Part-1 §A.5.2 + §B.2 — the post-transform
-            // component set is what Sd carves the tail from.
-            let operand_max = match self.cpih {
-                1 => 3u8, // RCT: c<3
-                3 => 4u8, // Star-Tetrix: c<4
-                _ => 0u8,
-            };
-            if operand_max > 0 && self.nc - self.sd < operand_max {
+            // Sd > 0 composes with the colour transform. The order of
+            // operations matters: per Annex F.2 Table F.1 the inverse
+            // colour transform reads the *wavelet output* O[c,x,y] for
+            // every operand component (c<3 for RCT, c<4 for Star-Tetrix),
+            // and the forward encoder applies the transform to all
+            // operand components *before* the wavelet stage (see the
+            // forward_rct / forward_star_tetrix call site — it runs on the
+            // full plane set ahead of the per-component DWT-suppression
+            // loop). Sd then suppresses the wavelet decomposition for the
+            // *trailing transform outputs* (Annex A.4.7: "wavelet
+            // decomposition is suppressed"), which are coded raw instead.
+            // A suppressed transform output is still a valid O[c] value, so
+            // the inverse transform consumes it unchanged.
+            //
+            // For Star-Tetrix (Cpih=3) this is exactly the spec's tabulated
+            // CFA configuration: Annex B Table B.10 (Sd=1, 4 components,
+            // 4:4:4:4, NL,y=1, 25 bands) and Table B.11 (NL,y=2, 31 bands)
+            // give the line-inclusion layout for `Nc=4, Sd=1` — the fourth
+            // Star-Tetrix output (blue, Table F.4) is raw-coded. The Annex H
+            // PSNR weight tables H.9–H.11 are written for precisely this
+            // `Sd=1` CFA case. So the only Cpih=3 requirement is that the
+            // four transform *inputs* exist (Nc>=4, already checked above);
+            // suppression carves the *output* tail and never reduces the
+            // transform's input window. RCT (Cpih=1) keeps the stricter
+            // Nc-Sd >= 3 guard: the spec tabulates no RCT-with-suppressed-
+            // output example, so we do not relax a path we cannot validate.
+            if self.cpih == 1 && self.nc - self.sd < 3 {
                 return Err(Error::invalid(format!(
-                    "jpegxs encoder: Cpih={} requires Nc-Sd >= {} so the colour transform's operand window is fully wavelet-coded (Annex F.2 Table F.1), got Nc={} Sd={}",
-                    self.cpih, operand_max, self.nc, self.sd
+                    "jpegxs encoder: Cpih=1 (RCT) requires Nc-Sd >= 3 so the RCT operand window is fully wavelet-coded (Annex F.2 Table F.1), got Nc={} Sd={}",
+                    self.nc, self.sd
                 )));
             }
         }
@@ -1110,7 +1123,7 @@ pub fn encode_planar_lossy_annex_h(
 ) -> Result<Vec<u8>> {
     let sx = vec![1u8; nc as usize];
     let sy = vec![1u8; nc as usize];
-    let Some((gains, priorities)) = annex_h_weights(nc, cpih, 0, nlx, nly, &sx, &sy) else {
+    let Some((gains, priorities)) = annex_h_weights(nc, cpih, 0, nlx, nly, 0, &sx, &sy) else {
         return encode_planar_lossy(width, height, nc, cpih, nlx, nly, q, planes);
     };
     let fq = if q == 0 { 0 } else { 8 };
@@ -1182,7 +1195,7 @@ pub fn encode_planar_subsampled_annex_h(
     sy: &[u8],
     planes: &[Vec<u8>],
 ) -> Result<Vec<u8>> {
-    let Some((gains, priorities)) = annex_h_weights(nc, cpih, 0, nlx, nly, sx, sy) else {
+    let Some((gains, priorities)) = annex_h_weights(nc, cpih, 0, nlx, nly, 0, sx, sy) else {
         return encode_planar_subsampled(width, height, nc, cpih, nlx, nly, q, sx, sy, planes);
     };
     let fq = if q == 0 { 0 } else { 8 };
@@ -1206,6 +1219,84 @@ pub fn encode_planar_subsampled_annex_h(
         priorities,
         0,          // cw: single precinct per row
         0,          // sd: no suppressed components
+        0,          // fs: signs jointly with data
+        0,          // hsl: single slice
+        0,          // qpih: deadzone inverse quantizer
+        0,          // rp: no precinct refinement
+        Vec::new(), // q_slices
+        Vec::new(), // q_precincts
+        Vec::new(), // r_precincts
+        planes,
+    )
+}
+
+/// CFA Star-Tetrix companion to [`encode_planar_lossy_annex_h`]: drives the
+/// WGT marker and forward truncation from the ISO/IEC 21122-1:2022 Annex H
+/// PSNR-optimized example tables H.9 / H.10 / H.11 for the **colour-filter-
+/// array** Star-Tetrix layout (`Cpih = 3`, `Sd = 1`, four 4:4:4:4
+/// components, `NL,x = 5`, `NL,y ∈ {0, 1, 2}`).
+///
+/// Star-Tetrix (Annex F.5) decorrelates the four CFA components `[R, G1, G2,
+/// B]` into four transform outputs; with `Sd = 1` the fourth output (blue,
+/// per Table F.4) is coded raw rather than wavelet-decomposed (Annex B
+/// Tables B.10 / B.11). The transform itself still reads all four inputs, so
+/// it composes cleanly with the suppressed output. The Annex H tables list a
+/// separate `(G[b], P[b])` column per CTS extent: `cf = 0` (full
+/// transformation, Table A.20) and `cf = 3` (restricted in-line). `cf`
+/// selects the column; both round-trip because the decoder reads the
+/// identical `(G[b], P[b])` off the WGT segment and rebuilds the same
+/// `T[p,b] = clamp(Q[p] − G[b] − r, 0, 15)` (Annex C.6.2 Table C.10).
+///
+/// `planes` is `[R, G1, G2, B]`, each `width * height` 8-bit samples (matching
+/// [`encode_planar_star_tetrix`]). `e1` / `e2` are the CTS chroma exponents
+/// (0..=3); `ct` is the CFA pattern type (0 = RGGB, 1 = GRBG). For any
+/// `(cf, nly)` outside the tabulated set (`cf ∉ {0, 3}` or `nly > 2`) the
+/// entry point falls back to the default-weights [`encode_planar_star_tetrix`]
+/// with `Sd = 1`, so callers always get a valid codestream.
+///
+/// As with the other Annex H entry points the weights are a no-op at `q = 0`
+/// (lossless) — every `T[p,b]` is already clamped to its `0` floor — so this
+/// path is meaningful for `q ∈ 1..=15`.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_star_tetrix_annex_h(
+    width: u16,
+    height: u16,
+    nlx: u8,
+    nly: u8,
+    q: u8,
+    e1: u8,
+    e2: u8,
+    cf: u8,
+    ct: u8,
+    planes: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    let sx = vec![1u8; 4];
+    let sy = vec![1u8; 4];
+    let fq = if q == 0 { 0 } else { 8 };
+    // Outside the tabulated H.9–H.11 set `annex_h_weights` returns `None`;
+    // empty gains/priorities then fall back to the default-weights Sd=1
+    // Star-Tetrix path so the CFA codestream is still well-formed.
+    let (gains, priorities) = annex_h_weights(4, 3, 1, nlx, nly, cf, &sx, &sy).unwrap_or_default();
+    encode_planar_inner_nlt(
+        width,
+        height,
+        4, // Nc = 4 CFA components
+        3, // Cpih = 3 (Star-Tetrix)
+        nlx,
+        nly,
+        fq,
+        q,
+        &sx,
+        &sy,
+        e1,
+        e2,
+        cf,
+        ct,
+        None,
+        gains,
+        priorities,
+        0,          // cw: single precinct per row
+        1,          // sd = 1: suppress the fourth Star-Tetrix output
         0,          // fs: signs jointly with data
         0,          // hsl: single slice
         0,          // qpih: deadzone inverse quantizer
@@ -3835,14 +3926,17 @@ pub fn encode_planar_sd_rct(
 /// Round-95 (r93) `Sd > 0` + `Cpih = 3` (Star-Tetrix) entry point.
 ///
 /// Per Annex F.2 Table F.1 the Star-Tetrix operand window is `c < 4`;
-/// when `Nc - Sd >= 4` the four CFA components are forward-Star-Tetrix'd
-/// before the DWT cascade and the suppressed trailing components ride
-/// through raw. Emits both the CTS marker (`Cf`, `e1`, `e2`) and the CRG
-/// marker (per Table F.9 from `ct`).
+/// the four CFA components are forward-Star-Tetrix'd before the DWT
+/// cascade (the transform reads all four inputs `c < 4` per Annex F.2
+/// Table F.1) and the `Sd` trailing transform *outputs* ride through raw.
+/// Suppressing a transform output is legal — the spec tabulates exactly
+/// this CFA layout (`Nc = 4, Sd = 1`) in Annex B Tables B.10 / B.11 — so
+/// the only requirement is that the four transform inputs exist (`Nc >= 4`).
+/// Emits both the CTS marker (`Cf`, `e1`, `e2`) and the CRG marker (per
+/// Table F.9 from `ct`).
 ///
-/// Constraints: `nc - sd >= 4`, `nc > 3` (CWD; in practice `nc >= 5`
-/// because `sd >= 1`), `sd >= 1`, `sx[i] = sy[i] = 1` for every
-/// component.
+/// Constraints: `nc >= 4` (Star-Tetrix input window), `nc > 3` (CWD),
+/// `1 <= sd < nc`, `sx[i] = sy[i] = 1` for every component.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_planar_sd_star_tetrix(
     width: u16,
@@ -5013,17 +5107,51 @@ fn build_band_priorities_sd(nc: u8, sd: u8, nlx: u8, nly: u8, sy: &[u8]) -> Vec<
 ///
 /// `sx` / `sy` select the chroma format: all-1 → 4:4:4 (H.1–H.3,
 /// `Cpih = 1`); chroma `sx = 2, sy = 1` → 4:2:2 (H.4–H.6, `Cpih = 0`);
-/// chroma `sx = sy = 2` → 4:2:0 (H.7–H.8, `Cpih = 0`). The CFA
-/// star-tetrix tables (H.9–H.11) remain deferred.
+/// chroma `sx = sy = 2` → 4:2:0 (H.7–H.8, `Cpih = 0`).
+///
+/// The CFA Star-Tetrix tables H.9–H.11 (`Cpih = 3`, `Sd = 1`, 4:4:4:4,
+/// `NL,x = 5`, `NL,y ∈ {0, 1, 2}`) are also returned. They list a separate
+/// `(G[b], P[b])` column per CTS extent `Cf ∈ {0, 3}` (Table A.20): `cf`
+/// selects the column. The band-emission order matches the Sd=1 layout of
+/// Annex B Tables B.10 / B.11 — `b = (Nc − Sd)×β + i` for the three
+/// wavelet-coded Star-Tetrix outputs, then the single raw-coded suppressed
+/// output as the tail band `b = (Nc − Sd)×Nβ` — i.e. exactly the order
+/// [`build_band_gains_sd`] / [`build_band_priorities_sd`] emit for
+/// `nc = 4, sd = 1`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn annex_h_weights(
     nc: u8,
     cpih: u8,
     sd: u8,
     nlx: u8,
     nly: u8,
+    cf: u8,
     sx: &[u8],
     sy: &[u8],
 ) -> Option<(Vec<u8>, Vec<u8>)> {
+    // CFA Star-Tetrix weight tables H.9–H.11 (Cpih=3, Sd=1, Nc=4, 4:4:4:4).
+    // Each table tabulates two columns, Cf=0 (full transform) and Cf=3
+    // (restricted in-line); `cf` picks the column. Every band exists for
+    // 4:4:4:4 sampling, so there are no `-*` slots to drop and the column
+    // is already in existing-band emission order.
+    if cpih == 3 && sd == 1 && nc == 4 && nlx == 5 {
+        let is_4444 = sx.iter().take(4).all(|&v| v == 1) && sy.iter().take(4).all(|&v| v == 1);
+        if !is_4444 {
+            return None;
+        }
+        let table: &[(u8, u8, u8, u8)] = match nly {
+            0 => &H9_CFA_NLY0,
+            1 => &H10_CFA_NLY1,
+            2 => &H11_CFA_NLY2,
+            _ => return None,
+        };
+        let (gains, priorities): (Vec<u8>, Vec<u8>) = match cf {
+            0 => table.iter().map(|&(g0, p0, _, _)| (g0, p0)).unzip(),
+            3 => table.iter().map(|&(_, _, g3, p3)| (g3, p3)).unzip(),
+            _ => return None,
+        };
+        return Some((gains, priorities));
+    }
     if nc != 3 || sd != 0 || nlx != 5 {
         return None;
     }
@@ -5321,6 +5449,109 @@ const H8_420_NLY2: [Option<(u8, u8)>; 30] = [
     Some((0, 11)),
     Some((0, 10)),
     Some((0, 9)),
+];
+
+// ---------------------------------------------------------------------------
+// ISO/IEC 21122-1:2022 Annex H CFA Star-Tetrix weight tables H.9–H.11
+// (informative, Cpih = 3, Sd = 1, 4:4:4:4, NL,x = 5). Transcribed from the
+// spec PDF under docs/image/jpegxs/. Each entry is
+// `(G_cf0, P_cf0, G_cf3, P_cf3)` — the spec tabulates two columns per band,
+// one for CTS extent Cf = 0 (full transform) and one for Cf = 3 (restricted
+// in-line). `annex_h_weights` selects the column from the encode `cf`. All
+// 4:4:4:4 bands exist, so there are no `-*` slots. Band order is the Sd=1
+// layout of Annex B Tables B.10 / B.11: `b = (Nc − Sd)×β + i` for the three
+// wavelet-coded Star-Tetrix outputs, then the suppressed raw-coded output as
+// the final tail band.
+// ---------------------------------------------------------------------------
+
+/// Table H.9 — CFA Star-Tetrix, Sd=1, 5 horizontal / 0 vertical levels
+/// (19 bands).
+const H9_CFA_NLY0: [(u8, u8, u8, u8); 19] = [
+    (3, 3, 4, 18),
+    (3, 17, 3, 17),
+    (3, 16, 3, 16),
+    (2, 1, 3, 13),
+    (2, 15, 2, 12),
+    (2, 14, 2, 11),
+    (2, 11, 2, 5),
+    (1, 7, 1, 4),
+    (1, 6, 1, 3),
+    (1, 0, 2, 14),
+    (1, 13, 1, 10),
+    (1, 12, 1, 9),
+    (1, 10, 1, 6),
+    (0, 5, 0, 1),
+    (0, 4, 0, 0),
+    (1, 18, 1, 15),
+    (0, 9, 0, 9),
+    (0, 8, 0, 7),
+    (0, 2, 0, 2),
+];
+
+/// Table H.10 — CFA Star-Tetrix, Sd=1, 5 horizontal / 1 vertical level
+/// (25 bands).
+const H10_CFA_NLY1: [(u8, u8, u8, u8); 25] = [
+    (4, 20, 4, 13),
+    (3, 17, 3, 12),
+    (3, 16, 3, 11),
+    (3, 12, 3, 8),
+    (2, 11, 2, 7),
+    (2, 10, 2, 6),
+    (2, 0, 3, 20),
+    (2, 24, 2, 19),
+    (2, 23, 2, 18),
+    (2, 15, 2, 9),
+    (1, 9, 1, 5),
+    (1, 8, 1, 4),
+    (1, 1, 2, 21),
+    (1, 22, 1, 17),
+    (1, 21, 1, 16),
+    (1, 14, 1, 10),
+    (0, 6, 0, 2),
+    (0, 4, 0, 1),
+    (1, 13, 1, 9),
+    (0, 5, 1, 23),
+    (0, 3, 1, 22),
+    (0, 7, 1, 24),
+    (0, 19, 0, 15),
+    (0, 18, 0, 14),
+    (0, 2, 0, 3),
+];
+
+/// Table H.11 — CFA Star-Tetrix, Sd=1, 5 horizontal / 2 vertical levels
+/// (31 bands).
+const H11_CFA_NLY2: [(u8, u8, u8, u8); 31] = [
+    (4, 9, 4, 5),
+    (3, 8, 3, 4),
+    (3, 7, 3, 3),
+    (3, 0, 4, 28),
+    (3, 30, 3, 27),
+    (3, 29, 3, 26),
+    (3, 20, 3, 18),
+    (2, 19, 2, 17),
+    (2, 18, 2, 16),
+    (2, 1, 3, 30),
+    (2, 28, 2, 23),
+    (2, 27, 2, 22),
+    (2, 24, 2, 19),
+    (1, 16, 1, 14),
+    (1, 14, 1, 13),
+    (2, 23, 2, 12),
+    (1, 15, 1, 11),
+    (1, 13, 1, 10),
+    (1, 17, 1, 9),
+    (0, 11, 0, 8),
+    (0, 10, 0, 7),
+    (1, 22, 1, 15),
+    (0, 6, 0, 2),
+    (0, 4, 0, 1),
+    (1, 21, 1, 0),
+    (0, 5, 1, 25),
+    (0, 3, 1, 24),
+    (0, 12, 1, 29),
+    (0, 26, 0, 21),
+    (0, 25, 0, 20),
+    (0, 2, 0, 6),
 ];
 
 /// Per-(β, i) band geometry needed by the encoder.
@@ -10609,18 +10840,44 @@ mod tests {
         );
     }
 
-    /// Round 95 (r93): encoder rejects Sd that suppresses a Star-Tetrix
-    /// operand component (Nc-Sd < 4).
+    /// Round 330: Star-Tetrix tolerates suppressing a transform *output*
+    /// (not just a pass-through component). Per Annex F.2 Table F.1 the
+    /// transform reads all four CFA inputs (c<4) and emits four outputs;
+    /// Sd suppresses the wavelet decomposition of the *trailing outputs*,
+    /// which are then coded raw (Annex A.4.7, Annex B Tables B.10 / B.11).
+    /// The earlier "Nc-Sd >= 4" reject was over-strict — it conflated the
+    /// transform input window with output suppression. Here Nc=5, Sd=2
+    /// suppresses output 3 (blue, Table F.4) and pass-through output 4, and
+    /// the picture still round-trips losslessly because the inverse
+    /// transform consumes the raw-coded O[3] unchanged.
     #[test]
-    fn round95_rejects_sd_overlapping_star_tetrix_operand_window() {
-        // Nc=5, Sd=2 means Nc-Sd=3 → suppresses component 3 (B operand
-        // of Star-Tetrix). Must reject.
-        let p = vec![vec![0u8; 16 * 8]; 5];
-        let result = encode_planar_sd_star_tetrix(16, 8, 5, 1, 1, 0, 2, 0, 0, 0, 0, &p);
-        assert!(
-            result.is_err(),
-            "Cpih=3 + Sd=2 with Nc=5 must reject (Star-Tetrix operand overlap)"
-        );
+    fn round330_sd2_cpih3_star_tetrix_5comp_suppresses_output_lossless() {
+        let w = 16usize;
+        let h = 8usize;
+        let make = |seed: u32| {
+            let mut v = vec![0u8; w * h];
+            for y in 0..h {
+                for x in 0..w {
+                    v[y * w + x] = ((x as u32)
+                        .wrapping_mul(seed + 2)
+                        .wrapping_add((y as u32).wrapping_mul(seed + 3))
+                        .wrapping_add(seed)
+                        % 256) as u8;
+                }
+            }
+            v
+        };
+        let planes = [make(11), make(17), make(23), make(29), make(41)];
+        // Nc=5, Sd=2 → Nc-Sd=3 wavelet-coded, outputs 3 (B) + 4 (tail) raw.
+        let cs =
+            encode_planar_sd_star_tetrix(w as u16, h as u16, 5, 1, 1, 0, 2, 0, 0, 0, 0, &planes)
+                .expect("encode Nc=5 Sd=2 Cpih=3 (suppressed Star-Tetrix output)");
+        let img = decode_codestream(&cs, None).expect("decode Nc=5 Sd=2 Cpih=3");
+        assert_eq!(img.num_components, 5);
+        assert_eq!(img.cpih, 3);
+        for (i, want) in planes.iter().enumerate() {
+            assert_eq!(&img.planes[i].data, want, "component {i} lossless");
+        }
     }
 
     // === Round 100: Fs=1 separate sign sub-packet (Annex C.5.5) =========
@@ -15023,7 +15280,7 @@ mod tests {
     fn round323_annex_h_weights_roundtrip_and_differ_from_default() {
         let planes = make_synthetic_rgb_64x64();
         for nly in 0u8..=2 {
-            let (exp_g, exp_p) = annex_h_weights(3, 1, 0, 5, nly, &[1, 1, 1], &[1, 1, 1])
+            let (exp_g, exp_p) = annex_h_weights(3, 1, 0, 5, nly, 0, &[1, 1, 1], &[1, 1, 1])
                 .expect("Annex H table for 4:4:4 RCT NLx=5");
 
             let cs = encode_planar_lossy_annex_h(64, 64, 3, 1, 5, nly, 4, &planes)
@@ -15090,7 +15347,7 @@ mod tests {
     fn round323_annex_h_falls_back_to_default_when_unmatched() {
         let planes = make_synthetic_rgb_64x64();
         assert!(
-            annex_h_weights(3, 1, 0, 2, 2, &[1, 1, 1], &[1, 1, 1]).is_none(),
+            annex_h_weights(3, 1, 0, 2, 2, 0, &[1, 1, 1], &[1, 1, 1]).is_none(),
             "no H table for NLx=2"
         );
         let fallback =
@@ -15154,7 +15411,7 @@ mod tests {
             let planes = make_subsampled_planes(64, 64, sxc as usize, syc as usize);
             let sx = [1u8, sxc, sxc];
             let sy = [1u8, syc, syc];
-            let (exp_g, exp_p) = annex_h_weights(3, 0, 0, 5, nly, &sx, &sy)
+            let (exp_g, exp_p) = annex_h_weights(3, 0, 0, 5, nly, 0, &sx, &sy)
                 .unwrap_or_else(|| panic!("Annex H subsampled table sx={sxc} sy={syc} NLy={nly}"));
             assert_eq!(
                 exp_g.len(),
@@ -15256,7 +15513,7 @@ mod tests {
         let sx = [1u8, 2, 2];
         let sy = [1u8, 2, 2];
         assert!(
-            annex_h_weights(3, 0, 0, 5, 3, &sx, &sy).is_none(),
+            annex_h_weights(3, 0, 0, 5, 3, 0, &sx, &sy).is_none(),
             "no 4:2:0 NLy=3 Annex H table"
         );
         let planes = make_subsampled_planes(64, 64, 2, 2);
@@ -15267,6 +15524,148 @@ mod tests {
         assert_eq!(
             fallback, default_cs,
             "unmatched subsampled config must equal encode_planar_subsampled"
+        );
+    }
+
+    // === Round 330: Annex H CFA Star-Tetrix weight tables H.9 / H.10 / H.11 ==
+
+    /// Build four 4:4:4:4 CFA planes (`[R, G1, G2, B]`) with distinct
+    /// per-component texture so the Star-Tetrix decorrelation is exercised.
+    fn cfa_planes(w: usize, h: usize) -> [Vec<u8>; 4] {
+        let make = |seed: u32| {
+            let mut v = vec![0u8; w * h];
+            for y in 0..h {
+                for x in 0..w {
+                    v[y * w + x] = ((x as u32)
+                        .wrapping_mul(seed + 2)
+                        .wrapping_add((y as u32).wrapping_mul(seed + 3))
+                        .wrapping_add(seed)
+                        % 256) as u8;
+                }
+            }
+            v
+        };
+        [make(7), make(13), make(19), make(31)]
+    }
+
+    /// Round 330: the CFA Star-Tetrix Annex H entry point
+    /// [`encode_planar_star_tetrix_annex_h`] (a) emits a WGT carrying exactly
+    /// the H.9 / H.10 / H.11 `(G[b], P[b])` column selected by `cf`, with one
+    /// pair per existing band (NL = (Nc−Sd)·Nβ + Sd = 19 / 25 / 31), (b)
+    /// round-trips through the decoder for the previously-rejected `Cpih = 3,
+    /// Sd = 1, Nc = 4` CFA layout (Annex B Tables B.10 / B.11), and (c) yields
+    /// a genuinely different codestream from the default-weights
+    /// [`encode_planar_star_tetrix`] with the same suppression.
+    #[test]
+    fn round330_cfa_star_tetrix_annex_h_roundtrip_and_differ() {
+        let (w, h) = (32usize, 16usize);
+        let planes = cfa_planes(w, h);
+        // (NLy, expected band count). NL = 3·Nβ + 1; Nβ = NLx+1+NLy = 6/7/8 →
+        // wait, Nβ = NLx + 1 for NLy=0 (6), +2 per extra vertical level: the
+        // spec tables give 19 / 25 / 31 directly (H.9 / H.10 / H.11).
+        let cases: &[(u8, usize)] = &[(0, 19), (1, 25), (2, 31)];
+        for &(nly, n_bands) in cases {
+            for cf in [0u8, 3u8] {
+                let sx = [1u8; 4];
+                let sy = [1u8; 4];
+                let (exp_g, exp_p) = annex_h_weights(4, 3, 1, 5, nly, cf, &sx, &sy)
+                    .unwrap_or_else(|| panic!("H table NLy={nly} cf={cf}"));
+                assert_eq!(exp_g.len(), exp_p.len(), "g/p len agree NLy={nly} cf={cf}");
+                assert_eq!(
+                    exp_g.len(),
+                    n_bands,
+                    "NLy={nly}: band count NL = (Nc−Sd)·Nβ + Sd"
+                );
+
+                let cs = encode_planar_star_tetrix_annex_h(
+                    w as u16, h as u16, 5, nly, 2, 0, 0, cf, 0, &planes,
+                )
+                .unwrap_or_else(|e| panic!("CFA Annex H encode NLy={nly} cf={cf}: {e:?}"));
+
+                // (a) WGT carries exactly the selected H-table column.
+                let parsed = crate::codestream::parse(&cs).expect("parse CFA Annex H stream");
+                let weights = parsed.wgt().expect("typed WGT view");
+                let got_g: Vec<u8> = weights.iter().map(|w| w.gain).collect();
+                let got_p: Vec<u8> = weights.iter().map(|w| w.priority).collect();
+                assert_eq!(got_g, exp_g, "NLy={nly} cf={cf}: WGT gains");
+                assert_eq!(got_p, exp_p, "NLy={nly} cf={cf}: WGT priorities");
+                assert_eq!(got_g.len(), n_bands, "NLy={nly} cf={cf}: WGT entry count");
+
+                // (b) Round-trips through the decoder.
+                let img = decode_codestream(&cs, None).expect("decode CFA Annex H stream");
+                assert_eq!(img.num_components, 4, "NLy={nly} cf={cf}: 4 CFA comps");
+                assert_eq!(img.cpih, 3, "NLy={nly} cf={cf}: Cpih=3");
+                assert_eq!(img.width as usize, w);
+                assert_eq!(img.height as usize, h);
+
+                // (c) Differs from the default-weights Star-Tetrix path (same
+                // Cpih=3, Sd=1 suppression and CTS cf, but default P[b]=b /
+                // capped gains instead of the Annex H column).
+                let default_cs = encode_planar_sd_star_tetrix(
+                    w as u16, h as u16, 4, 5, nly, 2, 1, 0, 0, cf, 0, &planes,
+                )
+                .expect("default-weights Sd=1 Star-Tetrix");
+                assert_ne!(
+                    cs, default_cs,
+                    "NLy={nly} cf={cf}: Annex H stream must differ from default"
+                );
+            }
+        }
+    }
+
+    /// Round 330: at `q = 0` the CFA Star-Tetrix Annex H weights are a no-op
+    /// for the reconstructed samples — every component self-roundtrips
+    /// bit-exactly even though the WGT advertises the H-table gains/priorities.
+    /// This is the strict encoder/decoder `T[p,b]` alignment proof for the
+    /// Cpih=3, Sd=1 CFA layout.
+    #[test]
+    fn round330_cfa_star_tetrix_annex_h_lossless_bit_exact() {
+        let (w, h) = (32usize, 16usize);
+        let planes = cfa_planes(w, h);
+        for nly in [0u8, 1, 2] {
+            for cf in [0u8, 3u8] {
+                let cs = encode_planar_star_tetrix_annex_h(
+                    w as u16, h as u16, 5, nly, 0, 0, 0, cf, 0, &planes,
+                )
+                .expect("CFA Annex H lossless encode");
+                let img = decode_codestream(&cs, None).expect("decode CFA Annex H lossless");
+                for (c, (rec, src)) in img.planes.iter().zip(planes.iter()).enumerate() {
+                    assert_eq!(
+                        rec.data, *src,
+                        "NLy={nly} cf={cf}: component {c} bit-exact at q=0"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Round 330: a CFA configuration outside the tabulated H.9–H.11 set
+    /// (`cf ∉ {0, 3}` or `NLy > 2`) falls back to the default-weights
+    /// Star-Tetrix path and is byte-identical to a direct default encode.
+    #[test]
+    fn round330_cfa_star_tetrix_annex_h_falls_back_when_unmatched() {
+        let sx = [1u8; 4];
+        let sy = [1u8; 4];
+        assert!(
+            annex_h_weights(4, 3, 1, 5, 3, 0, &sx, &sy).is_none(),
+            "no NLy=3 CFA Annex H table"
+        );
+        assert!(
+            annex_h_weights(4, 3, 1, 5, 1, 1, &sx, &sy).is_none(),
+            "no cf=1 CFA Annex H column"
+        );
+        let (w, h) = (32usize, 16usize);
+        let planes = cfa_planes(w, h);
+        // NLy=3 → no table → default weights with Sd=1 Star-Tetrix.
+        let fallback =
+            encode_planar_star_tetrix_annex_h(w as u16, h as u16, 5, 3, 2, 0, 0, 0, 0, &planes)
+                .expect("fallback CFA encode");
+        let direct =
+            encode_planar_sd_star_tetrix(w as u16, h as u16, 4, 5, 3, 2, 1, 0, 0, 0, 0, &planes)
+                .expect("direct default Sd=1 Star-Tetrix encode");
+        assert_eq!(
+            fallback, direct,
+            "unmatched CFA config must equal default Sd=1 Star-Tetrix"
         );
     }
 }

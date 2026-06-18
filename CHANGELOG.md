@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased — round 330 (content-adaptive WGT weights — Annex H CFA Star-Tetrix tables H.9–H.11)
+
+Completes the Annex H example-weight-table coverage with the CFA
+Star-Tetrix tables H.9 / H.10 / H.11 (`Cpih = 3`, `Sd = 1`, four 4:4:4:4
+components, `NL,x = 5`, `NL,y ∈ {0, 1, 2}`).
+
+* `encoder::annex_h_weights` gained a `cf` parameter and now returns the
+  ISO/IEC 21122-1:2022 Annex H CFA Star-Tetrix tables H.9 / H.10 / H.11
+  (19 / 25 / 31 bands). Each table tabulates a separate `(G[b], P[b])`
+  column per CTS extent `Cf ∈ {0, 3}` (full / restricted in-line, Table
+  A.20); `cf` selects the column. Band order follows the `Sd = 1` layout
+  of Annex B Tables B.10 / B.11 (`b = (Nc − Sd)·β + i` for the three
+  wavelet-coded outputs, then the suppressed raw-coded output tail).
+* `encoder::encode_planar_star_tetrix_annex_h(width, height, nlx, nly, q,
+  e1, e2, cf, ct, planes)` — public entry point (re-exported at the crate
+  root) that drives both the WGT marker and the forward truncation
+  `T[p,b] = clamp(Q[p] − G[b] − r, 0, 15)` from the CFA Annex H weights, so
+  the codestream round-trips through `decode_jpeg_xs`. Falls back to the
+  default-weights `Sd = 1` Star-Tetrix path for any non-tabulated
+  `(cf, nly)`.
+* Corrected an over-strict `Cpih = 3` constraint in both the encoder
+  (`EncodeConfig::validate`) and decoder: the previous `Nc − Sd ≥ 4` guard
+  conflated the Star-Tetrix *input* window (`c < 4`, Annex F.2 Table F.1)
+  with `Sd` output suppression. Per Annex A.4.7 + Tables B.10 / B.11, `Sd`
+  suppresses the wavelet decomposition of trailing transform *outputs*
+  (coded raw, then consumed unchanged by the inverse transform), so the
+  requirement is just `Nc ≥ 4`. RCT (`Cpih = 1`) keeps the stricter
+  `Nc − Sd ≥ 3` guard. The CFA layout `Nc = 4, Sd = 1` (Nc−Sd = 3) now
+  encodes and decodes; `Nc = 5, Sd = 2` (suppress a Star-Tetrix output)
+  round-trips losslessly.
+* Tests: WGT-readback (both `Cf` columns) + band-count checks for H.9 /
+  H.10 / H.11, q=0 bit-exact self-roundtrip across all `(nly, cf)`,
+  unmatched-config fallback equivalence, and the previously-rejecting
+  `Nc = 5, Sd = 2` case rewritten to a lossless round-trip.
+
 ## Unreleased — round 327 (content-adaptive WGT weights — Annex H subsampled tables H.4–H.8)
 
 Extends the round-323 content-adaptive WGT path to the chroma-subsampled

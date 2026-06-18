@@ -69,9 +69,26 @@ non-existent (`bx[β,i] = 0`, the `-*` slots); the encoder emits one
 `(G[b], P[b])` pair per *existing* band only (Annex A.4.11 WGT loop), and
 those `-*` positions are dropped so the supplied weights land in the
 encoder's existing-band emission order — matching the
-`picture_beta_to_local_beta` skip rule position-for-position.
-Configurations outside the tabulated set fall back to the default-weights
-path.
+`picture_beta_to_local_beta` skip rule position-for-position. The
+`encode_planar_star_tetrix_annex_h` entry point completes the set with the
+**CFA Star-Tetrix** tables H.9 / H.10 / H.11 (`Cpih = 3`, `Sd = 1`,
+4:4:4:4, `NL,x = 5`, `NL,y ∈ {0, 1, 2}`): the Star-Tetrix transform reads
+all four CFA inputs and the fourth output (blue, Table F.4) is raw-coded
+per Annex B Tables B.10 / B.11, so `NL = (Nc−Sd)·Nβ + Sd = 19 / 25 / 31`
+bands. Each table tabulates a separate `(G[b], P[b])` column per CTS extent
+`Cf ∈ {0, 3}` (full / restricted in-line); the encode `cf` selects the
+column. Configurations outside any tabulated set fall back to the
+default-weights path.
+
+Wiring up the CFA tables required correcting an over-strict `Cpih = 3`
+constraint: the encoder and decoder previously rejected `Nc − Sd < 4`,
+conflating the Star-Tetrix *input* window (`c < 4`, Annex F.2 Table F.1)
+with output suppression. Per Annex A.4.7 + Tables B.10 / B.11, `Sd`
+suppresses the wavelet decomposition of trailing transform *outputs*
+(coded raw), which the inverse transform consumes unchanged — so the only
+requirement is `Nc ≥ 4` (four transform inputs). RCT (`Cpih = 1`) keeps the
+stricter `Nc − Sd ≥ 3` guard (no tabulated RCT-with-suppressed-output
+example).
 
 ### Codestream parser
 
@@ -98,12 +115,15 @@ rate not observable from the codestream.
 ### Not yet covered
 
 - Bit depths above 16 (would need a `u32` plane format).
-- Content-adaptive WGT weights for the CFA star-tetrix layouts (Annex H
-  tables H.9–H.11), which split into separate `Cf = 0` / `Cf = 3`
-  gain/priority columns for the colour-filter-array components. The 4:4:4
-  RCT tables (H.1–H.3, `encode_planar_lossy_annex_h`) and the subsampled
-  4:2:2 / 4:2:0 tables (H.4–H.8, `encode_planar_subsampled_annex_h`,
-  including the `-*` non-existent-band handling) are wired up.
+- Content-adaptive WGT weights for the CFA star-tetrix layouts at bit
+  depths above 8 — the H.9–H.11 tables are wired through
+  `encode_planar_star_tetrix_annex_h` for the 8-bit CFA path; a
+  high-bit-depth companion is a follow-up. All Annex H example tables are
+  now transcribed: the 4:4:4 RCT tables (H.1–H.3,
+  `encode_planar_lossy_annex_h`), the subsampled 4:2:2 / 4:2:0 tables
+  (H.4–H.8, `encode_planar_subsampled_annex_h`, including the `-*`
+  non-existent-band handling), and the CFA Star-Tetrix tables (H.9–H.11,
+  `encode_planar_star_tetrix_annex_h`, `Cf = 0` / `Cf = 3` columns).
 
 ## Public API
 
@@ -119,8 +139,9 @@ let picture = oxideav_jpegxs::decode_jpeg_xs(bytes)?;
 
 Encoder entry points (in `oxideav_jpegxs::encoder`) cover single-luma,
 interleaved RGB, and generalised planar input, with `_lossy`,
-`_lossy_annex_h`, `_subsampled_annex_h`, `_highbd`, `_subsampled`,
-`_star_tetrix`, `_nlt_quadratic`, `_nlt_extended`, `_hsl_qslice`,
+`_lossy_annex_h`, `_subsampled_annex_h`, `_star_tetrix_annex_h`, `_highbd`,
+`_subsampled`, `_star_tetrix`, `_nlt_quadratic`, `_nlt_extended`,
+`_hsl_qslice`,
 `_qpr_rpr`, and `*_target_bytes` variants for the feature axes above. See
 the module docs for the exact signatures and scope per entry point.
 

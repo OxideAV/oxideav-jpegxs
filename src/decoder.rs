@@ -186,12 +186,16 @@ pub(crate) fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<JpegXsIm
     }
 
     // Annex F inverse colour transform — Table F.1 dispatches by Cpih.
-    // The transform's operand window is fixed at c < 3 (RCT) or c < 4
-    // (Star-Tetrix); when Sd > 0, the suppressed-tail components live at
-    // c ≥ Nc - Sd and must not overlap the operand window, otherwise the
-    // transform would consume samples that were never wavelet-coded
-    // (Part-1 §A.5.2 + §B.2). We re-check the constraint here so a
-    // malformed codestream fails fast instead of producing garbage.
+    // The transform reads the wavelet output O[c,x,y] for every operand
+    // component (c < 3 for RCT, c < 4 for Star-Tetrix). When Sd > 0 the
+    // suppressed tail (c ≥ Nc - Sd) is *raw-coded* rather than wavelet-
+    // decomposed; its O[c] values were written directly into `samples[c]`
+    // during the gather pass (see the suppressed-component branch above),
+    // so the inverse transform consumes them unchanged. Suppressing a
+    // transform *output* therefore composes cleanly — Annex B Tables B.10 /
+    // B.11 tabulate exactly this for Star-Tetrix (Sd=1, Nc=4 CFA, the case
+    // the Annex H weight tables H.9–H.11 target). RCT keeps the stricter
+    // Nc-Sd >= 3 guard (no tabulated RCT-with-suppressed-output example).
     if pih.cpih == 1 {
         if (pih.nc - sd) < 3 {
             return Err(Error::invalid(format!(
@@ -224,12 +228,6 @@ pub(crate) fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<JpegXsIm
             return Err(Error::invalid(format!(
                 "jpegxs Cpih=3: Star-Tetrix requires Nc>=4 per Annex F.2, got {}",
                 pih.nc
-            )));
-        }
-        if (pih.nc - sd) < 4 {
-            return Err(Error::invalid(format!(
-                "jpegxs Cpih=3 + Sd>0: Nc-Sd must be >= 4 so Star-Tetrix operand window c<4 is wavelet-coded, got Nc={} Sd={}",
-                pih.nc, sd
             )));
         }
         let mut refs: Vec<&mut [i32]> = samples.iter_mut().map(|p| p.as_mut_slice()).collect();
