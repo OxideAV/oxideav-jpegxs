@@ -30,8 +30,8 @@ use crate::dequant::dequantize_precinct;
 use crate::dwt::{inverse_2d, inverse_cascade_2d};
 use crate::entropy::packet_body::{PrecinctState, PrecinctTop};
 use crate::entropy::{
-    decode_packet_body, parse_packet_header, parse_precinct_header, precinct_truncation,
-    BandCoefficients, PrecinctHeader,
+    decode_packet_body, parse_packet_header, parse_precinct_header, precinct_filler_bytes,
+    precinct_truncation, BandCoefficients, PacketWireSize, PrecinctHeader,
 };
 use crate::error::{JpegXsError as Error, Result};
 use crate::image::{JpegXsImage, JpegXsPlane as VideoPlane};
@@ -308,6 +308,15 @@ fn decode_slice(
         let mut entropy_cursor = entropy_start;
         let mut state = PrecinctState::default();
 
+        // Collect each non-empty packet's wire layout so that, after the
+        // precinct is fully decoded, the wire `Lprc[p]` / `Lcnt`+`Lsig`
+        // buffer-bound fields can be cross-checked against the values
+        // independently reconstructed from the coding state (Annex C.2
+        // Table C.1 + Annex C.5.3.4 Table C.6). `entries` references the
+        // packet layout owned by `precinct_plan`, which outlives this
+        // borrow, so the slices stay valid for the post-loop checks.
+        let mut wire_sizes: Vec<PacketWireSize> = Vec::new();
+
         for packet_layout in precinct_plan.packets.iter() {
             if packet_layout.entries.is_empty() {
                 continue;
@@ -331,6 +340,54 @@ fn decode_slice(
                 top_above.as_ref(),
             )?;
             entropy_cursor += dec.bytes_consumed;
+
+            wire_sizes.push(PacketWireSize {
+                header_bytes: packet_header.header_bytes as u32,
+                lcnt: packet_header.lcnt,
+                ldat: packet_header.ldat,
+                lsgn: packet_header.lsgn,
+                dr: packet_header.dr,
+                entries: &packet_layout.entries,
+            });
+        }
+
+        // Annex C.2 (Table C.1): the precinct's `Lprc[p]` field must be at
+        // least the summed on-wire size of all its packets (headers +
+        // sub-packets, including the inferred significance sub-packet); any
+        // surplus is filler. `precinct_filler_bytes` returns `Err` when the
+        // packets do not fit — a malformed codestream whose `Lprc[p]` is too
+        // small to contain its own packets. Reject it rather than decode
+        // past the declared precinct length.
+        //
+        // (The Annex C.5.3.4 / Table C.6 bitplane-count buffer bound is a
+        // *codestream-construction* constraint, not a decode gate: a
+        // degenerate all-zero precinct whose single-line bands each occupy
+        // a whole byte can legally violate it yet still decode, so it is
+        // exposed via [`bitplane_buffer_bound_satisfied`] for strict
+        // conformance callers rather than enforced here.)
+        let inferred_filler =
+            precinct_filler_bytes(&precinct_plan.geometry, &precinct_header, &wire_sizes)?;
+
+        // Cross-check: the filler-byte count `precinct_filler_bytes`
+        // reconstructs from the per-packet sizes (header + inferred
+        // `Lsig[p,s]` + `Lcnt` + `Ldat` + `Lsgn`) must equal the gap the
+        // decoder is about to skip (`entropy_end - entropy_cursor`). The
+        // decoder's own `entropy_cursor` advanced by `header_bytes +
+        // bytes_consumed`, where `bytes_consumed` already folds in the
+        // significance sub-packet it read off the wire, so the two
+        // accountings are independent: one infers `Lsig` from the band
+        // geometry, the other reads it from the codestream. A mismatch
+        // means the codestream's sub-packet lengths are internally
+        // inconsistent (e.g. a doctored `Lcnt`/`Ldat` field that still sums
+        // to a valid `Lprc`), which the bare `Lprc` bound alone would miss.
+        let actual_filler = entropy_end - entropy_cursor;
+        if inferred_filler as usize != actual_filler {
+            return Err(Error::invalid(format!(
+                "jpegxs decoder: precinct p={} sub-packet length fields inconsistent — \
+                 inferred {inferred_filler} filler bytes but {actual_filler} remain before Lprc end \
+                 (Annex C.2/C.3 Tables C.1/C.3)",
+                precinct_plan.p
+            )));
         }
 
         // Capture this precinct's vertical-prediction predecessor for
@@ -1192,6 +1249,60 @@ mod tests {
             vf.planes[0].data,
             vec![129, 129, 129, 129],
             "non-zero LL coefficient should propagate through the inverse 5/3 DWT"
+        );
+    }
+
+    /// Annex C.2 (Table C.1) gate: a precinct whose `Lprc[p]` field is too
+    /// small to contain its own packet headers + sub-packets must be
+    /// rejected, not silently decoded against a truncated entropy window.
+    /// We take the valid `build_constant_4x1_lossless` codestream and
+    /// overwrite the 24-bit `Lprc[p]` field at the start of its (only)
+    /// precinct header with 1, which is smaller than the two packet
+    /// headers the precinct carries, so `precinct_filler_bytes` reports the
+    /// packets do not fit.
+    #[test]
+    fn decode_rejects_undersized_lprc() {
+        let mut buf = build_constant_4x1_lossless();
+        // Layout (see `build_constant_4x1_lossless`): the buffer ends with
+        // the 2-byte EOC, preceded by `payload`, preceded by the 6-byte
+        // precinct header. The first 3 bytes of that precinct header are
+        // the big-endian `Lprc[p]` field. Recompute the payload length the
+        // same way the builder does so the offset is exact.
+        let mut payload_len = 0usize;
+        // packet 1: 5-byte header + 2 body bytes (0b10000000, 0x0C).
+        payload_len += 5 + 2;
+        // packet 2: 5-byte header + 1 body byte (0x00).
+        payload_len += 5 + 1;
+        let eoc = 2usize;
+        let prec_hdr_len = 6usize;
+        let prec_hdr_off = buf.len() - eoc - payload_len - prec_hdr_len;
+        // Sanity: the original Lprc equals payload_len.
+        let orig_lprc = ((buf[prec_hdr_off] as u32) << 16)
+            | ((buf[prec_hdr_off + 1] as u32) << 8)
+            | (buf[prec_hdr_off + 2] as u32);
+        assert_eq!(
+            orig_lprc as usize, payload_len,
+            "test self-check: located the precinct header Lprc field"
+        );
+        // Corrupt Lprc to 1 (too small for the packet headers).
+        buf[prec_hdr_off] = 0;
+        buf[prec_hdr_off + 1] = 0;
+        buf[prec_hdr_off + 2] = 1;
+
+        let params = CodecParameters::video(CodecId::new(crate::CODEC_ID_STR));
+        let mut dec = make_decoder(&params).unwrap();
+        let pkt = Packet::new(0, TimeBase::new(1, 25), buf);
+        // The undersized Lprc must surface as a decode error (it is caught
+        // either by the precinct-length consistency gate added here or by
+        // the downstream marker-chain check that finds the following SLH /
+        // EOC marker missing because the precinct's declared length stopped
+        // short) — never silently mis-decoded.
+        let res = dec
+            .send_packet(&pkt)
+            .and_then(|_| dec.receive_frame().map(|_| ()));
+        assert!(
+            res.is_err(),
+            "undersized Lprc[p] must be rejected, got Ok(())"
         );
     }
 
