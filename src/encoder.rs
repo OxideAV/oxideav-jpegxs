@@ -1065,6 +1065,219 @@ pub fn encode_planar_star_tetrix_highbd_lossy(
     )
 }
 
+/// High-bit-depth (`B[i] > 8`) **default-weights** CFA Star-Tetrix
+/// (`Cpih = 3`, `Sd = 1`) entry point.
+///
+/// The high-bit-depth companion to the 8-bit [`encode_planar_sd_star_tetrix`]
+/// at `nc = 4`, `sd = 1`. Suppresses the fourth Star-Tetrix output (the blue
+/// channel, Table F.4): that transform output is *raw-coded* per Annex B
+/// Tables B.10 / B.11 rather than wavelet-decomposed, while the inverse
+/// transform consumes it unchanged — so `NL = (Nc−Sd)·Nβ + Sd = 19 / 25 / 31`
+/// bands for `NL,x = 5`, `NL,y ∈ {0, 1, 2}`. The four CFA planes carry
+/// little-endian `u16` samples in `0..=2^bd − 1` (`bd ∈ 9..=16`), with
+/// `Bw = B[i] = bd` and the Annex G.3 DC level shift `1 << (bd − 1)`. The
+/// Star-Tetrix lifting (Annex F.5 Tables F.4–F.8), the forward / inverse
+/// quantizer, and the colour transform all operate on `i32` coefficients, so
+/// the only bit-depth-dependent pieces remain the level shift and the
+/// two-bytes-per-sample plane packing. `q = 0` → lossless (`Fq = 0`); `q ∈
+/// 1..=15` → regular (`Fq = 8`) deadzone quantization. Self-roundtrips
+/// bit-exactly at `q = 0`. Use [`encode_planar_sd_star_tetrix`] for the 8-bit
+/// path; use [`encode_planar_star_tetrix_highbd_annex_h`] to drive the Annex H
+/// PSNR-optimized weights on this same `Sd = 1` highbd layout.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_sd_star_tetrix_highbd(
+    width: u16,
+    height: u16,
+    nlx: u8,
+    nly: u8,
+    bd: u8,
+    q: u8,
+    e1: u8,
+    e2: u8,
+    cf: u8,
+    ct: u8,
+    planes: &[Vec<u16>],
+) -> Result<Vec<u8>> {
+    let byte_planes = pack_cfa_u16_planes(
+        width,
+        height,
+        bd,
+        planes,
+        "encode_planar_sd_star_tetrix_highbd",
+    )?;
+    let sx = vec![1u8; 4];
+    let sy = vec![1u8; 4];
+    let fq = if q == 0 { 0 } else { 8 };
+    encode_planar_inner_bd(
+        width,
+        height,
+        4,
+        bd,
+        3, // Cpih = 3 (Star-Tetrix)
+        nlx,
+        nly,
+        fq,
+        q,
+        &sx,
+        &sy,
+        e1,
+        e2,
+        cf,
+        ct,
+        None,
+        Vec::new(), // band_gains: default (build_band_gains_sd)
+        Vec::new(), // band_priorities: default (build_band_priorities_sd)
+        0,          // cw: single precinct per row
+        1,          // sd = 1: suppress the fourth Star-Tetrix output
+        0,          // fs: signs jointly with data
+        0,          // hsl: single slice
+        0,          // qpih: deadzone inverse quantizer
+        0,          // rp: no precinct refinement
+        Vec::new(), // q_slices
+        Vec::new(), // q_precincts
+        Vec::new(), // r_precincts
+        &byte_planes,
+    )
+}
+
+/// High-bit-depth (`B[i] > 8`) **Annex H content-adaptive WGT** CFA
+/// Star-Tetrix (`Cpih = 3`, `Sd = 1`) entry point.
+///
+/// The high-bit-depth companion to the 8-bit
+/// [`encode_planar_star_tetrix_annex_h`]. Identical `Sd = 1` CFA layout (four
+/// `width × height` little-endian `u16` planes `[R, G1, G2, B]` in
+/// `0..=2^bd − 1`, `bd ∈ 9..=16`, the fourth output raw-coded per Annex B
+/// Tables B.10 / B.11), but drives the WGT marker and forward truncation
+/// `T[p,b] = clamp(Q[p] − G[b] − r, 0, 15)` from the ISO/IEC 21122-1:2022
+/// Annex H PSNR-optimized CFA tables H.9 / H.10 / H.11 (`Cpih = 3`, `Sd = 1`,
+/// 4:4:4:4, `NL,x = 5`, `NL,y ∈ {0, 1, 2}`). Each table tabulates a separate
+/// `(G[b], P[b])` column per CTS extent `Cf ∈ {0, 3}` (full / restricted
+/// in-line); `cf` selects the column. Configurations outside the tabulated set
+/// (`cf ∉ {0, 3}`, `NL,x ≠ 5`, `NL,y > 2`) fall back to the default-weights
+/// [`encode_planar_sd_star_tetrix_highbd`] path so the codestream is always
+/// well-formed.
+///
+/// Bit depth and the Annex H weights are orthogonal: the H-table gains /
+/// priorities and the matching forward-truncation branch are bit-depth
+/// agnostic (they act on `i32` wavelet coefficients), so the only
+/// bit-depth-dependent pieces remain the Annex G.3 DC level shift
+/// `1 << (bd − 1)` and the two-bytes-per-sample `u16`-LE plane packing. `q = 0`
+/// → lossless (the WGT advertises the H column but `T = 0` so every sample
+/// self-roundtrips bit-exactly); `q ∈ 1..=15` → regular deadzone quantization
+/// using the H gains. This closes the previously-deferred "content-adaptive WGT
+/// weights for the CFA Star-Tetrix layouts at bit depths above 8" follow-up.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_star_tetrix_highbd_annex_h(
+    width: u16,
+    height: u16,
+    nlx: u8,
+    nly: u8,
+    bd: u8,
+    q: u8,
+    e1: u8,
+    e2: u8,
+    cf: u8,
+    ct: u8,
+    planes: &[Vec<u16>],
+) -> Result<Vec<u8>> {
+    let sx = vec![1u8; 4];
+    let sy = vec![1u8; 4];
+    // Outside the tabulated H.9–H.11 set `annex_h_weights` returns `None`; fall
+    // back to the default-weights highbd Sd=1 Star-Tetrix path so the CFA
+    // codestream is still well-formed (mirrors the 8-bit
+    // `encode_planar_star_tetrix_annex_h` fallback).
+    let Some((gains, priorities)) = annex_h_weights(4, 3, 1, nlx, nly, cf, &sx, &sy) else {
+        return encode_planar_sd_star_tetrix_highbd(
+            width, height, nlx, nly, bd, q, e1, e2, cf, ct, planes,
+        );
+    };
+    let byte_planes = pack_cfa_u16_planes(
+        width,
+        height,
+        bd,
+        planes,
+        "encode_planar_star_tetrix_highbd_annex_h",
+    )?;
+    let fq = if q == 0 { 0 } else { 8 };
+    encode_planar_inner_bd(
+        width,
+        height,
+        4,
+        bd,
+        3, // Cpih = 3 (Star-Tetrix)
+        nlx,
+        nly,
+        fq,
+        q,
+        &sx,
+        &sy,
+        e1,
+        e2,
+        cf,
+        ct,
+        None,
+        gains,
+        priorities,
+        0,          // cw: single precinct per row
+        1,          // sd = 1: suppress the fourth Star-Tetrix output
+        0,          // fs: signs jointly with data
+        0,          // hsl: single slice
+        0,          // qpih: deadzone inverse quantizer
+        0,          // rp: no precinct refinement
+        Vec::new(), // q_slices
+        Vec::new(), // q_precincts
+        Vec::new(), // r_precincts
+        &byte_planes,
+    )
+}
+
+/// Validate + pack four high-bit-depth (`bd ∈ 9..=16`) CFA `u16` planes into
+/// the two-bytes-per-sample little-endian byte layout `encode_planar_inner_bd`
+/// expects (`Cpih = 3` Star-Tetrix, `Nc = 4`, 4:4:4:4). Shared by the highbd
+/// `Sd = 1` Star-Tetrix entry points so the bound / count / range checks live
+/// in exactly one place. `who` names the caller for error messages.
+fn pack_cfa_u16_planes(
+    width: u16,
+    height: u16,
+    bd: u8,
+    planes: &[Vec<u16>],
+    who: &str,
+) -> Result<Vec<Vec<u8>>> {
+    if !(9..=16).contains(&bd) {
+        return Err(Error::Unsupported(format!(
+            "jpegxs encoder: {who} requires B[i] in 9..=16, got {bd} (use the 8-bit Star-Tetrix entry points for bd=8)"
+        )));
+    }
+    if planes.len() != 4 {
+        return Err(Error::invalid(format!(
+            "jpegxs encoder: {who} requires exactly 4 component planes (Cpih=3, Annex F.2), got {}",
+            planes.len()
+        )));
+    }
+    let max_sample: u16 = ((1u32 << bd) - 1) as u16;
+    let want_samples = (width as usize) * (height as usize);
+    let mut byte_planes: Vec<Vec<u8>> = Vec::with_capacity(4);
+    for (i, p) in planes.iter().enumerate() {
+        if p.len() != want_samples {
+            return Err(Error::invalid(format!(
+                "jpegxs encoder: {who} plane {i} sample count {} != width*height {want_samples}",
+                p.len()
+            )));
+        }
+        let mut bytes = Vec::with_capacity(p.len() * 2);
+        for &s in p {
+            if s > max_sample {
+                return Err(Error::invalid(format!(
+                    "jpegxs encoder: {who} plane {i} sample {s} exceeds B[i]={bd} max {max_sample}"
+                )));
+            }
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        byte_planes.push(bytes);
+    }
+    Ok(byte_planes)
+}
+
 /// Lossy entry point. `q` is the precinct quantization step (0..=15);
 /// 0 reduces to lossless. `fq` must be 8 for `q > 0` per Table A.8.
 #[allow(clippy::too_many_arguments)]
@@ -15745,6 +15958,210 @@ mod tests {
             fallback, direct,
             "unmatched CFA config must equal default Sd=1 Star-Tetrix"
         );
+    }
+
+    // === Round 346: high-bit-depth (B[i] > 8) CFA Star-Tetrix Annex H
+    // weights (H.9–H.11) on the Sd=1 layout. Closes the README "content-
+    // adaptive WGT weights for the CFA star-tetrix layouts at bit depths
+    // above 8" follow-up. ================================================
+
+    /// Build four deterministic CFA `u16` planes with samples in
+    /// `0..=2^bd − 1` (the `[R, G1, G2, B]` highbd input for the Sd=1
+    /// Star-Tetrix entry points).
+    fn cfa_planes_u16(w: usize, h: usize, bd: u8) -> [Vec<u16>; 4] {
+        let max = (1u32 << bd) - 1;
+        let make = |seed: u32| {
+            let mut v = vec![0u16; w * h];
+            for y in 0..h {
+                for x in 0..w {
+                    v[y * w + x] = ((x as u32)
+                        .wrapping_mul(seed + 2)
+                        .wrapping_add((y as u32).wrapping_mul(seed + 3))
+                        .wrapping_add(seed)
+                        % (max + 1)) as u16;
+                }
+            }
+            v
+        };
+        [make(7), make(13), make(19), make(31)]
+    }
+
+    /// Round 346: the high-bit-depth CFA Star-Tetrix Annex H entry point
+    /// [`encode_planar_star_tetrix_highbd_annex_h`] (a) emits a WGT carrying
+    /// exactly the H.9 / H.10 / H.11 `(G[b], P[b])` column selected by `cf`
+    /// (one pair per existing band, NL = 19 / 25 / 31), (b) round-trips through
+    /// the decoder for the `Cpih = 3, Sd = 1, Nc = 4` CFA layout at `bd ∈ {10,
+    /// 12, 16}`, and (c) differs from the default-weights highbd Sd=1 path.
+    #[test]
+    fn round346_cfa_star_tetrix_highbd_annex_h_roundtrip_and_differ() {
+        let (w, h) = (32usize, 16usize);
+        let cases: &[(u8, usize)] = &[(0, 19), (1, 25), (2, 31)];
+        for &bd in &[10u8, 12, 16] {
+            let planes = cfa_planes_u16(w, h, bd);
+            for &(nly, n_bands) in cases {
+                for cf in [0u8, 3u8] {
+                    let sx = [1u8; 4];
+                    let sy = [1u8; 4];
+                    let (exp_g, exp_p) = annex_h_weights(4, 3, 1, 5, nly, cf, &sx, &sy)
+                        .unwrap_or_else(|| panic!("H table NLy={nly} cf={cf}"));
+                    assert_eq!(exp_g.len(), n_bands, "bd={bd} NLy={nly}: band count");
+
+                    let cs = encode_planar_star_tetrix_highbd_annex_h(
+                        w as u16, h as u16, 5, nly, bd, 2, 0, 0, cf, 0, &planes,
+                    )
+                    .unwrap_or_else(|e| {
+                        panic!("highbd CFA Annex H encode bd={bd} NLy={nly} cf={cf}: {e:?}")
+                    });
+
+                    // (a) WGT carries exactly the selected H-table column.
+                    let parsed = crate::codestream::parse(&cs).expect("parse highbd CFA Annex H");
+                    let weights = parsed.wgt().expect("typed WGT view");
+                    let got_g: Vec<u8> = weights.iter().map(|w| w.gain).collect();
+                    let got_p: Vec<u8> = weights.iter().map(|w| w.priority).collect();
+                    assert_eq!(got_g, exp_g, "bd={bd} NLy={nly} cf={cf}: WGT gains");
+                    assert_eq!(got_p, exp_p, "bd={bd} NLy={nly} cf={cf}: WGT priorities");
+
+                    // (b) Round-trips through the decoder with the highbd plane
+                    // layout (2 bytes/sample, Bw=B[i]=bd).
+                    let img = decode_codestream(&cs, None).expect("decode highbd CFA Annex H");
+                    assert_eq!(img.num_components, 4, "bd={bd} NLy={nly}: 4 CFA comps");
+                    assert_eq!(img.cpih, 3, "bd={bd} NLy={nly}: Cpih=3");
+                    assert_eq!(img.bit_depth, bd, "bd={bd}: Bw byte");
+                    assert_eq!(img.width as usize, w);
+                    assert_eq!(img.height as usize, h);
+                    for p in &img.planes {
+                        assert_eq!(p.stride, w * 2, "bd={bd}: 2 bytes/sample plane stride");
+                    }
+
+                    // (c) Differs from the default-weights highbd Sd=1 path.
+                    let default_cs = encode_planar_sd_star_tetrix_highbd(
+                        w as u16, h as u16, 5, nly, bd, 2, 0, 0, cf, 0, &planes,
+                    )
+                    .expect("default-weights highbd Sd=1 Star-Tetrix");
+                    assert_ne!(
+                        cs, default_cs,
+                        "bd={bd} NLy={nly} cf={cf}: Annex H stream must differ from default"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Round 346: at `q = 0` the highbd CFA Star-Tetrix Annex H weights are a
+    /// no-op for the reconstructed samples — every component self-roundtrips
+    /// bit-exactly through the 2-bytes-per-sample plane layout even though the
+    /// WGT advertises the H-table gains/priorities. The strict encoder/decoder
+    /// `T[p,b]` alignment proof for the highbd Cpih=3, Sd=1 CFA layout.
+    #[test]
+    fn round346_cfa_star_tetrix_highbd_annex_h_lossless_bit_exact() {
+        let (w, h) = (32usize, 16usize);
+        for &bd in &[10u8, 12, 14, 16] {
+            let planes = cfa_planes_u16(w, h, bd);
+            for nly in [0u8, 1, 2] {
+                for cf in [0u8, 3u8] {
+                    let cs = encode_planar_star_tetrix_highbd_annex_h(
+                        w as u16, h as u16, 5, nly, bd, 0, 0, 0, cf, 0, &planes,
+                    )
+                    .expect("highbd CFA Annex H lossless encode");
+                    let img =
+                        decode_codestream(&cs, None).expect("decode highbd CFA Annex H lossless");
+                    // Reconstruct each component as u16 from the LE plane bytes
+                    // and compare against the source samples.
+                    for (c, (rec, src)) in img.planes.iter().zip(planes.iter()).enumerate() {
+                        let got: Vec<u16> = rec
+                            .data
+                            .chunks_exact(2)
+                            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                            .collect();
+                        assert_eq!(
+                            got, *src,
+                            "bd={bd} NLy={nly} cf={cf}: component {c} bit-exact at q=0"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Round 346: a highbd CFA configuration outside the tabulated H.9–H.11 set
+    /// (`cf ∉ {0, 3}` or `NLy > 2`) falls back to the default-weights highbd
+    /// Sd=1 Star-Tetrix path and is byte-identical to a direct default encode.
+    #[test]
+    fn round346_cfa_star_tetrix_highbd_annex_h_falls_back_when_unmatched() {
+        let (w, h) = (32usize, 16usize);
+        let bd = 12u8;
+        let planes = cfa_planes_u16(w, h, bd);
+        // NLy=3 → no table → default weights with Sd=1 highbd Star-Tetrix.
+        let fallback = encode_planar_star_tetrix_highbd_annex_h(
+            w as u16, h as u16, 5, 3, bd, 2, 0, 0, 0, 0, &planes,
+        )
+        .expect("fallback highbd CFA encode");
+        let direct = encode_planar_sd_star_tetrix_highbd(
+            w as u16, h as u16, 5, 3, bd, 2, 0, 0, 0, 0, &planes,
+        )
+        .expect("direct default highbd Sd=1 Star-Tetrix encode");
+        assert_eq!(
+            fallback, direct,
+            "unmatched highbd CFA config must equal default highbd Sd=1 Star-Tetrix"
+        );
+        // NL,x ≠ 5 → no table → also fallback (the H.9–H.11 tables are all
+        // tabulated at NL,x = 5). cf ∉ {0, 3} is rejected at CTS validation
+        // before the fallback can run, so it is not exercised here.
+        let fb_nlx = encode_planar_star_tetrix_highbd_annex_h(
+            w as u16, h as u16, 4, 1, bd, 2, 0, 0, 0, 0, &planes,
+        )
+        .expect("fallback highbd CFA encode NLx=4");
+        let direct_nlx = encode_planar_sd_star_tetrix_highbd(
+            w as u16, h as u16, 4, 1, bd, 2, 0, 0, 0, 0, &planes,
+        )
+        .expect("direct default highbd Sd=1 Star-Tetrix encode NLx=4");
+        assert_eq!(
+            fb_nlx, direct_nlx,
+            "NLx=4 highbd CFA must fall back to default"
+        );
+    }
+
+    /// Round 346: the highbd CFA Star-Tetrix entry points reject the same
+    /// out-of-band inputs as their 8-bit / `Sd = 0` siblings — bit depth
+    /// outside `9..=16`, the wrong plane count, mismatched plane sizes, and
+    /// out-of-range samples.
+    #[test]
+    fn round346_cfa_star_tetrix_highbd_input_validation() {
+        let (w, h) = (16usize, 8usize);
+        let bd = 10u8;
+        let planes = cfa_planes_u16(w, h, bd);
+        // bd = 8 rejected (use the 8-bit entry points).
+        assert!(matches!(
+            encode_planar_star_tetrix_highbd_annex_h(
+                w as u16, h as u16, 5, 1, 8, 2, 0, 0, 0, 0, &planes
+            ),
+            Err(Error::Unsupported(_))
+        ));
+        // bd = 17 rejected.
+        assert!(encode_planar_sd_star_tetrix_highbd(
+            w as u16, h as u16, 5, 1, 17, 2, 0, 0, 0, 0, &planes
+        )
+        .is_err());
+        // Wrong plane count (3, not 4) rejected.
+        let three: Vec<Vec<u16>> = planes[..3].to_vec();
+        assert!(encode_planar_star_tetrix_highbd_annex_h(
+            w as u16, h as u16, 5, 1, bd, 2, 0, 0, 0, 0, &three
+        )
+        .is_err());
+        // Mismatched plane sample count rejected.
+        let mut bad = planes.to_vec();
+        bad[2].pop();
+        assert!(encode_planar_sd_star_tetrix_highbd(
+            w as u16, h as u16, 5, 1, bd, 2, 0, 0, 0, 0, &bad
+        )
+        .is_err());
+        // Out-of-range sample (> 2^bd − 1) rejected.
+        let mut over = planes.to_vec();
+        over[0][0] = ((1u32 << bd) as u16).wrapping_add(5);
+        assert!(encode_planar_star_tetrix_highbd_annex_h(
+            w as u16, h as u16, 5, 1, bd, 2, 0, 0, 0, 0, &over
+        )
+        .is_err());
     }
 
     // === Round 343: uniform inverse quantizer (Qpih=1, Annex D.3) on

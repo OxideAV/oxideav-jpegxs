@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased — round 346 (high-bit-depth CFA Star-Tetrix Annex H weights)
+
+Closes the README "content-adaptive WGT weights for the CFA Star-Tetrix
+layouts at bit depths above 8" follow-up by wiring the ISO/IEC
+21122-1:2022 Annex H PSNR-optimized CFA tables (H.9 / H.10 / H.11) through
+the high-bit-depth (`B[i] ∈ 9..=16`, little-endian `u16` planes) `Sd = 1`
+Star-Tetrix path.
+
+* `encoder::encode_planar_sd_star_tetrix_highbd(width, height, nlx, nly,
+  bd, q, e1, e2, cf, ct, planes)` — the high-bit-depth companion to
+  [`encode_planar_sd_star_tetrix`] at `Nc = 4`, `Sd = 1`. Suppresses the
+  fourth Star-Tetrix output (raw-coded per Annex B Tables B.10 / B.11),
+  `NL = (Nc−Sd)·Nβ + Sd = 19 / 25 / 31` bands for `NL,x = 5`,
+  `NL,y ∈ {0, 1, 2}`. `Bw = B[i] = bd`, Annex G.3 DC level shift
+  `1 << (bd − 1)`, two-bytes-per-sample plane packing. This is the first
+  high-bit-depth `Sd = 1` Star-Tetrix entry point.
+* `encoder::encode_planar_star_tetrix_highbd_annex_h(width, height, nlx,
+  nly, bd, q, e1, e2, cf, ct, planes)` — the high-bit-depth companion to
+  [`encode_planar_star_tetrix_annex_h`]. Drives the WGT marker and the
+  forward truncation `T[p,b] = clamp(Q[p] − G[b] − r, 0, 15)` from the
+  H.9–H.11 `(G[b], P[b])` column selected by `cf ∈ {0, 3}`. Configurations
+  outside the tabulated set (`NL,x ≠ 5`, `NL,y > 2`) fall back to the
+  default-weights highbd path. Bit depth and the Annex H weights are
+  orthogonal (the gains / priorities act on `i32` coefficients), so the
+  reconstruction is bit-exact at `q = 0` even with the H column advertised.
+* A shared `pack_cfa_u16_planes` helper centralises the highbd CFA
+  validation (bit-depth `9..=16`, exactly 4 planes, plane-size and
+  per-sample range checks) for both new entry points.
+* +4 tests: WGT carries exactly the selected H column + decodes + differs
+  from default at `bd ∈ {10, 12, 16}` and `NL,y ∈ {0, 1, 2}` × `Cf ∈ {0, 3}`;
+  lossless bit-exact self-roundtrip at `bd ∈ {10, 12, 14, 16}`; fallback to
+  the default-weights highbd path for untabulated configs; and input
+  validation (bd outside `9..=16`, wrong plane count, mismatched sizes,
+  out-of-range samples).
+
 ## Unreleased — round 343 (uniform inverse quantizer `Qpih = 1` on chroma-subsampled inputs)
 
 Widens the uniform-quantizer (`Qpih = 1`, Annex D.3) decode path to the
