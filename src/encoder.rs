@@ -3605,6 +3605,71 @@ pub fn encode_planar_qpih(
     )
 }
 
+/// Chroma-subsampled companion to [`encode_planar_qpih`]: signals the
+/// uniform inverse quantizer (`Qpih = 1`, Annex A.4.4 Table A.10) on a
+/// picture whose components carry explicit per-component sampling factors
+/// `sx` / `sy` (4:2:2 = `sx=[1,2,2], sy=[1,1,1]`; 4:2:0 =
+/// `sx=[1,2,2], sy=[2,2,2]`).
+///
+/// The uniform-quantizer decode path (Annex D.3, the Neumann-series
+/// reconstruction) was previously only reachable for the 4:4:4 layout via
+/// [`encode_planar_qpih`]; this entry point lets a chroma-subsampled
+/// codestream select the same decoder kernel, so the inverse-uniform
+/// reconstruction is exercised end-to-end across all three documented
+/// chroma samplings (4:4:4 / 4:2:2 / 4:2:0).
+///
+/// As with [`encode_planar_qpih`], the data sub-packet is byte-identical
+/// to the `Qpih = 0` form — only the PIH `Qpih` bit changes — so at
+/// `q = 0` (lossless, `T[p,b] = 0`) the uniform reconstruction collapses
+/// to `v` and the stream round-trips bit-exactly. At `q > 0` (`Fq = 8`)
+/// the decoder applies the equal-bucket Neumann reconstruction per band.
+/// The decoder threads `pih.qpih` into `dequantize_precinct`, so any
+/// output round-trips through [`crate::decode_jpeg_xs`].
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_qpih_subsampled(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    q: u8,
+    sx: &[u8],
+    sy: &[u8],
+    planes: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    let fq = if q == 0 { 0 } else { 8 };
+    encode_planar_inner_nlt(
+        width,
+        height,
+        nc,
+        cpih,
+        nlx,
+        nly,
+        fq,
+        q,
+        sx,
+        sy,
+        0,
+        0,
+        0,
+        0,
+        None,
+        Vec::new(),
+        Vec::new(),
+        0,          // cw: single precinct column
+        0,          // sd: no CWD suppression
+        0,          // fs: signs jointly with data (Fs=0)
+        0,          // hsl: single slice (Hsl = Np,y)
+        1,          // qpih: uniform inverse quantizer (Qpih=1, Annex D.3)
+        0,          // rp: no precinct refinement (R[p] = 0)
+        Vec::new(), // q_slices: single picture-level q
+        Vec::new(), // q_precincts: no per-precinct override
+        Vec::new(), // r_precincts: no per-precinct R[p] override
+        planes,
+    )
+}
+
 /// Round-115 precinct-refinement entry point (`R[p] > 0`).
 ///
 /// Same shape as [`encode_planar_lossy`] but takes an explicit precinct
@@ -15666,6 +15731,181 @@ mod tests {
         assert_eq!(
             fallback, direct,
             "unmatched CFA config must equal default Sd=1 Star-Tetrix"
+        );
+    }
+
+    // === Round 343: uniform inverse quantizer (Qpih=1, Annex D.3) on
+    // chroma-subsampled inputs — exercises the inverse-uniform decode
+    // path across all three documented chroma samplings. =================
+
+    /// Build a deterministic 4:2:0 luma + half-resolution chroma triple of
+    /// the given full-resolution dimensions.
+    fn synthetic_420(w: usize, h: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let n_y = w * h;
+        let n_c = (w / 2) * (h / 2);
+        let mut y = vec![0u8; n_y];
+        let mut cb = vec![0u8; n_c];
+        let mut cr = vec![0u8; n_c];
+        for (i, slot) in y.iter_mut().enumerate() {
+            *slot = ((i * 7 + 13) % 256) as u8;
+        }
+        for i in 0..n_c {
+            cb[i] = ((i * 11 + 17) % 256) as u8;
+            cr[i] = ((i * 19 + 23) % 256) as u8;
+        }
+        (y, cb, cr)
+    }
+
+    /// Build a deterministic 4:2:2 luma + horizontally-halved chroma triple.
+    fn synthetic_422(w: usize, h: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let n_y = w * h;
+        let n_c = (w / 2) * h;
+        let mut y = vec![0u8; n_y];
+        let mut cb = vec![0u8; n_c];
+        let mut cr = vec![0u8; n_c];
+        for (i, slot) in y.iter_mut().enumerate() {
+            *slot = ((i * 5 + 9) % 256) as u8;
+        }
+        for i in 0..n_c {
+            cb[i] = ((i * 13 + 21) % 256) as u8;
+            cr[i] = ((i * 23 + 29) % 256) as u8;
+        }
+        (y, cb, cr)
+    }
+
+    /// 4:2:0 Qpih=1 lossless (q=0): the uniform reconstruction collapses to
+    /// `v` when `T = 0`, so the chroma-subsampled stream round-trips bit-
+    /// exactly through the inverse-uniform decode kernel. Confirms the PIH
+    /// Qpih bit is actually 1 (the decoder takes the Annex D.3 branch) and
+    /// every sample is recovered exactly.
+    #[test]
+    fn r343_qpih_uniform_420_lossless_round_trip() {
+        let (w, h) = (64usize, 64usize);
+        let (y, cb, cr) = synthetic_420(w, h);
+        let cs = encode_planar_qpih_subsampled(
+            w as u16,
+            h as u16,
+            3,
+            0,
+            2,
+            2,
+            0, // q = 0 lossless
+            &[1, 2, 2],
+            &[1, 2, 2],
+            &[y.clone(), cb.clone(), cr.clone()],
+        )
+        .expect("encode 4:2:0 Qpih=1 lossless");
+        let parsed = crate::codestream::parse(&cs).expect("parse");
+        assert_eq!(parsed.pih.qpih, 1, "4:2:0 stream must signal Qpih=1");
+        let img = decode_codestream(&cs, None).expect("decode 4:2:0 Qpih=1 lossless");
+        assert_eq!(img.num_components, 3);
+        assert_eq!(img.planes[0].data, y, "Y plane lossless");
+        assert_eq!(img.planes[1].data, cb, "Cb plane lossless");
+        assert_eq!(img.planes[2].data, cr, "Cr plane lossless");
+    }
+
+    /// 4:2:2 Qpih=1 lossless (q=0) bit-exact round-trip through the
+    /// inverse-uniform decode path.
+    #[test]
+    fn r343_qpih_uniform_422_lossless_round_trip() {
+        let (w, h) = (64usize, 48usize);
+        let (y, cb, cr) = synthetic_422(w, h);
+        let cs = encode_planar_qpih_subsampled(
+            w as u16,
+            h as u16,
+            3,
+            0,
+            3,
+            3,
+            0, // q = 0 lossless
+            &[1, 2, 2],
+            &[1, 1, 1],
+            &[y.clone(), cb.clone(), cr.clone()],
+        )
+        .expect("encode 4:2:2 Qpih=1 lossless");
+        let parsed = crate::codestream::parse(&cs).expect("parse");
+        assert_eq!(parsed.pih.qpih, 1, "4:2:2 stream must signal Qpih=1");
+        let img = decode_codestream(&cs, None).expect("decode 4:2:2 Qpih=1 lossless");
+        assert_eq!(img.planes[0].data, y, "Y plane lossless");
+        assert_eq!(img.planes[1].data, cb, "Cb plane lossless");
+        assert_eq!(img.planes[2].data, cr, "Cr plane lossless");
+    }
+
+    /// 4:2:0 Qpih=1 lossy (q=2): the decoder takes the Annex D.3 Neumann-
+    /// series branch on every band. Confirms the reconstruction stays valid
+    /// (decodable, correct geometry) and above a sane PSNR floor — the
+    /// uniform (round-to-nearest) kernel must not reconstruct worse than the
+    /// deadzone path it parallels.
+    #[test]
+    fn r343_qpih_uniform_420_lossy_q2_decodes_above_floor() {
+        let (w, h) = (64usize, 64usize);
+        let (y, cb, cr) = synthetic_420(w, h);
+        let cs = encode_planar_qpih_subsampled(
+            w as u16,
+            h as u16,
+            3,
+            0,
+            2,
+            2,
+            2, // q = 2 lossy → Fq = 8
+            &[1, 2, 2],
+            &[1, 2, 2],
+            &[y.clone(), cb.clone(), cr.clone()],
+        )
+        .expect("encode 4:2:0 Qpih=1 q=2");
+        let parsed = crate::codestream::parse(&cs).expect("parse");
+        assert_eq!(parsed.pih.qpih, 1, "4:2:0 lossy stream must signal Qpih=1");
+        let img = decode_codestream(&cs, None).expect("decode 4:2:0 Qpih=1 q=2");
+        assert_eq!(img.planes[0].data.len(), y.len());
+        assert_eq!(img.planes[1].data.len(), cb.len());
+        assert_eq!(img.planes[2].data.len(), cr.len());
+        let psnr_y = psnr(&y, &img.planes[0].data);
+        let psnr_cb = psnr(&cb, &img.planes[1].data);
+        let psnr_cr = psnr(&cr, &img.planes[2].data);
+        assert!(
+            psnr_y >= 20.0 && psnr_cb >= 20.0 && psnr_cr >= 20.0,
+            "4:2:0 Qpih=1 q=2 PSNR below 20 dB: Y={psnr_y} Cb={psnr_cb} Cr={psnr_cr}"
+        );
+    }
+
+    /// 4:4:4 RGB-RCT Qpih=1 lossy (q=2) under the uniform quantizer keeps the
+    /// reconstruction valid through the colour-transform inverse — confirms
+    /// the inverse-uniform kernel composes with the RCT decode path.
+    #[test]
+    fn r343_qpih_uniform_444_rct_lossy_q2_decodes() {
+        let (w, h) = (32usize, 32usize);
+        let n = w * h;
+        let mut r = vec![0u8; n];
+        let mut g = vec![0u8; n];
+        let mut b = vec![0u8; n];
+        for i in 0..n {
+            r[i] = ((i * 3 + 5) % 256) as u8;
+            g[i] = ((i * 7 + 11) % 256) as u8;
+            b[i] = ((i * 13 + 19) % 256) as u8;
+        }
+        let cs = encode_planar_qpih_subsampled(
+            w as u16,
+            h as u16,
+            3,
+            1, // Cpih=1 RCT
+            2,
+            2,
+            2, // q = 2
+            &[1, 1, 1],
+            &[1, 1, 1],
+            &[r.clone(), g.clone(), b.clone()],
+        )
+        .expect("encode 4:4:4 RCT Qpih=1 q=2");
+        let parsed = crate::codestream::parse(&cs).expect("parse");
+        assert_eq!(parsed.pih.qpih, 1, "RCT stream must signal Qpih=1");
+        let img = decode_codestream(&cs, None).expect("decode 4:4:4 RCT Qpih=1 q=2");
+        assert_eq!(img.num_components, 3);
+        let psnr_r = psnr(&r, &img.planes[0].data);
+        let psnr_g = psnr(&g, &img.planes[1].data);
+        let psnr_b = psnr(&b, &img.planes[2].data);
+        assert!(
+            psnr_r >= 18.0 && psnr_g >= 18.0 && psnr_b >= 18.0,
+            "4:4:4 RCT Qpih=1 q=2 PSNR below 18 dB: R={psnr_r} G={psnr_g} B={psnr_b}"
         );
     }
 }

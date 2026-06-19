@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased — round 343 (uniform inverse quantizer `Qpih = 1` on chroma-subsampled inputs)
+
+Widens the uniform-quantizer (`Qpih = 1`, Annex D.3) decode path to the
+chroma-subsampled layouts, so the inverse-uniform Neumann-series
+reconstruction is now exercised end-to-end across all three documented
+chroma samplings (4:4:4 / 4:2:2 / 4:2:0) rather than only the 4:4:4 path
+[`encode_planar_qpih`] reached.
+
+* `encoder::encode_planar_qpih_subsampled(width, height, nc, cpih, nlx,
+  nly, q, sx, sy, planes)` — chroma-subsampled companion to
+  [`encode_planar_qpih`]. Signals the PIH `Qpih = 1` bit so the decoder
+  takes the Annex D.3 inverse-uniform branch; takes explicit
+  per-component `sx` / `sy` sampling factors. The data sub-packet is
+  byte-identical to the `Qpih = 0` form, so the lossless (`q = 0`,
+  `T = 0`) stream round-trips bit-exactly while `q > 0` engages the
+  equal-bucket Neumann reconstruction per band.
+* +4 round-trip tests: 4:2:0 + 4:2:2 lossless bit-exact through the
+  inverse-uniform decode kernel (every sample recovered, PIH `Qpih = 1`
+  confirmed), 4:2:0 lossy `q = 2` above a 20 dB floor, and 4:4:4 RGB-RCT
+  lossy `q = 2` confirming the uniform kernel composes with the
+  reversible colour-transform inverse.
+
 ## Unreleased — round 334 (bitplane-count-subpacket size `Lcnt[p,s]` inference + consistency predicate)
 
 Adds the bitplane-count subpacket to the family of subpacket-size
