@@ -1306,6 +1306,72 @@ mod tests {
         );
     }
 
+    /// Annex C.3 (§4182): "the bitplane count, data and sign subpackets may
+    /// contain an arbitrary number of filler bytes at their end". The exact
+    /// sub-packet filler cross-check added to the decode path must *tolerate*
+    /// such legal filler, not reject it. We take the valid constant-4×1
+    /// codestream and grow packet 1's data sub-packet by one filler byte:
+    /// bump its short-form `Ldat` field from 1 to 2, insert one 0x00 filler
+    /// byte after the data byte, and grow `Lprc[p]` by 1 to match. The
+    /// decoder must skip the filler and reconstruct the identical
+    /// `[129, 129, 129, 129]` row.
+    #[test]
+    fn decode_tolerates_data_subpacket_filler() {
+        let base = build_constant_4x1_lossless();
+        // Locate the precinct header / payload boundaries exactly as in
+        // `decode_rejects_undersized_lprc`.
+        let payload_len = (5 + 2) + (5 + 1);
+        let eoc = 2usize;
+        let prec_hdr_len = 6usize;
+        let prec_hdr_off = base.len() - eoc - payload_len - prec_hdr_len;
+        let payload_off = prec_hdr_off + prec_hdr_len;
+        // Packet 1 is `hdr1` (5 bytes) + Lcnt byte (1) + Ldat byte (1). The
+        // short header packs Dr(1)|Ldat(15)|Lcnt(13)|Lsgn(11); `Ldat` is the
+        // top 15 bits after the Dr bit, i.e. bits [38..=24] of the 40-bit
+        // header. With the builder's values (Dr=0, Ldat=1, Lcnt=1, Lsgn=0)
+        // those header bytes are byte 0..5 of the payload.
+        let hdr1_off = payload_off;
+        // Rebuild hdr1 with Ldat = 2 instead of 1.
+        let mut bits1: u64 = 0;
+        bits1 <<= 1; // Dr = 0
+        bits1 = (bits1 << 15) | 2; // Ldat = 2 (was 1)
+        bits1 = (bits1 << 13) | 1; // Lcnt = 1
+        bits1 <<= 11; // Lsgn = 0
+        let mut new_buf = base.clone();
+        for i in 0..5 {
+            new_buf[hdr1_off + i] = ((bits1 >> (8 * (4 - i))) & 0xff) as u8;
+        }
+        // Insert one filler byte after packet 1's data byte. Packet 1 data
+        // byte is at payload offset 5 (hdr) + 1 (Lcnt) + 1 (Ldat) - 1 = index
+        // 6 within the payload; the filler goes immediately after it.
+        let filler_at = payload_off + 5 + 1 + 1; // after hdr1 + Lcnt + Ldat byte
+        new_buf.insert(filler_at, 0x00);
+        // Grow Lprc[p] by 1 to account for the inserted filler byte.
+        let lprc = ((new_buf[prec_hdr_off] as u32) << 16)
+            | ((new_buf[prec_hdr_off + 1] as u32) << 8)
+            | (new_buf[prec_hdr_off + 2] as u32);
+        let lprc = lprc + 1;
+        new_buf[prec_hdr_off] = ((lprc >> 16) & 0xff) as u8;
+        new_buf[prec_hdr_off + 1] = ((lprc >> 8) & 0xff) as u8;
+        new_buf[prec_hdr_off + 2] = (lprc & 0xff) as u8;
+
+        let params = CodecParameters::video(CodecId::new(crate::CODEC_ID_STR));
+        let mut dec = make_decoder(&params).unwrap();
+        let pkt = Packet::new(0, TimeBase::new(1, 25), new_buf);
+        dec.send_packet(&pkt).expect("send_packet filler");
+        let frame = dec
+            .receive_frame()
+            .expect("data sub-packet filler must be skipped, not rejected");
+        let Frame::Video(vf) = frame else {
+            panic!("expected video frame");
+        };
+        assert_eq!(
+            vf.planes[0].data,
+            vec![129, 129, 129, 129],
+            "legal data sub-packet filler must not perturb the decode"
+        );
+    }
+
     /// 3-component 4:4:4 4×1 zero codestream — entropy data sets every
     /// magnitude to zero, so every component plane decodes to a flat
     /// row of mid-grey samples. With no inverse colour transform
