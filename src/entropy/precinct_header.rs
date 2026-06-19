@@ -72,6 +72,19 @@ pub fn parse_precinct_header(buf: &[u8], geom: &PrecinctGeometry) -> Result<Prec
         return Err(Error::invalid(format!("jpegxs entropy: Q[p] = {q} > 31")));
     }
     let r = reader.read_bits(8)? as u8;
+    // Table C.1: R[p] ∈ [0, NL-1], where NL is the total band count the
+    // precinct header iterates over. R[p] feeds the §C.6.2 truncation
+    // selection `r = (P[b] < R[p]) ? 1 : 0`; a value at or beyond NL is
+    // outside the priorities any band can carry (P[b] ∈ [0, NL-1], Table
+    // A.24) and signals a malformed precinct header. NL == 0 cannot occur
+    // (a precinct always has at least the LL band).
+    let nl = geom.bands.len();
+    if nl > 0 && r as usize > nl - 1 {
+        return Err(Error::invalid(format!(
+            "jpegxs entropy: R[p] = {r} exceeds NL-1 = {} (Annex C.2 Table C.1)",
+            nl - 1
+        )));
+    }
 
     let mut d = Vec::with_capacity(geom.bands.len());
     for band in &geom.bands {
@@ -193,9 +206,9 @@ mod tests {
         // Only the first band gets a D field. Total bits: 24+8+8+2 =
         // 42 → 6 bytes after alignment. The unused six bits in the
         // last byte don't matter.
-        // Lprc = 7, Q = 2, R = 3, then D[0] = 0b11 left-aligned in
-        // the next byte.
-        let v = vec![0u8, 0u8, 7u8, 2u8, 3u8, 0b1100_0000];
+        // Lprc = 7, Q = 2, R = 1 (≤ NL-1 = 1, Table C.1), then
+        // D[0] = 0b11 left-aligned in the next byte.
+        let v = vec![0u8, 0u8, 7u8, 2u8, 1u8, 0b1100_0000];
         let h = parse_precinct_header(&v, &g).unwrap();
         assert_eq!(h.d, vec![0b11, 0]);
     }
@@ -217,6 +230,27 @@ mod tests {
         // Lprc = 2^20 should already be rejected by the LPRC_MAX
         // check (2^20 - 1 is the upper bound from Table C.1).
         let buf = build(1 << 20, 5, 0, 0, 0);
+        assert!(parse_precinct_header(&buf, &geom_two_bands()).is_err());
+    }
+
+    #[test]
+    fn accepts_r_at_nl_minus_1() {
+        // NL = 2, so R[p] = 1 (= NL-1) is the maximum legal value
+        // (Table C.1: R[p] ∈ [0, NL-1]).
+        let buf = build(1, 5, 1, 0, 0);
+        let h = parse_precinct_header(&buf, &geom_two_bands()).unwrap();
+        assert_eq!(h.r, 1);
+    }
+
+    #[test]
+    fn rejects_r_at_or_above_nl() {
+        // NL = 2; R[p] = 2 is out of the [0, NL-1] = [0, 1] range and must
+        // be rejected (Annex C.2 Table C.1). A garbage R[p] would otherwise
+        // silently over-apply the §C.6.2 refinement to every band.
+        let buf = build(1, 5, 2, 0, 0);
+        assert!(parse_precinct_header(&buf, &geom_two_bands()).is_err());
+        // Far-out-of-range value rejected too.
+        let buf = build(1, 5, 200, 0, 0);
         assert!(parse_precinct_header(&buf, &geom_two_bands()).is_err());
     }
 }
