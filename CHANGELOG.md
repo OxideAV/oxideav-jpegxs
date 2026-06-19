@@ -1,5 +1,42 @@
 # Changelog
 
+## Unreleased — round 346 (high-bit-depth subsampled Annex H weights + subsampled WGT-truncation alignment fix)
+
+Wires the ISO/IEC 21122-1:2022 Annex H subsampled tables (H.4–H.8) through
+the high-bit-depth (`B[i] ∈ 9..=16`) chroma-subsampled path and corrects a
+latent encoder/decoder truncation mismatch for subsampled layouts whose
+chroma bands do not all exist.
+
+* `encoder::encode_planar_subsampled_highbd_annex_h(width, height, nc, cpih,
+  nlx, nly, bd, q, sx, sy, planes)` — the high-bit-depth companion to
+  [`encode_planar_subsampled_annex_h`]. Drives the WGT + forward truncation
+  `T[p,b] = clamp(Q[p] − G[b] − r, 0, 15)` from the H.4 / H.5 / H.6 (4:2:2)
+  and H.7 / H.8 (4:2:0, `-*` slots dropped) tables over the `u16`-LE plane
+  layout. Falls back to the default-weights highbd subsampled path for
+  untabulated configs.
+* **Fix:** the subsampled Annex H forward truncation now indexes the supplied
+  weights by each band's position in the **β-major existing-band
+  enumeration** — the same cursor the decoder's WGT loader
+  (`slice_walker::build_plan`) walks — instead of by the full picture band
+  index. Previously the `custom_wgt` branch only engaged when the weights
+  vector length equalled the *full* band count, so for 4:2:0 (where H.7 / H.8
+  carry `-*` non-existent-band slots that shrink the vector) the encoder
+  silently truncated with *geometry-derived* gains while the WGT marker
+  advertised the *Annex H* gains. A conforming decoder reconstructing `T[p,b]`
+  from WGT therefore disagreed with the encoder; at high bit depth this
+  surfaced as an entropy buffer over-read. Encoder and decoder now compute the
+  identical `T[p,b]` for every chroma layout. This also makes the 8-bit
+  subsampled Annex H streams genuinely WGT-consistent (they previously decoded
+  only because the low-magnitude 8-bit coefficients masked the structural
+  inconsistency).
+* `pack_subsampled_u16_planes` helper centralises the highbd subsampled `u16`
+  plane validation / packing (shared with `encode_planar_subsampled_highbd`
+  and `_lossy`, deduplicating their inline copies).
+* +3 tests: WGT carries the existing-band column + decodes + differs from
+  default at `bd ∈ {10, 12, 16}` across all five H.4–H.8 configs; lossless
+  bit-exact self-roundtrip at `bd ∈ {10, 12, 14, 16}`; fallback (lossless and
+  lossy) for untabulated configs.
+
 ## Unreleased — round 346 (high-bit-depth CFA Star-Tetrix Annex H weights)
 
 Closes the README "content-adaptive WGT weights for the CFA Star-Tetrix

@@ -1752,11 +1752,6 @@ pub fn encode_planar_subsampled_highbd(
     sy: &[u8],
     planes: &[Vec<u16>],
 ) -> Result<Vec<u8>> {
-    if !(9..=16).contains(&bd) {
-        return Err(Error::Unsupported(format!(
-            "jpegxs encoder: encode_planar_subsampled_highbd requires B[i] in 9..=16, got {bd} (use encode_planar_subsampled for 8-bit)"
-        )));
-    }
     if cpih != 0 && cpih != 1 {
         return Err(Error::Unsupported(format!(
             "jpegxs encoder: encode_planar_subsampled_highbd supports Cpih in {{0, 1}}, got {cpih}"
@@ -1769,34 +1764,15 @@ pub fn encode_planar_subsampled_highbd(
             sy.len()
         )));
     }
-    let max_sample: u16 = ((1u32 << bd) - 1) as u16;
-    // Pack each plane to little-endian u16 bytes (the EncodeConfig
-    // bit_depth > 8 plane format), validating the nominal range and
-    // per-component sub-sampled dimensions first.
-    let mut byte_planes: Vec<Vec<u8>> = Vec::with_capacity(planes.len());
-    for (i, p) in planes.iter().enumerate() {
-        let want =
-            (width as usize).div_ceil(sx[i] as usize) * (height as usize).div_ceil(sy[i] as usize);
-        if p.len() != want {
-            return Err(Error::invalid(format!(
-                "jpegxs encoder: plane {i} sample count {} != Wc*Hc {} (sx={}, sy={})",
-                p.len(),
-                want,
-                sx[i],
-                sy[i]
-            )));
-        }
-        let mut bytes = Vec::with_capacity(p.len() * 2);
-        for &s in p {
-            if s > max_sample {
-                return Err(Error::invalid(format!(
-                    "jpegxs encoder: plane {i} sample {s} exceeds B[i]={bd} max {max_sample}"
-                )));
-            }
-            bytes.extend_from_slice(&s.to_le_bytes());
-        }
-        byte_planes.push(bytes);
-    }
+    let byte_planes = pack_subsampled_u16_planes(
+        width,
+        height,
+        bd,
+        sx,
+        sy,
+        planes,
+        "encode_planar_subsampled_highbd",
+    )?;
     encode_planar_inner_bd(
         width,
         height,
@@ -1860,11 +1836,6 @@ pub fn encode_planar_subsampled_highbd_lossy(
     sy: &[u8],
     planes: &[Vec<u16>],
 ) -> Result<Vec<u8>> {
-    if !(9..=16).contains(&bd) {
-        return Err(Error::Unsupported(format!(
-            "jpegxs encoder: encode_planar_subsampled_highbd_lossy requires B[i] in 9..=16, got {bd} (use encode_planar_subsampled for 8-bit)"
-        )));
-    }
     if q == 0 {
         return Err(Error::invalid(
             "jpegxs encoder: encode_planar_subsampled_highbd_lossy requires q > 0 (use encode_planar_subsampled_highbd for lossless)".to_string(),
@@ -1882,31 +1853,15 @@ pub fn encode_planar_subsampled_highbd_lossy(
             sy.len()
         )));
     }
-    let max_sample: u16 = ((1u32 << bd) - 1) as u16;
-    let mut byte_planes: Vec<Vec<u8>> = Vec::with_capacity(planes.len());
-    for (i, p) in planes.iter().enumerate() {
-        let want =
-            (width as usize).div_ceil(sx[i] as usize) * (height as usize).div_ceil(sy[i] as usize);
-        if p.len() != want {
-            return Err(Error::invalid(format!(
-                "jpegxs encoder: plane {i} sample count {} != Wc*Hc {} (sx={}, sy={})",
-                p.len(),
-                want,
-                sx[i],
-                sy[i]
-            )));
-        }
-        let mut bytes = Vec::with_capacity(p.len() * 2);
-        for &s in p {
-            if s > max_sample {
-                return Err(Error::invalid(format!(
-                    "jpegxs encoder: plane {i} sample {s} exceeds B[i]={bd} max {max_sample}"
-                )));
-            }
-            bytes.extend_from_slice(&s.to_le_bytes());
-        }
-        byte_planes.push(bytes);
-    }
+    let byte_planes = pack_subsampled_u16_planes(
+        width,
+        height,
+        bd,
+        sx,
+        sy,
+        planes,
+        "encode_planar_subsampled_highbd_lossy",
+    )?;
     encode_planar_inner_bd(
         width,
         height,
@@ -1935,6 +1890,150 @@ pub fn encode_planar_subsampled_highbd_lossy(
         Vec::new(), // q_slices: single picture-level q
         Vec::new(), // q_precincts: no per-precinct override
         Vec::new(), // r_precincts: no per-precinct R[p] override
+        &byte_planes,
+    )
+}
+
+/// Validate + pack high-bit-depth (`bd ∈ 9..=16`) chroma-sub-sampled `u16`
+/// planes into the two-bytes-per-sample little-endian byte layout
+/// `encode_planar_inner_bd` expects. Shared by the subsampled highbd entry
+/// points so the bit-depth / length / per-component-dimension / range checks
+/// live in one place. `who` names the caller for error messages.
+fn pack_subsampled_u16_planes(
+    width: u16,
+    height: u16,
+    bd: u8,
+    sx: &[u8],
+    sy: &[u8],
+    planes: &[Vec<u16>],
+    who: &str,
+) -> Result<Vec<Vec<u8>>> {
+    if !(9..=16).contains(&bd) {
+        return Err(Error::Unsupported(format!(
+            "jpegxs encoder: {who} requires B[i] in 9..=16, got {bd} (use the 8-bit subsampled entry points for bd=8)"
+        )));
+    }
+    let max_sample: u16 = ((1u32 << bd) - 1) as u16;
+    let mut byte_planes: Vec<Vec<u8>> = Vec::with_capacity(planes.len());
+    for (i, p) in planes.iter().enumerate() {
+        let want =
+            (width as usize).div_ceil(sx[i] as usize) * (height as usize).div_ceil(sy[i] as usize);
+        if p.len() != want {
+            return Err(Error::invalid(format!(
+                "jpegxs encoder: {who} plane {i} sample count {} != Wc*Hc {} (sx={}, sy={})",
+                p.len(),
+                want,
+                sx[i],
+                sy[i]
+            )));
+        }
+        let mut bytes = Vec::with_capacity(p.len() * 2);
+        for &s in p {
+            if s > max_sample {
+                return Err(Error::invalid(format!(
+                    "jpegxs encoder: {who} plane {i} sample {s} exceeds B[i]={bd} max {max_sample}"
+                )));
+            }
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        byte_planes.push(bytes);
+    }
+    Ok(byte_planes)
+}
+
+/// High-bit-depth (`B[i] > 8`) **Annex H content-adaptive WGT** chroma-
+/// sub-sampled entry point.
+///
+/// The high-bit-depth companion to the 8-bit
+/// [`encode_planar_subsampled_annex_h`]. Same `u16`-LE sub-sampled plane
+/// format (`bd ∈ 9..=16`, per-component `(sx, sy)`), but drives the WGT marker
+/// and the forward truncation `T[p,b] = clamp(Q[p] − G[b] − r, 0, 15)` from the
+/// ISO/IEC 21122-1:2022 Annex H subsampled tables H.4 / H.5 / H.6 (4:2:2, RCT
+/// disabled, `NL,y ∈ {0, 1, 2}`) and H.7 / H.8 (4:2:0, RCT disabled,
+/// `NL,y ∈ {1, 2}`) — all at `NL,x = 5`, `Cpih = 0`. The spec's `-*`
+/// non-existent-band slots are dropped so the emitted `(G[b], P[b])` pairs land
+/// in the encoder's existing-band emission order (matching the
+/// `picture_beta_to_local_beta` skip rule position-for-position). Configurations
+/// outside the tabulated set fall back to the default-weights
+/// [`encode_planar_subsampled_highbd`] / `_lossy` path so the codestream is
+/// always well-formed. `q = 0` → lossless (`Fq = 0`, bit-exact self-roundtrip
+/// even with the H column advertised); `q ∈ 1..=15` → regular (`Fq = 8`).
+///
+/// Bit depth and the Annex H weights are orthogonal — the gains / priorities
+/// and the matching forward-truncation branch act on `i32` wavelet
+/// coefficients, so the only bit-depth-dependent pieces remain the Annex G.3 DC
+/// level shift and the `u16`-LE plane packing.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_subsampled_highbd_annex_h(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    bd: u8,
+    q: u8,
+    sx: &[u8],
+    sy: &[u8],
+    planes: &[Vec<u16>],
+) -> Result<Vec<u8>> {
+    if sx.len() != nc as usize || sy.len() != nc as usize {
+        return Err(Error::invalid(format!(
+            "jpegxs encoder: sx/sy must have length nc={nc}, got sx={}, sy={}",
+            sx.len(),
+            sy.len()
+        )));
+    }
+    // Outside the tabulated H.4–H.8 set `annex_h_weights` returns `None`; fall
+    // back to the default-weights highbd subsampled path (lossless or lossy by
+    // `q`), mirroring the 8-bit `encode_planar_subsampled_annex_h` fallback.
+    let Some((gains, priorities)) = annex_h_weights(nc, cpih, 0, nlx, nly, 0, sx, sy) else {
+        return if q == 0 {
+            encode_planar_subsampled_highbd(width, height, nc, cpih, nlx, nly, bd, sx, sy, planes)
+        } else {
+            encode_planar_subsampled_highbd_lossy(
+                width, height, nc, cpih, nlx, nly, bd, q, sx, sy, planes,
+            )
+        };
+    };
+    let byte_planes = pack_subsampled_u16_planes(
+        width,
+        height,
+        bd,
+        sx,
+        sy,
+        planes,
+        "encode_planar_subsampled_highbd_annex_h",
+    )?;
+    let fq = if q == 0 { 0 } else { 8 };
+    encode_planar_inner_bd(
+        width,
+        height,
+        nc,
+        bd,
+        cpih,
+        nlx,
+        nly,
+        fq,
+        q,
+        sx,
+        sy,
+        0,
+        0,
+        0,
+        0,
+        None,
+        gains,
+        priorities,
+        0,          // cw: single precinct per row
+        0,          // sd: no suppressed components
+        0,          // fs: signs jointly with data
+        0,          // hsl: single slice
+        0,          // qpih: deadzone inverse quantizer
+        0,          // rp: no precinct refinement
+        Vec::new(), // q_slices
+        Vec::new(), // q_precincts
+        Vec::new(), // r_precincts
         &byte_planes,
     )
 }
@@ -6700,17 +6799,54 @@ fn encode_precinct_cascade(
     // emits — otherwise the decoder, which reconstructs `T[p,b]` from WGT
     // (Annex C.6.2 Table C.10), would disagree with the quantizer and the
     // picture would not round-trip at `Q[p] > 0`. The weights vector is
-    // built in `β`-major emission order (`build_band_*_sd`), so for the
-    // canonical all-bands-exist 4:4:4 case its slot index equals the band
-    // index `b = (Nc - Sd)×β + i`. `count_existing_bands(cfg) == NL` in
-    // that case, so indexing by `band_index` is in range; whenever the
-    // table is absent or shorter than `NL` (subsampled configs, where the
-    // emission slot ≠ band index) the closure falls back to the
-    // geometry-derived gain and the `P[b] = b` priority below, preserving
-    // every prior round's behaviour.
+    // built in `β`-major emission order (`build_band_*_sd` /
+    // [`annex_h_weights`]), matching the decoder's β-major existing-band WGT
+    // enumeration. For the canonical all-bands-exist 4:4:4 case every band
+    // exists so the emission slot equals the band index `b = (Nc - Sd)×β + i`.
+    // For subsampled configs some picture-β slots do not exist for chroma
+    // components (Annex B.4 `bx[β,i] = 0`); the supplied weights vector then
+    // carries one pair per *existing* band, so the closure must index it by
+    // the band's position in the β-major existing-band enumeration — the same
+    // cursor the decoder's WGT loader walks. We therefore precompute a
+    // `band_index → existing_slot` map below so the table-driven `T[p,b]`
+    // matches the WGT the decoder reconstructs from, for subsampled layouts
+    // (e.g. the Annex H H.7 / H.8 4:2:0 tables) as well as 4:4:4.
+    //
+    // Build the β-major existing-slot lookup keyed by the picture band index
+    // `b`. A band that does not exist maps to `None` (never read). Order MUST
+    // match `slice_walker::build_plan`'s WGT loader: `for beta { for i }`
+    // (wavelet bands), then the Sd tail.
+    let n_total_bands = (nd_u32 * nbeta_pic + cfg.sd as u32) as usize;
+    let mut existing_slot_of_band: Vec<Option<usize>> = vec![None; n_total_bands];
+    {
+        let mut cursor = 0usize;
+        for beta in 0..nbeta_pic {
+            for i in 0..n_decomposed {
+                let exists = crate::slice_walker::picture_beta_to_local_beta(
+                    beta, cfg.nlx, cfg.nly, cfg.sy[i],
+                )
+                .is_some();
+                if exists {
+                    let b = (nd_u32 * beta + i as u32) as usize;
+                    existing_slot_of_band[b] = Some(cursor);
+                    cursor += 1;
+                }
+            }
+        }
+        for i in 0..cfg.sd as usize {
+            let b = (nd_u32 * nbeta_pic + i as u32) as usize;
+            existing_slot_of_band[b] = Some(cursor);
+            cursor += 1;
+        }
+    }
+    // A custom table applies when both gain and priority vectors are present
+    // and their length equals the *existing*-band count — covering the
+    // all-exist 4:4:4 case (existing == total) and the subsampled case
+    // (existing < total) uniformly.
+    let n_existing_bands = existing_slot_of_band.iter().filter(|s| s.is_some()).count();
     let custom_wgt = !cfg.band_gains.is_empty()
         && cfg.band_gains.len() == cfg.band_priorities.len()
-        && cfg.band_gains.len() as u32 == (nd_u32 * nbeta_pic + cfg.sd as u32);
+        && cfg.band_gains.len() == n_existing_bands;
     let t_for_band = |beta: u32, comp_i: usize| -> u8 {
         let band_index: u32 = if comp_i < n_decomposed {
             // Wavelet band: b = (Nc - Sd)×β_pic + i.
@@ -6721,12 +6857,21 @@ fn encode_precinct_cascade(
         };
         if custom_wgt {
             // Table-driven path: read the exact gain/priority emitted to
-            // WGT for this band index, so encoder and decoder compute the
-            // identical `T[p,b] = clamp(Q[p] - G[b] - r, 0, 15)`.
-            let g = cfg.band_gains[band_index as usize] as i32;
-            let p = cfg.band_priorities[band_index as usize] as u32;
-            let refine = if p < cfg.rp as u32 { 1i32 } else { 0 };
-            return (cfg.q as i32 - g - refine).clamp(0, 15) as u8;
+            // WGT for this band, indexed by its β-major existing-band slot
+            // (the same slot the decoder reads), so encoder and decoder
+            // compute the identical `T[p,b] = clamp(Q[p] - G[b] - r, 0, 15)`.
+            if let Some(slot) = existing_slot_of_band
+                .get(band_index as usize)
+                .copied()
+                .flatten()
+            {
+                let g = cfg.band_gains[slot] as i32;
+                let p = cfg.band_priorities[slot] as u32;
+                let refine = if p < cfg.rp as u32 { 1i32 } else { 0 };
+                return (cfg.q as i32 - g - refine).clamp(0, 15) as u8;
+            }
+            // Non-existent band: falls through to the geometry-derived path
+            // (never actually coded, so the value is inconsequential).
         }
         let refine = if band_index < cfg.rp as u32 { 1i32 } else { 0 };
         // Gain: suppressed-tail bands have no wavelet axes (G = 0); the
@@ -15816,6 +15961,167 @@ mod tests {
             fallback, default_cs,
             "unmatched subsampled config must equal encode_planar_subsampled"
         );
+    }
+
+    // === Round 346: high-bit-depth (B[i] > 8) chroma-subsampled Annex H
+    // weights (H.4–H.8) on the 4:2:2 / 4:2:0 Cpih=0 layout. =================
+
+    /// High-bit-depth (`u16`) subsampled luma + chroma fixture: full-res luma
+    /// and two chroma planes sized for `(sx_c, sy_c)`, with samples in
+    /// `0..=2^bd − 1`. Same deterministic ramp shape as `make_subsampled_planes`.
+    fn make_subsampled_planes_u16(
+        w: usize,
+        h: usize,
+        sx_c: usize,
+        sy_c: usize,
+        bd: u8,
+    ) -> [Vec<u16>; 3] {
+        let max = ((1u32 << bd) - 1) as i64;
+        let cw = w / sx_c;
+        let ch = h / sy_c;
+        let mut y = vec![0u16; w * h];
+        let mut cb = vec![0u16; cw * ch];
+        let mut cr = vec![0u16; cw * ch];
+        for yy in 0..h {
+            for xx in 0..w {
+                y[yy * w + xx] = (((xx as i64) * 37 + (yy as i64) * 19) % (max + 1)) as u16;
+            }
+        }
+        for yy in 0..ch {
+            for xx in 0..cw {
+                cb[yy * cw + xx] = (((xx as i64) * 53 + (yy as i64) * 29) % (max + 1)) as u16;
+                cr[yy * cw + xx] = (((xx ^ yy) as i64 * 101 + 401) % (max + 1)) as u16;
+            }
+        }
+        [y, cb, cr]
+    }
+
+    /// Round 346: the high-bit-depth subsampled Annex H entry point
+    /// [`encode_planar_subsampled_highbd_annex_h`] (a) emits one `(G[b], P[b])`
+    /// pair per existing band (with the `-*` slots dropped) into the WGT,
+    /// matching `annex_h_weights`, (b) round-trips through the decoder for the
+    /// 4:2:2 / 4:2:0 `Cpih = 0` layout at `bd ∈ {10, 12, 16}`, and (c) differs
+    /// from the default-weights highbd subsampled path. Covers H.4 / H.5 / H.6
+    /// (4:2:2) and H.7 / H.8 (4:2:0).
+    #[test]
+    fn round346_subsampled_highbd_annex_h_roundtrip_and_differ() {
+        // (chroma sx, chroma sy, NLy, existing-band count) — same as round327.
+        let cases: &[(u8, u8, u8, usize)] = &[
+            (2, 1, 0, 18), // H.4
+            (2, 1, 1, 24), // H.5
+            (2, 1, 2, 30), // H.6
+            (2, 2, 1, 20), // H.7
+            (2, 2, 2, 26), // H.8
+        ];
+        for &bd in &[10u8, 12, 16] {
+            for &(sxc, syc, nly, n_exist) in cases {
+                let planes = make_subsampled_planes_u16(64, 64, sxc as usize, syc as usize, bd);
+                let sx = [1u8, sxc, sxc];
+                let sy = [1u8, syc, syc];
+                let (exp_g, exp_p) = annex_h_weights(3, 0, 0, 5, nly, 0, &sx, &sy)
+                    .unwrap_or_else(|| panic!("H table sx={sxc} sy={syc} NLy={nly}"));
+                assert_eq!(exp_g.len(), n_exist, "bd={bd} band count sx={sxc} sy={syc}");
+
+                let cs = encode_planar_subsampled_highbd_annex_h(
+                    64, 64, 3, 0, 5, nly, bd, 2, &sx, &sy, &planes,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("highbd subsampled Annex H bd={bd} sx={sxc} sy={syc} NLy={nly}: {e:?}")
+                });
+
+                // (a) WGT carries exactly the existing-band column.
+                let parsed =
+                    crate::codestream::parse(&cs).expect("parse highbd subsampled Annex H");
+                let weights = parsed.wgt().expect("typed WGT view");
+                let got_g: Vec<u8> = weights.iter().map(|w| w.gain).collect();
+                let got_p: Vec<u8> = weights.iter().map(|w| w.priority).collect();
+                assert_eq!(
+                    got_g, exp_g,
+                    "bd={bd} sx={sxc} sy={syc} NLy={nly}: WGT gains"
+                );
+                assert_eq!(
+                    got_p, exp_p,
+                    "bd={bd} sx={sxc} sy={syc} NLy={nly}: WGT priorities"
+                );
+
+                // (b) Round-trips through the decoder, highbd plane layout.
+                let img = decode_codestream(&cs, None).expect("decode highbd subsampled Annex H");
+                assert_eq!(img.num_components, 3);
+                assert_eq!(img.bit_depth, bd, "bd={bd}: Bw byte");
+
+                // (c) Differs from the default-weights highbd subsampled path.
+                let default_cs = encode_planar_subsampled_highbd_lossy(
+                    64, 64, 3, 0, 5, nly, bd, 2, &sx, &sy, &planes,
+                )
+                .expect("default-weights highbd subsampled");
+                assert_ne!(
+                    cs, default_cs,
+                    "bd={bd} sx={sxc} sy={syc} NLy={nly}: Annex H must differ from default"
+                );
+            }
+        }
+    }
+
+    /// Round 346: at `q = 0` the highbd subsampled Annex H weights are a no-op
+    /// for the reconstructed samples — every component self-roundtrips
+    /// bit-exactly through the 2-bytes-per-sample plane layout even though the
+    /// WGT advertises the H-table gains/priorities.
+    #[test]
+    fn round346_subsampled_highbd_annex_h_lossless_bit_exact() {
+        for &bd in &[10u8, 12, 14, 16] {
+            for &(sxc, syc, nly) in &[(2u8, 1u8, 2u8), (2u8, 2u8, 2u8)] {
+                let planes = make_subsampled_planes_u16(64, 64, sxc as usize, syc as usize, bd);
+                let sx = [1u8, sxc, sxc];
+                let sy = [1u8, syc, syc];
+                let cs = encode_planar_subsampled_highbd_annex_h(
+                    64, 64, 3, 0, 5, nly, bd, 0, &sx, &sy, &planes,
+                )
+                .expect("highbd subsampled Annex H lossless encode");
+                let img = decode_codestream(&cs, None).expect("decode highbd subsampled lossless");
+                for (c, (rec, src)) in img.planes.iter().zip(planes.iter()).enumerate() {
+                    let got: Vec<u16> = rec
+                        .data
+                        .chunks_exact(2)
+                        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                        .collect();
+                    assert_eq!(
+                        got, *src,
+                        "bd={bd} sx={sxc} sy={syc} NLy={nly}: component {c} bit-exact at q=0"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Round 346: a highbd subsampled configuration outside the tabulated H.4–H.8
+    /// set (4:2:0 with `NLy = 3`) falls back to the default-weights highbd
+    /// subsampled path and is byte-identical to a direct default encode (lossless
+    /// for `q = 0`, lossy otherwise).
+    #[test]
+    fn round346_subsampled_highbd_annex_h_falls_back_when_unmatched() {
+        let bd = 12u8;
+        let sx = [1u8, 2, 2];
+        let sy = [1u8, 2, 2];
+        assert!(
+            annex_h_weights(3, 0, 0, 5, 3, 0, &sx, &sy).is_none(),
+            "no 4:2:0 NLy=3 Annex H table"
+        );
+        let planes = make_subsampled_planes_u16(64, 64, 2, 2, bd);
+        // q = 0 → lossless fallback.
+        let fb0 =
+            encode_planar_subsampled_highbd_annex_h(64, 64, 3, 0, 5, 3, bd, 0, &sx, &sy, &planes)
+                .expect("fallback highbd subsampled lossless");
+        let direct0 = encode_planar_subsampled_highbd(64, 64, 3, 0, 5, 3, bd, &sx, &sy, &planes)
+            .expect("direct highbd subsampled lossless");
+        assert_eq!(fb0, direct0, "q=0 unmatched must equal lossless default");
+        // q > 0 → lossy fallback.
+        let fb1 =
+            encode_planar_subsampled_highbd_annex_h(64, 64, 3, 0, 5, 3, bd, 4, &sx, &sy, &planes)
+                .expect("fallback highbd subsampled lossy");
+        let direct1 =
+            encode_planar_subsampled_highbd_lossy(64, 64, 3, 0, 5, 3, bd, 4, &sx, &sy, &planes)
+                .expect("direct highbd subsampled lossy");
+        assert_eq!(fb1, direct1, "q>0 unmatched must equal lossy default");
     }
 
     // === Round 330: Annex H CFA Star-Tetrix weight tables H.9 / H.10 / H.11 ==

@@ -116,17 +116,29 @@ bands. Each table tabulates a separate `(G[b], P[b])` column per CTS extent
 column. Configurations outside any tabulated set fall back to the
 default-weights path.
 
-The CFA Star-Tetrix Annex H weights are now also wired through the
-**high-bit-depth** (`B[i] ∈ 9..=16`, little-endian `u16` planes) path:
-`encode_planar_star_tetrix_highbd_annex_h` drives the same H.9–H.11
+The Annex H weights are now also wired through the **high-bit-depth**
+(`B[i] ∈ 9..=16`, little-endian `u16` planes) paths. For the CFA Star-Tetrix
+layout: `encode_planar_star_tetrix_highbd_annex_h` drives the H.9–H.11
 `(G[b], P[b])` columns over the two-bytes-per-sample CFA layout, and
 `encode_planar_sd_star_tetrix_highbd` is its default-weights companion (the
-high-bit-depth `Sd = 1` Star-Tetrix entry point). Bit depth and the Annex H
-weights are orthogonal — the gains / priorities and the matching forward
-truncation act on `i32` wavelet coefficients, so the only bit-depth-dependent
-pieces remain the Annex G.3 DC level shift and the `u16`-LE plane packing.
-At `q = 0` every component self-roundtrips bit-exactly through the highbd
-decode path even though the WGT advertises the H column.
+high-bit-depth `Sd = 1` Star-Tetrix entry point). For the chroma-subsampled
+4:2:2 / 4:2:0 layouts: `encode_planar_subsampled_highbd_annex_h` drives the
+H.4–H.8 tables (including the `-*` non-existent-band drops) at high bit depth.
+Bit depth and the Annex H weights are orthogonal — the gains / priorities and
+the matching forward truncation act on `i32` wavelet coefficients, so the only
+bit-depth-dependent pieces remain the Annex G.3 DC level shift and the `u16`-LE
+plane packing. At `q = 0` every component self-roundtrips bit-exactly through
+the highbd decode path even though the WGT advertises the H column.
+
+The subsampled Annex H forward-truncation now indexes the supplied weights by
+each band's position in the **β-major existing-band enumeration** (the same
+cursor the decoder walks when loading WGT), rather than by the full picture
+band index. This makes the encoder's `T[p,b] = clamp(Q[p] − G[b] − r, 0, 15)`
+agree with the WGT the decoder reconstructs from for layouts whose chroma bands
+do not all exist (4:2:0, where H.7 / H.8 carry `-*` slots) — previously such
+streams advertised gains the encoder had not actually used for truncation, a
+latent inconsistency a conforming decoder would have mis-decoded (it surfaces
+as an entropy buffer over-read at high bit depth).
 
 Wiring up the CFA tables required correcting an over-strict `Cpih = 3`
 constraint: the encoder and decoder previously rejected `Nc − Sd < 4`,
@@ -163,17 +175,13 @@ rate not observable from the codestream.
 ### Not yet covered
 
 - Bit depths above 16 (would need a `u32` plane format).
-- Content-adaptive WGT weights for the subsampled 4:2:2 / 4:2:0 layouts
-  (H.4–H.8) at bit depths above 8 — the highbd companion now exists for the
-  4:4:4 RCT (`encode_planar_hsl_qslice_rp_highbd` path carries WGT) and the
-  CFA Star-Tetrix tables; a highbd subsampled Annex H entry point is a
-  follow-up. All Annex H example tables are transcribed: the 4:4:4 RCT
-  tables (H.1–H.3, `encode_planar_lossy_annex_h`), the subsampled 4:2:2 /
-  4:2:0 tables (H.4–H.8, `encode_planar_subsampled_annex_h`, including the
-  `-*` non-existent-band handling), and the CFA Star-Tetrix tables (H.9–H.11)
-  for both the 8-bit (`encode_planar_star_tetrix_annex_h`) and high-bit-depth
-  (`encode_planar_star_tetrix_highbd_annex_h`, `B[i] ∈ 9..=16`) paths,
-  `Cf = 0` / `Cf = 3` columns.
+- All Annex H example tables are transcribed and wired through both the 8-bit
+  and the high-bit-depth (`B[i] ∈ 9..=16`) encode paths: the 4:4:4 RCT tables
+  (H.1–H.3, `encode_planar_lossy_annex_h`), the subsampled 4:2:2 / 4:2:0 tables
+  (H.4–H.8, `encode_planar_subsampled_annex_h` / `_subsampled_highbd_annex_h`,
+  including the `-*` non-existent-band handling), and the CFA Star-Tetrix tables
+  (H.9–H.11, `encode_planar_star_tetrix_annex_h` /
+  `_star_tetrix_highbd_annex_h`, `Cf = 0` / `Cf = 3` columns).
 
 ## Public API
 
@@ -190,7 +198,8 @@ let picture = oxideav_jpegxs::decode_jpeg_xs(bytes)?;
 Encoder entry points (in `oxideav_jpegxs::encoder`) cover single-luma,
 interleaved RGB, and generalised planar input, with `_lossy`,
 `_lossy_annex_h`, `_subsampled_annex_h`, `_star_tetrix_annex_h`,
-`_star_tetrix_highbd_annex_h`, `_sd_star_tetrix_highbd`, `_highbd`,
+`_star_tetrix_highbd_annex_h`, `_sd_star_tetrix_highbd`,
+`_subsampled_highbd_annex_h`, `_highbd`,
 `_subsampled`, `_star_tetrix`, `_nlt_quadratic`, `_nlt_extended`,
 `_hsl_qslice`,
 `_qpr_rpr`, and `*_target_bytes` variants for the feature axes above. See
