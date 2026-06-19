@@ -15921,4 +15921,203 @@ mod tests {
             "4:4:4 RCT Qpih=1 q=2 PSNR below 18 dB: R={psnr_r} G={psnr_g} B={psnr_b}"
         );
     }
+
+    /// Thin wrapper around `encode_planar_inner_nlt` that pins `Qpih = 1`
+    /// (uniform inverse quantizer) and lets a test exercise the structural
+    /// axes (`hsl`, `cw`, `fs`) the public subsampled entry point fixes at
+    /// their defaults.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_qpih1_struct(
+        w: u16,
+        h: u16,
+        nc: u8,
+        cpih: u8,
+        nlx: u8,
+        nly: u8,
+        q: u8,
+        sx: &[u8],
+        sy: &[u8],
+        cw: u16,
+        hsl: u16,
+        fs: u8,
+        planes: &[Vec<u8>],
+    ) -> Result<Vec<u8>> {
+        let fq = if q == 0 { 0 } else { 8 };
+        encode_planar_inner_nlt(
+            w,
+            h,
+            nc,
+            cpih,
+            nlx,
+            nly,
+            fq,
+            q,
+            sx,
+            sy,
+            0,
+            0,
+            0,
+            0,
+            None,
+            Vec::new(),
+            Vec::new(),
+            cw,
+            0, // sd
+            fs,
+            hsl,
+            1, // qpih = 1 (uniform, Annex D.3)
+            0, // rp
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            planes,
+        )
+    }
+
+    /// Uniform quantizer composed with multi-slice (`Hsl > 0`): the
+    /// inverse-uniform decode path runs per slice. Lossless bit-exact
+    /// round-trip confirms slice boundaries do not perturb the Annex D.3
+    /// reconstruction. PIH `Qpih = 1` confirmed.
+    #[test]
+    fn r343_qpih_uniform_multi_slice_420_lossless() {
+        let (w, h) = (64usize, 64usize);
+        let (y, cb, cr) = synthetic_420(w, h);
+        // Hsl = 1 precinct row per slice → multiple slices over the picture.
+        let cs = encode_qpih1_struct(
+            w as u16,
+            h as u16,
+            3,
+            0,
+            2,
+            2,
+            0, // lossless
+            &[1, 2, 2],
+            &[1, 2, 2],
+            0, // cw: single precinct column
+            1, // hsl: one precinct row per slice
+            0, // fs
+            &[y.clone(), cb.clone(), cr.clone()],
+        )
+        .expect("encode 4:2:0 Qpih=1 multi-slice lossless");
+        let parsed = crate::codestream::parse(&cs).expect("parse");
+        assert_eq!(parsed.pih.qpih, 1, "multi-slice stream must signal Qpih=1");
+        let img = decode_codestream(&cs, None).expect("decode 4:2:0 Qpih=1 multi-slice");
+        assert_eq!(img.planes[0].data, y, "Y lossless across slices");
+        assert_eq!(img.planes[1].data, cb, "Cb lossless across slices");
+        assert_eq!(img.planes[2].data, cr, "Cr lossless across slices");
+    }
+
+    /// Uniform quantizer composed with multi-precinct-per-row (`Cw > 0`):
+    /// every precinct column dequantizes with the Annex D.3 kernel.
+    /// Lossless bit-exact round-trip over a 4:2:2 picture split into
+    /// multiple precinct columns.
+    #[test]
+    fn r343_qpih_uniform_multi_precinct_422_lossless() {
+        let (w, h) = (64usize, 32usize);
+        let (y, cb, cr) = synthetic_422(w, h);
+        // Cw = 1 → Cs = 8 * 1 * max(sx)=2 * 2^NLx. With NLx small the
+        // picture splits into several precinct columns per row.
+        let cs = encode_qpih1_struct(
+            w as u16,
+            h as u16,
+            3,
+            0,
+            1,
+            1,
+            0, // lossless
+            &[1, 2, 2],
+            &[1, 1, 1],
+            1, // cw: multi-precinct per row
+            0, // hsl: single slice
+            0, // fs
+            &[y.clone(), cb.clone(), cr.clone()],
+        )
+        .expect("encode 4:2:2 Qpih=1 multi-precinct lossless");
+        let parsed = crate::codestream::parse(&cs).expect("parse");
+        assert_eq!(
+            parsed.pih.qpih, 1,
+            "multi-precinct stream must signal Qpih=1"
+        );
+        let img = decode_codestream(&cs, None).expect("decode 4:2:2 Qpih=1 multi-precinct");
+        assert_eq!(img.planes[0].data, y, "Y lossless across precinct columns");
+        assert_eq!(
+            img.planes[1].data, cb,
+            "Cb lossless across precinct columns"
+        );
+        assert_eq!(
+            img.planes[2].data, cr,
+            "Cr lossless across precinct columns"
+        );
+    }
+
+    /// Uniform quantizer composed with the separate sign sub-packet
+    /// (`Fs = 1`) on a chroma-subsampled picture: confirms the inverse-
+    /// uniform kernel reconstructs correctly when signs arrive from the
+    /// dedicated sign sub-packet rather than interleaved in the data
+    /// sub-packet. Lossless bit-exact.
+    #[test]
+    fn r343_qpih_uniform_fs1_420_lossless() {
+        let (w, h) = (32usize, 32usize);
+        let (y, cb, cr) = synthetic_420(w, h);
+        let cs = encode_qpih1_struct(
+            w as u16,
+            h as u16,
+            3,
+            0,
+            2,
+            2,
+            0, // lossless
+            &[1, 2, 2],
+            &[1, 2, 2],
+            0, // cw
+            0, // hsl
+            1, // fs = 1 (separate sign sub-packet)
+            &[y.clone(), cb.clone(), cr.clone()],
+        )
+        .expect("encode 4:2:0 Qpih=1 Fs=1 lossless");
+        let parsed = crate::codestream::parse(&cs).expect("parse");
+        assert_eq!(parsed.pih.qpih, 1);
+        assert_eq!(parsed.pih.fs, 1, "Fs=1 separate sign sub-packet");
+        let img = decode_codestream(&cs, None).expect("decode 4:2:0 Qpih=1 Fs=1");
+        assert_eq!(img.planes[0].data, y);
+        assert_eq!(img.planes[1].data, cb);
+        assert_eq!(img.planes[2].data, cr);
+    }
+
+    /// Uniform quantizer on the CFA Star-Tetrix layout (`Cpih = 3`): the
+    /// inverse-uniform decode path composes with the Star-Tetrix colour
+    /// transform inverse. Lossless bit-exact round-trip over a 4-component
+    /// CFA picture.
+    #[test]
+    fn r343_qpih_uniform_star_tetrix_lossless() {
+        let (w, h) = (32usize, 16usize);
+        let planes = cfa_planes(w, h);
+        let cs = encode_qpih1_struct(
+            w as u16,
+            h as u16,
+            4,
+            3, // Cpih = 3 Star-Tetrix
+            2,
+            2,
+            0, // lossless
+            &[1, 1, 1, 1],
+            &[1, 1, 1, 1],
+            0, // cw
+            0, // hsl
+            0, // fs
+            &planes,
+        )
+        .expect("encode CFA Qpih=1 Star-Tetrix lossless");
+        let parsed = crate::codestream::parse(&cs).expect("parse");
+        assert_eq!(parsed.pih.qpih, 1, "Star-Tetrix stream must signal Qpih=1");
+        assert_eq!(parsed.pih.cpih, 3, "Cpih=3 Star-Tetrix");
+        let img = decode_codestream(&cs, None).expect("decode CFA Qpih=1 Star-Tetrix");
+        assert_eq!(img.num_components, 4);
+        for (c, plane) in planes.iter().enumerate() {
+            assert_eq!(
+                &img.planes[c].data, plane,
+                "CFA component {c} lossless under uniform quantizer"
+            );
+        }
+    }
 }

@@ -26,7 +26,12 @@ End-to-end decode of the multi-component subset:
 - `Cpih ∈ {0, 1, 3}` — no transform, reversible RGB↔YCbCr (Annex F.3),
   or Star-Tetrix (Annex F.5) for 4-component CFA images.
 - `Qpih ∈ {0, 1}` deadzone / uniform inverse quantizer; `Fq ∈ {0, 8}`
-  lossless / regular; `Bw ∈ {8, 18, 20}`; `B[i]` up to 16-bit.
+  lossless / regular; `Bw ∈ {8, 18, 20}`; `B[i]` up to 16-bit. The
+  uniform inverse quantizer (Annex D.3 Neumann-series reconstruction) is
+  exercised end-to-end across all three chroma samplings (4:4:4 / 4:2:2 /
+  4:2:0) and composed with multi-slice, multi-precinct-per-row, the
+  separate sign sub-packet, the reversible colour transform, and the CFA
+  Star-Tetrix transform.
 - Multi-level wavelet cascade (`NL,x ≥ NL,y`), multi-slice (`Hsl ≥ 0`),
   precinct refinement (`R[p]`), per-precinct `Q[p]`, separate sign
   sub-packet (`Fs = 1`), and the entropy-decode loss-of-synchronisation
@@ -66,6 +71,16 @@ Table C.1); the reserved code points of `Cpih` / `Qpih` / `Fs` / `Rm` /
 `Ppoc` and `Ss ∉ 1..=8` (Annex A.4.4 Tables A.9–A.13); and `Cpih = 3`
 Star-Tetrix with any sub-sampled CFA input (Annex A.4.3 / F.2, mirroring
 the existing `Cpih = 1` RCT guard).
+
+When the picture-header `Rl = 0`, the decoder also enforces the Annex C.3
+raw-mode-consistency rule: a band's raw-mode flag `Dr[p,s]` must be
+identical across every packet that includes the band within a precinct
+(raw and non-raw bitplane-count coding shall not be mixed within one
+band). The encoder, which selects the bitplane-count coding mode
+independently per packet, signals `Rl = 1` — the per-packet raw-selection
+regime (Annex C.5.3.3) whose per-line buffer bound holds by construction —
+so its streams pass the gate while a malformed `Rl = 0` stream that mixes
+raw and non-raw within a band is rejected.
 
 ### Encoder
 

@@ -40,6 +40,16 @@ path and corrects the encoder's raw-mode-selection flag.
   emitted `Rl = 0` while making per-packet raw choices, a non-conformant
   construction the new decode gate surfaces.
 
+Drives the uniform inverse-quantizer (`Qpih = 1`, Annex D.3) decode path
+through the structural-feature axes it had never been exercised against.
+
+* +4 lossless bit-exact round-trip tests composing `Qpih = 1` with
+  multi-slice (`Hsl > 0`, 4:2:0), multi-precinct-per-row (`Cw > 0`,
+  4:2:2), the separate sign sub-packet (`Fs = 1`, 4:2:0), and the CFA
+  Star-Tetrix colour transform (`Cpih = 3`, 4-component). Each confirms
+  the PIH `Qpih = 1` bit and recovers every sample exactly through the
+  inverse-uniform kernel composed with the respective decode path.
+
 ## Unreleased — round 334 (bitplane-count-subpacket size `Lcnt[p,s]` inference + consistency predicate)
 
 Adds the bitplane-count subpacket to the family of subpacket-size
