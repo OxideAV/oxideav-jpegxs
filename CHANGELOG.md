@@ -32,10 +32,12 @@ chroma bands do not all exist.
 * `pack_subsampled_u16_planes` helper centralises the highbd subsampled `u16`
   plane validation / packing (shared with `encode_planar_subsampled_highbd`
   and `_lossy`, deduplicating their inline copies).
-* +3 tests: WGT carries the existing-band column + decodes + differs from
+* +4 tests: WGT carries the existing-band column + decodes + differs from
   default at `bd ∈ {10, 12, 16}` across all five H.4–H.8 configs; lossless
   bit-exact self-roundtrip at `bd ∈ {10, 12, 14, 16}`; fallback (lossless and
-  lossy) for untabulated configs.
+  lossy) for untabulated configs; and a `q = 1` lossy PSNR-floor roundtrip on
+  the 4:2:0 H.7 / H.8 tables proving the truncation-alignment fix reconstructs
+  *correct pixels* (≥ 30 dB), not merely a non-crashing decode.
 
 ## Unreleased — round 346 (high-bit-depth CFA Star-Tetrix Annex H weights)
 

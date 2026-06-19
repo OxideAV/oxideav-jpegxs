@@ -16124,6 +16124,60 @@ mod tests {
         assert_eq!(fb1, direct1, "q>0 unmatched must equal lossy default");
     }
 
+    /// Round 346: lossy correctness proof for the WGT-truncation alignment
+    /// fix. With the encoder now indexing the Annex H weights by their β-major
+    /// existing-band slot (the decoder's cursor), a `q > 0` subsampled Annex H
+    /// stream must reconstruct to *correct pixels* — not merely decode without
+    /// over-read. Covers the 4:2:0 H.7 / H.8 tables (the `-*`-bearing ones the
+    /// old `custom_wgt` gate skipped) at high bit depth, against a smooth
+    /// low-frequency ramp where the high LL gains do not crush the signal.
+    #[test]
+    fn round346_subsampled_highbd_annex_h_lossy_psnr_floor() {
+        // Smooth gradient content (low spatial frequency) so the H.7/H.8 LL
+        // gains leave a recoverable signal at a small q.
+        let smooth = |w: usize, h: usize, bd: u8, seed: i64| -> Vec<u16> {
+            let max = (1i64 << bd) - 1;
+            let mut v = vec![0u16; w * h];
+            for y in 0..h {
+                for x in 0..w {
+                    let val = ((x as i64 + seed) * max / (w as i64 + 4)
+                        + (y as i64) * max / (h as i64 + 4) / 2)
+                        % (max + 1);
+                    v[y * w + x] = val as u16;
+                }
+            }
+            v
+        };
+        for &bd in &[10u8, 12] {
+            for &(sxc, syc, nly) in &[(2u8, 1u8, 2u8), (2u8, 2u8, 2u8)] {
+                let (w, h) = (64usize, 64usize);
+                let cw = w / sxc as usize;
+                let ch = h / syc as usize;
+                let planes = vec![
+                    smooth(w, h, bd, 0),
+                    smooth(cw, ch, bd, 3),
+                    smooth(cw, ch, bd, 7),
+                ];
+                let sx = [1u8, sxc, sxc];
+                let sy = [1u8, syc, syc];
+                let cs = encode_planar_subsampled_highbd_annex_h(
+                    w as u16, h as u16, 3, 0, 5, nly, bd, 1, &sx, &sy, &planes,
+                )
+                .expect("highbd subsampled Annex H lossy encode");
+                let img =
+                    decode_codestream(&cs, None).expect("decode highbd subsampled Annex H lossy");
+                for (i, orig) in planes.iter().enumerate() {
+                    let rec = plane_u16(&img.planes[i].data);
+                    let p = psnr_u16(orig, &rec, bd);
+                    assert!(
+                        p >= 30.0,
+                        "bd={bd} sx={sxc} sy={syc} NLy={nly} comp {i}: q=1 PSNR {p:.2} dB < 30 dB floor (WGT/truncation must agree)"
+                    );
+                }
+            }
+        }
+    }
+
     // === Round 330: Annex H CFA Star-Tetrix weight tables H.9 / H.10 / H.11 ==
 
     /// Build four 4:4:4:4 CFA planes (`[R, G1, G2, B]`) with distinct
