@@ -51,6 +51,22 @@ Table C.12) and the two VLC modes (no-prediction / vertical, Tables
 C.14 / C.13), the latter summing per-codeword bit lengths via the exact
 inverse of the Table C.15 unary VLC.
 
+These predicates are also **wired into the live decode path as
+conformance gates**: every precinct cross-checks its declared `Lprc[p]`
+against the summed on-wire size of its packets (Annex C.2 Table C.1),
+rejecting a length field too small to contain its own packets, and
+verifies that the filler-byte count reconstructed from the per-packet
+sizes (header + inferred `Lsig[p,s]` + `Lcnt` + `Ldat` + `Lsgn`) matches
+the gap the decoder actually skips — catching internally inconsistent
+sub-packet length fields that still sum to a valid `Lprc`. Legal
+trailing filler inside the data/sign/count sub-packets (Annex C.3) is
+tolerated. The decoder additionally rejects out-of-range header fields a
+conforming codestream cannot carry: `R[p] ∉ [0, NL−1]` (Annex C.2
+Table C.1); the reserved code points of `Cpih` / `Qpih` / `Fs` / `Rm` /
+`Ppoc` and `Ss ∉ 1..=8` (Annex A.4.4 Tables A.9–A.13); and `Cpih = 3`
+Star-Tetrix with any sub-sampled CFA input (Annex A.4.3 / F.2, mirroring
+the existing `Cpih = 1` RCT guard).
+
 ### Encoder
 
 A planar encoder covering the same feature matrix, lossless (`q = 0`)
