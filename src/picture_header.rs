@@ -132,6 +132,45 @@ pub fn parse(body: &[u8]) -> Result<PictureHeader> {
             "jpegxs: PIH dimensions must be non-zero, got {wf}x{hf}"
         )));
     }
+    // Reject the "Reserved for ISO/IEC purposes" code points of the
+    // enumerated PIH fields (Annex A.4.4 Tables A.9–A.13). A reserved
+    // value identifies a coding tool this edition of the standard does
+    // not define, so a conforming decoder cannot reconstruct the picture
+    // and must abort rather than silently mis-decode.
+    if !matches!(cpih, 0 | 1 | 3) {
+        return Err(Error::invalid(format!(
+            "jpegxs: PIH Cpih = {cpih} is reserved (Table A.9 defines only 0, 1, 3)"
+        )));
+    }
+    if qpih > 1 {
+        return Err(Error::invalid(format!(
+            "jpegxs: PIH Qpih = {qpih} is reserved (Table A.10 defines only 0, 1)"
+        )));
+    }
+    if fs > 1 {
+        return Err(Error::invalid(format!(
+            "jpegxs: PIH Fs = {fs} is reserved (Table A.11 defines only 0, 1)"
+        )));
+    }
+    if rm > 1 {
+        return Err(Error::invalid(format!(
+            "jpegxs: PIH Rm = {rm} is reserved (Table A.12 defines only 0, 1)"
+        )));
+    }
+    if ppoc != 0 {
+        return Err(Error::invalid(format!(
+            "jpegxs: PIH Ppoc = {ppoc} is reserved (Table A.13 defines only 0, the \
+             resolution-line-band-component order)"
+        )));
+    }
+    // Ss — code groups per significance group — has the explicit range
+    // 1..=8 (Annex A.4.4 Table A.7 "Values" column). Ss = 0 would make
+    // Ns[p,b] = ceil(Ncg / 0) undefined; Ss > 8 is reserved.
+    if ss == 0 || ss > 8 {
+        return Err(Error::invalid(format!(
+            "jpegxs: PIH Ss = {ss} out of range 1..=8 (Table A.7)"
+        )));
+    }
 
     Ok(PictureHeader {
         lcod,
@@ -245,28 +284,64 @@ mod tests {
 
     #[test]
     fn unpacks_packed_bytes() {
-        // Verify the packed nibble + bitfield decoding.
+        // Verify the packed nibble + bitfield decoding. Every field uses a
+        // value that is distinct *and* legal under the Table A.9–A.13
+        // reserved-value checks, so this exercises the bit-positions without
+        // tripping the semantic guards.
         let mut b = body(1, 4, 4, 0, 0x86);
         // body[20] = 0x86 → Fq=8, Br=6.
-        // body[21] = 0xCD → Fslc=1, Ppoc=4, Cpih=0xD.
-        b[21] = 0xCD;
-        // body[22] = 0x73 → NL,x=7, NL,y=3.
-        b[22] = 0x73;
-        // body[23] = 0xE5 = 1110 0101
-        //          → Lh=1, Rl=1, Qpih=2, Fs=1, Rm=1.
-        b[23] = 0xE5;
+        // body[21] = 0x83 = 1_000_0011 → Fslc=1, Ppoc=0, Cpih=3.
+        b[21] = 0x83;
+        // body[22] = 0x52 → NL,x=5, NL,y=2.
+        b[22] = 0x52;
+        // body[23] = 0xD5 = 1_1_01_01_01
+        //          → Lh=1, Rl=1, Qpih=1, Fs=1, Rm=1.
+        b[23] = 0xD5;
         let p = parse(&b).expect("packed");
         assert_eq!(p.fq, 8);
         assert_eq!(p.br, 6);
         assert_eq!(p.fslc, 1);
-        assert_eq!(p.ppoc, 4);
-        assert_eq!(p.cpih, 0xD);
-        assert_eq!(p.nlx, 7);
-        assert_eq!(p.nly, 3);
+        assert_eq!(p.ppoc, 0);
+        assert_eq!(p.cpih, 3);
+        assert_eq!(p.nlx, 5);
+        assert_eq!(p.nly, 2);
         assert_eq!(p.lh, 1);
         assert_eq!(p.rl, 1);
-        assert_eq!(p.qpih, 2);
+        assert_eq!(p.qpih, 1);
         assert_eq!(p.fs, 1);
         assert_eq!(p.rm, 1);
+    }
+
+    #[test]
+    fn rejects_reserved_enum_fields() {
+        // Each "Reserved for ISO/IEC purposes" code point of the enumerated
+        // PIH fields must be rejected (Tables A.9–A.13 + the Ss range).
+        // Cpih = 2 (reserved; Table A.9 defines 0/1/3).
+        let mut b = body(1, 4, 4, 0, 0x80);
+        b[21] = 0x02;
+        assert!(parse(&b).is_err(), "Cpih=2 reserved");
+        // Qpih = 2 (reserved; Table A.10 defines 0/1) — body[23] bits 5:4.
+        let mut b = body(1, 4, 4, 0, 0x80);
+        b[23] = 0b0010_0000;
+        assert!(parse(&b).is_err(), "Qpih=2 reserved");
+        // Fs = 2 (reserved; Table A.11 defines 0/1) — body[23] bits 3:2.
+        let mut b = body(1, 4, 4, 0, 0x80);
+        b[23] = 0b0000_1000;
+        assert!(parse(&b).is_err(), "Fs=2 reserved");
+        // Rm = 2 (reserved; Table A.12 defines 0/1) — body[23] bits 1:0.
+        let mut b = body(1, 4, 4, 0, 0x80);
+        b[23] = 0b0000_0010;
+        assert!(parse(&b).is_err(), "Rm=2 reserved");
+        // Ppoc = 1 (reserved; Table A.13 defines only 0) — body[21] bits 6:4.
+        let mut b = body(1, 4, 4, 0, 0x80);
+        b[21] = 0b0001_0000;
+        assert!(parse(&b).is_err(), "Ppoc=1 reserved");
+        // Ss out of range (Table A.7: 1..=8) — body[18].
+        let mut b = body(1, 4, 4, 0, 0x80);
+        b[18] = 0; // Ss = 0
+        assert!(parse(&b).is_err(), "Ss=0 out of range");
+        let mut b = body(1, 4, 4, 0, 0x80);
+        b[18] = 9; // Ss = 9
+        assert!(parse(&b).is_err(), "Ss=9 out of range");
     }
 }
