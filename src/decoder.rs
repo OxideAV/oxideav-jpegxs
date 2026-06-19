@@ -230,6 +230,19 @@ pub(crate) fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<JpegXsIm
                 pih.nc
             )));
         }
+        // Annex A.4.3 / §F.2: Cpih shall be 0 if any sx[i]/sy[i] for the
+        // transform inputs differ from 1. `inverse_star_tetrix` reads all
+        // four CFA inputs at full picture resolution (`planes[c][y*Wf+x]`),
+        // so a sub-sampled input plane would be the wrong size and the
+        // transform would index out of its own component. Reject it.
+        for (i, c) in cdt.components.iter().enumerate().take(4) {
+            if c.sx != 1 || c.sy != 1 {
+                return Err(Error::invalid(format!(
+                    "jpegxs Cpih=3: Star-Tetrix requires sx[i]=sy[i]=1 for i<4, got component {i} sx={} sy={} (Annex A.4.3 / F.2)",
+                    c.sx, c.sy
+                )));
+            }
+        }
         let mut refs: Vec<&mut [i32]> = samples.iter_mut().map(|p| p.as_mut_slice()).collect();
         inverse_star_tetrix(&mut refs, wf, hf, cts.e1, cts.e2, ct, cts.cf.cf())?;
     }
