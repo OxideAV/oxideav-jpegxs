@@ -22,6 +22,24 @@ chroma samplings (4:4:4 / 4:2:2 / 4:2:0) rather than only the 4:4:4 path
   lossy `q = 2` confirming the uniform kernel composes with the
   reversible colour-transform inverse.
 
+Adds the Annex C.3 raw-mode-consistency conformance gate to the decode
+path and corrects the encoder's raw-mode-selection flag.
+
+* `entropy::check_raw_mode_consistency(geom, packets)` — when the
+  picture-header `Rl = 0`, rejects a precinct in which a band's raw-mode
+  flag `Dr[p,s]` differs across the packets that include the band (raw
+  and non-raw bitplane-count coding mixed within one band, forbidden by
+  Annex C.3). No-op when `Rl = 1`, which lifts the restriction. Wired
+  into the live decode loop before the inverse quantizer. +4 unit tests.
+* Encoder now signals `Rl = 1` in the PIH `Lh:Rl:Qpih:Fs:Rm` byte. The
+  encoder selects the bitplane-count coding mode independently per packet
+  (the smaller of the raw and VLC form), so a multi-packet band can carry
+  a different `Dr` per packet — exactly the `Rl = 1` regime (Annex
+  C.5.3.3), whose per-line buffer bound holds automatically because each
+  packet's chosen size never exceeds its raw size. Previously the encoder
+  emitted `Rl = 0` while making per-packet raw choices, a non-conformant
+  construction the new decode gate surfaces.
+
 ## Unreleased — round 334 (bitplane-count-subpacket size `Lcnt[p,s]` inference + consistency predicate)
 
 Adds the bitplane-count subpacket to the family of subpacket-size

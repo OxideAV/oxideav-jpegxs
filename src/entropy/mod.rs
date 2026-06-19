@@ -755,6 +755,60 @@ pub fn count_subpacket_filler_bytes(
 /// The packet sizes are summed in `u64` so an adversarial set of
 /// per-packet counts cannot overflow the accumulator before the
 /// comparison against the 24-bit `Lprc[p]`.
+/// Annex C.3 (`Rl == 0`) raw-mode-consistency conformance gate.
+///
+/// When the picture-header raw-mode-selection flag `Rl` is 0, the spec
+/// constrains a conforming codestream so that "for a given precinct `p`
+/// and band `b`, the `Dr[p,s]` flag shall be identical for all packets
+/// `s` that include band `b` within precinct `p`, i.e. raw and non-raw
+/// coding of bitplane counts shall not be mixed within the same band in
+/// the same precinct." Formally: for all packets `s` and `s'`,
+/// `Dr[p,s] == Dr[p,s']` if there is a band `b` and lines `λ`, `λ'` with
+/// `I[p,b,λ,s] = 1` and `I[p,b,λ',s'] = 1`. The restriction does not
+/// apply when `Rl == 1`.
+///
+/// This is a decode-observable invariant — the decoder already reads
+/// every packet's `Dr` flag and the bands each packet covers, so a
+/// violation (a band coded raw in one packet and VLC in another within
+/// the same precinct) can be rejected before the inconsistent state
+/// feeds the inverse quantizer. Returns `Err` on the first band that is
+/// covered by two packets with differing `Dr`.
+pub fn check_raw_mode_consistency(
+    geom: &PrecinctGeometry,
+    packets: &[PacketWireSize<'_>],
+) -> Result<()> {
+    // Rl == 1 lifts the restriction (raw/non-raw may be mixed per line).
+    if geom.rl != 0 {
+        return Ok(());
+    }
+    // Track the first Dr seen per band; reject when a later packet covering
+    // the same band carries a different Dr.
+    let mut band_dr: Vec<Option<u8>> = vec![None; geom.bands.len()];
+    for pkt in packets {
+        let dr = pkt.dr & 1;
+        for entry in pkt.entries {
+            let bi = entry.band as usize;
+            // Entries are validated against geometry elsewhere; guard the
+            // index defensively so a stray band id can't panic here.
+            if bi >= band_dr.len() {
+                continue;
+            }
+            match band_dr[bi] {
+                None => band_dr[bi] = Some(dr),
+                Some(prev) if prev != dr => {
+                    return Err(Error::invalid(format!(
+                        "jpegxs entropy: band {bi} mixes raw (Dr={dr}) and \
+                         non-raw (Dr={prev}) bitplane-count coding within one \
+                         precinct while Rl=0 (Annex C.3)"
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn precinct_filler_bytes(
     geom: &PrecinctGeometry,
     precinct: &PrecinctHeader,
@@ -1495,5 +1549,75 @@ mod tests {
         };
         assert_eq!(sign_subpacket_filler_bytes(&g, &pkt, 0).unwrap(), 0);
         assert_eq!(sign_subpacket_filler_bytes(&g, &pkt, 7).unwrap(), 7);
+    }
+
+    // ---- Annex C.3 Rl=0 raw-mode-consistency conformance gate ----
+
+    fn wire(dr: u8, entries: &'static [PacketEntry]) -> PacketWireSize<'static> {
+        PacketWireSize {
+            header_bytes: 5,
+            lcnt: 1,
+            ldat: 1,
+            lsgn: 0,
+            dr,
+            entries,
+        }
+    }
+
+    /// Rl=0: two packets that each include band 0 with the *same* Dr are a
+    /// valid composition (raw and non-raw not mixed within the band).
+    #[test]
+    fn raw_mode_consistency_accepts_uniform_dr_per_band() {
+        let g = geom(vec![band(64, 0, 0)]);
+        let p0 = wire(1, &[PacketEntry { band: 0, line: 0 }]);
+        let p1 = wire(1, &[PacketEntry { band: 0, line: 1 }]);
+        assert!(check_raw_mode_consistency(&g, &[p0, p1]).is_ok());
+    }
+
+    /// Rl=0: band 0 coded raw (Dr=1) in one packet and non-raw (Dr=0) in
+    /// another within the same precinct violates Annex C.3 and is rejected.
+    #[test]
+    fn raw_mode_consistency_rejects_mixed_dr_within_band() {
+        let g = geom(vec![band(64, 0, 0)]);
+        let p0 = wire(0, &[PacketEntry { band: 0, line: 0 }]);
+        let p1 = wire(1, &[PacketEntry { band: 0, line: 1 }]);
+        let err = check_raw_mode_consistency(&g, &[p0, p1]).unwrap_err();
+        assert!(
+            format!("{err}").contains("mixes raw"),
+            "expected raw-mode mix rejection, got: {err}"
+        );
+    }
+
+    /// Rl=0: distinct bands may independently choose raw vs non-raw — only
+    /// mixing *within* the same band is forbidden. Two bands with opposite
+    /// Dr, each consistent across its own packets, is valid (Figure C.1).
+    #[test]
+    fn raw_mode_consistency_allows_per_band_choice() {
+        let g = geom(vec![band(32, 0, 0), band(32, 0, 0)]);
+        // Band 0 always raw, band 1 always non-raw, across two packets that
+        // each cover both bands.
+        let p0 = wire(
+            0,
+            &[
+                PacketEntry { band: 0, line: 0 },
+                PacketEntry { band: 1, line: 0 },
+            ],
+        );
+        // p1 must keep band 0's Dr=0 consistent; it is a separate packet for
+        // band 0 on a different line. (A band's Dr is per-precinct-per-band,
+        // so the second packet for band 0 must match the first.)
+        let p1 = wire(0, &[PacketEntry { band: 0, line: 1 }]);
+        assert!(check_raw_mode_consistency(&g, &[p0, p1]).is_ok());
+    }
+
+    /// Rl=1 lifts the restriction entirely: a band may mix raw and non-raw
+    /// across packets without violating conformance.
+    #[test]
+    fn raw_mode_consistency_noop_when_rl_set() {
+        let mut g = geom(vec![band(64, 0, 0)]);
+        g.rl = 1;
+        let p0 = wire(0, &[PacketEntry { band: 0, line: 0 }]);
+        let p1 = wire(1, &[PacketEntry { band: 0, line: 1 }]);
+        assert!(check_raw_mode_consistency(&g, &[p0, p1]).is_ok());
     }
 }

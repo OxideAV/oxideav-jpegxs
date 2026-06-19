@@ -4853,8 +4853,21 @@ fn write_pih_body(out: &mut Vec<u8>, cfg: &EncodeConfig) {
     // Lh (1) : Rl (1) : Qpih (2) : Fs (2) : Rm (2). Qpih (bits 5:4,
     // Annex A.4.4 Table A.10) selects the decoder's inverse-quantizer
     // kernel (0 = deadzone, 1 = uniform); Fs (bits 3:2, Table A.11)
-    // selects sign handling. Lh/Rl/Rm stay 0.
-    out.push(((cfg.qpih & 0x03) << 4) | ((cfg.fs & 0x03) << 2));
+    // selects sign handling.
+    //
+    // Rl (bit 6, Table A.7) is the raw-mode-selection-per-packet flag. The
+    // encoder picks the bitplane-count coding mode independently per packet
+    // — for each packet it emits the smaller of the raw (`Dr = 1`) and the
+    // VLC (`Dr = 0`) form — so a band that spans multiple packets can carry
+    // a different `Dr` in each. Under `Rl = 0` Annex C.3 forbids mixing raw
+    // and non-raw coding within one band of a precinct; the per-packet
+    // greedy choice is instead exactly the `Rl = 1` regime (Annex C.5.3.3),
+    // whose per-line buffer bound `L'l_tot ≤ Ll_raw` is satisfied
+    // automatically because each packet's chosen size never exceeds its raw
+    // size. Signal `Rl = 1` so the construction is conformant and the
+    // decoder's Annex C.3 consistency gate does not reject the encoder's own
+    // streams. `Lh`/`Rm` stay 0.
+    out.push((1 << 6) | ((cfg.qpih & 0x03) << 4) | ((cfg.fs & 0x03) << 2));
 }
 
 /// Build a slice-local `EncodeConfig` whose `q` is overridden by the

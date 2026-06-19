@@ -30,8 +30,8 @@ use crate::dequant::dequantize_precinct;
 use crate::dwt::{inverse_2d, inverse_cascade_2d};
 use crate::entropy::packet_body::{PrecinctState, PrecinctTop};
 use crate::entropy::{
-    decode_packet_body, parse_packet_header, parse_precinct_header, precinct_filler_bytes,
-    precinct_truncation, BandCoefficients, PacketWireSize, PrecinctHeader,
+    check_raw_mode_consistency, decode_packet_body, parse_packet_header, parse_precinct_header,
+    precinct_filler_bytes, precinct_truncation, BandCoefficients, PacketWireSize, PrecinctHeader,
 };
 use crate::error::{JpegXsError as Error, Result};
 use crate::image::{JpegXsImage, JpegXsPlane as VideoPlane};
@@ -363,6 +363,14 @@ fn decode_slice(
                 entries: &packet_layout.entries,
             });
         }
+
+        // Annex C.3 (`Rl = 0`): a band's raw-mode flag `Dr[p,s]` must be
+        // identical across every packet that includes the band within this
+        // precinct — raw and non-raw bitplane-count coding shall not be
+        // mixed within one band. Reject a codestream that violates this
+        // before the inconsistent decode state reaches the inverse
+        // quantizer. The check is a no-op when `Rl = 1`.
+        check_raw_mode_consistency(&precinct_plan.geometry, &wire_sizes)?;
 
         // Annex C.2 (Table C.1): the precinct's `Lprc[p]` field must be at
         // least the summed on-wire size of all its packets (headers +
