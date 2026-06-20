@@ -363,9 +363,12 @@ impl EncodeConfig {
                 self.nlx, self.nly
             )));
         }
-        if self.fq != 0 && self.fq != 8 {
+        // Fq must be one of the ISO/IEC 21122-1:2022 Table A.8 values:
+        // 0 (integer / lossless transform), 6 (NLT, Bw = 18), or 8
+        // (high-precision regular, Bw = 20).
+        if !matches!(self.fq, 0 | 6 | 8) {
             return Err(Error::Unsupported(format!(
-                "jpegxs encoder round 3: Fq must be 0 (lossless) or 8 (regular), got {}",
+                "jpegxs encoder: Fq must be 0, 6, or 8 (Table A.8), got {}",
                 self.fq
             )));
         }
@@ -396,11 +399,11 @@ impl EncodeConfig {
                 self.q
             )));
         }
-        if self.q > 0 && self.fq == 0 {
-            return Err(Error::invalid(
-                "jpegxs encoder round 3: q > 0 requires Fq = 8 (regular mode); for lossless use q = 0".to_string(),
-            ));
-        }
+        // NOTE: q > 0 does NOT require Fq != 0. Lossy quantisation is
+        // driven by the precinct truncation T[p,b], which the inverse
+        // quantiser applies independently of Fq. The integer-transform
+        // regular lossy stream is the conformant Table A.8 combination
+        // (Bw = B[0], Fq = 0): a non-zero T still drops bitplanes there.
         if self.sx.len() != self.nc as usize || self.sy.len() != self.nc as usize {
             return Err(Error::invalid(format!(
                 "jpegxs encoder: sx/sy must have length nc={}",
@@ -575,11 +578,6 @@ impl EncodeConfig {
                         "jpegxs encoder: q_slices[{t}] = {qs} > 15 (per-band T clamp range)"
                     )));
                 }
-                if qs > 0 && self.fq == 0 {
-                    return Err(Error::invalid(format!(
-                        "jpegxs encoder: q_slices[{t}] = {qs} > 0 requires Fq = 8 (regular mode); for lossless use q = 0 everywhere"
-                    )));
-                }
             }
         }
         // Round 233 — per-precinct Q overrides (Annex C.2 Table C.1; Q[p]
@@ -610,11 +608,6 @@ impl EncodeConfig {
                 if qp > 15 {
                     return Err(Error::invalid(format!(
                         "jpegxs encoder: q_precincts[{p}] = {qp} > 15 (per-band T clamp range)"
-                    )));
-                }
-                if qp > 0 && self.fq == 0 {
-                    return Err(Error::invalid(format!(
-                        "jpegxs encoder: q_precincts[{p}] = {qp} > 0 requires Fq = 8 (regular mode); for lossless use q = 0 everywhere"
                     )));
                 }
             }
@@ -820,7 +813,7 @@ pub fn encode_planar_star_tetrix(
 ) -> Result<Vec<u8>> {
     let sx = vec![1u8; 4];
     let sy = vec![1u8; 4];
-    let fq = if q == 0 { 0 } else { 8 };
+    let fq = 0; // integer-transform path; quantisation via T[p,b], Fq=0 (Table A.8)
     encode_planar_inner(
         width, height, 4, 3, nlx, nly, fq, q, &sx, &sy, e1, e2, cf, ct, planes,
     )
@@ -1041,7 +1034,7 @@ pub fn encode_planar_star_tetrix_highbd_lossy(
         3, // Cpih = 3 (Star-Tetrix)
         nlx,
         nly,
-        8, // fq = 8 (regular, Table A.8 — required for q > 0)
+        0, // fq = 0 (integer-transform path; lossy via T[p,b], Table A.8)
         q,
         &sx,
         &sy,
@@ -1107,7 +1100,7 @@ pub fn encode_planar_sd_star_tetrix_highbd(
     )?;
     let sx = vec![1u8; 4];
     let sy = vec![1u8; 4];
-    let fq = if q == 0 { 0 } else { 8 };
+    let fq = 0; // integer-transform path; quantisation via T[p,b], Fq=0 (Table A.8)
     encode_planar_inner_bd(
         width,
         height,
@@ -1198,7 +1191,7 @@ pub fn encode_planar_star_tetrix_highbd_annex_h(
         planes,
         "encode_planar_star_tetrix_highbd_annex_h",
     )?;
-    let fq = if q == 0 { 0 } else { 8 };
+    let fq = 0; // integer-transform path; quantisation via T[p,b], Fq=0 (Table A.8)
     encode_planar_inner_bd(
         width,
         height,
@@ -1293,7 +1286,7 @@ pub fn encode_planar_lossy(
 ) -> Result<Vec<u8>> {
     let sx = vec![1u8; nc as usize];
     let sy = vec![1u8; nc as usize];
-    let fq = if q == 0 { 0 } else { 8 };
+    let fq = 0; // integer-transform path; quantisation via T[p,b], Fq=0 (Table A.8)
     encode_planar_inner(
         width, height, nc, cpih, nlx, nly, fq, q, &sx, &sy, 0, 0, 0, 0, planes,
     )
@@ -1339,7 +1332,7 @@ pub fn encode_planar_lossy_annex_h(
     let Some((gains, priorities)) = annex_h_weights(nc, cpih, 0, nlx, nly, 0, &sx, &sy) else {
         return encode_planar_lossy(width, height, nc, cpih, nlx, nly, q, planes);
     };
-    let fq = if q == 0 { 0 } else { 8 };
+    let fq = 0; // integer-transform path; quantisation via T[p,b], Fq=0 (Table A.8)
     encode_planar_inner_nlt(
         width,
         height,
@@ -1411,7 +1404,7 @@ pub fn encode_planar_subsampled_annex_h(
     let Some((gains, priorities)) = annex_h_weights(nc, cpih, 0, nlx, nly, 0, sx, sy) else {
         return encode_planar_subsampled(width, height, nc, cpih, nlx, nly, q, sx, sy, planes);
     };
-    let fq = if q == 0 { 0 } else { 8 };
+    let fq = 0; // integer-transform path; quantisation via T[p,b], Fq=0 (Table A.8)
     encode_planar_inner_nlt(
         width,
         height,
@@ -1485,10 +1478,10 @@ pub fn encode_planar_star_tetrix_annex_h(
 ) -> Result<Vec<u8>> {
     let sx = vec![1u8; 4];
     let sy = vec![1u8; 4];
-    let fq = if q == 0 { 0 } else { 8 };
-    // Outside the tabulated H.9–H.11 set `annex_h_weights` returns `None`;
-    // empty gains/priorities then fall back to the default-weights Sd=1
-    // Star-Tetrix path so the CFA codestream is still well-formed.
+    let fq = 0; // integer-transform path; quantisation via T[p,b], Fq=0 (Table A.8)
+                // Outside the tabulated H.9–H.11 set `annex_h_weights` returns `None`;
+                // empty gains/priorities then fall back to the default-weights Sd=1
+                // Star-Tetrix path so the CFA codestream is still well-formed.
     let (gains, priorities) = annex_h_weights(4, 3, 1, nlx, nly, cf, &sx, &sy).unwrap_or_default();
     encode_planar_inner_nlt(
         width,
@@ -1690,7 +1683,7 @@ pub fn encode_planar_highbd_lossy(
         cpih,
         nlx,
         nly,
-        8, // fq = 8 (regular, Table A.8 — required for q > 0)
+        0, // fq = 0 (integer-transform path; lossy via T[p,b], Table A.8)
         q,
         &sx,
         &sy,
@@ -1870,7 +1863,7 @@ pub fn encode_planar_subsampled_highbd_lossy(
         cpih,
         nlx,
         nly,
-        8, // fq = 8 (regular, Table A.8 — required for q > 0)
+        0, // fq = 0 (integer-transform path; lossy via T[p,b], Table A.8)
         q,
         sx,
         sy,
@@ -2005,7 +1998,7 @@ pub fn encode_planar_subsampled_highbd_annex_h(
         planes,
         "encode_planar_subsampled_highbd_annex_h",
     )?;
-    let fq = if q == 0 { 0 } else { 8 };
+    let fq = 0; // integer-transform path; quantisation via T[p,b], Fq=0 (Table A.8)
     encode_planar_inner_bd(
         width,
         height,
@@ -2076,7 +2069,7 @@ pub fn encode_planar_hsl(
 ) -> Result<Vec<u8>> {
     let sx = vec![1u8; nc as usize];
     let sy = vec![1u8; nc as usize];
-    let fq = if q == 0 { 0 } else { 8 };
+    let fq = 0; // integer-transform path; quantisation via T[p,b], Fq=0 (Table A.8)
     encode_planar_inner_nlt(
         width,
         height,
@@ -2166,11 +2159,7 @@ pub fn encode_planar_hsl_qslice(
     let q_pic = q_slices.iter().copied().max().unwrap_or(0);
     // Fq = 8 whenever any slice quantizes; 0 only when every slice is
     // lossless (so the byte-identical lossless layout is preserved).
-    let fq = if q_slices.iter().any(|&v| v > 0) {
-        8
-    } else {
-        0
-    };
+    let fq = 0; // integer-transform path; quantisation via T[p,b], Fq=0 (Table A.8)
     encode_planar_inner_nlt(
         width,
         height,
@@ -2272,11 +2261,7 @@ pub fn encode_planar_qpr(
     // Fq = 8 whenever any precinct quantizes; 0 only when every precinct
     // is lossless (preserves byte-identical output to encode_planar
     // for the all-zero case).
-    let fq = if q_precincts.iter().any(|&v| v > 0) {
-        8
-    } else {
-        0
-    };
+    let fq = 0; // integer-transform path; quantisation via T[p,b], Fq=0 (Table A.8)
     encode_planar_inner_nlt(
         width,
         height,
@@ -2485,11 +2470,7 @@ pub fn encode_planar_qpr_rpr(
     let q_pic = q_precincts.iter().copied().max().unwrap_or(0);
     let rp_pic = r_precincts.iter().copied().max().unwrap_or(0);
     // Fq=8 whenever any precinct quantizes (matches encode_planar_qpr).
-    let fq = if q_precincts.iter().any(|&v| v > 0) {
-        8
-    } else {
-        0
-    };
+    let fq = 0; // integer-transform path; quantisation via T[p,b], Fq=0 (Table A.8)
     encode_planar_inner_nlt(
         width,
         height,
@@ -3057,11 +3038,7 @@ pub fn encode_planar_hsl_qslice_rp(
     let sx = vec![1u8; nc as usize];
     let sy = vec![1u8; nc as usize];
     let q_pic = q_slices.iter().copied().max().unwrap_or(0);
-    let fq = if q_slices.iter().any(|&v| v > 0) {
-        8
-    } else {
-        0
-    };
+    let fq = 0; // integer-transform path; quantisation via T[p,b], Fq=0 (Table A.8)
     encode_planar_inner_nlt(
         width,
         height,
@@ -3499,11 +3476,7 @@ pub fn encode_planar_hsl_qslice_rp_highbd(
     let sx = vec![1u8; nc as usize];
     let sy = vec![1u8; nc as usize];
     let q_pic = q_slices.iter().copied().max().unwrap_or(0);
-    let fq = if q_slices.iter().any(|&v| v > 0) {
-        8
-    } else {
-        0
-    };
+    let fq = 0; // integer-transform path; quantisation via T[p,b], Fq=0 (Table A.8)
     encode_planar_inner_bd(
         width,
         height,
@@ -3885,7 +3858,7 @@ pub fn encode_planar_qpih(
 ) -> Result<Vec<u8>> {
     let sx = vec![1u8; nc as usize];
     let sy = vec![1u8; nc as usize];
-    let fq = if q == 0 { 0 } else { 8 };
+    let fq = 0; // integer-transform path; quantisation via T[p,b], Fq=0 (Table A.8)
     encode_planar_inner_nlt(
         width,
         height,
@@ -3950,7 +3923,7 @@ pub fn encode_planar_qpih_subsampled(
     sy: &[u8],
     planes: &[Vec<u8>],
 ) -> Result<Vec<u8>> {
-    let fq = if q == 0 { 0 } else { 8 };
+    let fq = 0; // integer-transform path; quantisation via T[p,b], Fq=0 (Table A.8)
     encode_planar_inner_nlt(
         width,
         height,
@@ -4031,7 +4004,7 @@ pub fn encode_planar_rp(
 ) -> Result<Vec<u8>> {
     let sx = vec![1u8; nc as usize];
     let sy = vec![1u8; nc as usize];
-    let fq = if q == 0 { 0 } else { 8 };
+    let fq = 0; // integer-transform path; quantisation via T[p,b], Fq=0 (Table A.8)
     encode_planar_inner_nlt(
         width,
         height,
@@ -4092,7 +4065,7 @@ pub fn encode_planar_fs1(
 ) -> Result<Vec<u8>> {
     let sx = vec![1u8; nc as usize];
     let sy = vec![1u8; nc as usize];
-    let fq = if q == 0 { 0 } else { 8 };
+    let fq = 0; // integer-transform path; quantisation via T[p,b], Fq=0 (Table A.8)
     encode_planar_inner_nlt(
         width,
         height,
@@ -4155,7 +4128,7 @@ pub fn encode_planar_cw(
 ) -> Result<Vec<u8>> {
     let sx = vec![1u8; nc as usize];
     let sy = vec![1u8; nc as usize];
-    let fq = if q == 0 { 0 } else { 8 };
+    let fq = 0; // integer-transform path; quantisation via T[p,b], Fq=0 (Table A.8)
     encode_planar_inner_nlt(
         width,
         height,
@@ -4210,7 +4183,7 @@ pub fn encode_planar_sd(
 ) -> Result<Vec<u8>> {
     let sx = vec![1u8; nc as usize];
     let sy = vec![1u8; nc as usize];
-    let fq = if q == 0 { 0 } else { 8 };
+    let fq = 0; // integer-transform path; quantisation via T[p,b], Fq=0 (Table A.8)
     encode_planar_inner_nlt(
         width,
         height,
@@ -4268,7 +4241,7 @@ pub fn encode_planar_sd_rct(
 ) -> Result<Vec<u8>> {
     let sx = vec![1u8; nc as usize];
     let sy = vec![1u8; nc as usize];
-    let fq = if q == 0 { 0 } else { 8 };
+    let fq = 0; // integer-transform path; quantisation via T[p,b], Fq=0 (Table A.8)
     encode_planar_inner_nlt(
         width,
         height,
@@ -4331,7 +4304,7 @@ pub fn encode_planar_sd_star_tetrix(
 ) -> Result<Vec<u8>> {
     let sx = vec![1u8; nc as usize];
     let sy = vec![1u8; nc as usize];
-    let fq = if q == 0 { 0 } else { 8 };
+    let fq = 0; // integer-transform path; quantisation via T[p,b], Fq=0 (Table A.8)
     encode_planar_inner_nlt(
         width,
         height,
@@ -4381,7 +4354,7 @@ pub fn encode_planar_subsampled(
     sy: &[u8],
     planes: &[Vec<u8>],
 ) -> Result<Vec<u8>> {
-    let fq = if q == 0 { 0 } else { 8 };
+    let fq = 0; // integer-transform path; quantisation via T[p,b], Fq=0 (Table A.8)
     encode_planar_inner(
         width, height, nc, cpih, nlx, nly, fq, q, sx, sy, 0, 0, 0, 0, planes,
     )
@@ -4416,7 +4389,7 @@ pub fn encode_planar_nlt_quadratic(
     }
     let sx = vec![1u8; nc as usize];
     let sy = vec![1u8; nc as usize];
-    let fq = if q == 0 { 0 } else { 8 };
+    let fq = 0; // integer-transform path; quantisation via T[p,b], Fq=0 (Table A.8)
     encode_planar_inner_nlt(
         width,
         height,
@@ -4497,7 +4470,7 @@ pub fn encode_planar_nlt_extended(
     }
     let sx = vec![1u8; nc as usize];
     let sy = vec![1u8; nc as usize];
-    let fq = if q == 0 { 0 } else { 8 };
+    let fq = 0; // integer-transform path; quantisation via T[p,b], Fq=0 (Table A.8)
     encode_planar_inner_nlt(
         width,
         height,
@@ -4605,7 +4578,7 @@ pub fn encode_planar_nlt_quadratic_highbd(
     }
     let sx = vec![1u8; nc as usize];
     let sy = vec![1u8; nc as usize];
-    let fq = if q == 0 { 0 } else { 8 };
+    let fq = 0; // integer-transform path; quantisation via T[p,b], Fq=0 (Table A.8)
     encode_planar_inner_bd(
         width,
         height,
@@ -4727,7 +4700,7 @@ pub fn encode_planar_nlt_extended_highbd(
     }
     let sx = vec![1u8; nc as usize];
     let sy = vec![1u8; nc as usize];
-    let fq = if q == 0 { 0 } else { 8 };
+    let fq = 0; // integer-transform path; quantisation via T[p,b], Fq=0 (Table A.8)
     encode_planar_inner_bd(
         width,
         height,
@@ -4943,6 +4916,39 @@ fn encode_planar_inner_bd(
         18
     } else {
         8
+    };
+    // Resolve Fq to a value the crate signals *truthfully* and pair it
+    // with `bw` per ISO/IEC 21122-1:2022 Table A.8, which lists exactly
+    // three valid (Bw, Fq) combinations: (B[0], 0) for lossless /
+    // integer-transform coding, (18, 6) when a non-linearity (NLT marker)
+    // is present, and (20, 8) for the high-precision regular case.
+    //
+    // `Fq` is the number of fractional bits the wavelet transform carries
+    // (Annex E.3, Table E.13): the dequantised coefficient is up-scaled by
+    // `<< Fq` before the inverse DWT and the forward-DWT output is
+    // down-scaled by `>> Fq` after it (see [`fq_downscale_band`] and
+    // [`crate::dequant::dequantize_precinct`]; the two are exact inverses).
+    //
+    // * The default integer-transform regular path passes `fq = 0`: zero
+    //   extra fractional precision. Lossy quantisation via the precinct
+    //   truncation `T[p,b]` is still permitted (the inverse quantiser is
+    //   independent of Fq), so a regular lossy stream is the conformant
+    //   (Bw = B[0], Fq = 0) combination. (The historical `Fq = 8` written
+    //   alongside `Bw = 8` was *not* a Table A.8 combination — a conforming
+    //   decoder would have `<< 8`-ed the coefficients and corrupted them.)
+    // * NLT requires Fq != 0 (Annex A.4.6: "This marker shall not be
+    //   present if Fq=0"); the chosen Bw selects the Table A.8 value.
+    // * The high-precision regular entry point passes `fq = 8`, pairing
+    //   with `Bw = 20` and the Annex E.3 input up-scaling below.
+    let (bw, fq) = if nlt.is_some() {
+        (bw, if bw >= 20 { 8 } else { 6 })
+    } else if fq >= 8 {
+        // High-precision regular case: pin the conformant (20, 8) pair.
+        // The Annex E.3 input up-scaling is applied in `write_slice`.
+        (20, 8)
+    } else {
+        // Integer-transform regular path (0 extra fractional bits).
+        (bw, 0)
     };
     let cfg = EncodeConfig {
         width,
@@ -6047,6 +6053,29 @@ fn band_dims(wc: usize, hc: usize, nlx: u8, nly: u8, beta: u32) -> (usize, usize
     (w as usize, h as usize)
 }
 
+/// Apply the Annex E.3 / Table E.13 forward fractional down-scaling
+/// `c[p,λ,b,ξ] = sign(T) * ((|T| + r) >> Fq)` with `r = (1 << Fq) >> 1`,
+/// in place over a band's wavelet coefficients. This is the exact inverse
+/// of the decoder's `c << Fq` reconstruction step (applied in
+/// [`crate::dequant::dequantize_precinct`]). A no-op for `Fq = 0`, so the
+/// lossless / integer-transform path is byte-identical.
+fn fq_downscale_band(band: &mut [i32], fq: u8) {
+    if fq == 0 {
+        return;
+    }
+    let fq_u = fq as u32;
+    let r: i64 = (1i64 << fq_u) >> 1;
+    for v in band.iter_mut() {
+        let t = *v as i64;
+        let scaled = if t >= 0 {
+            (t + r) >> fq_u
+        } else {
+            -((-t + r) >> fq_u)
+        };
+        *v = scaled as i32;
+    }
+}
+
 /// Per-precinct band-row offset count `pow_h = 2^max(NL,y - dy, 0)`.
 fn pow_h(nly: u8, dy: u32) -> usize {
     let nly_u = nly as u32;
@@ -6166,23 +6195,34 @@ fn write_slice(out: &mut Vec<u8>, cfg: &EncodeConfig, planes_u8: &[Vec<u8>]) -> 
             }
         }
         None => {
-            // Normal linear path: input samples shifted to the i32 wavelet
-            // domain by the DC bias `1 << (Bw - 1)` (Annex G.3 inverse). For
-            // `B[i] == 8` the plane is one byte per sample; for `B[i] > 8`
-            // (round 118 high-bit-depth path) it is two little-endian bytes
-            // per sample, matching `crate::image::JpegXsPlane` so the encode
-            // and decode plane formats are symmetric.
+            // Normal linear path: input samples are scaled into the i32
+            // wavelet domain as the exact inverse of the Annex G.2 (Table
+            // G.2) output scaling `R = (Ω + dc_bias + half) >> ζ`. The
+            // forward map is therefore `Ω = (sample << ζ) - dc_bias`, with
+            //   ζ        = Bw - B[i]   (the nominal-precision headroom), and
+            //   dc_bias  = 1 << (Bw - 1)   (the inverse DC level shift).
+            // For the integer-transform path (`Bw = B[i]`) ζ = 0 and this
+            // reduces to the byte-identical legacy `sample - dc_bias`. For
+            // the high-precision regular case (`Bw = 20`) ζ > 0 widens the
+            // dynamic range so the `>> Fq` fractional precision survives the
+            // transform. For `B[i] == 8` the plane is one byte per sample;
+            // for `B[i] > 8` it is two little-endian bytes per sample.
+            let zeta = (cfg.bw as i32 - cfg.bit_depth as i32).max(0) as u32;
             if cfg.bit_depth <= 8 {
                 planes_u8
                     .iter()
-                    .map(|p| p.iter().map(|&v| v as i32 - dc_bias).collect::<Vec<i32>>())
+                    .map(|p| {
+                        p.iter()
+                            .map(|&v| ((v as i32) << zeta) - dc_bias)
+                            .collect::<Vec<i32>>()
+                    })
                     .collect()
             } else {
                 planes_u8
                     .iter()
                     .map(|p| {
                         p.chunks_exact(2)
-                            .map(|c| u16::from_le_bytes([c[0], c[1]]) as i32 - dc_bias)
+                            .map(|c| ((u16::from_le_bytes([c[0], c[1]]) as i32) << zeta) - dc_bias)
                             .collect::<Vec<i32>>()
                     })
                     .collect()
@@ -6265,7 +6305,14 @@ fn write_slice(out: &mut Vec<u8>, cfg: &EncodeConfig, planes_u8: &[Vec<u8>]) -> 
                 4 => 2,
                 _ => 0,
             });
-            let bands = forward_cascade_2d(wc, hc, cfg.nlx, nly_i, plane)?;
+            let mut bands = forward_cascade_2d(wc, hc, cfg.nlx, nly_i, plane)?;
+            // Annex E.3 / Table E.13 forward fractional down-scaling
+            // (`>> Fq`). The decoder applies the matching `<< Fq` at the
+            // dequant boundary, so the two are exact inverses. No-op for
+            // the integer-transform path (`Fq = 0`).
+            for band in bands.iter_mut() {
+                fq_downscale_band(band, cfg.fq);
+            }
             bands_per_comp.push(bands);
         }
         // For suppressed (Sd) components, encode_precinct_cascade reads
@@ -6273,7 +6320,14 @@ fn write_slice(out: &mut Vec<u8>, cfg: &EncodeConfig, planes_u8: &[Vec<u8>]) -> 
         // directly (no DWT was applied). `comp_planes` is already
         // DC-biased so the values fed into the entropy coder match the
         // dynamic range the decoder dequant path will produce when
-        // copying straight back into the sample plane.
+        // copying straight back into the sample plane. The Sd band is
+        // still subject to the Annex E.3 `>> Fq` (the decoder's reorder
+        // step scales every component, including suppressed ones).
+        if cfg.fq != 0 {
+            for plane in comp_planes.iter_mut().skip(n_decomposed) {
+                fq_downscale_band(plane, cfg.fq);
+            }
+        }
         let mut t: u16 = 0;
         let mut py_start = 0usize;
         while py_start < np_y {
@@ -6430,6 +6484,9 @@ fn encode_precinct_single_level(
             let mut ll = vec![0i32; ll_w];
             let mut hl = vec![0i32; hl_w];
             crate::dwt::forward_horizontal_1d(&strip, &mut ll, &mut hl)?;
+            // Annex E.3 / Table E.13 forward fractional down-scaling.
+            fq_downscale_band(&mut ll, cfg.fq);
+            fq_downscale_band(&mut hl, cfg.fq);
             comp_bands.push(CompBands {
                 nly_i,
                 ll,
@@ -6450,6 +6507,11 @@ fn encode_precinct_single_level(
             let mut lh = vec![0i32; ll_w * lh_h_per_precinct];
             let mut hh = vec![0i32; hl_w * lh_h_per_precinct];
             forward_2d(wc, hp_i, &strip, &mut ll, &mut hl, &mut lh, &mut hh)?;
+            // Annex E.3 / Table E.13 forward fractional down-scaling.
+            fq_downscale_band(&mut ll, cfg.fq);
+            fq_downscale_band(&mut hl, cfg.fq);
+            fq_downscale_band(&mut lh, cfg.fq);
+            fq_downscale_band(&mut hh, cfg.fq);
             comp_bands.push(CompBands {
                 nly_i,
                 ll,
@@ -16719,7 +16781,7 @@ mod tests {
         fs: u8,
         planes: &[Vec<u8>],
     ) -> Result<Vec<u8>> {
-        let fq = if q == 0 { 0 } else { 8 };
+        let fq = 0; // integer-transform path; quantisation via T[p,b], Fq=0 (Table A.8)
         encode_planar_inner_nlt(
             w,
             h,
@@ -16896,5 +16958,81 @@ mod tests {
                 "CFA component {c} lossless under uniform quantizer"
             );
         }
+    }
+
+    /// Round 351 — a regular *lossy* stream (q > 0, no NLT) now signals the
+    /// conformant ISO/IEC 21122-1:2022 Table A.8 combination
+    /// `(Bw = B[0], Fq = 0)` instead of the historical non-tabulated
+    /// `(Bw = 8, Fq = 8)`. The integer 5/3 transform carries no extra
+    /// fractional bits, so Fq = 0 is the truthful signalling; lossy
+    /// compression is still achieved through the precinct truncation
+    /// `T[p,b]`, and the stream still round-trips within the PSNR floor.
+    #[test]
+    fn round351_regular_lossy_signals_conformant_bw_fq() {
+        let w = 32usize;
+        let h = 32usize;
+        let mut pixels = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                pixels[y * w + x] = ((x * 7 + y * 11) % 256) as u8;
+            }
+        }
+        let cs = encode_planar_lossy(w as u16, h as u16, 1, 0, 2, 2, 2, &[pixels.clone()])
+            .expect("encode 32x32 luma q=2");
+        let parsed = crate::codestream::parse(&cs).expect("parse");
+        assert_eq!(
+            parsed.pih.fq, 0,
+            "regular lossy must signal the conformant Fq=0 (Table A.8), not 8"
+        );
+        assert_eq!(
+            parsed.pih.bw, 8,
+            "Fq=0 requires Bw=B[0]=8 (Table A.8 lossless combination)"
+        );
+        // Still genuinely lossy + decodes within the floor.
+        let img = decode_codestream(&cs, None).expect("decode 32x32 luma q=2");
+        let p = psnr(&pixels, &img.planes[0].data);
+        assert!(
+            p >= 25.0,
+            "regular lossy q=2 PSNR {p:.2} dB below 25 dB floor"
+        );
+    }
+
+    /// Round 351 — the decoder rejects a hand-mutated codestream whose
+    /// `(Bw, Fq)` pair is outside ISO/IEC 21122-1:2022 Table A.8. We take a
+    /// valid lossless stream (`Bw = 8, Fq = 0`) and flip the PIH `Fq`
+    /// nibble to 8, producing the non-tabulated `(8, 8)` pair the old
+    /// encoder used to emit. A conforming decoder must reject it rather
+    /// than silently `<< 8`-scale the coefficients.
+    #[test]
+    fn round351_decoder_rejects_non_table_a8_bw_fq() {
+        let w = 16usize;
+        let h = 16usize;
+        let pixels: Vec<u8> = (0..(w * h)).map(|i| (i % 256) as u8).collect();
+        let mut cs = encode_planar(w as u16, h as u16, 1, 0, 2, 2, &[pixels])
+            .expect("encode 16x16 luma lossless");
+        // Locate the PIH marker (FF 12) and flip the Fq nibble (the high
+        // nibble of the Fq:Br byte, which is `Lpih(2) + 2 + ... ` into the
+        // body). Rather than hand-compute the offset, find the byte that
+        // currently encodes Fq:Br = 0x?8 with Fq nibble 0 and set Fq=8.
+        let pih_pos = cs
+            .windows(2)
+            .position(|w| w == [0xff, 0x12])
+            .expect("PIH marker present");
+        // PIH body layout: marker(2) Lpih(2) then fields; within the body
+        // (the bytes after Lpih) Bw is body[19] and Fq:Br is body[20].
+        // Absolute index: pih_pos + 2 (marker) + 2 (Lpih) + 20.
+        let fq_br_idx = pih_pos + 4 + 20;
+        // Sanity: current Fq nibble is 0 (lossless).
+        assert_eq!(cs[fq_br_idx] >> 4, 0, "lossless PIH should carry Fq=0");
+        // Set Fq nibble to 8 (keep Br low nibble), producing the
+        // non-tabulated (Bw=8, Fq=8) pair.
+        cs[fq_br_idx] = (8 << 4) | (cs[fq_br_idx] & 0x0f);
+        let err = decode_codestream(&cs, None)
+            .expect_err("decoder must reject the non-Table-A.8 (Bw=8, Fq=8) pair");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Table A.8"),
+            "rejection should cite Table A.8, got: {msg}"
+        );
     }
 }

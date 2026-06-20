@@ -1,5 +1,45 @@
 # Changelog
 
+## Unreleased — round 351 (Annex E.3 Fq fractional-coefficient scaling + Table A.8 (Bw, Fq) conformance)
+
+Implements the ISO/IEC 21122-1:2022 Annex E.3 (Table E.13) wavelet-coefficient
+fractional scaling — `T[β,x,y] = c[p,λ,b,ξ] << Fq` on decode and the exact
+inverse `c = sign(T)·((|T| + ((1<<Fq)>>1)) >> Fq)` on encode — and aligns the
+signalled `(Bw, Fq)` pair to a valid Table A.8 combination on every path.
+
+* **Fix (conformance):** the regular lossy path used to write the
+  non-tabulated `(Bw = 8, Fq = 8)` pair while applying *no* fractional
+  scaling. A conforming decoder reconstructing per Annex E.3 would have
+  left-shifted the coefficients by 8 and corrupted the output; the streams
+  only round-tripped here because this crate's decoder also ignored `Fq`.
+  Table A.8 lists exactly three valid combinations: `(B[0], 0)` (integer /
+  lossless transform), `(18, 6)` (NLT present), `(20, 8)` (high-precision
+  regular). The integer 5/3 transform carries zero extra fractional bits, so
+  a regular lossy stream now truthfully signals `(B[0], 0)` — lossy
+  compression is still driven by the precinct truncation `T[p,b]`, which the
+  inverse quantiser applies independently of `Fq`. The bogus
+  `q > 0 ⇒ Fq = 8` encoder invariant is removed.
+* **Decode:** [`dequant::dequantize_precinct`] now takes `fq` and applies the
+  Annex E.3 `<< Fq` up-scaling to every band of every component (including the
+  suppressed `Sd` components copied straight to the sample plane), centralised
+  at the dequant boundary so both the cascade and streaming synthesis paths
+  inherit it. No-op for `Fq = 0`, so the lossless path is byte-identical.
+* **Encode:** [`fq_downscale_band`] applies the matching `>> Fq` rounding to
+  the forward-DWT output (cascade, streaming 1-D / 2-D, and `Sd` bands) before
+  quantisation. The linear input scaling now performs the full Annex G.2
+  inverse `Ω = (sample << ζ) − dc_bias` with `ζ = Bw − B[i]`, so the
+  high-precision `(Bw = 20, Fq = 8)` regular case has the dynamic-range
+  headroom for the fractional bits to survive the transform (ζ = 0 reduces to
+  the byte-identical legacy shift for the integer path).
+* **Decode conformance gate:** `decode_codestream` rejects any `(Bw, Fq)` pair
+  outside Table A.8, and an NLT marker present with `Fq = 0` (Annex A.4.6).
+* The NLT paths now signal the Table A.8 `(18, 6)` / `(20, 8)` value for their
+  `Bw` and carry the matching `>> Fq` / `<< Fq` scaling, making them
+  `Fq`-truthful (previously they wrote `Fq = 8` with no scaling).
+* +2 tests: a regular lossy stream signals the conformant `(Bw = B[0], Fq = 0)`
+  and still decodes within the PSNR floor; the decoder rejects a hand-mutated
+  `(Bw = 8, Fq = 8)` stream citing Table A.8.
+
 ## Unreleased — round 346 (high-bit-depth subsampled Annex H weights + subsampled WGT-truncation alignment fix)
 
 Wires the ISO/IEC 21122-1:2022 Annex H subsampled tables (H.4–H.8) through

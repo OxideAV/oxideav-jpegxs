@@ -119,12 +119,26 @@ pub fn inverse_quantize(qpih: u8, band: &BandCoefficients, t: u8, ng: u8, out: &
 /// Convenience: dequantize every band of a precinct using a freshly-
 /// computed truncation table. Returns one `Vec<i32>` per band, each
 /// row-major `(num_lines × wpb)`.
+///
+/// `fq` is the picture-header number of fractional bits in the wavelet
+/// coefficients (Annex A.4.4, Table A.8). Per Annex E.3 (Table E.13,
+/// "Coefficient insertion into precinct") the dequantized coefficient
+/// `c[p,λ,b,ξ]` is scaled up by `Fq` before it is handed to the inverse
+/// wavelet transform: `T[β,x,y] = c[p,λ,b,ξ] << Fq`. This "additional
+/// scaling step improves the precision of the wavelet transformation".
+/// The scaling is applied to every band of every component (including
+/// the suppressed `Sd` components whose single populated band is copied
+/// straight into the sample plane), so it is centralised here at the
+/// dequant boundary. For the lossless combination `(Bw = B[0], Fq = 0)`
+/// the shift is a no-op and the byte-exact lossless path is unchanged.
 pub fn dequantize_precinct(
     qpih: u8,
     geom: &PrecinctGeometry,
     truncation: &[u8],
     bands: &[BandCoefficients],
+    fq: u8,
 ) -> Vec<Vec<i32>> {
+    let fq_u = fq as u32;
     let mut out = Vec::with_capacity(geom.bands.len());
     for (b, coef) in bands.iter().enumerate() {
         let band_geom = &geom.bands[b];
@@ -136,6 +150,12 @@ pub fn dequantize_precinct(
         let mut buf = vec![0i32; len];
         let t = truncation.get(b).copied().unwrap_or(0);
         inverse_quantize(qpih, coef, t, geom.ng, &mut buf);
+        if fq_u != 0 {
+            // Annex E.3, Table E.13: T[β,x,y] = c[p,λ,b,ξ] << Fq.
+            for v in buf.iter_mut() {
+                *v = ((*v as i64) << fq_u) as i32;
+            }
+        }
         out.push(buf);
     }
     out

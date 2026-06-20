@@ -52,6 +52,31 @@ pub(crate) fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<JpegXsIm
             pih.qpih
         )));
     }
+    // ISO/IEC 21122-1:2022 Table A.8 — the only conformant (Bw, Fq)
+    // combinations are (B[0], 0) for lossless / integer-transform coding,
+    // (18, 6) when a non-linearity (NLT marker) is present, and (20, 8)
+    // for the high-precision regular case. Reject everything else: a
+    // non-tabulated pair (e.g. the historical Bw=8/Fq=8) is not a stream a
+    // conforming encoder can produce, and decoding it under the Annex E.3
+    // `c << Fq` scaling would silently corrupt the output.
+    match (pih.bw, pih.fq) {
+        (bw, 0) if bw == cdt.components[0].bit_depth => {}
+        (18, 6) => {}
+        (20, 8) => {}
+        (bw, fq) => {
+            return Err(Error::Unsupported(format!(
+                "jpegxs decoder: (Bw={bw}, Fq={fq}) is not a valid ISO/IEC 21122-1:2022 \
+                 Table A.8 combination (expected (B[0]={}, 0), (18, 6), or (20, 8))",
+                cdt.components[0].bit_depth
+            )));
+        }
+    }
+    // Annex A.4.6: the NLT marker "shall not be present if Fq=0".
+    if pih.fq == 0 && cs.nlt()?.is_some() {
+        return Err(Error::Unsupported(
+            "jpegxs decoder: NLT marker present with Fq=0 (Annex A.4.6 forbids this)".to_string(),
+        ));
+    }
     // CWD body is validated by the codestream parser; here we route
     // the Sd lookup through the typed [`codestream::Codestream::cwd`]
     // accessor (Annex A.4.7 Table A.18). Absent CWD → Sd = 0.
@@ -472,7 +497,7 @@ fn gather_precinct(
     samples: &mut [Vec<i32>],
 ) -> Result<()> {
     let trunc = precinct_truncation(&precinct_plan.geometry, precinct_header);
-    let dequant = dequantize_precinct(pih.qpih, &precinct_plan.geometry, &trunc, bands);
+    let dequant = dequantize_precinct(pih.qpih, &precinct_plan.geometry, &trunc, bands, pih.fq);
 
     let _nc = plan.nc as u32;
     let n_decomposed = plan.n_decomposed;
@@ -753,7 +778,7 @@ fn synthesise_precinct(
     samples: &mut [Vec<i32>],
 ) -> Result<()> {
     let trunc = precinct_truncation(&precinct_plan.geometry, precinct_header);
-    let dequant = dequantize_precinct(pih.qpih, &precinct_plan.geometry, &trunc, bands);
+    let dequant = dequantize_precinct(pih.qpih, &precinct_plan.geometry, &trunc, bands, pih.fq);
 
     let nlx = plan.nlx as u32;
     let nly = plan.nly as u32;
