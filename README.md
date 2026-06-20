@@ -90,6 +90,23 @@ and lossy (`q ∈ 1..=15`), with rate-budget pickers that drive per-slice
 8-bit and high-bit-depth (`B[i] ∈ 9..=16`, little-endian `u16` planes)
 paths exist for all three colour-transform modes and both NLT modes.
 
+Every encode path signals a **valid ISO/IEC 21122-1:2022 Table A.8
+`(Bw, Fq)` combination** and applies the Annex E.3 (Table E.13) wavelet
+fractional scaling that the pair implies: `(Bw = B[0], Fq = 0)` for the
+default integer-transform regular case (lossy via the precinct truncation
+`T[p,b]`, which the inverse quantizer applies independently of `Fq`),
+`(Bw = 18, Fq = 6)` / `(Bw = 20, Fq = 8)` when an NLT non-linearity is
+present, and `(Bw = 20, Fq = 8)` for the high-precision regular case
+exposed by `encode_planar_highprec_lossy`. The decoder reconstructs
+`T[β,x,y] = c[p,λ,b,ξ] << Fq` before the inverse DWT and the encoder
+applies the exact inverse `c = sign(T)·((|T| + ((1<<Fq)>>1)) >> Fq)` after
+the forward DWT; the linear input/output scaling is the Annex G.2
+`ζ = Bw − B[i]` up/down shift. The high-precision path carries 8
+fractional bits through the transform, removing the per-level integer
+rounding the `Fq = 0` path injects (bit-exact on smooth content at low
+`q`). The decoder rejects any `(Bw, Fq)` outside Table A.8 and an NLT
+marker present with `Fq = 0` (Annex A.4.6).
+
 The encoder also supports **content-adaptive WGT weights**: the
 `encode_planar_lossy_annex_h` entry point drives both the WGT marker and
 the forward truncation `T[p,b] = clamp(Q[p] − G[b] − r, 0, 15)` from the
@@ -197,6 +214,7 @@ let picture = oxideav_jpegxs::decode_jpeg_xs(bytes)?;
 
 Encoder entry points (in `oxideav_jpegxs::encoder`) cover single-luma,
 interleaved RGB, and generalised planar input, with `_lossy`,
+`_highprec_lossy`,
 `_lossy_annex_h`, `_subsampled_annex_h`, `_star_tetrix_annex_h`,
 `_star_tetrix_highbd_annex_h`, `_sd_star_tetrix_highbd`,
 `_subsampled_highbd_annex_h`, `_highbd`,

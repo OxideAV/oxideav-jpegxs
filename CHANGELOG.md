@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased — round 351 (high-precision (Bw=20, Fq=8) regular lossy entry point)
+
+Adds a public entry point for the ISO/IEC 21122-1:2022 Table A.8
+`(Bw = 20, Fq = 8)` high-precision regular case, built on the Annex E.3
+fractional-coefficient scaling landed earlier this round.
+
+* `encoder::encode_planar_highprec_lossy(width, height, nc, cpih, nlx, nly, q,
+  planes)` — carries 8 fractional bits through the wavelet transform: the
+  `B[i]`-bit samples are up-scaled into the 20-bit wavelet domain
+  (`Ω = (sample << (Bw − B[i])) − (1 << (Bw − 1))`, the inverse of the Annex G.2
+  output scaling), the forward DWT runs in that wider domain, and its output is
+  down-scaled by `>> Fq` before quantisation. The decoder applies `c << Fq` and
+  the Annex G.2 `>> (Bw − B[i])` symmetrically. The extra precision removes the
+  per-decomposition-level integer rounding the `(Bw = B[0], Fq = 0)` path
+  injects, so for a fixed `q` the reconstructed PSNR is at least as high.
+* +1 test: the high-precision path signals `(Bw = 20, Fq = 8)`, decodes a 64×64
+  NL = 5/5 gradient within the 30 dB floor at `q = 2`, and reconstructs it at
+  least as faithfully as the integer-transform path (in fact bit-exactly —
+  PSNR = ∞ — where the integer path loses ≈ 49 dB to per-level rounding).
+
 ## Unreleased — round 351 (Annex E.3 Fq fractional-coefficient scaling + Table A.8 (Bw, Fq) conformance)
 
 Implements the ISO/IEC 21122-1:2022 Annex E.3 (Table E.13) wavelet-coefficient

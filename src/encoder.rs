@@ -1272,7 +1272,13 @@ fn pack_cfa_u16_planes(
 }
 
 /// Lossy entry point. `q` is the precinct quantization step (0..=15);
-/// 0 reduces to lossless. `fq` must be 8 for `q > 0` per Table A.8.
+/// 0 reduces to lossless. This is the **integer-transform** regular case:
+/// it signals the conformant ISO/IEC 21122-1:2022 Table A.8 combination
+/// `(Bw = B[0], Fq = 0)` and achieves lossy compression purely through the
+/// precinct truncation `T[p,b]` (the inverse quantiser is independent of
+/// `Fq`). For genuinely higher fractional precision use
+/// [`encode_planar_highprec_lossy`], which selects the `(Bw = 20, Fq = 8)`
+/// combination.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_planar_lossy(
     width: u16,
@@ -1289,6 +1295,47 @@ pub fn encode_planar_lossy(
     let fq = 0; // integer-transform path; quantisation via T[p,b], Fq=0 (Table A.8)
     encode_planar_inner(
         width, height, nc, cpih, nlx, nly, fq, q, &sx, &sy, 0, 0, 0, 0, planes,
+    )
+}
+
+/// High-precision lossy entry point — the ISO/IEC 21122-1:2022 Table A.8
+/// `(Bw = 20, Fq = 8)` regular case.
+///
+/// Where [`encode_planar_lossy`] runs the integer 5/3 transform with zero
+/// fractional bits (`Fq = 0`), this entry point carries **8 fractional
+/// bits** through the wavelet transform per Annex E.3 (Table E.13): the
+/// `B[i]`-bit samples are up-scaled into the 20-bit wavelet domain
+/// (`Ω = (sample << (Bw − B[i])) − (1 << (Bw − 1))`, the inverse of the
+/// Annex G.2 output scaling), the forward DWT runs in that wider domain,
+/// and its output is down-scaled by `>> Fq` before quantisation. The
+/// decoder applies the exact inverse `c << Fq` at the dequant boundary and
+/// the Annex G.2 `>> (Bw − B[i])` on output. The extra fractional precision
+/// reduces the rounding noise the integer transform injects at each
+/// decomposition level, so for a given `q` the reconstructed PSNR is at
+/// least as high as the integer-transform path — and strictly higher once
+/// the transform depth makes the per-level rounding visible.
+///
+/// `q` is the precinct quantization step (0..=15). `q = 0` is permitted
+/// (the fractional scaling is exercised but no bitplanes are dropped);
+/// note that because the `>> Fq` rounding discards the bottom `Fq` bits it
+/// is *not* bit-exact lossless — use [`encode_planar`] for lossless.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_highprec_lossy(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    q: u8,
+    planes: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    let sx = vec![1u8; nc as usize];
+    let sy = vec![1u8; nc as usize];
+    // fq = 8 selects the (Bw = 20, Fq = 8) Table A.8 combination in
+    // encode_planar_inner_bd (the non-NLT `fq >= 8` branch).
+    encode_planar_inner(
+        width, height, nc, cpih, nlx, nly, 8, q, &sx, &sy, 0, 0, 0, 0, planes,
     )
 }
 
@@ -17033,6 +17080,55 @@ mod tests {
         assert!(
             msg.contains("Table A.8"),
             "rejection should cite Table A.8, got: {msg}"
+        );
+    }
+
+    /// Round 351 — the high-precision `(Bw = 20, Fq = 8)` regular lossy
+    /// path (Annex E.3 fractional scaling) signals the conformant Table A.8
+    /// pair, decodes within a PSNR floor, and is at least as faithful as the
+    /// integer-transform path at the same `q` on a smooth (gradient) image,
+    /// where the per-decomposition-level integer rounding is visible.
+    #[test]
+    fn round351_highprec_lossy_bw20_fq8_psnr() {
+        let w = 64usize;
+        let h = 64usize;
+        // Smooth diagonal gradient — the multi-level 5/3 transform's
+        // per-level rounding is most visible on low-frequency content.
+        let mut pixels = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                pixels[y * w + x] = (((x + y) * 2) % 256) as u8;
+            }
+        }
+        // NL = 5/5 to give the fractional precision several levels of
+        // rounding to improve on.
+        let q = 2u8;
+        let hp = encode_planar_highprec_lossy(w as u16, h as u16, 1, 0, 5, 5, q, &[pixels.clone()])
+            .expect("encode 64x64 high-precision q=2");
+        let parsed = crate::codestream::parse(&hp).expect("parse high-precision PIH");
+        assert_eq!(
+            (parsed.pih.bw, parsed.pih.fq),
+            (20, 8),
+            "high-precision path must signal the (Bw=20, Fq=8) Table A.8 pair"
+        );
+        let hp_img = decode_codestream(&hp, None).expect("decode high-precision q=2");
+        let hp_psnr = psnr(&pixels, &hp_img.planes[0].data);
+        assert!(
+            hp_psnr >= 30.0,
+            "high-precision lossy q=2 PSNR {hp_psnr:.2} dB below 30 dB floor"
+        );
+
+        // The integer-transform path at the same q on the same content.
+        let lo = encode_planar_lossy(w as u16, h as u16, 1, 0, 5, 5, q, &[pixels.clone()])
+            .expect("encode 64x64 integer-transform q=2");
+        let lo_img = decode_codestream(&lo, None).expect("decode integer-transform q=2");
+        let lo_psnr = psnr(&pixels, &lo_img.planes[0].data);
+        // The extra fractional precision must not make reconstruction worse;
+        // allow a tiny epsilon for cases where both paths are already near
+        // the quantiser-limited ceiling.
+        assert!(
+            hp_psnr >= lo_psnr - 0.01,
+            "high-precision PSNR {hp_psnr:.2} dB should be >= integer-transform {lo_psnr:.2} dB"
         );
     }
 }
