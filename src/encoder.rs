@@ -10502,6 +10502,67 @@ mod tests {
         assert_eq!(img.planes[2].data, b, "blue plane NL,y=0");
     }
 
+    /// Horizontal-only (NL,y = 0) lossy quantised round-trip: the
+    /// joint LL+HL first packet must hold under non-zero quantisation
+    /// (T[p,b] truncation) too. PSNR floor checks the decode is coherent.
+    #[test]
+    fn round357_nly0_horizontal_only_lossy_q2_psnr() {
+        let pixels = make_nl_test_64x64();
+        let cs = encode_planar_lossy(64, 64, 1, 0, 1, 0, 2, std::slice::from_ref(&pixels))
+            .expect("encode luma NL,y=0 q=2");
+        let img = decode_codestream(&cs, None).expect("decode NL,y=0 q=2");
+        let p = psnr(&pixels, &img.planes[0].data);
+        assert!(p >= 25.0, "NL,y=0 q=2 PSNR {p:.2} dB below 25 dB floor");
+    }
+
+    /// Horizontal-only (NL,y = 0) at high bit depth (12-bit luma): the
+    /// joint first-packet layout is orthogonal to sample precision, so the
+    /// u16-LE plane path must round-trip bit-exactly.
+    #[test]
+    fn round357_nly0_horizontal_only_highbd_12bit_round_trip() {
+        let (w, h) = (32usize, 16usize);
+        let pixels: Vec<u16> = (0..(w * h)).map(|i| ((i * 37) & 0x0fff) as u16).collect();
+        let cs = encode_planar_highbd(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            1,
+            0,
+            12,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("encode 12-bit NL,y=0");
+        let img = decode_codestream(&cs, None).expect("decode 12-bit NL,y=0");
+        // Plane is u16-LE packed.
+        let got: Vec<u16> = img.planes[0]
+            .data
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(got, pixels, "12-bit luma must round-trip at NL,y=0");
+    }
+
+    /// Deeper horizontal-only cascade (NL,x = 3, NL,y = 0): NL,x > 1
+    /// routes through the cascade encoder, which already handled NL,y = 0
+    /// (β1 = NL,x + 1 with all bands in the first packet). This locks that
+    /// the streaming-path fix did not perturb the cascade path's existing
+    /// NL,y = 0 coverage.
+    #[test]
+    fn round357_nly0_horizontal_only_cascade_nlx3_round_trip() {
+        let pixels = make_nl_test_64x64();
+        for nlx in [2u8, 3, 5] {
+            let cs = encode_planar(64, 64, 1, 0, nlx, 0, std::slice::from_ref(&pixels))
+                .unwrap_or_else(|e| panic!("encode NL,x={nlx} NL,y=0: {e:?}"));
+            let img = decode_codestream(&cs, None)
+                .unwrap_or_else(|e| panic!("decode NL,x={nlx} NL,y=0: {e:?}"));
+            assert_eq!(
+                img.planes[0].data, pixels,
+                "luma must round-trip at NL,x={nlx} NL,y=0"
+            );
+        }
+    }
+
     /// NL,x=9 must be rejected (round-7 cap is NL=8; spec Annex A.4.4
     /// Table A.7 hard maximum is 8).
     #[test]
