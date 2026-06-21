@@ -35,7 +35,12 @@ End-to-end decode of the multi-component subset:
 - Multi-level wavelet cascade (`NL,x ≥ NL,y`), multi-slice (`Hsl ≥ 0`),
   precinct refinement (`R[p]`), per-precinct `Q[p]`, separate sign
   sub-packet (`Fs = 1`), and the entropy-decode loss-of-synchronisation
-  guard.
+  guard. The horizontal-only decomposition (`NL,y = 0`) is covered across
+  the single-level streaming and multi-level cascade encoders: Annex B.7
+  Table B.4 gives `β1 = NL,x + 1`, so the LL and HL bands of every
+  component share the first packet (Table B.5), and that joint-packet
+  layout self-roundtrips for luma, multi-component RGB (`Cpih ∈ {0, 1}`),
+  4:2:2 subsampling, high bit depth, and lossy (`q > 0`) modes.
 - Annex G linear / quadratic / extended (NLT) output scaling.
 
 Every bitplane-count decode mode (raw, no-prediction, vertical

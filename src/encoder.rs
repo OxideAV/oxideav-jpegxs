@@ -10563,6 +10563,46 @@ mod tests {
         }
     }
 
+    /// 4:2:2 horizontal-only (NL,y = 0): the chroma planes are
+    /// horizontally subsampled (sx = 2, sy = 1) while no vertical
+    /// decomposition is performed. Every component decomposes at NL,x = 1,
+    /// NL,y = 0 (β1 = 2 joint LL+HL first packet) and the luma carries the
+    /// full picture width. Locks the subsampling × horizontal-only
+    /// decode-geometry combination.
+    #[test]
+    fn round357_nly0_chroma_422_lossless_round_trip() {
+        let (w, h) = (32u16, 16u16);
+        let n = (w as usize) * (h as usize);
+        let n_c = (w as usize / 2) * (h as usize);
+        let mut y_plane = vec![0u8; n];
+        let mut cb_plane = vec![0u8; n_c];
+        let mut cr_plane = vec![0u8; n_c];
+        for (i, slot) in y_plane.iter_mut().enumerate() {
+            *slot = ((i * 7 + 13) % 256) as u8;
+        }
+        for i in 0..n_c {
+            cb_plane[i] = ((i * 11 + 17) % 256) as u8;
+            cr_plane[i] = ((i * 19 + 23) % 256) as u8;
+        }
+        let cs = encode_planar_subsampled(
+            w,
+            h,
+            3,
+            0,
+            1,
+            0,
+            0,
+            &[1, 2, 2],
+            &[1, 1, 1],
+            &[y_plane.clone(), cb_plane.clone(), cr_plane.clone()],
+        )
+        .expect("encode 4:2:2 NL,y=0 lossless");
+        let img = decode_codestream(&cs, None).expect("decode 4:2:2 NL,y=0");
+        assert_eq!(img.planes[0].data, y_plane, "Y plane 4:2:2 NL,y=0");
+        assert_eq!(img.planes[1].data, cb_plane, "Cb plane 4:2:2 NL,y=0");
+        assert_eq!(img.planes[2].data, cr_plane, "Cr plane 4:2:2 NL,y=0");
+    }
+
     /// NL,x=9 must be rejected (round-7 cap is NL=8; spec Annex A.4.4
     /// Table A.7 hard maximum is 8).
     #[test]
