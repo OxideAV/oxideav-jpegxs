@@ -6640,8 +6640,26 @@ fn encode_precinct_single_level(
         (cfg.q as i32 - gain as i32 - refine).clamp(0, 15) as u8
     };
 
-    // First packet: β=0 (LL) for all components — but only those with
-    // a non-empty LL line for this precinct.
+    // First packet (Annex B.7 Table B.4): β1 = max(NL,x, NL,y) − min(NL,x,
+    // NL,y) + 1 filter types of all components are grouped JOINTLY on line
+    // λ = 0. The single-level streaming path always runs at NL,x = 1
+    // (NL,x > 1 is routed to the cascade encoder), so β1 is governed by the
+    // PICTURE-level NL,y:
+    //   * NL,y = 1 → β1 = 1: only β = 0 (LL) joins the first packet; HL
+    //     (and, for non-subsampled components, LH/HH) follow as proxy
+    //     packets. A 4:2:0-subsampled chroma component has N'L,y[i] = 0 but
+    //     β1 is still 1 — its HL line is emitted as a proxy packet under the
+    //     Table B.4 sub-sampling guard, NOT in the first packet.
+    //   * NL,y = 0 → β1 = 2: β = 0 (LL) AND β = 1 (HL) of every component
+    //     share the first packet (Table B.5: NL,x = N, NL,y = 0 groups all
+    //     N + 1 bands of every component into packet 0).
+    // Per Table B.4 the first packet is filled β-major, component-minor:
+    //   for β in 0..β1 { for i in 0..Nc-Sd { include band (Nc-Sd)·β + i } }
+    // so all components' LL entries precede all components' HL entries. The
+    // decoder's packet plan
+    // ([`crate::slice_walker::compute_packet_layouts`]) builds the entry
+    // list in exactly this order; the encoder must match it.
+    let picture_nly0 = cfg.nly == 0;
     let mut first_entries: Vec<PerBandEntry> = Vec::new();
     for (i, cb) in comp_bands.iter().enumerate() {
         if lines_ll_real_per_comp[i] == 0 {
@@ -6655,6 +6673,22 @@ fn encode_precinct_single_level(
             t: t_for_band(0, 0, i),
         });
     }
+    // β=1 (HL) joins the first packet for every component when the
+    // picture-level NL,y = 0 (β1 = 2), appended after all LL entries to
+    // preserve β-major order.
+    if picture_nly0 {
+        for (i, cb) in comp_bands.iter().enumerate() {
+            if lines_ll_real_per_comp[i] == 0 {
+                continue;
+            }
+            let hl_data = cb.hl[..cb.hl_w].to_vec();
+            first_entries.push(PerBandEntry {
+                wpb: cb.hl_w as u32,
+                line: BandLineSlice::Direct(hl_data),
+                t: t_for_band(1, 1, i),
+            });
+        }
+    }
     if !first_entries.is_empty() {
         emit_packet(&mut entropy, cfg, &first_entries)?;
     }
@@ -6665,6 +6699,14 @@ fn encode_precinct_single_level(
         for (i, cb) in comp_bands.iter().enumerate() {
             // Existence per component.
             if beta_idx >= 2 && cb.nly_i == 0 {
+                continue;
+            }
+            // When the picture-level NL,y = 0 (β1 = 2), every component's
+            // HL band was already grouped into the first packet above; do
+            // not re-emit it as a standalone proxy packet. (At NL,y = 1 the
+            // HL band — including a 4:2:0 chroma component's — stays a proxy
+            // packet.)
+            if beta_idx == 1 && picture_nly0 {
                 continue;
             }
             let lines_real = if beta_idx == 1 {
@@ -10380,6 +10422,84 @@ mod tests {
             img.planes[0].data, pixels,
             "luma must round-trip losslessly at NL=3/2"
         );
+    }
+
+    /// Horizontal-only decomposition (NL,y = 0) is a distinct geometry
+    /// class: bands are LL (β = 0) and HL (β = 1), each precinct is a
+    /// single image line (Hp = 2^NL,y = 1), and Annex B.7 Table B.4 gives
+    /// β1 = NL,x − 0 + 1 = 2, so the LL and HL bands of every component
+    /// are grouped into the FIRST packet (Table B.5). The single-level
+    /// streaming encoder previously emitted HL as a standalone proxy
+    /// packet, mismatching the decoder's spec-derived packet plan and
+    /// underrunning the entropy buffer. This locks the joint-first-packet
+    /// emit for the NL,x = 1, NL,y = 0 streaming path.
+    #[test]
+    fn round357_nly0_horizontal_only_lossless_round_trip_luma() {
+        let pixels = make_nl_test_64x64();
+        let cs = encode_planar(64, 64, 1, 0, 1, 0, std::slice::from_ref(&pixels))
+            .expect("encode luma NL,x=1 NL,y=0");
+        let img = decode_codestream(&cs, None).expect("decode NL,y=0");
+        assert_eq!(
+            img.planes[0].data, pixels,
+            "luma must round-trip losslessly at NL,x=1 NL,y=0"
+        );
+    }
+
+    /// Horizontal-only (NL,y = 0) for odd dimensions exercises the
+    /// partial-line precinct accounting alongside the joint LL+HL first
+    /// packet.
+    #[test]
+    fn round357_nly0_horizontal_only_odd_dims_round_trip() {
+        let (w, h) = (31usize, 17usize);
+        let pixels: Vec<u8> = (0..(w * h)).map(|i| ((i * 13 + 7) & 0xff) as u8).collect();
+        let cs = encode_planar(
+            w as u16,
+            h as u16,
+            1,
+            0,
+            1,
+            0,
+            std::slice::from_ref(&pixels),
+        )
+        .expect("encode 31x17 NL,y=0");
+        let img = decode_codestream(&cs, None).expect("decode 31x17 NL,y=0");
+        assert_eq!(
+            img.planes[0].data, pixels,
+            "odd-dimension luma must round-trip at NL,x=1 NL,y=0"
+        );
+    }
+
+    /// Horizontal-only (NL,y = 0) multi-component RGB with the reversible
+    /// colour transform: every component decomposes at NL,x = 1, NL,y = 0,
+    /// so each contributes an LL+HL pair to the first packet.
+    #[test]
+    fn round357_nly0_horizontal_only_rgb_rct_round_trip() {
+        let pixels = make_synthetic_rgb_32x32();
+        let n = 32 * 32;
+        let (mut r, mut g, mut b) = (
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+        );
+        for chunk in pixels.chunks_exact(3) {
+            r.push(chunk[0]);
+            g.push(chunk[1]);
+            b.push(chunk[2]);
+        }
+        // Cpih=0 (no colour transform) first to isolate the packet path.
+        let cs0 = encode_planar(32, 32, 3, 0, 1, 0, &[r.clone(), g.clone(), b.clone()])
+            .expect("encode RGB NL,y=0 Cpih=0");
+        let img0 = decode_codestream(&cs0, None).expect("decode RGB NL,y=0 Cpih=0");
+        assert_eq!(img0.planes[0].data, r, "red plane NL,y=0 Cpih=0");
+        assert_eq!(img0.planes[1].data, g, "green plane NL,y=0 Cpih=0");
+        assert_eq!(img0.planes[2].data, b, "blue plane NL,y=0 Cpih=0");
+
+        let cs = encode_planar(32, 32, 3, 1, 1, 0, &[r.clone(), g.clone(), b.clone()])
+            .expect("encode RGB NL,y=0 Cpih=1");
+        let img = decode_codestream(&cs, None).expect("decode RGB NL,y=0");
+        assert_eq!(img.planes[0].data, r, "red plane NL,y=0");
+        assert_eq!(img.planes[1].data, g, "green plane NL,y=0");
+        assert_eq!(img.planes[2].data, b, "blue plane NL,y=0");
     }
 
     /// NL,x=9 must be rejected (round-7 cap is NL=8; spec Annex A.4.4
