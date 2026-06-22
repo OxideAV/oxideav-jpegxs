@@ -10354,6 +10354,348 @@ mod tests {
         pixels
     }
 
+    // ----------------------------------------------------------------
+    // Round 359 — deepen DECODE-geometry coverage past the round-357
+    // horizontal-only (NL,y = 0) envelope. JPEG XS allows asymmetric
+    // decomposition NL,x ≥ NL,y; for a 4:2:0 component (sy = 2) the
+    // decoder drops log2(sy) = 1 vertical level, so the chroma planes
+    // decompose at N'L,y[i] = NL,y − 1 (decoder.rs `nly_i` subtraction).
+    // The round-343 4:2:0 tests pinned NL,y = 2 (chroma N'L,y = 1); the
+    // tests below push the vertical cascade to NL,y ∈ {3, 4, 5} (chroma
+    // N'L,y up to 4) and add asymmetric NL,x > NL,y, high-bit-depth
+    // 4:2:0, lossy 4:2:0, NLT (Bw = 18) and high-precision (Bw = 20)
+    // luma at deeper vertical cascades — exercising the per-band
+    // `beta_key_for` cascade-key derivation across the full N'L,y range.
+    // ----------------------------------------------------------------
+
+    /// Build a deterministic high-bit-depth 4:2:0 luma + half-resolution
+    /// chroma triple, every sample masked to `bd` significant bits.
+    fn synthetic_420_highbd(w: usize, h: usize, bd: u8) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
+        let n_y = w * h;
+        let n_c = (w / 2) * (h / 2);
+        let mask = (1u32 << bd) - 1;
+        let y: Vec<u16> = (0..n_y)
+            .map(|i| ((i as u32 * 7 + 13) & mask) as u16)
+            .collect();
+        let cb: Vec<u16> = (0..n_c)
+            .map(|i| ((i as u32 * 11 + 17) & mask) as u16)
+            .collect();
+        let cr: Vec<u16> = (0..n_c)
+            .map(|i| ((i as u32 * 19 + 23) & mask) as u16)
+            .collect();
+        (y, cb, cr)
+    }
+
+    /// 4:2:0 lossless decode with a symmetric vertical cascade deeper than
+    /// the round-343 NL,y = 2 baseline. Each luma plane decomposes at
+    /// NL,x = NL,y ∈ {3, 4, 5}; the sy = 2 chroma planes decompose one
+    /// vertical level shallower (N'L,y = NL,y − 1 ∈ {2, 3, 4}). Bit-exact
+    /// recovery of all three planes locks the deeper-cascade decode path.
+    #[test]
+    fn round359_420_lossless_deep_vertical_cascade() {
+        let (w, h) = (64usize, 64usize);
+        let (y, cb, cr) = synthetic_420(w, h);
+        for nl in [3u8, 4, 5] {
+            let cs = encode_planar_subsampled(
+                w as u16,
+                h as u16,
+                3,
+                0,
+                nl,
+                nl,
+                0,
+                &[1, 2, 2],
+                &[1, 2, 2],
+                &[y.clone(), cb.clone(), cr.clone()],
+            )
+            .unwrap_or_else(|e| panic!("encode 4:2:0 NL={nl}/{nl}: {e:?}"));
+            let img = decode_codestream(&cs, None)
+                .unwrap_or_else(|e| panic!("decode 4:2:0 NL={nl}/{nl}: {e:?}"));
+            assert_eq!(img.num_components, 3);
+            assert_eq!(img.planes[0].data, y, "Y plane 4:2:0 NL={nl}/{nl}");
+            assert_eq!(img.planes[1].data, cb, "Cb plane 4:2:0 NL={nl}/{nl}");
+            assert_eq!(img.planes[2].data, cr, "Cr plane 4:2:0 NL={nl}/{nl}");
+        }
+    }
+
+    /// 4:2:0 lossless decode with an **asymmetric** cascade NL,x > NL,y.
+    /// The horizontal and vertical decomposition depths differ, so the
+    /// per-band cascade keys (`beta_key_for`) span the asymmetric region
+    /// of Annex B.7 Table B.4 (β1 = NL,x − NL,y + 1 > 1). Chroma drops one
+    /// vertical level (N'L,y = NL,y − 1) while keeping the full NL,x.
+    #[test]
+    fn round359_420_lossless_asymmetric_cascade() {
+        let (w, h) = (64usize, 64usize);
+        let (y, cb, cr) = synthetic_420(w, h);
+        for (nlx, nly) in [(3u8, 2u8), (4, 2), (4, 3), (5, 3)] {
+            let cs = encode_planar_subsampled(
+                w as u16,
+                h as u16,
+                3,
+                0,
+                nlx,
+                nly,
+                0,
+                &[1, 2, 2],
+                &[1, 2, 2],
+                &[y.clone(), cb.clone(), cr.clone()],
+            )
+            .unwrap_or_else(|e| panic!("encode 4:2:0 NL={nlx}/{nly}: {e:?}"));
+            let img = decode_codestream(&cs, None)
+                .unwrap_or_else(|e| panic!("decode 4:2:0 NL={nlx}/{nly}: {e:?}"));
+            assert_eq!(img.planes[0].data, y, "Y plane 4:2:0 NL={nlx}/{nly}");
+            assert_eq!(img.planes[1].data, cb, "Cb plane 4:2:0 NL={nlx}/{nly}");
+            assert_eq!(img.planes[2].data, cr, "Cr plane 4:2:0 NL={nlx}/{nly}");
+        }
+    }
+
+    /// High-bit-depth (`B[i] ∈ {10, 12, 14, 16}`) 4:2:0 lossless decode at
+    /// NL,y = 3. The u16-LE plane path composes with the deeper vertical
+    /// cascade and the sy = 2 chroma level-drop; every plane round-trips
+    /// bit-exactly, confirming sample precision is orthogonal to the
+    /// 4:2:0 decode geometry.
+    #[test]
+    fn round359_420_highbd_deep_vertical_cascade() {
+        let (w, h) = (64usize, 64usize);
+        for &bd in &[10u8, 12, 14, 16] {
+            let (yp, cbp, crp) = synthetic_420_highbd(w, h, bd);
+            let cs = encode_planar_subsampled_highbd(
+                w as u16,
+                h as u16,
+                3,
+                0,
+                3,
+                3,
+                bd,
+                &[1, 2, 2],
+                &[1, 2, 2],
+                &[yp.clone(), cbp.clone(), crp.clone()],
+            )
+            .unwrap_or_else(|e| panic!("encode {bd}-bit 4:2:0 NL=3/3: {e:?}"));
+            let img = decode_codestream(&cs, None)
+                .unwrap_or_else(|e| panic!("decode {bd}-bit 4:2:0 NL=3/3: {e:?}"));
+            let unpack = |d: &[u8]| -> Vec<u16> {
+                d.chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect()
+            };
+            assert_eq!(unpack(&img.planes[0].data), yp, "Y {bd}-bit 4:2:0 NL=3/3");
+            assert_eq!(unpack(&img.planes[1].data), cbp, "Cb {bd}-bit 4:2:0 NL=3/3");
+            assert_eq!(unpack(&img.planes[2].data), crp, "Cr {bd}-bit 4:2:0 NL=3/3");
+        }
+    }
+
+    /// 4:2:0 lossy (q = 2) decode at NL,y ∈ {2, 3, 4}: the deeper vertical
+    /// cascade composes with the `T[p,b]` truncation. The reconstruction
+    /// stays coherent (correct geometry, decodable) and above a sane PSNR
+    /// floor at every depth.
+    #[test]
+    fn round359_420_lossy_deep_vertical_cascade() {
+        let (w, h) = (64usize, 64usize);
+        let (y, cb, cr) = synthetic_420(w, h);
+        for nl in [2u8, 3, 4] {
+            let cs = encode_planar_subsampled(
+                w as u16,
+                h as u16,
+                3,
+                0,
+                nl,
+                nl,
+                2,
+                &[1, 2, 2],
+                &[1, 2, 2],
+                &[y.clone(), cb.clone(), cr.clone()],
+            )
+            .unwrap_or_else(|e| panic!("encode 4:2:0 lossy NL={nl}/{nl}: {e:?}"));
+            let img = decode_codestream(&cs, None)
+                .unwrap_or_else(|e| panic!("decode 4:2:0 lossy NL={nl}/{nl}: {e:?}"));
+            assert_eq!(img.planes[0].data.len(), y.len());
+            assert_eq!(img.planes[1].data.len(), cb.len());
+            assert_eq!(img.planes[2].data.len(), cr.len());
+            let py = psnr(&y, &img.planes[0].data);
+            let pcb = psnr(&cb, &img.planes[1].data);
+            let pcr = psnr(&cr, &img.planes[2].data);
+            assert!(
+                py >= 25.0 && pcb >= 25.0 && pcr >= 25.0,
+                "4:2:0 lossy NL={nl}/{nl} PSNR below 25 dB: Y={py:.2} Cb={pcb:.2} Cr={pcr:.2}"
+            );
+        }
+    }
+
+    /// NLT quadratic (Annex G.4, Bw = 18) luma decode at deeper vertical
+    /// cascades NL,y ∈ {1, 2, 3, 4}. The non-linearity inverse composes
+    /// with the multi-level vertical synthesis; round-357 locked NL,y = 0
+    /// horizontal-only, this extends the NLT decode path through the
+    /// vertical cascade. PSNR floor checks the quadratic round-trip.
+    #[test]
+    fn round359_nlt_quadratic_deep_vertical_cascade() {
+        let lp = make_nl_test_64x64();
+        for nly in [1u8, 2, 3, 4] {
+            let cs = encode_planar_nlt_quadratic(
+                64,
+                64,
+                1,
+                0,
+                nly,
+                nly,
+                0,
+                0,
+                std::slice::from_ref(&lp),
+            )
+            .unwrap_or_else(|e| panic!("encode NLT-quad NL={nly}/{nly}: {e:?}"));
+            let parsed = crate::codestream::parse(&cs).expect("parse NLT-quad");
+            assert_eq!(parsed.pih.bw, 18, "NLT quadratic forces Bw=18");
+            let img = decode_codestream(&cs, None)
+                .unwrap_or_else(|e| panic!("decode NLT-quad NL={nly}/{nly}: {e:?}"));
+            let p = psnr(&lp, &img.planes[0].data);
+            assert!(
+                p >= 40.0,
+                "NLT-quad NL={nly}/{nly} PSNR {p:.2} dB below 40 dB floor"
+            );
+        }
+    }
+
+    /// NLT extended (Annex G.4, Bw = 18) luma decode at deeper vertical
+    /// cascades NL,y ∈ {1, 2, 3}. The two-threshold extended non-linearity
+    /// inverse (T1 < T2, E) composes with the vertical cascade synthesis.
+    #[test]
+    fn round359_nlt_extended_deep_vertical_cascade() {
+        let lp = make_nl_test_64x64();
+        for nly in [1u8, 2, 3] {
+            let cs = encode_planar_nlt_extended(
+                64,
+                64,
+                1,
+                0,
+                nly,
+                nly,
+                0,
+                4096,
+                32768,
+                2,
+                std::slice::from_ref(&lp),
+            )
+            .unwrap_or_else(|e| panic!("encode NLT-ext NL={nly}/{nly}: {e:?}"));
+            let parsed = crate::codestream::parse(&cs).expect("parse NLT-ext");
+            assert_eq!(parsed.pih.bw, 18, "NLT extended forces Bw=18");
+            let img = decode_codestream(&cs, None)
+                .unwrap_or_else(|e| panic!("decode NLT-ext NL={nly}/{nly}: {e:?}"));
+            let p = psnr(&lp, &img.planes[0].data);
+            assert!(
+                p >= 40.0,
+                "NLT-ext NL={nly}/{nly} PSNR {p:.2} dB below 40 dB floor"
+            );
+        }
+    }
+
+    /// High-precision (Bw = 20, Fq = 8) luma decode at deeper vertical
+    /// cascades NL,y ∈ {1, 2, 3, 4}. The 8-fractional-bit transform path
+    /// (`T[β,x,y] = c << Fq` reconstruction) composes with the multi-level
+    /// vertical synthesis; the smooth `make_nl_test_64x64` content decodes
+    /// bit-exactly at low q, so this asserts a lossless round-trip.
+    #[test]
+    fn round359_highprec_bw20_deep_vertical_cascade() {
+        let lp = make_nl_test_64x64();
+        for nly in [1u8, 2, 3, 4] {
+            let cs =
+                encode_planar_highprec_lossy(64, 64, 1, 0, nly, nly, 1, std::slice::from_ref(&lp))
+                    .unwrap_or_else(|e| panic!("encode highprec NL={nly}/{nly}: {e:?}"));
+            let parsed = crate::codestream::parse(&cs).expect("parse highprec");
+            assert_eq!(parsed.pih.bw, 20, "high-precision path forces Bw=20");
+            let img = decode_codestream(&cs, None)
+                .unwrap_or_else(|e| panic!("decode highprec NL={nly}/{nly}: {e:?}"));
+            assert_eq!(
+                img.planes[0].data, lp,
+                "high-precision Bw=20 luma must round-trip at NL={nly}/{nly}"
+            );
+        }
+    }
+
+    /// Star-Tetrix (`Cpih = 3`, 4-component 4:4:4 CFA, Annex F.5) lossless
+    /// decode at deeper vertical cascades NL,y ∈ {2, 3, 4}. The CFA inverse
+    /// transform composes with the multi-level vertical synthesis; all four
+    /// components round-trip bit-exactly, locking the Star-Tetrix decode
+    /// path past the round-343 NL = 2 baseline.
+    #[test]
+    fn round359_star_tetrix_deep_vertical_cascade() {
+        let n = 64 * 64;
+        let mk =
+            |a: usize, b: usize| -> Vec<u8> { (0..n).map(|i| ((i * a + b) % 256) as u8).collect() };
+        let planes = [mk(7, 13), mk(11, 17), mk(19, 23), mk(29, 31)];
+        for nl in [2u8, 3, 4] {
+            let cs = encode_planar_star_tetrix(64, 64, nl, nl, 0, 0, 0, 0, 0, &planes)
+                .unwrap_or_else(|e| panic!("encode Star-Tetrix NL={nl}/{nl}: {e:?}"));
+            let parsed = crate::codestream::parse(&cs).expect("parse Star-Tetrix");
+            assert_eq!(parsed.pih.cpih, 3, "Star-Tetrix must signal Cpih=3");
+            let img = decode_codestream(&cs, None)
+                .unwrap_or_else(|e| panic!("decode Star-Tetrix NL={nl}/{nl}: {e:?}"));
+            assert_eq!(img.num_components, 4);
+            for (c, plane) in planes.iter().enumerate() {
+                assert_eq!(
+                    &img.planes[c].data, plane,
+                    "Star-Tetrix component {c} NL={nl}/{nl}"
+                );
+            }
+        }
+    }
+
+    /// High-bit-depth (`B[i] = 12`) NLT quadratic (Bw = 18) luma decode at
+    /// deeper vertical cascades NL,y ∈ {1, 2, 3}. Combines the three
+    /// milestone axes — non-linearity, high precision, and a deep vertical
+    /// cascade — on the u16-LE plane path. The quadratic approximation
+    /// keeps mean-squared error tiny (≤ a few LSB²) at lossless q = 0.
+    #[test]
+    fn round359_nlt_quadratic_highbd_deep_vertical_cascade() {
+        let n = 64 * 64;
+        let bd = 12u8;
+        let mask = (1u32 << bd) - 1;
+        let lp: Vec<u16> = (0..n).map(|i| ((i as u32 * 37) & mask) as u16).collect();
+        for nly in [1u8, 2, 3] {
+            let cs = encode_planar_nlt_quadratic_highbd(
+                64,
+                64,
+                1,
+                0,
+                nly,
+                nly,
+                bd,
+                0,
+                0,
+                std::slice::from_ref(&lp),
+            )
+            .unwrap_or_else(|e| panic!("encode NLT-quad-highbd NL={nly}/{nly}: {e:?}"));
+            let parsed = crate::codestream::parse(&cs).expect("parse NLT-quad-highbd");
+            // High-bit-depth NLT runs the wavelet domain at Bw = 20 (top of
+            // the Table A.8 {8, 18, 20} set) for ≥ 4 bits of precision
+            // headroom over B[i] ≤ 16 — unlike the 8-bit NLT path's Bw = 18.
+            assert_eq!(
+                parsed.pih.bw, 20,
+                "high-bit-depth NLT runs the wavelet domain at Bw=20"
+            );
+            let img = decode_codestream(&cs, None)
+                .unwrap_or_else(|e| panic!("decode NLT-quad-highbd NL={nly}/{nly}: {e:?}"));
+            let got: Vec<u16> = img.planes[0]
+                .data
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            assert_eq!(got.len(), lp.len());
+            let mse: f64 = got
+                .iter()
+                .zip(&lp)
+                .map(|(a, b)| {
+                    let d = *a as f64 - *b as f64;
+                    d * d
+                })
+                .sum::<f64>()
+                / n as f64;
+            assert!(
+                mse <= 4.0,
+                "NLT-quad-highbd NL={nly}/{nly} MSE {mse:.3} above 4.0 LSB^2"
+            );
+        }
+    }
+
     #[test]
     fn round6_nl_3_3_lossless_round_trip_luma() {
         let pixels = make_nl_test_64x64();

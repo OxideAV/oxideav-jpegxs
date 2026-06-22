@@ -41,7 +41,22 @@ End-to-end decode of the multi-component subset:
   component share the first packet (Table B.5), and that joint-packet
   layout self-roundtrips for luma, multi-component RGB (`Cpih ∈ {0, 1}`),
   4:2:2 subsampling, high bit depth, and lossy (`q > 0`) modes.
-- Annex G linear / quadratic / extended (NLT) output scaling.
+- **4:2:0 with a deep vertical cascade** (`NL,y ∈ {2, 3, 4, 5}`): a
+  `sy = 2` chroma component decomposes one vertical level shallower than
+  luma (`N'L,y[i] = NL,y − log2(sy[i])`), so the per-band cascade-key
+  derivation (`beta_key_for`) is exercised across the full `N'L,y` range
+  up to 4. Decode is bit-exact for lossless 4:2:0 (symmetric `NL,x = NL,y`
+  and asymmetric `NL,x > NL,y`), composes with high bit depth
+  (`B[i] ∈ {10, 12, 14, 16}`), holds a ≥ 25 dB PSNR floor for lossy
+  (`q = 2`) at every depth, and round-trips the 4-component Star-Tetrix
+  (`Cpih = 3`) CFA inverse across `NL ∈ {2, 3, 4}`.
+- Annex G linear / quadratic / extended (NLT) output scaling, including
+  decode at deeper vertical cascades: the quadratic and extended (`Bw =
+  18`) non-linearity inverses and the high-precision (`Bw = 20, Fq = 8`)
+  fractional-coefficient path each round-trip luma across `NL,y ∈ {1, 2,
+  3, 4}`, and the high-bit-depth (`B[i] = 12`) NLT path (which runs the
+  wavelet domain at `Bw = 20` for precision headroom) reconstructs within
+  a few LSB² across `NL,y ∈ {1, 2, 3}`.
 
 Every bitplane-count decode mode (raw, no-prediction, vertical
 prediction — Tables C.12 / C.13 / C.14) enforces the spec range

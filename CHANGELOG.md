@@ -1,5 +1,41 @@
 # Changelog
 
+## Unreleased — round 359 (deepen decode-geometry coverage: 4:2:0 + NLT + Bw=20 at deeper vertical cascades)
+
+Extends the regression-locked decode-geometry envelope past the round-357
+horizontal-only (`NL,y = 0`) baseline into deeper symmetric and asymmetric
+vertical cascades, composed with the chroma-subsampled, high-bit-depth, NLT,
+and high-precision paths. JPEG XS allows `NL,x ≥ NL,y`; for a `sy = 2`
+component the decoder drops `log2(sy) = 1` vertical level, so a 4:2:0 stream
+at `NL,y` decomposes chroma at `N'L,y = NL,y − 1`. The round-343 4:2:0 tests
+pinned `NL,y = 2` (chroma `N'L,y = 1`); these push the vertical cascade to
+`NL,y ∈ {3, 4, 5}` (chroma `N'L,y` up to 4), exercising the per-band
+`beta_key_for` cascade-key derivation across the full vertical range. No
+decoder logic changes were required — the cascade synthesis already handled
+these geometries; this round locks them against regression.
+
+* +9 tests (511 → 520):
+  * `round359_420_lossless_deep_vertical_cascade` — bit-exact 4:2:0 lossless
+    at `NL = NL,y ∈ {3, 4, 5}`.
+  * `round359_420_lossless_asymmetric_cascade` — bit-exact 4:2:0 lossless at
+    asymmetric `(NL,x, NL,y) ∈ {(3,2), (4,2), (4,3), (5,3)}`
+    (`β1 = NL,x − NL,y + 1 > 1`).
+  * `round359_420_highbd_deep_vertical_cascade` — bit-exact 4:2:0 lossless at
+    `NL,y = 3` for `B[i] ∈ {10, 12, 14, 16}` (u16-LE planes).
+  * `round359_420_lossy_deep_vertical_cascade` — 4:2:0 lossy (`q = 2`) at
+    `NL,y ∈ {2, 3, 4}` above a 25 dB PSNR floor on all three planes.
+  * `round359_nlt_quadratic_deep_vertical_cascade` /
+    `round359_nlt_extended_deep_vertical_cascade` — NLT (`Bw = 18`) luma
+    decode across `NL,y ∈ {1..4}` / `{1..3}`.
+  * `round359_highprec_bw20_deep_vertical_cascade` — high-precision
+    (`Bw = 20, Fq = 8`) luma round-trips bit-exactly across `NL,y ∈ {1..4}`.
+  * `round359_star_tetrix_deep_vertical_cascade` — 4-component Star-Tetrix
+    (`Cpih = 3`) CFA lossless across `NL ∈ {2, 3, 4}`.
+  * `round359_nlt_quadratic_highbd_deep_vertical_cascade` — high-bit-depth
+    (`B[i] = 12`) NLT quadratic across `NL,y ∈ {1, 2, 3}`; confirms the
+    high-bit-depth NLT path runs the wavelet domain at `Bw = 20` (not the
+    8-bit path's `Bw = 18`) for precision headroom, with MSE ≤ 4 LSB².
+
 ## Unreleased — round 351 (high-precision (Bw=20, Fq=8) regular lossy entry point)
 
 Adds a public entry point for the ISO/IEC 21122-1:2022 Table A.8
