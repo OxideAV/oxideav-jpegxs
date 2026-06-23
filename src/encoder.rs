@@ -10324,6 +10324,128 @@ mod tests {
         assert_eq!(img1.planes[0].data, pixels, "NL=1 round-trip");
     }
 
+    // === Round 362: multiple significance groups per band-line (Ns > 1) ====
+    //
+    // The significance sub-packet (Annex B.9 / Table C.5) carries one Z
+    // bit per *significance group*, and a band-line holds
+    // `Ns[p,b] = ceil(Wpb / (Ng·Ss))` of them (Ng = 4, Ss = 8 → one Z bit
+    // every 32 code-positions). Every prior significance round-trip used a
+    // picture narrow enough that the widest band stayed at `Wpb ≤ 32`, so
+    // `Ns = 1` and the `sig_group = g / Ss` indexing on both the encoder
+    // (`group_sig`) and decoder (`sig_flags` keyed by group `j`) collapsed
+    // to a single group. These tests push the LL band past 32 positions so
+    // `Ns ∈ {2, 3}`, exercising the per-significance-group Z dispatch on
+    // both sides.
+    //
+    // Band widths (Annex B.2): the LL band of a width-`W` picture is
+    // `ceil(W/2)` at NL = 1 and `ceil(ceil(W/2)/2)` at NL = 2. To get the
+    // *significant* group to land in the second/third sig group (not the
+    // first), the perturbed pixels are placed near the right edge of the
+    // picture so their wavelet energy concentrates in the high-`g` code
+    // groups of each band line.
+
+    /// Wide single-level (NL = 1) picture whose bands span multiple
+    /// significance-group widths (`Ns >= 3` on the 66-wide LL band, `Ns = 2`
+    /// on the 33-wide HL band), routed through the per-precinct streaming
+    /// synthesis path (`synthesise_precinct`) rather than the multi-level
+    /// gather/cascade. Non-flat content keeps the encoder on a
+    /// non-significance D form, so this locks the wide-band streaming
+    /// geometry independently of the significance-coding round-trips below.
+    #[test]
+    fn round362_wide_band_nl1_streaming_round_trips() {
+        let w: u16 = 132;
+        let h: u16 = 16;
+        let (wu, hu) = (w as usize, h as usize);
+        // Non-flat gradient + fringe so the bands carry real AC energy.
+        let mut pixels = vec![0u8; wu * hu];
+        for y in 0..hu {
+            for x in 0..wu {
+                let v = 100i32 + (x as i32 - 66) / 3 + (((x ^ y) as i32) & 0x0f);
+                pixels[y * wu + x] = v.clamp(0, 255) as u8;
+            }
+        }
+        // Precondition: LL band width ceil(W/2) = 66 > 2·Ng·Ss = 64, so the
+        // band-line significance-group count Ns = ceil(66/32) = 3.
+        let ll = wu.div_ceil(2);
+        assert!(
+            ll.div_ceil(32) >= 3,
+            "expected Ns>=3 on LL band, got width {ll}"
+        );
+        let cs = encode_planar(w, h, 1, 0, 1, 1, std::slice::from_ref(&pixels))
+            .expect("encode wide NL=1");
+        let img = decode_codestream(&cs, None).expect("decode wide NL=1");
+        assert_eq!(img.planes[0].data, pixels, "wide NL=1 streaming round-trip");
+    }
+
+    /// `Ns = 2` on the LL band at NL = 2 (LL width 33), flat enough that
+    /// significance coding stays the rate-optimal `D & 2` form across both
+    /// significance groups. Round-trips losslessly and stays well under the
+    /// raw budget.
+    #[test]
+    fn round362_significance_ns2_nl2_flat_round_trips() {
+        let w: u16 = 132;
+        let h: u16 = 64;
+        let (wu, hu) = (w as usize, h as usize);
+        let mut pixels = vec![128u8; wu * hu];
+        // A couple of point perturbations so we avoid the all-zero
+        // degenerate but keep most significance groups insignificant.
+        pixels[0] = 130;
+        pixels[wu * hu - 1] = 125;
+        pixels[(hu / 2) * wu + wu - 1] = 132;
+        // LL band at NL=2 is ceil(ceil(W/2)/2); for W=132 that is 33 > 32,
+        // so Ns = 2 on the LL band.
+        let ll = wu.div_ceil(2).div_ceil(2);
+        assert!(
+            ll.div_ceil(32) >= 2,
+            "expected Ns>=2 on LL band, got width {ll}"
+        );
+        let cs = encode_planar(w, h, 1, 0, 2, 2, std::slice::from_ref(&pixels))
+            .expect("encode Ns=2 NL=2 flat");
+        assert!(
+            cs.len() < wu * hu,
+            "Ns=2 significance-coded codestream ({} B) not below the raw pixel budget ({} B)",
+            cs.len(),
+            wu * hu
+        );
+        let img = decode_codestream(&cs, None).expect("decode Ns=2 NL=2 flat");
+        assert_eq!(img.planes[0].data, pixels, "Ns=2 NL=2 round-trip");
+    }
+
+    /// `Ns > 1` composed with three-component RGB + the reversible colour
+    /// transform (Cpih = 1): each colour plane independently carries
+    /// multi-significance-group band lines, and the inverse RCT recombines
+    /// them. Confirms the per-group Z dispatch is correct in the
+    /// multi-component gather path.
+    #[test]
+    fn round362_significance_ns2_rgb_rct_round_trips() {
+        let w: u16 = 140;
+        let h: u16 = 16;
+        let (wu, hu) = (w as usize, h as usize);
+        let mut r = vec![120u8; wu * hu];
+        let mut g = vec![120u8; wu * hu];
+        let mut b = vec![120u8; wu * hu];
+        for y in 0..hu {
+            for x in 100..wu {
+                let v: u8 = if (x ^ y) & 1 == 0 { 180 } else { 40 };
+                r[y * wu + x] = v;
+                g[y * wu + x] = v.saturating_add(8);
+                b[y * wu + x] = v.saturating_sub(8);
+            }
+        }
+        // LL band at NL=2 is ceil(ceil(140/2)/2) = 35 > 32 → Ns = 2.
+        let ll = wu.div_ceil(2).div_ceil(2);
+        assert!(
+            ll.div_ceil(32) >= 2,
+            "expected Ns>=2 on LL band, got width {ll}"
+        );
+        let planes = [r.clone(), g.clone(), b.clone()];
+        let cs = encode_planar(w, h, 3, 1, 2, 2, &planes).expect("encode Ns>1 RGB RCT");
+        let img = decode_codestream(&cs, None).expect("decode Ns>1 RGB RCT");
+        assert_eq!(img.planes[0].data, r, "R plane round-trip");
+        assert_eq!(img.planes[1].data, g, "G plane round-trip");
+        assert_eq!(img.planes[2].data, b, "B plane round-trip");
+    }
+
     // === Round 6: deeper wavelet cascade (NL > 2) ==========================
     //
     // The decoder cascade has always been generic (`forward_cascade_2d`

@@ -1,5 +1,39 @@
 # Changelog
 
+## Unreleased — round 362 (multi-significance-group coverage + Ng/Ss conformance gate)
+
+Two threads, both anchored in Annex A.4.4 Table A.7 / Annex B.8–B.9.
+
+**Multiple significance groups per band-line (`Ns > 1`).** The significance
+sub-packet (Table C.5) carries one `Z` bit per significance group, and a
+band-line holds `Ns[p,b] = ⌈Wpb / (Ng·Ss)⌉` of them (`Ng = 4`, `Ss = 8` ⇒ a
+fresh `Z` bit every 32 code-positions). Every prior significance round-trip
+used a picture narrow enough that the widest band stayed at `Wpb ≤ 32`, so
+`Ns = 1` and the `sig_group = g / Ss` group dispatch on both the encoder
+(`group_sig`) and decoder (`sig_flags` keyed by group `j`) collapsed to a
+single group. The new flat-field NL=2 tests push the LL/HL bands past 32
+positions so the encoder selects the significance-coded `D & 2` form with
+`Ns ∈ {2, 3}`, and the decode path resolves each `Z` bit to the correct
+group span — verified to carry both insignificant (`Z = 1`) and significant
+(`Z = 0`) bits in groups `j > 0`.
+
+* +3 tests (520 → 523):
+  * `round362_significance_ns2_nl2_flat_round_trips` — flat 132×64 luma, NL=2;
+    LL band width 33 (`Ns = 2`), HL bands width 66 (`Ns = 3`), significance
+    coding active across all bands.
+  * `round362_significance_ns2_rgb_rct_round_trips` — `Ns = 2` composed with
+    3-component RGB + the reversible colour transform (`Cpih = 1`).
+  * `round362_wide_band_nl1_streaming_round_trips` — wide single-level (NL=1)
+    picture whose LL band spans `Ns = 3` group widths, routed through the
+    per-precinct streaming synthesis path.
+
+**`Ng = 4` / `Ss = 8` conformance gate (Table A.7).** Table A.7 lists a
+single conformant value for both `Ng` (4) and `Ss` (8) — with no range like
+the `1—8` given for `Nc`. Every code-group / significance-group geometry
+computation presumes these values, so the PIH parser now rejects any other
+`Ng` or `Ss` rather than silently mis-grouping coefficients. (Previously
+`Ss` was checked against an over-permissive `1..=8` and `Ng` was unchecked.)
+
 ## Unreleased — round 359 (deepen decode-geometry coverage: 4:2:0 + NLT + Bw=20 at deeper vertical cascades)
 
 Extends the regression-locked decode-geometry envelope past the round-357
