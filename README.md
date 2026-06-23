@@ -88,9 +88,17 @@ trailing filler inside the data/sign/count sub-packets (Annex C.3) is
 tolerated. The decoder additionally rejects out-of-range header fields a
 conforming codestream cannot carry: `R[p] ∉ [0, NL−1]` (Annex C.2
 Table C.1); the reserved code points of `Cpih` / `Qpih` / `Fs` / `Rm` /
-`Ppoc` and `Ss ∉ 1..=8` (Annex A.4.4 Tables A.9–A.13); and `Cpih = 3`
+`Ppoc` (Annex A.4.4 Tables A.9–A.13); the single-value `Ng = 4` / `Ss = 8`
+fields (Table A.7 lists no range for either, so any other value would
+mis-group the code-group / significance-group geometry); and `Cpih = 3`
 Star-Tetrix with any sub-sampled CFA input (Annex A.4.3 / F.2, mirroring
 the existing `Cpih = 1` RCT guard).
+
+Significance coding (`D[p,b] & 2`, Table C.5) is exercised end-to-end with
+**multiple significance groups per band line** (`Ns[p,b] = ⌈Wpb / (Ng·Ss)⌉
+> 1`, Annex B.9): for bands wider than `Ng·Ss = 32` code-positions the
+encoder emits one `Z` bit per group and the decoder dispatches each to its
+`g / Ss` group span, round-tripping luma and RGB-with-RCT at `Ns ∈ {2, 3}`.
 
 When the picture-header `Rl = 0`, the decoder also enforces the Annex C.3
 raw-mode-consistency rule: a band's raw-mode flag `Dr[p,s]` must be
