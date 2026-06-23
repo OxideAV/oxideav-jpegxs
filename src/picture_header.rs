@@ -163,12 +163,23 @@ pub fn parse(body: &[u8]) -> Result<PictureHeader> {
              resolution-line-band-component order)"
         )));
     }
-    // Ss — code groups per significance group — has the explicit range
-    // 1..=8 (Annex A.4.4 Table A.7 "Values" column). Ss = 0 would make
-    // Ns[p,b] = ceil(Ncg / 0) undefined; Ss > 8 is reserved.
-    if ss == 0 || ss > 8 {
+    // Ng — coefficients per code group — and Ss — code groups per
+    // significance group — each have a single conformant value in the
+    // Annex A.4.4 Table A.7 "Values" column: Ng = 4 and Ss = 8 (the same
+    // singular-value form the table uses, e.g. there is no range like the
+    // "1—8" given for Nc). Every code-group / significance-group geometry
+    // computation downstream (`Ncg = ceil(Wpb/Ng)`, `Ns = ceil(Wpb/(Ng·Ss))`,
+    // Annex B.8/B.9) presumes these values; a stream carrying any other Ng
+    // or Ss is not one a conforming JPEG XS encoder can produce, so reject
+    // it here rather than silently mis-grouping the wavelet coefficients.
+    if ng != 4 {
         return Err(Error::invalid(format!(
-            "jpegxs: PIH Ss = {ss} out of range 1..=8 (Table A.7)"
+            "jpegxs: PIH Ng = {ng}; the only conformant value is 4 (Table A.7)"
+        )));
+    }
+    if ss != 8 {
+        return Err(Error::invalid(format!(
+            "jpegxs: PIH Ss = {ss}; the only conformant value is 8 (Table A.7)"
         )));
     }
 
@@ -336,12 +347,27 @@ mod tests {
         let mut b = body(1, 4, 4, 0, 0x80);
         b[21] = 0b0001_0000;
         assert!(parse(&b).is_err(), "Ppoc=1 reserved");
-        // Ss out of range (Table A.7: 1..=8) — body[18].
+        // Ng != 4 (Table A.7 lists the single value 4) — body[17].
+        let mut b = body(1, 4, 4, 0, 0x80);
+        b[17] = 3; // Ng = 3
+        assert!(parse(&b).is_err(), "Ng=3 non-conformant");
+        let mut b = body(1, 4, 4, 0, 0x80);
+        b[17] = 8; // Ng = 8
+        assert!(parse(&b).is_err(), "Ng=8 non-conformant");
+        // Ss != 8 (Table A.7 lists the single value 8) — body[18].
         let mut b = body(1, 4, 4, 0, 0x80);
         b[18] = 0; // Ss = 0
-        assert!(parse(&b).is_err(), "Ss=0 out of range");
+        assert!(parse(&b).is_err(), "Ss=0 non-conformant");
+        let mut b = body(1, 4, 4, 0, 0x80);
+        b[18] = 4; // Ss = 4 (in the old 1..=8 range but not the single value 8)
+        assert!(parse(&b).is_err(), "Ss=4 non-conformant");
         let mut b = body(1, 4, 4, 0, 0x80);
         b[18] = 9; // Ss = 9
-        assert!(parse(&b).is_err(), "Ss=9 out of range");
+        assert!(parse(&b).is_err(), "Ss=9 non-conformant");
+        // The conformant pair (Ng=4, Ss=8) parses.
+        assert!(
+            parse(&body(1, 4, 4, 0, 0x80)).is_ok(),
+            "Ng=4 Ss=8 conformant"
+        );
     }
 }
