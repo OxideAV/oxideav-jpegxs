@@ -1,5 +1,53 @@
 # Changelog
 
+## Unreleased — round 366 (JXS still-image file format — ISO/IEC 21122-3 Annex A box parser)
+
+New decode subsystem: the box-based **JXS still-image file format**
+(ISO/IEC 21122-3:2019 Annex A) that optionally wraps a raw ISO/IEC
+21122-1 codestream. Until now the crate decoded only the bare codestream
+(`SOC … EOC`); a `.jxs` file produced by a conforming writer carries the
+codestream inside a JPEG 2000-family box structure, which this round
+parses end-to-end and round-trips through the existing codestream
+decoder.
+
+* New `fileformat` module (`src/fileformat.rs`):
+  * `parse_box_header` / `parse_boxes` — the A.3 Table A.1 box syntax
+    (`LBox | TBox | [XLBox] | DBox`, big-endian). Handles all three
+    `LBox` length encodings: literal (`>= 8`), the `LBox = 1` 8-byte
+    `XLBox` extended length, and the `LBox = 0` to-end-of-buffer form;
+    rejects the reserved `2..=7` values and any box that overruns its
+    container.
+  * Typed box bodies with body-level validation: `FileType` (A.5.2,
+    brand + minor-version + compatibility list, `'jxs\040'`-compat
+    check), `ImageHeader` (A.5.4.2 / Table A.16–A.17, with the BPC
+    sign-flag / varying-depth (`0xFF`) / 38-bit-max decoding),
+    `ColourSpec` + `Cicp` (A.5.4.3, the CICP `METH = 5` code points),
+    `ChannelDefinition` (A.5.4.4 Table A.25), `ProfileLevel` (A.5.3.3
+    Table A.11).
+  * `parse_jxs_file` — enforces the mandatory ordering (Signature box
+    first, File Type box immediately after, Header box before the first
+    Contiguous Codestream box; A.2.3 / Figure A.1), skips unknown boxes
+    (A.6), and pulls the optional `jxpl` Profile/Level box out of a
+    `jpvs` Video Support superbox.
+  * `is_jxs_file` — signature-box discriminator between a `.jxs` file
+    and a bare codestream.
+  * `decode_jxs_file` — extracts the first codestream and decodes it,
+    cross-checking the `ihdr` `NC` / width / height against the
+    codestream picture header (A.5.4.2 declares contradictory files
+    non-conforming).
+* The `registry` `Decoder` now routes each packet on its leading
+  signature: a box-wrapped JXS file is unwrapped via `decode_jxs_file`,
+  a bare codestream takes the existing path. No new container crate —
+  the box layer is intrinsic to the `.jxs` still-image format. The
+  module stays `oxideav-core`-free, so the standalone (no-`registry`)
+  build is unaffected.
+* +17 tests (523 → 540): box-chain parse + codestream extraction, full
+  luma round-trip through the wrapper, `XLBox` / `LBox = 0` length
+  forms, reserved-`LBox` rejection, missing-signature / misplaced-ftyp
+  rejection, `ihdr`↔codestream `NC` and dimension mismatch rejection,
+  unknown + XML box skipping, per-box-body parse/validation units, and
+  two `Decoder`-trait tests (box-wrapped and bare codestream).
+
 ## Unreleased — round 362 (multi-significance-group coverage + Ng/Ss conformance gate)
 
 Two threads, both anchored in Annex A.4.4 Table A.7 / Annex B.8–B.9.

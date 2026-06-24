@@ -18,6 +18,7 @@ use oxideav_core::{
 
 use crate::decoder::decode_codestream;
 use crate::error::JpegXsError;
+use crate::fileformat::{decode_jxs_file, is_jxs_file};
 use crate::image::JpegXsImage;
 use crate::CODEC_ID_STR;
 
@@ -61,12 +62,15 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
 
 /// Register JPEG XS file extensions into the supplied [`ContainerRegistry`].
 ///
-/// JPEG XS has no separate container layer of its own — a `.jxs` file is
-/// the bare ISO/IEC 21122 codestream (SOC marker first), so no demuxer
-/// or probe is registered. We *do* register the canonical `.jxs`
-/// extension against the codec id `"jpegxs"` so a caller resolving a
-/// path hint via [`ContainerRegistry::container_for_extension`] still
-/// gets a useful answer. Lookups are case-insensitive (handled by
+/// A `.jxs` file may be either a bare ISO/IEC 21122-1 codestream (SOC
+/// marker first) or the box-based JXS still-image file format of ISO/IEC
+/// 21122-3 Annex A (JPEG XS Signature box first); the decoder accepts
+/// both, routing on the leading signature. No standalone demuxer is
+/// registered — the codec's `Decoder` unwraps the box layer itself. We
+/// register the canonical `.jxs` extension against the codec id
+/// `"jpegxs"` so a caller resolving a path hint via
+/// [`ContainerRegistry::container_for_extension`] still gets a useful
+/// answer. Lookups are case-insensitive (handled by
 /// [`ContainerRegistry::register_extension`] / `container_for_extension`,
 /// which lowercase both sides).
 pub fn register_containers(reg: &mut ContainerRegistry) {
@@ -119,12 +123,113 @@ impl Decoder for JpegXsDecoder {
                 Err(Error::NeedMore)
             };
         };
-        let img = decode_codestream(&pkt.data, pkt.pts)?;
+        // A packet may carry either a bare ISO/IEC 21122-1 codestream
+        // (SOC marker first) or a box-wrapped JXS file (ISO/IEC 21122-3
+        // Annex A, JPEG XS Signature box first). Route on the signature.
+        let img = if is_jxs_file(&pkt.data) {
+            let mut img = decode_jxs_file(&pkt.data)?;
+            img.pts = pkt.pts;
+            img
+        } else {
+            decode_codestream(&pkt.data, pkt.pts)?
+        };
         Ok(img.into())
     }
 
     fn flush(&mut self) -> Result<()> {
         self.eof = true;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fileformat::{
+        BRAND_JXS, COLR_METH_CICP, COMPRESSION_JPEG_XS, SIGNATURE_BOX, TBOX_CODESTREAM,
+        TBOX_COLOUR, TBOX_FILETYPE, TBOX_HEADER, TBOX_IMAGE_HEADER,
+    };
+    use oxideav_core::TimeBase;
+
+    fn boxed(tbox: u32, body: &[u8]) -> Vec<u8> {
+        let len = 8 + body.len();
+        let mut v = Vec::with_capacity(len);
+        v.extend_from_slice(&(len as u32).to_be_bytes());
+        v.extend_from_slice(&tbox.to_be_bytes());
+        v.extend_from_slice(body);
+        v
+    }
+
+    fn wrap(cs: &[u8], w: u32, h: u32) -> Vec<u8> {
+        let mut file = Vec::new();
+        file.extend_from_slice(&SIGNATURE_BOX);
+        let mut ftyp = Vec::new();
+        ftyp.extend_from_slice(&BRAND_JXS.to_be_bytes());
+        ftyp.extend_from_slice(&0u32.to_be_bytes());
+        ftyp.extend_from_slice(&BRAND_JXS.to_be_bytes());
+        file.extend_from_slice(&boxed(TBOX_FILETYPE, &ftyp));
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&h.to_be_bytes());
+        ihdr.extend_from_slice(&w.to_be_bytes());
+        ihdr.extend_from_slice(&1u16.to_be_bytes());
+        ihdr.push(7); // BPC: 8-bit unsigned
+        ihdr.push(COMPRESSION_JPEG_XS);
+        ihdr.push(0);
+        ihdr.push(0);
+        let mut colr = vec![COLR_METH_CICP, 0, 0];
+        colr.extend_from_slice(&1u16.to_be_bytes());
+        colr.extend_from_slice(&13u16.to_be_bytes());
+        colr.extend_from_slice(&0u16.to_be_bytes());
+        colr.push(0);
+        let mut jp2h = Vec::new();
+        jp2h.extend_from_slice(&boxed(TBOX_IMAGE_HEADER, &ihdr));
+        jp2h.extend_from_slice(&boxed(TBOX_COLOUR, &colr));
+        file.extend_from_slice(&boxed(TBOX_HEADER, &jp2h));
+        file.extend_from_slice(&boxed(TBOX_CODESTREAM, cs));
+        file
+    }
+
+    #[test]
+    fn decoder_accepts_box_wrapped_jxs_file() {
+        let (w, h) = (8u16, 4u16);
+        let pixels: Vec<u8> = (0..(w as usize * h as usize))
+            .map(|i| (i * 5) as u8)
+            .collect();
+        let cs =
+            crate::encoder::encode_planar(w, h, 1, 0, 1, 1, std::slice::from_ref(&pixels)).unwrap();
+        let file = wrap(&cs, w as u32, h as u32);
+
+        let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        let mut dec = make_decoder(&params).unwrap();
+        let pkt = Packet::new(0, TimeBase::new(1, 25), file).with_pts(42);
+        dec.send_packet(&pkt).unwrap();
+        let frame = dec.receive_frame().unwrap();
+        match frame {
+            Frame::Video(v) => {
+                assert_eq!(v.pts, Some(42));
+                assert_eq!(v.planes[0].data, pixels);
+            }
+            _ => panic!("expected a video frame"),
+        }
+    }
+
+    #[test]
+    fn decoder_still_accepts_bare_codestream() {
+        let (w, h) = (8u16, 4u16);
+        let pixels: Vec<u8> = (0..(w as usize * h as usize))
+            .map(|i| (i * 3) as u8)
+            .collect();
+        let cs =
+            crate::encoder::encode_planar(w, h, 1, 0, 1, 1, std::slice::from_ref(&pixels)).unwrap();
+
+        let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        let mut dec = make_decoder(&params).unwrap();
+        dec.send_packet(&Packet::new(0, TimeBase::new(1, 25), cs))
+            .unwrap();
+        let frame = dec.receive_frame().unwrap();
+        match frame {
+            Frame::Video(v) => assert_eq!(v.planes[0].data, pixels),
+            _ => panic!("expected a video frame"),
+        }
     }
 }

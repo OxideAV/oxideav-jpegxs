@@ -61,6 +61,7 @@ pub mod dwt;
 pub mod encoder;
 pub mod entropy;
 pub mod error;
+pub mod fileformat;
 pub mod image;
 pub mod markers;
 pub mod output;
@@ -98,6 +99,10 @@ pub use encoder::{
     pick_qpr_rpr_for_target_bytes, pick_rp_for_target_bytes,
 };
 pub use error::{JpegXsError, Result};
+pub use fileformat::{
+    decode_jxs_file, is_jxs_file, parse_jxs_file, ChannelDef, ChannelDefinition, Cicp, ColourSpec,
+    FileType, HeaderBox, ImageHeader, JxsFile, ProfileLevel,
+};
 pub use image::{JpegXsImage, JpegXsPlane};
 pub use markers::Marker;
 pub use output::{parse_nlt, NltParams};

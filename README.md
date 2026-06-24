@@ -206,6 +206,26 @@ The marker-chain parser per ISO/IEC 21122-1:2022 Annex A recognises:
 - Each header marker has a typed body accessor (`cts()`, `crg()`,
   `nlt()`, `wgt()`, `cwd()`, `com()`) surfacing field-level errors.
 
+### JXS still-image file format
+
+The `fileformat` module parses the box-based **JXS still-image file
+format** (ISO/IEC 21122-3:2019 Annex A) that optionally wraps a raw
+ISO/IEC 21122-1 codestream. It walks the JPEG 2000-family box syntax
+(A.3 Table A.1 — `LBox | TBox | [XLBox] | DBox`, all three `LBox` length
+forms), validates the mandatory ordering (Signature box first, File Type
+box next, Header box before the first Contiguous Codestream box), skips
+unknown boxes (A.6), and surfaces typed bodies for the File Type box,
+Image Header box (`ihdr`, with the Table A.17 sign-flag / varying-depth /
+bit-depth decoding), Colour Specification box (`colr` CICP code points),
+Channel Definition box (`cdef`), and Profile/Level box (`jxpl`).
+
+`decode_jxs_file` extracts the embedded codestream, cross-checks the
+`ihdr` geometry against the codestream picture header (A.5.4.2 rejects
+contradictory files), and decodes through the standard path. The
+registry `Decoder` accepts either a bare codestream or a box-wrapped
+`.jxs` file, routing on the leading signature; `is_jxs_file`
+discriminates the two.
+
 ### Profile / level surface
 
 The `profile` module implements the ISO/IEC 21122-2:2019 Annex A
