@@ -713,6 +713,155 @@ pub fn decode_jxs_file(buf: &[u8]) -> Result<crate::image::JpegXsImage> {
     crate::decode_jpeg_xs(codestream)
 }
 
+/// Serialize one box: `LBox(4) | TBox(4) | DBox`, big-endian (A.3
+/// Table A.1). Uses the literal-length form (the optional `XLBox`
+/// extended length is only needed past the 4 GiB box-length ceiling,
+/// which a still image never reaches in practice).
+fn serialize_box(out: &mut Vec<u8>, tbox: u32, body: &[u8]) {
+    let len = (8 + body.len()) as u32;
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(&tbox.to_be_bytes());
+    out.extend_from_slice(body);
+}
+
+/// Builder for a conforming JXS still-image file (ISO/IEC 21122-3
+/// Annex A). The mandatory Image Header and a CICP Colour Specification
+/// box are derived from / supplied to the builder; the optional Channel
+/// Definition and Profile/Level boxes can be added.
+///
+/// The Image Header `WIDTH` / `HEIGHT` / `NC` / `BPC` are taken from the
+/// codestream picture header (A.5.4.2 declares them redundant), so the
+/// emitted file is internally consistent by construction.
+#[derive(Debug, Clone)]
+pub struct JxsFileBuilder {
+    cicp: Cicp,
+    colourspace_unknown: u8,
+    channels: Option<Vec<ChannelDef>>,
+    profile_level: Option<ProfileLevel>,
+}
+
+impl JxsFileBuilder {
+    /// New builder with a CICP colour specification. A common sRGB
+    /// choice is `Cicp { colour_primaries: 1, transfer_characteristics:
+    /// 13, matrix_coefficients: 0, full_range: false }`.
+    pub fn new(cicp: Cicp) -> Self {
+        Self {
+            cicp,
+            colourspace_unknown: 0,
+            channels: None,
+            profile_level: None,
+        }
+    }
+
+    /// Set the `UnkC` colourspace-unknown flag (A.5.4.2; 0 or 1).
+    pub fn colourspace_unknown(mut self, unknown: bool) -> Self {
+        self.colourspace_unknown = u8::from(unknown);
+        self
+    }
+
+    /// Add a Channel Definition box (A.5.4.4).
+    pub fn channels(mut self, channels: Vec<ChannelDef>) -> Self {
+        self.channels = Some(channels);
+        self
+    }
+
+    /// Add a JPEG XS Video Support superbox carrying a Profile/Level box
+    /// (A.5.3.3). The `jpvi` video-information box that A.5.3.1 marks
+    /// mandatory inside `jpvs` is out of scope here, so this is emitted
+    /// only when the caller asks for the profile/level wrapper.
+    pub fn profile_level(mut self, ppih: u16, plev: u16) -> Self {
+        self.profile_level = Some(ProfileLevel { ppih, plev });
+        self
+    }
+
+    /// Serialize the file around the supplied raw codestream. The
+    /// codestream is parsed to derive the `ihdr` fields; an invalid
+    /// codestream is rejected.
+    pub fn build(&self, codestream: &[u8]) -> Result<Vec<u8>> {
+        let cs = crate::codestream::parse(codestream)?;
+        let width = cs.pih.width();
+        let height = cs.pih.height();
+        let nc = u16::from(cs.pih.nc);
+        let bit_depth = cs.cdt.max_bit_depth();
+        if bit_depth == 0 || bit_depth > 38 {
+            return Err(JpegXsError::invalid(
+                "jxs writer: component bit depth out of the Table A.17 range",
+            ));
+        }
+        // BPC: unsigned components, depth − 1 in the low 7 bits.
+        let bpc = bit_depth - 1;
+        let ipr = 0u8;
+
+        let mut file = Vec::new();
+        // Signature box (A.5.1).
+        file.extend_from_slice(&SIGNATURE_BOX);
+        // File Type box (A.5.2): BR = jxs, MinV = 0, CLi = [jxs].
+        let mut ftyp = Vec::new();
+        ftyp.extend_from_slice(&BRAND_JXS.to_be_bytes());
+        ftyp.extend_from_slice(&0u32.to_be_bytes());
+        ftyp.extend_from_slice(&BRAND_JXS.to_be_bytes());
+        serialize_box(&mut file, TBOX_FILETYPE, &ftyp);
+
+        // JPEG XS Header superbox (A.5.4): ihdr, colr, optional cdef.
+        let mut jp2h = Vec::new();
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        ihdr.extend_from_slice(&width.to_be_bytes());
+        ihdr.extend_from_slice(&nc.to_be_bytes());
+        ihdr.push(bpc);
+        ihdr.push(COMPRESSION_JPEG_XS);
+        ihdr.push(self.colourspace_unknown);
+        ihdr.push(ipr);
+        serialize_box(&mut jp2h, TBOX_IMAGE_HEADER, &ihdr);
+
+        let mut colr = vec![COLR_METH_CICP, 0, 0];
+        colr.extend_from_slice(&self.cicp.colour_primaries.to_be_bytes());
+        colr.extend_from_slice(&self.cicp.transfer_characteristics.to_be_bytes());
+        colr.extend_from_slice(&self.cicp.matrix_coefficients.to_be_bytes());
+        colr.push(if self.cicp.full_range { 0x80 } else { 0x00 });
+        serialize_box(&mut jp2h, TBOX_COLOUR, &colr);
+
+        if let Some(channels) = &self.channels {
+            let mut cdef = Vec::new();
+            cdef.extend_from_slice(&(channels.len() as u16).to_be_bytes());
+            for c in channels {
+                cdef.extend_from_slice(&c.channel.to_be_bytes());
+                cdef.extend_from_slice(&c.typ.to_be_bytes());
+                cdef.extend_from_slice(&c.assoc.to_be_bytes());
+            }
+            serialize_box(&mut jp2h, TBOX_CHANNEL_DEF, &cdef);
+        }
+        serialize_box(&mut file, TBOX_HEADER, &jp2h);
+
+        // Optional JPEG XS Video Support superbox (jpvs) carrying jxpl.
+        if let Some(pl) = &self.profile_level {
+            let mut jpvs = Vec::new();
+            let mut jxpl = Vec::new();
+            jxpl.extend_from_slice(&pl.ppih.to_be_bytes());
+            jxpl.extend_from_slice(&pl.plev.to_be_bytes());
+            serialize_box(&mut jpvs, TBOX_PROFILE_LEVEL, &jxpl);
+            serialize_box(&mut file, TBOX_VIDEO_SUPPORT, &jpvs);
+        }
+
+        // Contiguous Codestream box (A.5.5).
+        serialize_box(&mut file, TBOX_CODESTREAM, codestream);
+        Ok(file)
+    }
+}
+
+/// Wrap a raw ISO/IEC 21122-1 codestream in a minimal conforming JXS
+/// file (ISO/IEC 21122-3 Annex A) with a CICP sRGB colour specification
+/// and no auxiliary boxes. For finer control use [`JxsFileBuilder`].
+pub fn write_jxs_file(codestream: &[u8]) -> Result<Vec<u8>> {
+    JxsFileBuilder::new(Cicp {
+        colour_primaries: 1,
+        transfer_characteristics: 13,
+        matrix_coefficients: 0,
+        full_range: false,
+    })
+    .build(codestream)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -984,5 +1133,142 @@ mod tests {
         assert_eq!(pl.ppih, 0x1234);
         assert_eq!(pl.plev, 0x5678);
         assert!(ProfileLevel::parse(&[0, 0, 0]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod writer_tests {
+    use super::*;
+
+    fn srgb() -> Cicp {
+        Cicp {
+            colour_primaries: 1,
+            transfer_characteristics: 13,
+            matrix_coefficients: 0,
+            full_range: false,
+        }
+    }
+
+    #[test]
+    fn write_then_decode_luma_round_trips() {
+        let (w, h) = (16u16, 8u16);
+        let pixels: Vec<u8> = (0..(w as usize * h as usize))
+            .map(|i| (i * 11) as u8)
+            .collect();
+        let cs =
+            crate::encoder::encode_planar(w, h, 1, 0, 1, 1, std::slice::from_ref(&pixels)).unwrap();
+        let file = write_jxs_file(&cs).unwrap();
+        assert!(is_jxs_file(&file));
+        // Parse re-derives the geometry from the codestream.
+        let parsed = parse_jxs_file(&file).unwrap();
+        assert_eq!(parsed.header.image_header.width, w as u32);
+        assert_eq!(parsed.header.image_header.height, h as u32);
+        assert_eq!(parsed.header.image_header.num_components, 1);
+        assert_eq!(parsed.header.image_header.bit_depth(), Some(8));
+        let img = decode_jxs_file(&file).unwrap();
+        assert_eq!(img.planes[0].data, pixels);
+    }
+
+    #[test]
+    fn write_rgb_with_channels_and_profile_level() {
+        let (w, h) = (8u16, 8u16);
+        let planes: Vec<Vec<u8>> = (0..3)
+            .map(|c| {
+                (0..(w as usize * h as usize))
+                    .map(|i| (i + c * 17) as u8)
+                    .collect()
+            })
+            .collect();
+        // Cpih=0 (no colour transform) 3-component planar.
+        let cs = crate::encoder::encode_planar(w, h, 3, 0, 1, 1, &planes).unwrap();
+        let channels = vec![
+            ChannelDef {
+                channel: 0,
+                typ: 0,
+                assoc: 1,
+            },
+            ChannelDef {
+                channel: 1,
+                typ: 0,
+                assoc: 2,
+            },
+            ChannelDef {
+                channel: 2,
+                typ: 0,
+                assoc: 3,
+            },
+        ];
+        let file = JxsFileBuilder::new(srgb())
+            .channels(channels.clone())
+            .profile_level(0x1234, 0x5678)
+            .build(&cs)
+            .unwrap();
+        let parsed = parse_jxs_file(&file).unwrap();
+        assert_eq!(parsed.header.image_header.num_components, 3);
+        let cdef = parsed.header.channel_def.as_ref().unwrap();
+        assert_eq!(cdef.channels, channels);
+        let pl = parsed.profile_level.unwrap();
+        assert_eq!(pl.ppih, 0x1234);
+        assert_eq!(pl.plev, 0x5678);
+        let img = decode_jxs_file(&file).unwrap();
+        assert_eq!(img.num_components, 3);
+        for (c, plane) in planes.iter().enumerate() {
+            assert_eq!(&img.planes[c].data, plane, "component {c} round-trips");
+        }
+    }
+
+    #[test]
+    fn write_high_bit_depth_sets_bpc() {
+        // 12-bit luma: BPC low-7 == 11.
+        let (w, h) = (8u16, 4u16);
+        let samples: Vec<u16> = (0..(w as usize * h as usize))
+            .map(|i| (i * 13) as u16)
+            .collect();
+        let cs = crate::encoder::encode_planar_highbd(
+            w,
+            h,
+            1,
+            0,
+            1,
+            1,
+            12,
+            std::slice::from_ref(&samples),
+        )
+        .unwrap();
+        let file = write_jxs_file(&cs).unwrap();
+        let parsed = parse_jxs_file(&file).unwrap();
+        assert_eq!(parsed.header.image_header.bit_depth(), Some(12));
+        assert!(!parsed.header.image_header.is_signed());
+        // Decodes back to the same 12-bit samples.
+        let img = decode_jxs_file(&file).unwrap();
+        assert_eq!(img.bit_depth, 12);
+        assert_eq!(
+            img.planes[0].data,
+            samples
+                .iter()
+                .flat_map(|s| s.to_le_bytes())
+                .collect::<Vec<u8>>()
+        );
+    }
+
+    #[test]
+    fn write_rejects_invalid_codestream() {
+        assert!(write_jxs_file(&[0xff, 0x10, 0x00]).is_err());
+    }
+
+    #[test]
+    fn cicp_full_range_round_trips() {
+        let (w, h) = (4u16, 4u16);
+        let pixels = vec![100u8; (w * h) as usize];
+        let cs =
+            crate::encoder::encode_planar(w, h, 1, 0, 1, 1, std::slice::from_ref(&pixels)).unwrap();
+        let mut cicp = srgb();
+        cicp.full_range = true;
+        cicp.colour_primaries = 9;
+        let file = JxsFileBuilder::new(cicp).build(&cs).unwrap();
+        let parsed = parse_jxs_file(&file).unwrap();
+        let got = parsed.header.colour_specs[0].cicp.unwrap();
+        assert!(got.full_range);
+        assert_eq!(got.colour_primaries, 9);
     }
 }

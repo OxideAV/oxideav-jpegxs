@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased — round 366 (JXS file-format writer + builder)
+
+Completes the JXS still-image file-format round with a **writer** that
+serializes a conforming ISO/IEC 21122-3 Annex A box wrapper around an
+encoded codestream, giving a real encode → wrap → decode round-trip.
+
+* `fileformat::JxsFileBuilder` — emits the Signature, File Type, JPEG XS
+  Header (ihdr + CICP colr + optional cdef), optional `jpvs`/`jxpl`
+  Profile-Level, and Contiguous Codestream boxes. The `ihdr`
+  `WIDTH`/`HEIGHT`/`NC`/`BPC` are derived from the codestream picture
+  header (A.5.4.2), so the file is internally consistent by
+  construction; the builder takes a CICP colour spec and optional
+  channel definitions / profile-level / `UnkC` flag.
+* `fileformat::write_jxs_file` — convenience wrapper emitting a minimal
+  CICP-sRGB file with no auxiliary boxes.
+* Both stay `oxideav-core`-free (standalone build unaffected) and are
+  re-exported at the crate root.
+* +5 tests (540 → 545): luma write → decode round-trip; 3-component
+  RGB with a Channel Definition box + a Profile/Level box, all
+  round-tripping; 12-bit high-bit-depth `BPC` derivation + decode;
+  invalid-codestream rejection; full-range CICP carriage.
+
 ## Unreleased — round 366 (JXS still-image file format — ISO/IEC 21122-3 Annex A box parser)
 
 New decode subsystem: the box-based **JXS still-image file format**

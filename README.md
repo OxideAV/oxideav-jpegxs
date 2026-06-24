@@ -226,6 +226,12 @@ registry `Decoder` accepts either a bare codestream or a box-wrapped
 `.jxs` file, routing on the leading signature; `is_jxs_file`
 discriminates the two.
 
+A matching writer round-trips the wrapper: `JxsFileBuilder` /
+`write_jxs_file` serialize a conforming box file around an encoded
+codestream — deriving the `ihdr` geometry from the picture header,
+carrying a CICP colour specification, and optionally emitting a Channel
+Definition box and a `jpvs`/`jxpl` Profile-and-Level box.
+
 ### Profile / level surface
 
 The `profile` module implements the ISO/IEC 21122-2:2019 Annex A
