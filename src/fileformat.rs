@@ -782,14 +782,25 @@ impl JxsFileBuilder {
         let width = cs.pih.width();
         let height = cs.pih.height();
         let nc = u16::from(cs.pih.nc);
-        let bit_depth = cs.cdt.max_bit_depth();
-        if bit_depth == 0 || bit_depth > 38 {
-            return Err(JpegXsError::invalid(
-                "jxs writer: component bit depth out of the Table A.17 range",
-            ));
-        }
-        // BPC: unsigned components, depth − 1 in the low 7 bits.
-        let bpc = bit_depth - 1;
+        // BPC (Table A.17): if every component shares one bit depth, encode
+        // `depth − 1` in the low 7 bits (unsigned components). If the
+        // components vary, emit the `0xFF` "components vary in bit depth"
+        // code, in which case the per-component depths come from the
+        // codestream rather than the ihdr.
+        let depths: Vec<u8> = cs.cdt.components.iter().map(|c| c.bit_depth).collect();
+        let uniform = depths
+            .first()
+            .copied()
+            .filter(|&d| depths.iter().all(|&x| x == d));
+        let bpc = match uniform {
+            Some(d) if (1..=38).contains(&d) => d - 1,
+            Some(_) => {
+                return Err(JpegXsError::invalid(
+                    "jxs writer: component bit depth out of the Table A.17 range",
+                ));
+            }
+            None => 0xFF, // components vary in bit depth (Table A.17)
+        };
         let ipr = 0u8;
 
         let mut file = Vec::new();

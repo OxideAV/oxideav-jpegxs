@@ -258,11 +258,17 @@ rate not observable from the codestream.
 
 ```rust
 // Probe: width / height / components / bit depth / profile / level /
-// Cpih / lossless flag.
+// Cpih / lossless flag. Accepts a bare codestream or a box-wrapped
+// .jxs file.
 let info = oxideav_jpegxs::probe(bytes);
 
-// Decode a codestream.
+// Decode a bare codestream.
 let picture = oxideav_jpegxs::decode_jpeg_xs(bytes)?;
+
+// Decode a box-wrapped .jxs file (ISO/IEC 21122-3 Annex A), or write
+// one around an encoded codestream.
+// let picture = oxideav_jpegxs::decode_jxs_file(jxs_bytes)?;
+// let jxs = oxideav_jpegxs::write_jxs_file(&codestream)?;
 # Ok::<(), oxideav_jpegxs::Error>(())
 ```
 

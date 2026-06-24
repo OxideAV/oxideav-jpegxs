@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased — round 366 (probe accepts box-wrapped JXS files)
+
+The crate-root `probe` now transparently accepts a box-wrapped JXS
+still-image file (ISO/IEC 21122-3 Annex A) as well as a bare ISO/IEC
+21122-1 codestream: when the buffer leads with the JPEG XS Signature
+box it locates the embedded codestream and probes that, so a routing
+layer handed a real `.jxs` file gets the same `JpegXsFileInfo` it would
+from the raw codestream. Bare-codestream probing (`FF 10` lead) is
+unchanged.
+
+* +2 tests (545 → 547): a wrapped file and its bare codestream probe to
+  identical geometry; garbage / truncated-box buffers return `None`.
+
+Also refines `JxsFileBuilder`: when the codestream's components do not
+all share one bit depth it now emits the Table A.17 `0xFF`
+"components vary in bit depth" `BPC` code instead of the maximum depth,
+keeping the emitted `ihdr` spec-correct for any conforming codestream
+(uniform-depth streams — every stream this crate's encoder produces —
+are byte-identical to before).
+
 ## Unreleased — round 366 (JXS file-format writer + builder)
 
 Completes the JXS still-image file-format round with a **writer** that
