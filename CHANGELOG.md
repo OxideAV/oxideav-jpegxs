@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased — round 371 (high-bit-depth NLT + chroma sub-sampling)
+
+Extends the round-371 NLT × chroma sub-sampling composition to the
+high-bit-depth (`B[i] ∈ 9..=16`, `Bw = 20`, `u16`-LE plane) paths:
+`encode_planar_subsampled_nlt_quadratic_highbd` (Tnlt=1) and
+`encode_planar_subsampled_nlt_extended_highbd` (Tnlt=2) take per-component
+`(sx[i], sy[i]) ∈ {1, 2}`, driving a 4:2:2 / 4:2:0 luma + chroma picture
+through the high-precision NLT path.
+
+* +3 tests (551 → 554): 12-bit 4:2:2 and 10-bit 4:2:0 NLT-quadratic
+  round-trip (all components ≥ 40 dB), 12-bit 4:2:2 NLT-extended
+  round-trip (≥ 30 dB).
+
 ## Unreleased — round 371 (NLT + chroma sub-sampling encode paths)
 
 Adds two public encoder entry points composing the Annex G non-linear

@@ -64,7 +64,12 @@ End-to-end decode of the multi-component subset:
   `cpih = 0`) through the NLT marker path — each component (full-res luma,
   half-resolution chroma decomposing one vertical level shallower)
   round-trips above the NLT PSNR floor, while RCT (`cpih = 1`) with a
-  sub-sampled component is rejected per Annex F.2.
+  sub-sampled component is rejected per Annex F.2. The same NLT × chroma
+  sub-sampling composition is exposed at **high bit depth**
+  (`B[i] ∈ 9..=16`, `Bw = 20`, `u16`-LE planes):
+  `encode_planar_subsampled_nlt_quadratic_highbd` /
+  `_subsampled_nlt_extended_highbd` drive a 4:2:2 / 4:2:0 luma + chroma
+  picture through the high-precision NLT path.
 
 Every bitplane-count decode mode (raw, no-prediction, vertical
 prediction — Tables C.12 / C.13 / C.14) enforces the spec range
@@ -288,6 +293,7 @@ interleaved RGB, and generalised planar input, with `_lossy`,
 `_subsampled_highbd_annex_h`, `_highbd`,
 `_subsampled`, `_star_tetrix`, `_nlt_quadratic`, `_nlt_extended`,
 `_subsampled_nlt_quadratic`, `_subsampled_nlt_extended`,
+`_subsampled_nlt_quadratic_highbd`, `_subsampled_nlt_extended_highbd`,
 `_hsl_qslice`,
 `_qpr_rpr`, and `*_target_bytes` variants for the feature axes above. See
 the module docs for the exact signatures and scope per entry point.

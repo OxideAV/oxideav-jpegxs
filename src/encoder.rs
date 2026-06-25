@@ -4805,6 +4805,98 @@ pub fn encode_planar_nlt_quadratic_highbd(
     )
 }
 
+/// r371 high-bit-depth NLT quadratic (`Tnlt = 1`, Annex G.4) with chroma
+/// sub-sampling.
+///
+/// Widens [`encode_planar_nlt_quadratic_highbd`] from 4:4:4-only to
+/// per-component `(sx[i], sy[i]) ∈ {1, 2}`. As with the 8-bit
+/// [`encode_planar_subsampled_nlt_quadratic`], the Annex G.4 forward
+/// pre-distortion `y = round(sqrt(x / (2^B − 1)) × (2^Bw − 1)) + dco`
+/// runs per-sample, per-component over the `u16`-LE plane chunks before
+/// the DWT, so it composes with the sub-sampled plane geometry: each
+/// `planes[i]` carries `⌈width / sx[i]⌉ × ⌈height / sy[i]⌉` samples
+/// (§B.1 ceiling) and the sub-sampled chroma decomposes one vertical
+/// level shallower per `log2(sy[i])`. The wavelet domain runs at
+/// `Bw = 20` (Table A.8). `cpih` must be `0` for a genuinely sub-sampled
+/// component (the inner RCT guard rejects `cpih = 1` per Annex F.2);
+/// Star-Tetrix high bit depth remains out of scope.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_subsampled_nlt_quadratic_highbd(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    bd: u8,
+    q: u8,
+    dco: i32,
+    sx: &[u8],
+    sy: &[u8],
+    planes: &[Vec<u16>],
+) -> Result<Vec<u8>> {
+    if !(9..=16).contains(&bd) {
+        return Err(Error::Unsupported(format!(
+            "jpegxs encoder: encode_planar_subsampled_nlt_quadratic_highbd requires B[i] in 9..=16, got {bd} (use encode_planar_subsampled_nlt_quadratic for 8-bit)"
+        )));
+    }
+    if cpih != 0 && cpih != 1 {
+        return Err(Error::Unsupported(format!(
+            "jpegxs encoder: encode_planar_subsampled_nlt_quadratic_highbd supports Cpih in {{0, 1}} (Star-Tetrix high-bit-depth is out of scope), got {cpih}"
+        )));
+    }
+    if !(-32768..=32767).contains(&dco) {
+        return Err(Error::invalid(format!(
+            "jpegxs NLT quadratic: dco {dco} out of signed 16-bit range"
+        )));
+    }
+    let max_sample: u16 = ((1u32 << bd) - 1) as u16;
+    let mut byte_planes: Vec<Vec<u8>> = Vec::with_capacity(planes.len());
+    for (i, p) in planes.iter().enumerate() {
+        let mut bytes = Vec::with_capacity(p.len() * 2);
+        for &s in p {
+            if s > max_sample {
+                return Err(Error::invalid(format!(
+                    "jpegxs encoder: plane {i} sample {s} exceeds B[i]={bd} max {max_sample}"
+                )));
+            }
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        byte_planes.push(bytes);
+    }
+    let fq = 0; // integer-transform path; quantisation via T[p,b], Fq=0 (Table A.8)
+    encode_planar_inner_bd(
+        width,
+        height,
+        nc,
+        bd,
+        cpih,
+        nlx,
+        nly,
+        fq,
+        q,
+        sx,
+        sy,
+        0,
+        0,
+        0,
+        0,
+        Some(NltParams::Quadratic { dco }),
+        Vec::new(),
+        Vec::new(),
+        0,
+        0,
+        0,          // fs = 0 (joint signs)
+        0,          // hsl = 0 (single slice)
+        0,          // qpih = 0 (deadzone inverse)
+        0,          // rp = 0 (no precinct refinement)
+        Vec::new(), // q_slices: single picture-level q
+        Vec::new(), // q_precincts: no per-precinct override
+        Vec::new(), // r_precincts: no per-precinct R[p] override
+        &byte_planes,
+    )
+}
+
 /// Round-193 high-bit-depth NLT extended (`Tnlt = 2`, Annex G.5)
 /// encoder.
 ///
@@ -4907,6 +4999,109 @@ pub fn encode_planar_nlt_extended_highbd(
         q,
         &sx,
         &sy,
+        0,
+        0,
+        0,
+        0,
+        Some(NltParams::Extended { t1, t2, e }),
+        Vec::new(),
+        Vec::new(),
+        0,
+        0,
+        0,          // fs = 0 (joint signs)
+        0,          // hsl = 0 (single slice)
+        0,          // qpih = 0 (deadzone inverse)
+        0,          // rp = 0 (no precinct refinement)
+        Vec::new(), // q_slices: single picture-level q
+        Vec::new(), // q_precincts: no per-precinct override
+        Vec::new(), // r_precincts: no per-precinct R[p] override
+        &byte_planes,
+    )
+}
+
+/// r371 high-bit-depth NLT extended (`Tnlt = 2`, Annex G.5) with chroma
+/// sub-sampling.
+///
+/// Widens [`encode_planar_nlt_extended_highbd`] from 4:4:4-only to
+/// per-component `(sx[i], sy[i]) ∈ {1, 2}`. The three-segment extended
+/// reverse-LUT pre-distortion runs per-sample, per-component over the
+/// `u16`-LE planes before the DWT, so it composes with the sub-sampled
+/// plane geometry exactly as the quadratic variant. `Bw = 20` (Table
+/// A.8). `cpih` must be `0` for a genuinely sub-sampled component (Annex
+/// F.2); Star-Tetrix high bit depth remains out of scope. The extended
+/// constraints apply: `0 < t1 < t2`, `1 ≤ e ≤ 4`, both thresholds in
+/// `1..=2^Bw − 1`.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_subsampled_nlt_extended_highbd(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    bd: u8,
+    q: u8,
+    t1: u32,
+    t2: u32,
+    e: u8,
+    sx: &[u8],
+    sy: &[u8],
+    planes: &[Vec<u16>],
+) -> Result<Vec<u8>> {
+    if !(9..=16).contains(&bd) {
+        return Err(Error::Unsupported(format!(
+            "jpegxs encoder: encode_planar_subsampled_nlt_extended_highbd requires B[i] in 9..=16, got {bd} (use encode_planar_subsampled_nlt_extended for 8-bit)"
+        )));
+    }
+    if cpih != 0 && cpih != 1 {
+        return Err(Error::Unsupported(format!(
+            "jpegxs encoder: encode_planar_subsampled_nlt_extended_highbd supports Cpih in {{0, 1}} (Star-Tetrix high-bit-depth is out of scope), got {cpih}"
+        )));
+    }
+    if t1 == 0 || t2 == 0 || t2 <= t1 {
+        return Err(Error::invalid(format!(
+            "jpegxs NLT extended: require 0 < T1 < T2, got T1={t1} T2={t2}"
+        )));
+    }
+    if !(1..=4).contains(&e) {
+        return Err(Error::invalid(format!(
+            "jpegxs NLT extended: E must be in 1..=4, got {e}"
+        )));
+    }
+    // Bw is forced to 20 by encode_planar_inner_bd when bd > 8 && nlt.is_some().
+    let bw_max = (1u32 << 20) - 1;
+    if t1 > bw_max || t2 > bw_max {
+        return Err(Error::invalid(format!(
+            "jpegxs NLT extended highbd: T1={t1} or T2={t2} exceeds 2^Bw-1={bw_max}"
+        )));
+    }
+    let max_sample: u16 = ((1u32 << bd) - 1) as u16;
+    let mut byte_planes: Vec<Vec<u8>> = Vec::with_capacity(planes.len());
+    for (i, p) in planes.iter().enumerate() {
+        let mut bytes = Vec::with_capacity(p.len() * 2);
+        for &s in p {
+            if s > max_sample {
+                return Err(Error::invalid(format!(
+                    "jpegxs encoder: plane {i} sample {s} exceeds B[i]={bd} max {max_sample}"
+                )));
+            }
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        byte_planes.push(bytes);
+    }
+    let fq = 0; // integer-transform path; quantisation via T[p,b], Fq=0 (Table A.8)
+    encode_planar_inner_bd(
+        width,
+        height,
+        nc,
+        bd,
+        cpih,
+        nlx,
+        nly,
+        fq,
+        q,
+        sx,
+        sy,
         0,
         0,
         0,
@@ -9985,6 +10180,140 @@ mod tests {
             p >= 40.0,
             "12-bit NLT quadratic q=0 PSNR {p:.2} dB below 40 dB floor"
         );
+    }
+
+    /// r371: high-bit-depth (`B[i] = 12`) NLT quadratic composed with 4:2:2
+    /// chroma sub-sampling. The Annex G.4 forward pre-distortion runs
+    /// per-component over the u16-LE planes, so full-res luma and half-width
+    /// chroma each round-trip ≥ 40 dB through the `Bw = 20` NLT path. NL=2/2.
+    #[test]
+    fn round371_nlt_quadratic_highbd_subsampled_422() {
+        let w = 32usize;
+        let h = 32usize;
+        let bd = 12u8;
+        let y = make_synthetic_highbd_luma(w, h, bd);
+        let u = make_synthetic_highbd_luma(w / 2, h, bd);
+        let v = make_synthetic_highbd_luma(w / 2, h, bd);
+        let sx = [1u8, 2, 2];
+        let sy = [1u8, 1, 1];
+        let cs = encode_planar_subsampled_nlt_quadratic_highbd(
+            w as u16,
+            h as u16,
+            3,
+            0,
+            2,
+            2,
+            bd,
+            0, // q = 0
+            0, // dco
+            &sx,
+            &sy,
+            &[y.clone(), u.clone(), v.clone()],
+        )
+        .expect("encode 4:2:2 high-bd NLT quadratic");
+        let img = crate::decoder::decode_codestream(&cs, None).expect("decode 4:2:2 high-bd NLT");
+        assert_eq!(img.num_components, 3);
+        for (orig, plane, name) in [
+            (&y, &img.planes[0].data, "Y"),
+            (&u, &img.planes[1].data, "U"),
+            (&v, &img.planes[2].data, "V"),
+        ] {
+            let p = psnr_u16_bytes(orig, plane, bd);
+            assert!(
+                p >= 40.0,
+                "4:2:2 12-bit NLT quadratic component {name} PSNR {p:.2} dB below 40 dB floor"
+            );
+        }
+    }
+
+    /// r371: high-bit-depth (`B[i] = 10`) NLT quadratic composed with 4:2:0
+    /// chroma sub-sampling (half-width/half-height chroma decomposing one
+    /// vertical level shallower). NL=2/2.
+    #[test]
+    fn round371_nlt_quadratic_highbd_subsampled_420() {
+        let w = 32usize;
+        let h = 32usize;
+        let bd = 10u8;
+        let y = make_synthetic_highbd_luma(w, h, bd);
+        let u = make_synthetic_highbd_luma(w / 2, h / 2, bd);
+        let v = make_synthetic_highbd_luma(w / 2, h / 2, bd);
+        let sx = [1u8, 2, 2];
+        let sy = [1u8, 2, 2];
+        let cs = encode_planar_subsampled_nlt_quadratic_highbd(
+            w as u16,
+            h as u16,
+            3,
+            0,
+            2,
+            2,
+            bd,
+            0,
+            0,
+            &sx,
+            &sy,
+            &[y.clone(), u.clone(), v.clone()],
+        )
+        .expect("encode 4:2:0 high-bd NLT quadratic");
+        let img = crate::decoder::decode_codestream(&cs, None).expect("decode 4:2:0 high-bd NLT");
+        for (orig, plane, name) in [
+            (&y, &img.planes[0].data, "Y"),
+            (&u, &img.planes[1].data, "U"),
+            (&v, &img.planes[2].data, "V"),
+        ] {
+            let p = psnr_u16_bytes(orig, plane, bd);
+            assert!(
+                p >= 40.0,
+                "4:2:0 10-bit NLT quadratic component {name} PSNR {p:.2} dB below 40 dB floor"
+            );
+        }
+    }
+
+    /// r371: high-bit-depth (`B[i] = 12`) NLT extended (Tnlt=2, three-segment
+    /// kernel) composed with 4:2:2 chroma sub-sampling. The reverse-LUT
+    /// pre-distortion is per-component, so half-width chroma round-trips
+    /// alongside full-res luma above the extended-NLT PSNR floor. NL=2/2.
+    #[test]
+    fn round371_nlt_extended_highbd_subsampled_422() {
+        let w = 32usize;
+        let h = 32usize;
+        let bd = 12u8;
+        let y = make_synthetic_highbd_luma(w, h, bd);
+        let u = make_synthetic_highbd_luma(w / 2, h, bd);
+        let v = make_synthetic_highbd_luma(w / 2, h, bd);
+        let sx = [1u8, 2, 2];
+        let sy = [1u8, 1, 1];
+        // E=1 matches the proven single-luma extended path; T1/T2 within
+        // the Bw=20 extended-NLT constraints.
+        let cs = encode_planar_subsampled_nlt_extended_highbd(
+            w as u16,
+            h as u16,
+            3,
+            0,
+            2,
+            2,
+            bd,
+            0,
+            1 << 16,
+            1 << 18,
+            1,
+            &sx,
+            &sy,
+            &[y.clone(), u.clone(), v.clone()],
+        )
+        .expect("encode 4:2:2 high-bd NLT extended");
+        let img = crate::decoder::decode_codestream(&cs, None)
+            .expect("decode 4:2:2 high-bd NLT extended");
+        for (orig, plane, name) in [
+            (&y, &img.planes[0].data, "Y"),
+            (&u, &img.planes[1].data, "U"),
+            (&v, &img.planes[2].data, "V"),
+        ] {
+            let p = psnr_u16_bytes(orig, plane, bd);
+            assert!(
+                p >= 30.0,
+                "4:2:2 12-bit NLT extended component {name} PSNR {p:.2} dB below 30 dB floor"
+            );
+        }
     }
 
     /// Round 181: NLT quadratic at `B[i] = 16` self-roundtrips with PSNR
