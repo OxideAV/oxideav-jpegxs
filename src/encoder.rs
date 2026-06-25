@@ -4549,6 +4549,153 @@ pub fn encode_planar_nlt_extended(
     )
 }
 
+/// Sub-sampled (4:2:2 / 4:2:0) NLT quadratic (`Tnlt = 1`, Annex G.4)
+/// encoder.
+///
+/// Widens [`encode_planar_nlt_quadratic`] from 4:4:4-only to per-component
+/// chroma sub-sampling `(sx[i], sy[i]) ∈ {1, 2}`. The Annex G.4 forward
+/// pre-distortion `y = round(sqrt(x / (2^B − 1)) × (2^Bw − 1)) + dco` is a
+/// per-sample, per-component map (it runs on each `planes[i]` before the
+/// DWT), so it is orthogonal to the per-component plane geometry: each
+/// sub-sampled chroma plane has length `⌈width / sx[i]⌉ × ⌈height /
+/// sy[i]⌉` (§B.1 ceiling) and decomposes one vertical level shallower
+/// per `log2(sy[i])`, exactly as the linear sub-sampled path. `Bw = 18`
+/// (Table A.8) is forced by the present NLT marker. Because the NLT
+/// non-linearity and the inter-component RCT do not compose under the
+/// spec's Annex F constraints (RCT requires 4:4:4 for `i < 3`), `cpih`
+/// must be `0` (no colour transform) for genuinely sub-sampled input;
+/// the inner RCT guard rejects `cpih = 1` with a sub-sampled component.
+///
+/// `q = 0` is lossless within the quadratic LUT resolution; `q > 0`
+/// engages the `Fq = 8` lossy mode.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_subsampled_nlt_quadratic(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    q: u8,
+    dco: i32,
+    sx: &[u8],
+    sy: &[u8],
+    planes: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    if !(-32768..=32767).contains(&dco) {
+        return Err(Error::invalid(format!(
+            "jpegxs NLT quadratic: dco {dco} out of signed 16-bit range"
+        )));
+    }
+    let fq = 0; // integer-transform path; quantisation via T[p,b], Fq=0 (Table A.8)
+    encode_planar_inner_nlt(
+        width,
+        height,
+        nc,
+        cpih,
+        nlx,
+        nly,
+        fq,
+        q,
+        sx,
+        sy,
+        0,
+        0,
+        0,
+        0,
+        Some(NltParams::Quadratic { dco }),
+        Vec::new(),
+        Vec::new(),
+        0,
+        0,
+        0,          // fs: signs jointly with data (Fs=0)
+        0,          // hsl: single slice (Hsl = Np,y)
+        0,          // qpih: deadzone inverse quantizer (Qpih=0)
+        0,          // rp: no precinct refinement (R[p] = 0)
+        Vec::new(), // q_slices: single picture-level q
+        Vec::new(), // q_precincts: no per-precinct override
+        Vec::new(), // r_precincts: no per-precinct R[p] override
+        planes,
+    )
+}
+
+/// Sub-sampled (4:2:2 / 4:2:0) NLT extended (`Tnlt = 2`, Annex G.5)
+/// encoder.
+///
+/// Widens [`encode_planar_nlt_extended`] from 4:4:4-only to per-component
+/// chroma sub-sampling `(sx[i], sy[i]) ∈ {1, 2}`. As with the quadratic
+/// variant the three-segment extended pre-distortion is a per-sample,
+/// per-component reverse-LUT map applied before the DWT, so it composes
+/// freely with the sub-sampled plane geometry. `Bw = 18` (Table A.8) is
+/// forced by the present NLT marker. The extended parameter constraints
+/// from [`encode_planar_nlt_extended`] apply: `0 < t1 < t2`, `1 ≤ e ≤ 4`,
+/// both thresholds in `1..=2^Bw − 1`. `cpih` must be `0` for genuinely
+/// sub-sampled input (see [`encode_planar_subsampled_nlt_quadratic`]).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_subsampled_nlt_extended(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    q: u8,
+    t1: u32,
+    t2: u32,
+    e: u8,
+    sx: &[u8],
+    sy: &[u8],
+    planes: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    if t1 == 0 || t2 == 0 || t2 <= t1 {
+        return Err(Error::invalid(format!(
+            "jpegxs NLT extended: require 0 < T1 < T2, got T1={t1} T2={t2}"
+        )));
+    }
+    if !(1..=4).contains(&e) {
+        return Err(Error::invalid(format!(
+            "jpegxs NLT extended: E must be in 1..=4, got {e}"
+        )));
+    }
+    // Bw is forced to 18 by encode_planar_inner_nlt when nlt.is_some().
+    let bw_max = (1u32 << 18) - 1;
+    if t1 > bw_max || t2 > bw_max {
+        return Err(Error::invalid(format!(
+            "jpegxs NLT extended: T1={t1} or T2={t2} exceeds 2^Bw-1={bw_max}"
+        )));
+    }
+    let fq = 0; // integer-transform path; quantisation via T[p,b], Fq=0 (Table A.8)
+    encode_planar_inner_nlt(
+        width,
+        height,
+        nc,
+        cpih,
+        nlx,
+        nly,
+        fq,
+        q,
+        sx,
+        sy,
+        0,
+        0,
+        0,
+        0,
+        Some(NltParams::Extended { t1, t2, e }),
+        Vec::new(),
+        Vec::new(),
+        0,
+        0,
+        0,          // fs: signs jointly with data (Fs=0)
+        0,          // hsl: single slice (Hsl = Np,y)
+        0,          // qpih: deadzone inverse quantizer (Qpih=0)
+        0,          // rp: no precinct refinement (R[p] = 0)
+        Vec::new(), // q_slices: single picture-level q
+        Vec::new(), // q_precincts: no per-precinct override
+        Vec::new(), // r_precincts: no per-precinct R[p] override
+        planes,
+    )
+}
+
 /// Round-181 high-bit-depth NLT quadratic (`Tnlt = 1`, Annex G.4)
 /// encoder.
 ///
@@ -9526,6 +9673,192 @@ mod tests {
             p >= 40.0,
             "NLT quadratic round-trip PSNR {p:.2} dB below 40 dB floor"
         );
+    }
+
+    /// r371: NLT quadratic composed with 4:2:2 chroma sub-sampling
+    /// (`cpih = 0`, `(sx, sy) = (1,1)/(2,1)/(2,1)`). The Annex G.4 forward
+    /// pre-distortion is per-component, so each plane — full-res luma and
+    /// half-width chroma — survives the round-trip at ≥ 40 dB. NL=2/2.
+    #[test]
+    fn round371_nlt_quadratic_subsampled_422() {
+        let w = 32usize;
+        let h = 32usize;
+        let mut y = vec![0u8; w * h];
+        let mut u = vec![0u8; (w / 2) * h];
+        let mut v = vec![0u8; (w / 2) * h];
+        for j in 0..h {
+            for i in 0..w {
+                y[j * w + i] = ((i * 5 + j * 7 + ((i ^ j) & 0x0f) * 3) % 256) as u8;
+            }
+            for i in 0..(w / 2) {
+                u[j * (w / 2) + i] = ((i * 9 + j * 3 + 31) % 256) as u8;
+                v[j * (w / 2) + i] = ((i * 11 + j * 13 + 47) % 256) as u8;
+            }
+        }
+        let sx = [1u8, 2, 2];
+        let sy = [1u8, 1, 1];
+        let cs = encode_planar_subsampled_nlt_quadratic(
+            w as u16,
+            h as u16,
+            3,
+            0,
+            2,
+            2,
+            0,
+            0,
+            &sx,
+            &sy,
+            &[y.clone(), u.clone(), v.clone()],
+        )
+        .expect("encode 4:2:2 NLT quadratic");
+        let img = decode_codestream(&cs, None).expect("decode 4:2:2 NLT quadratic");
+        for (plane, orig, name) in [
+            (&img.planes[0].data, &y, "Y"),
+            (&img.planes[1].data, &u, "U"),
+            (&img.planes[2].data, &v, "V"),
+        ] {
+            let p = psnr(orig, plane);
+            assert!(
+                p >= 40.0,
+                "4:2:2 NLT quadratic component {name} PSNR {p:.2} dB below 40 dB floor"
+            );
+        }
+    }
+
+    /// r371: NLT quadratic composed with 4:2:0 chroma sub-sampling
+    /// (`(sx, sy) = (1,1)/(2,2)/(2,2)`). The half-width/half-height chroma
+    /// components decompose one vertical level shallower (`N'L,y = NL,y −
+    /// log2(sy)`); the per-component NLT map is unaffected. NL=2/2.
+    #[test]
+    fn round371_nlt_quadratic_subsampled_420() {
+        let w = 32usize;
+        let h = 32usize;
+        let mut y = vec![0u8; w * h];
+        let mut u = vec![0u8; (w / 2) * (h / 2)];
+        let mut v = vec![0u8; (w / 2) * (h / 2)];
+        for j in 0..h {
+            for i in 0..w {
+                y[j * w + i] = ((i * 3 + j * 5 + ((i ^ j) & 0x0f) * 2) % 256) as u8;
+            }
+        }
+        for j in 0..(h / 2) {
+            for i in 0..(w / 2) {
+                u[j * (w / 2) + i] = ((i * 7 + j * 11 + 23) % 256) as u8;
+                v[j * (w / 2) + i] = ((i * 13 + j * 17 + 41) % 256) as u8;
+            }
+        }
+        let sx = [1u8, 2, 2];
+        let sy = [1u8, 2, 2];
+        let cs = encode_planar_subsampled_nlt_quadratic(
+            w as u16,
+            h as u16,
+            3,
+            0,
+            2,
+            2,
+            0,
+            0,
+            &sx,
+            &sy,
+            &[y.clone(), u.clone(), v.clone()],
+        )
+        .expect("encode 4:2:0 NLT quadratic");
+        let img = decode_codestream(&cs, None).expect("decode 4:2:0 NLT quadratic");
+        for (plane, orig, name) in [
+            (&img.planes[0].data, &y, "Y"),
+            (&img.planes[1].data, &u, "U"),
+            (&img.planes[2].data, &v, "V"),
+        ] {
+            let p = psnr(orig, plane);
+            assert!(
+                p >= 40.0,
+                "4:2:0 NLT quadratic component {name} PSNR {p:.2} dB below 40 dB floor"
+            );
+        }
+    }
+
+    /// r371: NLT extended (Tnlt=2, three-segment kernel) composed with
+    /// 4:2:2 sub-sampling. The reverse-LUT pre-distortion is per-component
+    /// so half-width chroma round-trips alongside full-res luma. NL=2/2.
+    #[test]
+    fn round371_nlt_extended_subsampled_422() {
+        let w = 32usize;
+        let h = 32usize;
+        // Smooth, non-wrapping ramps (no `% 256` discontinuity) so the
+        // three-segment extended LUT reconstruction stays well-conditioned —
+        // matching the gentle content the single-luma extended test relies on.
+        let mut y = vec![0u8; w * h];
+        let mut u = vec![0u8; (w / 2) * h];
+        let mut v = vec![0u8; (w / 2) * h];
+        for j in 0..h {
+            for i in 0..w {
+                y[j * w + i] = ((i * 4 + j * 3) / 2).min(255) as u8;
+            }
+            for i in 0..(w / 2) {
+                u[j * (w / 2) + i] = (40 + (i * 5 + j * 2) / 3).min(255) as u8;
+                v[j * (w / 2) + i] = (80 + (i * 3 + j * 4) / 3).min(255) as u8;
+            }
+        }
+        let sx = [1u8, 2, 2];
+        let sy = [1u8, 1, 1];
+        // T1 / T2 / E within the Bw=18 extended-NLT constraints (E=1 matches
+        // the proven single-luma extended path).
+        let cs = encode_planar_subsampled_nlt_extended(
+            w as u16,
+            h as u16,
+            3,
+            0,
+            2,
+            2,
+            0,
+            1 << 14,
+            1 << 16,
+            1,
+            &sx,
+            &sy,
+            &[y.clone(), u.clone(), v.clone()],
+        )
+        .expect("encode 4:2:2 NLT extended");
+        let img = decode_codestream(&cs, None).expect("decode 4:2:2 NLT extended");
+        for (plane, orig, name) in [
+            (&img.planes[0].data, &y, "Y"),
+            (&img.planes[1].data, &u, "U"),
+            (&img.planes[2].data, &v, "V"),
+        ] {
+            let p = psnr(orig, plane);
+            assert!(
+                p >= 30.0,
+                "4:2:2 NLT extended component {name} PSNR {p:.2} dB below 30 dB floor"
+            );
+        }
+    }
+
+    /// r371: the sub-sampled NLT entry points reject `cpih = 1` (RCT) with a
+    /// genuinely sub-sampled component, mirroring the inner RCT guard (Annex
+    /// F.2 requires `sx[i] = sy[i] = 1` for `i < 3`).
+    #[test]
+    fn round371_nlt_subsampled_rejects_rct_with_subsampling() {
+        let w = 16usize;
+        let h = 16usize;
+        let y = vec![64u8; w * h];
+        let u = vec![64u8; (w / 2) * h];
+        let v = vec![64u8; (w / 2) * h];
+        let sx = [1u8, 2, 2];
+        let sy = [1u8, 1, 1];
+        let r = encode_planar_subsampled_nlt_quadratic(
+            w as u16,
+            h as u16,
+            3,
+            1, // cpih = 1 (RCT) — illegal with sub-sampled chroma
+            1,
+            1,
+            0,
+            0,
+            &sx,
+            &sy,
+            &[y, u, v],
+        );
+        assert!(r.is_err(), "RCT with sub-sampled chroma must be rejected");
     }
 
     /// NLT quadratic with q=2 (lossy) compresses further than lossless and

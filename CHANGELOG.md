@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased — round 371 (NLT + chroma sub-sampling encode paths)
+
+Adds two public encoder entry points composing the Annex G non-linear
+transforms (NLT) with chroma sub-sampling: `encode_planar_subsampled_
+nlt_quadratic` (Tnlt=1, Annex G.4) and `encode_planar_subsampled_nlt_
+extended` (Tnlt=2, Annex G.5). Both take per-component `(sx[i], sy[i]) ∈
+{1, 2}` and drive a luma + 4:2:2 / 4:2:0 chroma picture through the NLT
+marker path. The forward pre-distortions are per-sample, per-component
+maps, so they are orthogonal to the sub-sampled plane geometry (each
+chroma plane is §B.1-ceiling-sized and decomposes one vertical level
+shallower per `log2(sy[i])`). RCT (`cpih = 1`) with a sub-sampled
+component is rejected (Annex F.2).
+
+* +4 tests (547 → 551): 4:2:2 and 4:2:0 NLT-quadratic round-trip (all
+  three components ≥ 40 dB), 4:2:2 NLT-extended round-trip (≥ 30 dB), and
+  the RCT-with-sub-sampling rejection guard.
+
 ## Unreleased — round 366 (probe accepts box-wrapped JXS files)
 
 The crate-root `probe` now transparently accepts a box-wrapped JXS
