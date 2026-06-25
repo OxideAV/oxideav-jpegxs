@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased — round 371 (Cw>0 × 4:2:0 multi-level coverage + stale-doc fix)
+
+Adds a bit-exact lossless round-trip for multi-precinct-per-row
+(`Cw > 0`) composed with 4:2:0 chroma sub-sampling at a multi-level
+cascade (NL=2/2): a 128-wide picture with Cw=1 splits into Np,x=2
+precincts per row, routed through the picture-level gather/cascade path
+where the sub-sampled chroma decomposes one vertical level shallower.
+
+Also corrects the stale encoder module-doc "out-of-scope" list — `Cw>0`,
+per-precinct `Q[p]`/`R[p]`, and `Sd>0` (CWD) are all long-implemented.
+
+* +1 test (556 → 557).
+
 ## Unreleased — round 371 (sub-sampled NLT lossy + odd-dimension coverage)
 
 Adds round-trip coverage for the new sub-sampled NLT paths under the

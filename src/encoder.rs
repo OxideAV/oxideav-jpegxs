@@ -81,10 +81,14 @@
 //!   `NL` — only the validation threshold needed adjustment. NL=6/6
 //!   self-roundtrip verified.
 //!
-//! Out-of-scope (deferred to round 8+):
-//! * `Cw > 0` (custom precinct widths).
-//! * Per-band per-precinct Q rate-distortion optimization.
-//! * `Sd > 0` decomposition suppression (CWD).
+//! Previously-deferred items, all now implemented:
+//! * `Cw > 0` (custom precinct widths / multi-precinct-per-row) —
+//!   [`encode_planar_cw`]; composes with chroma sub-sampling and the
+//!   multi-level cascade (r371 verified 4:2:0 NL=2/2).
+//! * Per-precinct `Q[p]` / `R[p]` rate-distortion overrides —
+//!   [`encode_planar_qpr_rpr`] and the `*_target_bytes` pickers.
+//! * `Sd > 0` decomposition suppression (CWD) — [`encode_planar_sd`]
+//!   and the Star-Tetrix / RCT `_sd_*` companions.
 //!
 //! Byte stream shape:
 //!
@@ -12222,6 +12226,69 @@ mod tests {
         assert_eq!(img.planes[0].data, y_plane);
         assert_eq!(img.planes[1].data, u_plane);
         assert_eq!(img.planes[2].data, v_plane);
+    }
+
+    /// r371: multi-precinct-per-row (`Cw > 0`) composed with 4:2:0 chroma
+    /// sub-sampling at a multi-level cascade (NL=2/2). With max(sx)=2,
+    /// NL,x=2, Cw=1 → Cs = 8·1·2·4 = 64, so a 128-wide picture splits into
+    /// Np,x = 2 precincts per row. The decoder routes Cw>0 through the
+    /// picture-level gather/cascade path, where the sub-sampled chroma
+    /// components decompose one vertical level shallower; lossless
+    /// self-roundtrip is bit-exact for all three components.
+    #[test]
+    fn round371_cw1_128x32_yuv_420_nl_2_2_lossless() {
+        let w = 128usize;
+        let h = 32usize;
+        let mut y = vec![0u8; w * h];
+        let mut u = vec![0u8; (w / 2) * (h / 2)];
+        let mut v = vec![0u8; (w / 2) * (h / 2)];
+        for j in 0..h {
+            for i in 0..w {
+                y[j * w + i] = ((i * 3 + j * 5) % 256) as u8;
+            }
+        }
+        for j in 0..(h / 2) {
+            for i in 0..(w / 2) {
+                u[j * (w / 2) + i] = ((i * 7 + j * 11 + 17) % 256) as u8;
+                v[j * (w / 2) + i] = ((i * 13 + j * 17 + 29) % 256) as u8;
+            }
+        }
+        let sx = vec![1u8, 2, 2];
+        let sy = vec![1u8, 2, 2];
+        let cs = encode_planar_inner_nlt(
+            w as u16,
+            h as u16,
+            3,
+            0, // cpih
+            2, // nlx
+            2, // nly
+            0, // fq
+            0, // q (lossless)
+            &sx,
+            &sy,
+            0,
+            0,
+            0,
+            0,
+            None, // no NLT
+            Vec::new(),
+            Vec::new(),
+            1, // cw = 1 → Np,x = 2 for 128-wide 4:2:0
+            0, // sd
+            0, // fs
+            0, // hsl
+            0, // qpih
+            0, // rp
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            &[y.clone(), u.clone(), v.clone()],
+        )
+        .expect("encode 128x32 4:2:0 Cw=1 NL=2/2");
+        let img = decode_codestream(&cs, None).expect("decode 128x32 4:2:0 Cw=1 NL=2/2");
+        assert_eq!(img.planes[0].data, y, "luma Cw=1 4:2:0 NL=2/2 lossless");
+        assert_eq!(img.planes[1].data, u, "U Cw=1 4:2:0 NL=2/2 lossless");
+        assert_eq!(img.planes[2].data, v, "V Cw=1 4:2:0 NL=2/2 lossless");
     }
 
     /// Odd-width picture with Cw > 0: rightmost precinct picks up the
