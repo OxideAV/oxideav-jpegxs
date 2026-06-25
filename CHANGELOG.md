@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased — round 371 (Cw>0 × NLT path-intersection coverage)
+
+Adds a round-trip exercising the intersection of the two decode paths
+that both force the picture-level gather/cascade: multi-precinct-per-row
+(`Cw > 0`) and the NLT quadratic non-linearity (Tnlt=1). A 96-wide luma
+picture at NL,x=2 Cw=1 splits into Np,x=3 precincts per row while the
+Annex G.4 forward pre-distortion runs over the plane before gather;
+round-trip holds ≥ 40 dB.
+
+* +1 test (557 → 558).
+
 ## Unreleased — round 371 (Cw>0 × 4:2:0 multi-level coverage + stale-doc fix)
 
 Adds a bit-exact lossless round-trip for multi-precinct-per-row

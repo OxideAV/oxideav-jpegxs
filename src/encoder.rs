@@ -12291,6 +12291,63 @@ mod tests {
         assert_eq!(img.planes[2].data, v, "V Cw=1 4:2:0 NL=2/2 lossless");
     }
 
+    /// r371: multi-precinct-per-row (`Cw > 0`) composed with the NLT
+    /// quadratic non-linearity (Tnlt=1, Annex G.4). The decoder routes both
+    /// Cw>0 and the NLT marker through the picture-level gather/cascade
+    /// path; this exercises their intersection. With max(sx)=1, NL,x=2,
+    /// Cw=1 → Cs = 8·1·1·4 = 32, so a 96-wide luma picture splits into
+    /// Np,x = 3 precincts per row. The forward pre-distortion runs once
+    /// over the plane before gather, so the round-trip holds ≥ 40 dB.
+    #[test]
+    fn round371_cw1_96x32_luma_nlt_quadratic() {
+        let w = 96usize;
+        let h = 32usize;
+        let mut y = vec![0u8; w * h];
+        for j in 0..h {
+            for i in 0..w {
+                y[j * w + i] = ((i * 5 + j * 7 + ((i ^ j) & 0x0f) * 3) % 256) as u8;
+            }
+        }
+        let sx = vec![1u8];
+        let sy = vec![1u8];
+        let cs = encode_planar_inner_nlt(
+            w as u16,
+            h as u16,
+            1,
+            0, // cpih
+            2, // nlx
+            2, // nly
+            0, // fq (forced to 6 by NLT inner path)
+            0, // q
+            &sx,
+            &sy,
+            0,
+            0,
+            0,
+            0,
+            Some(NltParams::Quadratic { dco: 0 }),
+            Vec::new(),
+            Vec::new(),
+            1, // cw = 1 → Np,x = 3 for 96-wide luma at NL,x=2
+            0,
+            0,
+            0,
+            0,
+            0,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            &[y.clone()],
+        )
+        .expect("encode 96x32 luma Cw=1 NLT quadratic");
+        let img = decode_codestream(&cs, None).expect("decode 96x32 luma Cw=1 NLT quadratic");
+        let p = psnr(&y, &img.planes[0].data);
+        assert!(
+            p >= 40.0,
+            "Cw=1 NLT quadratic round-trip PSNR {p:.2} dB below 40 dB floor"
+        );
+    }
+
     /// Odd-width picture with Cw > 0: rightmost precinct picks up the
     /// remainder. 96×16 luma at NL=1/1 Cw=1 → Cs=16, Np,x=⌈96/16⌉=6,
     /// every precinct is 16 wide (no remainder).
