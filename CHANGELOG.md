@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased — round 371 (Sd>0 CWD × NLT path-intersection coverage)
+
+Adds a round-trip exercising CWD decomposition suppression (`Sd > 0`)
+composed with the NLT quadratic non-linearity. With Nc=4, Sd=1 the
+trailing component is coded raw (Annex B.7 Table B.4) while the leading
+three are wavelet-coded; both force the picture-level gather path. The
+forward pre-distortion applies per-component including the suppressed
+tail (copied straight through the entropy coder), and the decoder's
+per-component Annex G inverse restores every component ≥ 40 dB —
+confirming the non-obvious raw-tail-through-NLT-inverse composition.
+
+* +1 test (558 → 559).
+
 ## Unreleased — round 371 (Cw>0 × NLT path-intersection coverage)
 
 Adds a round-trip exercising the intersection of the two decode paths

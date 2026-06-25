@@ -12348,6 +12348,75 @@ mod tests {
         );
     }
 
+    /// r371: CWD decomposition suppression (`Sd > 0`) composed with the NLT
+    /// quadratic non-linearity (Tnlt=1, Annex G.4). With Nc=4, Sd=1 the
+    /// trailing component is coded raw (no wavelet) per Annex B.7 Table B.4
+    /// while the leading three are wavelet-coded; both Sd>0 and the NLT
+    /// marker force the decoder's picture-level gather path. The forward
+    /// pre-distortion applies per-component (including the suppressed tail,
+    /// whose values are copied straight through the entropy coder), and the
+    /// decoder's per-component Annex G inverse restores every component
+    /// above the NLT PSNR floor. NL=2/2, 4:4:4:4.
+    #[test]
+    fn round371_sd1_nlt_quadratic_4comp() {
+        let w = 32usize;
+        let h = 32usize;
+        let mk = |a: usize, b: usize, c: usize| {
+            let mut p = vec![0u8; w * h];
+            for j in 0..h {
+                for i in 0..w {
+                    p[j * w + i] = ((i * a + j * b + c) % 256) as u8;
+                }
+            }
+            p
+        };
+        let p0 = mk(5, 7, 0);
+        let p1 = mk(3, 9, 11);
+        let p2 = mk(7, 2, 23);
+        let p3 = mk(11, 5, 41);
+        let sx = vec![1u8; 4];
+        let sy = vec![1u8; 4];
+        let cs = encode_planar_inner_nlt(
+            w as u16,
+            h as u16,
+            4,
+            0, // cpih
+            2, // nlx
+            2, // nly
+            0, // fq
+            0, // q
+            &sx,
+            &sy,
+            0,
+            0,
+            0,
+            0,
+            Some(NltParams::Quadratic { dco: 0 }),
+            Vec::new(),
+            Vec::new(),
+            0, // cw
+            1, // sd = 1 → trailing component coded raw
+            0,
+            0,
+            0,
+            0,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            &[p0.clone(), p1.clone(), p2.clone(), p3.clone()],
+        )
+        .expect("encode Sd=1 NLT quadratic 4-comp");
+        let img = decode_codestream(&cs, None).expect("decode Sd=1 NLT quadratic 4-comp");
+        assert_eq!(img.num_components, 4);
+        for (idx, orig) in [&p0, &p1, &p2, &p3].iter().enumerate() {
+            let p = psnr(orig, &img.planes[idx].data);
+            assert!(
+                p >= 40.0,
+                "Sd=1 NLT quadratic component {idx} PSNR {p:.2} dB below 40 dB floor"
+            );
+        }
+    }
+
     /// Odd-width picture with Cw > 0: rightmost precinct picks up the
     /// remainder. 96×16 luma at NL=1/1 Cw=1 → Cs=16, Np,x=⌈96/16⌉=6,
     /// every precinct is 16 wide (no remainder).
