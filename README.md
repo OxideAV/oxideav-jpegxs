@@ -69,7 +69,11 @@ End-to-end decode of the multi-component subset:
   (`B[i] ∈ 9..=16`, `Bw = 20`, `u16`-LE planes):
   `encode_planar_subsampled_nlt_quadratic_highbd` /
   `_subsampled_nlt_extended_highbd` drive a 4:2:2 / 4:2:0 luma + chroma
-  picture through the high-precision NLT path.
+  picture through the high-precision NLT path. The NLT marker also
+  composes with the two other gather-path features: multi-precinct-per-row
+  (`Cw > 0`, `Np,x > 1`) and CWD decomposition suppression (`Sd > 0`, the
+  suppressed raw-coded tail flowing through the per-component NLT inverse
+  unchanged) both round-trip alongside the quadratic non-linearity.
 
 Every bitplane-count decode mode (raw, no-prediction, vertical
 prediction — Tables C.12 / C.13 / C.14) enforces the spec range
