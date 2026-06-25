@@ -10056,6 +10056,134 @@ mod tests {
         assert!(r.is_err(), "RCT with sub-sampled chroma must be rejected");
     }
 
+    /// r371: lossy (`q = 2`, `Fq = 8`) sub-sampled NLT quadratic. The
+    /// per-band deadzone truncation engages under the NLT marker path; the
+    /// stream is no larger than its lossless counterpart and every
+    /// component (luma + 4:2:0 chroma) holds the ≥ 30 dB lossy floor.
+    #[test]
+    fn round371_nlt_quadratic_subsampled_420_lossy_q2() {
+        let w = 32usize;
+        let h = 32usize;
+        let mut y = vec![0u8; w * h];
+        let mut u = vec![0u8; (w / 2) * (h / 2)];
+        let mut v = vec![0u8; (w / 2) * (h / 2)];
+        for j in 0..h {
+            for i in 0..w {
+                y[j * w + i] = ((i * 3 + j * 5) % 200) as u8;
+            }
+        }
+        for j in 0..(h / 2) {
+            for i in 0..(w / 2) {
+                u[j * (w / 2) + i] = (40 + (i * 4 + j * 2) % 150) as u8;
+                v[j * (w / 2) + i] = (60 + (i * 2 + j * 4) % 150) as u8;
+            }
+        }
+        let sx = [1u8, 2, 2];
+        let sy = [1u8, 2, 2];
+        let lossless = encode_planar_subsampled_nlt_quadratic(
+            w as u16,
+            h as u16,
+            3,
+            0,
+            2,
+            2,
+            0,
+            0,
+            &sx,
+            &sy,
+            &[y.clone(), u.clone(), v.clone()],
+        )
+        .expect("encode 4:2:0 NLT lossless")
+        .len();
+        let lossy = encode_planar_subsampled_nlt_quadratic(
+            w as u16,
+            h as u16,
+            3,
+            0,
+            2,
+            2,
+            2,
+            0,
+            &sx,
+            &sy,
+            &[y.clone(), u.clone(), v.clone()],
+        )
+        .expect("encode 4:2:0 NLT lossy q=2");
+        assert!(
+            lossy.len() <= lossless,
+            "4:2:0 NLT lossy q=2 size {} not <= lossless {}",
+            lossy.len(),
+            lossless
+        );
+        let img = decode_codestream(&lossy, None).expect("decode 4:2:0 NLT lossy q=2");
+        for (plane, orig, name) in [
+            (&img.planes[0].data, &y, "Y"),
+            (&img.planes[1].data, &u, "U"),
+            (&img.planes[2].data, &v, "V"),
+        ] {
+            let p = psnr(orig, plane);
+            assert!(
+                p >= 30.0,
+                "4:2:0 NLT quadratic lossy q=2 component {name} PSNR {p:.2} dB below 30 dB floor"
+            );
+        }
+    }
+
+    /// r371: odd picture dimensions with sub-sampled NLT quadratic — the
+    /// §B.1 ceiling sizes the chroma planes (`⌈W/2⌉ × ⌈H/2⌉`), so a 30×18
+    /// 4:2:0 picture has 15×9 chroma. Exercises the ceiling path under the
+    /// NLT marker. Lossless self-roundtrip floor (≥ 40 dB).
+    #[test]
+    fn round371_nlt_quadratic_subsampled_420_odd_dims() {
+        let w = 30usize;
+        let h = 18usize;
+        let cw = w.div_ceil(2);
+        let ch = h.div_ceil(2);
+        let mut y = vec![0u8; w * h];
+        let mut u = vec![0u8; cw * ch];
+        let mut v = vec![0u8; cw * ch];
+        for j in 0..h {
+            for i in 0..w {
+                y[j * w + i] = ((i * 5 + j * 7 + ((i ^ j) & 0x0f) * 3) % 256) as u8;
+            }
+        }
+        for j in 0..ch {
+            for i in 0..cw {
+                u[j * cw + i] = ((i * 9 + j * 11 + 17) % 256) as u8;
+                v[j * cw + i] = ((i * 13 + j * 3 + 29) % 256) as u8;
+            }
+        }
+        let sx = [1u8, 2, 2];
+        let sy = [1u8, 2, 2];
+        let cs = encode_planar_subsampled_nlt_quadratic(
+            w as u16,
+            h as u16,
+            3,
+            0,
+            2,
+            2,
+            0,
+            0,
+            &sx,
+            &sy,
+            &[y.clone(), u.clone(), v.clone()],
+        )
+        .expect("encode odd-dim 4:2:0 NLT quadratic");
+        let img = decode_codestream(&cs, None).expect("decode odd-dim 4:2:0 NLT quadratic");
+        assert_eq!(img.planes[1].data.len(), cw * ch, "chroma is ceil-sized");
+        for (plane, orig, name) in [
+            (&img.planes[0].data, &y, "Y"),
+            (&img.planes[1].data, &u, "U"),
+            (&img.planes[2].data, &v, "V"),
+        ] {
+            let p = psnr(orig, plane);
+            assert!(
+                p >= 40.0,
+                "odd-dim 4:2:0 NLT quadratic component {name} PSNR {p:.2} dB below 40 dB floor"
+            );
+        }
+    }
+
     /// NLT quadratic with q=2 (lossy) compresses further than lossless and
     /// still achieves ≥ 30 dB PSNR on a synthetic gradient.
     #[test]

@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased — round 371 (sub-sampled NLT lossy + odd-dimension coverage)
+
+Adds round-trip coverage for the new sub-sampled NLT paths under the
+lossy regime and odd picture dimensions:
+
+* lossy `q = 2` (`Fq = 8` per-band deadzone truncation) 4:2:0 NLT
+  quadratic — stream ≤ lossless, all components ≥ 30 dB.
+* odd-dimension (30×18) 4:2:0 NLT quadratic — the §B.1 ceiling sizes the
+  chroma planes to 15×9; lossless self-roundtrip ≥ 40 dB.
+
+* +2 tests (554 → 556).
+
 ## Unreleased — round 371 (high-bit-depth NLT + chroma sub-sampling)
 
 Extends the round-371 NLT × chroma sub-sampling composition to the
