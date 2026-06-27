@@ -129,6 +129,28 @@ pub(crate) fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<JpegXsIm
             pih.hf, max_sy, pih.nly, hf_min
         )));
     }
+    // Cw rightmost-precinct conformance (ISO/IEC 21122-1:2022 Table 11).
+    // When Cw ≠ 0 the column stride is Cs = 8 × Cw × max_i(sx) × 2^NL,x;
+    // the rightmost (partial) precinct then has width `Wf mod Cs`. The
+    // table requires
+    //
+    //   Wf umod (8 × Cw × max_i(sx) × 2^NL,x) ≥ max_i(sx) × 2^NL,x
+    //
+    // i.e. the trailing partial column must still hold at least one
+    // decomposed low-frequency sample (`wf_min`), or evenly divide
+    // (remainder 0). A remainder in (0, wf_min) leaves a sliver too narrow
+    // to carry an LL sample, so the precinct grid is malformed.
+    if pih.cw != 0 {
+        let cs = 8u32 * (pih.cw as u32) * wf_min;
+        let rem = (pih.wf as u32) % cs;
+        if rem != 0 && rem < wf_min {
+            return Err(Error::invalid(format!(
+                "jpegxs decoder: Cw={}: rightmost precinct width Wf mod Cs = {} mod {} = {} is in \
+                 (0, {}) — below one decomposed sample max_i(sx)×2^NL,x (Table 11)",
+                pih.cw, pih.wf, cs, rem, wf_min
+            )));
+        }
+    }
 
     if pih.qpih > 1 {
         return Err(Error::Unsupported(format!(

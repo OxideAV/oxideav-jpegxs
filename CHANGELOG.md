@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased — round 376 (Cw rightmost-precinct conformance, both directions)
+
+Enforces the Table 11 / §B.5-Note-1 `Cw` constraint that "all bands of
+the rightmost precincts are non-empty":
+
+```text
+  Wf umod (8 × Cw × max_i(sx) × 2^NL,x) ≥ max_i(sx) × 2^NL,x   (Cw ≠ 0)
+```
+
+i.e. the rightmost partial precinct must hold at least one decomposed
+low-frequency sample, or divide `Wf` evenly. The decoder rejects a stream
+whose rightmost precinct is a sub-LL-sample sliver; the encoder refuses to
+emit one (it previously left this to the caller).
+
+Corrects `r282_odd_width_422_cw1_lossless_round_trip`, which used a 65×16
+4:2:2 Cw=1 picture whose rightmost precinct is a single column (`65 umod
+32 = 1 < 4`) — a non-conformant geometry. Re-pinned to width 69 (`69 umod
+32 = 5 ≥ 4`), preserving the odd-width Np,x=3 intent. The rejected 65-wide
+case is now an explicit encoder-refusal test.
+
+* net +1 test (577 → 578: +1 encoder rejection, 1 fixture re-pinned).
+
 ## Unreleased — round 376 (picture-dimension vs decomposition conformance)
 
 The decoder now enforces the Wf / Hf picture-dimension ranges of

@@ -519,11 +519,27 @@ impl EncodeConfig {
                 )));
             }
             // Spec Note 1 in §B.5: all but the rightmost precincts must
-            // contain at least 8 samples of the LL band, which is the
-            // motivation for the 8× factor in Cs.  The encoder cannot
-            // do better than the formula gives; the user is responsible
-            // for picking Cw such that the rightmost precinct also has
-            // reasonable width.
+            // contain at least 8 samples of the LL band (the 8× factor in
+            // Cs), and "all bands of the rightmost precincts are
+            // non-empty". Table 11 makes the latter a hard Cw constraint:
+            //
+            //   Wf umod Cs ≥ max_i(sx) × 2^NL,x
+            //
+            // i.e. the rightmost partial precinct must still hold at least
+            // one decomposed low-frequency sample, or divide Wf evenly.
+            // Refuse to emit a stream whose rightmost precinct is a sliver
+            // narrower than one LL sample — such a stream is non-conformant
+            // and the decoder rejects it.
+            let ll_sample = max_sx * pow_nlx;
+            let rem = (self.width as u32) % cs;
+            if rem != 0 && rem < ll_sample {
+                return Err(Error::invalid(format!(
+                    "jpegxs encoder: Cw={}: rightmost precinct width Wf umod Cs = {} umod {} = {} \
+                     is below one decomposed sample max_i(sx)×2^NL,x = {} (Table 11 / §B.5 Note 1) \
+                     — choose a Cw whose column stride divides Wf or leaves ≥ {} columns",
+                    self.cw, self.width, cs, rem, ll_sample, ll_sample
+                )));
+            }
         }
         // Hsl > 0 — slice height in precinct rows (Annex B.10). A value
         // exceeding Np,y is meaningless: it would describe a single slice
@@ -12712,12 +12728,14 @@ mod tests {
     }
 
     /// Odd width 4:2:2 with Cw=1 multi-column precincts at NL=1/1:
-    /// Cs = 8 × 1 × 2 × 2 = 32 → Np,x = ⌈65 / 32⌉ = 3, and the last
-    /// precinct column covers a single image column (chroma width
-    /// ⌈1 / 2⌉ = 1 per §B.1 applied to the precinct remainder).
+    /// Cs = 8 × 1 × 2 × 2 = 32 → Np,x = ⌈69 / 32⌉ = 3. The rightmost
+    /// precinct covers `69 umod 32 = 5` image columns, which exceeds one
+    /// decomposed LL sample (`max_i(sx)×2^NL,x = 4`), so the picture is
+    /// Table 11 / §B.5-conformant. (Width 65, whose rightmost precinct
+    /// would be a single column < 4, is now rejected by the encoder.)
     #[test]
     fn r282_odd_width_422_cw1_lossless_round_trip() {
-        let (w, h) = (65usize, 16usize);
+        let (w, h) = (69usize, 16usize);
         let sx = vec![1u8, 2, 2];
         let sy = vec![1u8, 1, 1];
         let planes = r282_planes(w, h, &sx, &sy);
@@ -12750,11 +12768,58 @@ mod tests {
             Vec::new(), // r_precincts
             &planes,
         )
-        .expect("encode 65x16 4:2:2 Cw=1 NL=1/1");
-        let img = decode_codestream(&cs, None).expect("decode 65x16 4:2:2 Cw=1");
+        .expect("encode 69x16 4:2:2 Cw=1 NL=1/1");
+        let img = decode_codestream(&cs, None).expect("decode 69x16 4:2:2 Cw=1");
         for (i, p) in planes.iter().enumerate() {
             assert_eq!(&img.planes[i].data, p, "plane {i} Cw=1 odd-width roundtrip");
         }
+    }
+
+    /// The encoder refuses a Cw whose rightmost precinct is a sliver
+    /// narrower than one decomposed LL sample (Table 11 / §B.5 Note 1).
+    /// A 65×16 4:2:2 picture at Cw=1, NL=1/1 has Cs=32, so the rightmost
+    /// precinct is `65 umod 32 = 1` column < `max_i(sx)×2^NL,x = 4`.
+    #[test]
+    fn r376_cw_rightmost_sliver_rejected() {
+        let (w, h) = (65usize, 16usize);
+        let sx = vec![1u8, 2, 2];
+        let sy = vec![1u8, 1, 1];
+        let planes = r282_planes(w, h, &sx, &sy);
+        let err = encode_planar_inner_nlt(
+            w as u16,
+            h as u16,
+            3,
+            0,
+            1,
+            1,
+            0,
+            0,
+            &sx,
+            &sy,
+            0,
+            0,
+            0,
+            0,
+            None,
+            Vec::new(),
+            Vec::new(),
+            1, // cw → Cs = 32, rightmost precinct = 1 column
+            0,
+            0,
+            0,
+            0,
+            0,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            &planes,
+        )
+        .expect_err("65×16 Cw=1 sliver rightmost precinct must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("rightmost precinct") && msg.contains("Table 11"),
+            "expected Table 11 rightmost-precinct rejection, got {msg}"
+        );
     }
 
     /// A floor-sized plane (the pre-282 convention) is rejected: §B.1
