@@ -423,6 +423,42 @@ impl Sublevel {
             Sublevel::Sublev3bpp => 3,
         })
     }
+
+    /// Resolve the effective nominal bits-per-pixel `Nbpp` for this
+    /// sublevel, consulting `profile` only for the `Full` sublevel
+    /// (whose `Nbpp` is the profile's max-decoded-bpp from Table A.4).
+    ///
+    /// Returns `None` for the `Unrestricted` sublevel (no coded-domain
+    /// bound), and `None` for `Full` with an `Unrestricted` profile
+    /// (which Table A.7 forbids — `Full` "shall only be used if the
+    /// profile value is not unrestricted").
+    pub fn effective_nbpp(self, profile: Profile) -> Option<u32> {
+        match self {
+            Sublevel::Unrestricted => None,
+            Sublevel::Full => profile.max_decoded_bpp(),
+            other => other.nominal_bpp(),
+        }
+    }
+}
+
+/// Maximum admissible codestream size `Ssl,max` in bytes from SOC to EOC
+/// (§A.4.1):
+///
+/// ```text
+///   Ssl,max = floor(Lmax × Nbpp / 8)
+/// ```
+///
+/// where `Lmax` is the level's maximum number of sampling-grid points
+/// (`Level::max_samples`) and `Nbpp` is the sublevel's nominal
+/// bits-per-pixel (`Sublevel::effective_nbpp`, profile-dependent for the
+/// `Full` sublevel). Returns `None` when the level or sublevel is
+/// unrestricted (no coded-domain bound, §A.5), in which case the
+/// codestream size is unconstrained. The closed form is verified against
+/// every numeric entry of Tables A.8–A.11 in the unit tests.
+pub fn max_codestream_size(level: Level, sublevel: Sublevel, profile: Profile) -> Option<u64> {
+    let lmax = level.max_samples()?;
+    let nbpp = sublevel.effective_nbpp(profile)? as u64;
+    Some(lmax.saturating_mul(nbpp) / 8)
 }
 
 /// Chroma format families implied by the per-component sampling
@@ -844,6 +880,42 @@ pub fn check_level(cs: &Codestream) -> Result<Option<Level>> {
         }
     }
     Ok(Some(level))
+}
+
+/// Check that the on-wire codestream length `codestream_len` (the full
+/// SOC-to-EOC byte count, including all markers) does not exceed the
+/// `Ssl,max` coded-domain bound implied by the picture header's declared
+/// level (`Plev` high byte) and sublevel (`Plev` low byte), per §A.4.1.
+///
+/// Returns `Ok(())` when no bound applies — an unrestricted level or
+/// sublevel, or a `Plev` that decodes to no sublevel id (treated as
+/// unconstrained here; [`check_level`] is responsible for rejecting a
+/// reserved *level* high byte). Returns `Err(Error::invalid)` when the
+/// codestream is larger than `Ssl,max`.
+///
+/// The profile (`Ppih`) is consulted only to resolve the `Full`
+/// sublevel's `Nbpp` (Table A.4); an unmappable `Ppih` falls back to
+/// `Unrestricted`, which leaves the `Full` sublevel without a bound
+/// (the profile/level checks reject the reserved `Ppih` separately).
+pub fn check_codestream_size(cs: &Codestream, codestream_len: usize) -> Result<()> {
+    let Some(level) = Level::from_plev_high(cs.pih.plev) else {
+        // Reserved level high byte — check_level reports this; nothing to
+        // bound here.
+        return Ok(());
+    };
+    let Some(sublevel) = Sublevel::from_plev_low(cs.pih.plev) else {
+        return Ok(());
+    };
+    let profile = Profile::from_ppih(cs.pih.ppih).unwrap_or(Profile::Unrestricted);
+    if let Some(max) = max_codestream_size(level, sublevel, profile) {
+        if codestream_len as u64 > max {
+            return Err(Error::invalid(format!(
+                "jpegxs sublevel {sublevel:?} @ level {level:?}: codestream is {codestream_len} \
+                 bytes, exceeds Ssl,max = {max} bytes (floor(Lmax × Nbpp / 8), §A.4.1)"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1288,5 +1360,143 @@ mod tests {
         cs.pih.plev = 0x1000;
         let err = check_level(&cs).unwrap_err();
         assert!(format!("{err}").contains("Lmax"));
+    }
+
+    #[test]
+    fn ssl_max_matches_tables_a8_to_a11() {
+        // Closed form Ssl,max = floor(Lmax × Nbpp / 8) reproduced against
+        // every numeric entry of Tables A.8 (3 bpp), A.9 (6), A.10 (9),
+        // A.11 (12). `profile` is irrelevant for non-Full sublevels.
+        let levels = [
+            (Level::L2k1, 0x10u16),
+            (Level::L4k1, 0x20),
+            (Level::L4k2, 0x24),
+            (Level::L4k3, 0x28),
+            (Level::L8k1, 0x30),
+            (Level::L8k2, 0x34),
+            (Level::L8k3, 0x38),
+            (Level::L10k1, 0x40),
+        ];
+        // (sublevel, [Ssl,max per level above]).
+        let cases: &[(Sublevel, [u64; 8])] = &[
+            (
+                Sublevel::Sublev3bpp,
+                [
+                    1_572_864, 3_342_336, 6_291_456, 6_291_456, 13_369_344, 25_165_824, 25_165_824,
+                    39_321_600,
+                ],
+            ),
+            (
+                Sublevel::Sublev6bpp,
+                [
+                    3_145_728, 6_684_672, 12_582_912, 12_582_912, 26_738_688, 50_331_648,
+                    50_331_648, 78_643_200,
+                ],
+            ),
+            (
+                Sublevel::Sublev9bpp,
+                [
+                    4_718_592,
+                    10_027_008,
+                    18_874_368,
+                    18_874_368,
+                    40_108_032,
+                    75_497_472,
+                    75_497_472,
+                    117_964_800,
+                ],
+            ),
+            (
+                Sublevel::Sublev12bpp,
+                [
+                    6_291_456,
+                    13_369_344,
+                    25_165_824,
+                    25_165_824,
+                    53_477_376,
+                    100_663_296,
+                    100_663_296,
+                    157_286_400,
+                ],
+            ),
+        ];
+        for (sub, expected) in cases {
+            for ((level, _), &exp) in levels.iter().zip(expected.iter()) {
+                let got = max_codestream_size(*level, *sub, Profile::Unrestricted)
+                    .expect("bounded sublevel/level");
+                assert_eq!(got, exp, "Ssl,max {sub:?} @ {level:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn unrestricted_level_or_sublevel_has_no_size_bound() {
+        assert_eq!(
+            max_codestream_size(
+                Level::Unrestricted,
+                Sublevel::Sublev3bpp,
+                Profile::Main422_10
+            ),
+            None
+        );
+        assert_eq!(
+            max_codestream_size(Level::L2k1, Sublevel::Unrestricted, Profile::Main422_10),
+            None
+        );
+    }
+
+    #[test]
+    fn full_sublevel_nbpp_follows_profile() {
+        // Full sublevel Nbpp is the profile's max-decoded-bpp (Table A.4):
+        // Main 422.10 → 20, Main 4444.12 → 48. Ssl,max scales accordingly.
+        let lmax = Level::L2k1.max_samples().unwrap();
+        assert_eq!(
+            max_codestream_size(Level::L2k1, Sublevel::Full, Profile::Main422_10),
+            Some(lmax * 20 / 8)
+        );
+        assert_eq!(
+            max_codestream_size(Level::L2k1, Sublevel::Full, Profile::Main4444_12),
+            Some(lmax * 48 / 8)
+        );
+        // Full with an unrestricted profile has no Nbpp (Table A.7 forbids
+        // the combination); we surface that as "no bound" rather than
+        // panicking.
+        assert_eq!(
+            max_codestream_size(Level::L2k1, Sublevel::Full, Profile::Unrestricted),
+            None
+        );
+    }
+
+    #[test]
+    fn check_codestream_size_rejects_oversized() {
+        // L2k1 + Sublev3bpp → Ssl,max = 1 572 864 bytes.
+        let mut cs = make_cs(
+            Profile::Main422_10,
+            3,
+            8,
+            &[(1, 1), (2, 1), (2, 1)],
+            5,
+            1,
+            0,
+            1920,
+            1080,
+            0,
+            8,
+        );
+        cs.pih.plev = 0x1004; // level 2k-1 (0x10), sublevel 3bpp (0x04)
+        let max = 1_572_864usize;
+        check_codestream_size(&cs, max).expect("exactly Ssl,max is allowed");
+        let err = check_codestream_size(&cs, max + 1).unwrap_err();
+        assert!(
+            format!("{err}").contains("Ssl,max"),
+            "expected Ssl,max rejection, got {err}"
+        );
+    }
+
+    #[test]
+    fn check_codestream_size_no_bound_when_unrestricted() {
+        let mut cs = make_cs(Profile::Unrestricted, 1, 8, &[(1, 1)], 1, 0, 0, 4, 1, 0, 1);
+        cs.pih.plev = 0x0000; // unrestricted level + sublevel
+        check_codestream_size(&cs, usize::MAX).expect("unrestricted: no size bound");
     }
 }

@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased — round 376 (sublevel coded-size bound Ssl,max enforced at decode)
+
+The decoder now enforces the sublevel coded-domain bound: the SOC-to-EOC
+codestream byte count must not exceed
+
+```text
+  Ssl,max = floor(Lmax × Nbpp / 8)
+```
+
+(ISO/IEC 21122-2:2019 §A.4.1), where `Lmax` is the declared level's
+maximum sampling-grid-point count and `Nbpp` is the declared sublevel's
+nominal bits-per-pixel (Table A.7; profile-dependent for the `Full`
+sublevel via Table A.4). New `profile::max_codestream_size` /
+`check_codestream_size` and `Sublevel::effective_nbpp`; the closed form
+is reproduced bit-exactly against every numeric entry of Tables A.8–A.11
+(3 / 6 / 9 / 12 bpp × eight levels). Unrestricted level or sublevel
+imposes no bound.
+
+* +5 tests (564 → 569).
+
 ## Unreleased — round 376 (profile / level conformance enforced at decode)
 
 The decoder now validates every codestream against the profile (`Ppih`,

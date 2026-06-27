@@ -75,6 +75,10 @@ pub(crate) fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<JpegXsIm
         }
     }
     crate::profile::check_level(&cs)?;
+    // Sublevel coded-domain bound: the SOC-to-EOC codestream byte count
+    // must not exceed Ssl,max = floor(Lmax × Nbpp / 8) for the declared
+    // level + sublevel (§A.4.1, Tables A.8–A.11).
+    crate::profile::check_codestream_size(&cs, buf.len())?;
 
     if pih.qpih > 1 {
         return Err(Error::Unsupported(format!(

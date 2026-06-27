@@ -109,8 +109,9 @@ pub use output::{parse_nlt, NltParams};
 pub use picture_header::PictureHeader;
 pub use probe::{probe, JpegXsFileInfo};
 pub use profile::{
-    check_codestream as check_profile, check_level, classify_chroma, column_width, ChromaFormat,
-    ColumnMode, Level, Profile, ProfileLimits, QpihAllowed, Sublevel,
+    check_codestream as check_profile, check_codestream_size, check_level, classify_chroma,
+    column_width, max_codestream_size, ChromaFormat, ColumnMode, Level, Profile, ProfileLimits,
+    QpihAllowed, Sublevel,
 };
 pub use slice_header::SliceHeader;
 pub use slice_walker::{parse_wgt, BandWeight};
