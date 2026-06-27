@@ -12914,6 +12914,30 @@ mod tests {
         assert!(crate::capabilities::unsupported_cap_bits(&parsed.cap).is_empty());
     }
 
+    /// Table A.8: the (B[0], 0) lossless combination requires
+    /// `B[i] = B[0]` for every component. Encode a uniform-8-bit 3-comp
+    /// stream, then patch component 1's CDT bit-depth to 10 — the decoder
+    /// must reject the now-non-uniform lossless stream.
+    #[test]
+    fn r376_decode_rejects_mixed_depth_lossless() {
+        let pixels = make_synthetic_rgb_32x32();
+        let mut cs = encode_rgb_8bit(32, 32, &pixels, 0, 1).expect("encode RGB");
+        // Locate the CDT marker (0xff13) and patch component 1's B[i].
+        let cdt_pos = cs
+            .windows(2)
+            .position(|w| w == [0xff, 0x13])
+            .expect("CDT marker present");
+        // CDT: marker(2) + Lcdt(2) + body; body[i*2] = B[i].
+        let body = cdt_pos + 4;
+        assert_eq!(cs[body], 8, "component 0 is 8-bit");
+        cs[body + 2] = 10; // component 1 → 10-bit (now != B[0])
+        let err = decode_codestream(&cs, None).unwrap_err();
+        assert!(
+            format!("{err}").contains("requires B[i]=B[0]"),
+            "expected uniform-depth rejection, got {err}"
+        );
+    }
+
     /// A 4:2:0 luma+chroma stream (sy=2 on the chroma planes) sets the
     /// vertical-subsampling CAP bit (bit 4).
     #[test]

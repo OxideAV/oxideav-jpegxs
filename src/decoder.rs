@@ -197,6 +197,58 @@ pub(crate) fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<JpegXsIm
             "jpegxs decoder: NLT marker present with Fq=0 (Annex A.4.6 forbids this)".to_string(),
         ));
     }
+
+    // Table A.8 "Additional constraints" column, beyond the (Bw, Fq)
+    // pairing already enforced above.
+    let caps = cs.capabilities();
+    match (pih.bw, pih.fq) {
+        // (B[0], 0): "B[i] = B[0] for all i" — the integer-transform
+        // lossless case requires a uniform component bit depth.
+        (_, 0) => {
+            let b0 = cdt.components[0].bit_depth;
+            if let Some((i, c)) = cdt
+                .components
+                .iter()
+                .enumerate()
+                .find(|(_, c)| c.bit_depth != b0)
+            {
+                return Err(Error::invalid(format!(
+                    "jpegxs decoder: Fq=0 (lossless) requires B[i]=B[0]={b0} for all i, but \
+                     component {i} has B[{i}]={} (Table A.8)",
+                    c.bit_depth
+                )));
+            }
+        }
+        // (18, 6): "A NLT marker segment shall be present. Bit 2 or bit 3
+        // of the CAP marker shall be 1."
+        (18, 6) => {
+            if cs.nlt()?.is_none() {
+                return Err(Error::invalid(
+                    "jpegxs decoder: (Bw=18, Fq=6) requires a NLT marker segment (Table A.8)"
+                        .to_string(),
+                ));
+            }
+            if !caps.nlt_quadratic && !caps.nlt_extended {
+                return Err(Error::invalid(
+                    "jpegxs decoder: (Bw=18, Fq=6) requires CAP bit 2 or bit 3 set \
+                     (quadratic / extended NLT capability) (Table A.8)"
+                        .to_string(),
+                ));
+            }
+        }
+        // (20, 8): Table A.8 lists this as the regular high-precision case
+        // with "Bits 2 and 3 of the CAP marker not present or shall be 0"
+        // (no non-linearity). We deliberately do NOT enforce the
+        // NLT-forbidden half here: this crate's high-bit-depth NLT path
+        // runs the wavelet domain at Bw=20 for precision headroom and
+        // emits (Bw=20, Fq=8) *with* an NLT marker — a combination Table
+        // A.8 does not tabulate (it offers only (18, 6) for NLT, which has
+        // insufficient headroom for B[i] up to 16). Enforcing the
+        // CAP-bits-0 rule would reject our own high-bd NLT streams. See
+        // the documented "NLT@Bw=20" gap in the round report; the (18, 6)
+        // and (B[0], 0) constraints above are enforced unconditionally.
+        _ => {}
+    }
     // CWD body is validated by the codestream parser; here we route
     // the Sd lookup through the typed [`codestream::Codestream::cwd`]
     // accessor (Annex A.4.7 Table A.18). Absent CWD → Sd = 0.
@@ -1407,6 +1459,26 @@ mod tests {
         assert!(
             format!("{err}").contains("Hf=1 below the minimum"),
             "expected Hf-minimum rejection, got {err}"
+        );
+    }
+
+    /// PIH body byte offsets: Bw is body[19] = abs 29; the Fq|Br byte is
+    /// body[20] = abs 30 (Fq high nibble, Br low nibble).
+    const BW_OFFSET: usize = 29;
+    const FQBR_OFFSET: usize = 30;
+
+    #[test]
+    fn decode_rejects_bw18_fq6_without_nlt() {
+        // The 4×1 fixture carries Bw=20, Fq=8 and no NLT marker. Patch it
+        // to (Bw=18, Fq=6): Table A.8 says this combination "shall have a
+        // NLT marker present", which is absent — reject.
+        let mut buf = build_zero_codestream_4x1();
+        buf[BW_OFFSET] = 18;
+        buf[FQBR_OFFSET] = (6 << 4) | (buf[FQBR_OFFSET] & 0x0f); // Fq=6, keep Br
+        let err = decode_buf(buf).unwrap_err();
+        assert!(
+            format!("{err}").contains("requires a NLT marker"),
+            "expected (18,6)-needs-NLT rejection, got {err}"
         );
     }
 

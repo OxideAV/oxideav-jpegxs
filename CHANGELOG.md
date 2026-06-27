@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased — round 376 (Table A.8 "additional constraints" enforced at decode)
+
+The decoder enforced the (Bw, Fq) pairing of Table A.8 but not the
+table's "Additional constraints" column. Now also enforced:
+
+* **(B[0], 0)** — the lossless integer-transform case requires
+  `B[i] = B[0]` for every component (uniform bit depth). A stream with a
+  non-uniform CDT bit depth at Fq=0 is rejected.
+* **(18, 6)** — requires a NLT marker present *and* CAP bit 2 or bit 3
+  set (quadratic / extended NLT capability).
+
+Deliberately **not** enforced: the (20, 8) "CAP bits 2 and 3 shall be 0"
+half. This crate's high-bit-depth NLT path runs the wavelet domain at
+Bw=20 for precision headroom and emits (Bw=20, Fq=8) *with* an NLT marker
+— a combination Table A.8 does not tabulate (it offers only (18, 6) for
+NLT, which lacks headroom for `B[i]` up to 16). This is the known
+**NLT@Bw=20 docs gap**; enforcing the rule would reject our own
+high-bd NLT streams.
+
+* +2 tests (585 → 587).
+
 ## Unreleased — round 376 (CTS-marker presence is fully determined by Cpih)
 
 The codestream parser already required a CTS marker when `Cpih=3`; it now
