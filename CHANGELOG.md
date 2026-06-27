@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased — round 376 (Full sublevel requires a non-unrestricted profile)
+
+Enforces §A.4.2: "The Full sublevel shall only be used if the profile
+value is not unrestricted." A stream whose `Plev` low byte selects the
+Full sublevel (0x80) while `Ppih = 0` (Unrestricted) has no defined
+`Nbpp` — Table A.7 defers Full's bits-per-pixel to the profile's
+max-decoded-bpp — so the combination is non-conformant and
+`check_codestream_size` now rejects it.
+
+* +2 tests (587 → 589).
+
 ## Unreleased — round 376 (Table A.8 "additional constraints" enforced at decode)
 
 The decoder enforced the (Bw, Fq) pairing of Table A.8 but not the

@@ -907,6 +907,17 @@ pub fn check_codestream_size(cs: &Codestream, codestream_len: usize) -> Result<(
         return Ok(());
     };
     let profile = Profile::from_ppih(cs.pih.ppih).unwrap_or(Profile::Unrestricted);
+    // §A.4.2: "The Full sublevel shall only be used if the profile value
+    // is not unrestricted." A Full sublevel with Ppih=0 has no defined
+    // Nbpp (Table A.7 defers it to the profile's max-decoded-bpp), so the
+    // combination is non-conformant — reject it.
+    if matches!(sublevel, Sublevel::Full) && matches!(profile, Profile::Unrestricted) {
+        return Err(Error::invalid(
+            "jpegxs: Full sublevel (Plev low 0x80) is only valid with a non-unrestricted profile \
+             (Ppih ≠ 0) — §A.4.2"
+                .to_string(),
+        ));
+    }
     if let Some(max) = max_codestream_size(level, sublevel, profile) {
         if codestream_len as u64 > max {
             return Err(Error::invalid(format!(
@@ -1491,6 +1502,44 @@ mod tests {
             format!("{err}").contains("Ssl,max"),
             "expected Ssl,max rejection, got {err}"
         );
+    }
+
+    #[test]
+    fn check_codestream_size_rejects_full_with_unrestricted_profile() {
+        // §A.4.2: Full sublevel requires a non-unrestricted profile. A
+        // Ppih=0 (Unrestricted) stream with Plev sublevel = Full (0x80) at
+        // level 2k-1 (0x10) is non-conformant.
+        let mut cs = make_cs(Profile::Unrestricted, 1, 8, &[(1, 1)], 1, 0, 0, 4, 1, 0, 1);
+        cs.pih.ppih = 0x0000; // Unrestricted
+        cs.pih.plev = 0x1080; // level 2k-1, sublevel Full
+        let err = check_codestream_size(&cs, 100).unwrap_err();
+        assert!(
+            format!("{err}").contains("Full sublevel"),
+            "expected Full+unrestricted rejection, got {err}"
+        );
+    }
+
+    #[test]
+    fn check_codestream_size_accepts_full_with_real_profile() {
+        // Full sublevel with a real profile (Main 422.10 → Nbpp 20) is
+        // valid and bounds the codestream at floor(Lmax × 20 / 8).
+        let mut cs = make_cs(
+            Profile::Main422_10,
+            3,
+            8,
+            &[(1, 1), (2, 1), (2, 1)],
+            5,
+            1,
+            0,
+            1920,
+            1080,
+            0,
+            8,
+        );
+        cs.pih.plev = 0x1080; // level 2k-1, sublevel Full
+        let max = (Level::L2k1.max_samples().unwrap() * 20 / 8) as usize;
+        check_codestream_size(&cs, max).expect("at-bound Full decodes");
+        assert!(check_codestream_size(&cs, max + 1).is_err());
     }
 
     #[test]
