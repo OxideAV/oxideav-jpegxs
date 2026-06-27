@@ -80,6 +80,28 @@ pub(crate) fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<JpegXsIm
     // level + sublevel (§A.4.1, Tables A.8–A.11).
     crate::profile::check_codestream_size(&cs, buf.len())?;
 
+    // Lcod conformance (ISO/IEC 21122-1:2022 Table 11). The picture
+    // header's Lcod field is "the size of the entire codestream in bytes
+    // from SOC to EOC, including all markers, if constant-bitrate coding
+    // is used; 0 if variable-bitrate coding is used." When non-zero it is
+    // a CBR self-description that must match the codestream's actual
+    // SOC-to-EOC length — the EOC marker ends at `eoc_offset + 2` (the
+    // marker is two bytes). A mismatch means the stream's own length
+    // field disagrees with its byte layout, so a conforming decoder
+    // rejects it rather than decode a stream that mis-describes itself.
+    if pih.lcod != 0 {
+        if let Some(eoc) = cs.eoc_offset {
+            let actual = (eoc + 2) as u64;
+            if pih.lcod as u64 != actual {
+                return Err(Error::invalid(format!(
+                    "jpegxs decoder: Lcod={} (declared CBR codestream length) does not match the \
+                     actual SOC-to-EOC length of {actual} bytes (Table 11)",
+                    pih.lcod
+                )));
+            }
+        }
+    }
+
     if pih.qpih > 1 {
         return Err(Error::Unsupported(format!(
             "jpegxs decoder: Qpih == {} reserved for ISO/IEC use (Table A.10)",
@@ -1177,12 +1199,19 @@ mod tests {
         }
     }
 
-    /// Byte offset of the PIH `Ppih` field inside a codestream built by
+    /// Byte offset of the PIH `Lcod` field inside a codestream built by
     /// the `build_zero_codestream_*` helpers: SOC(2) + CAP marker(2) +
-    /// Lcap(2) + PIH marker(2) + Lpih(2) + Lcod(4) = 14, then Ppih(2) at
-    /// 14, Plev(2) at 16.
+    /// Lcap(2) + PIH marker(2) + Lpih(2) = 10, then Lcod(4) at 10.
+    const LCOD_OFFSET: usize = 10;
+    /// Byte offset of the PIH `Ppih` field: Lcod(4) follows at 10..14,
+    /// then Ppih(2) at 14, Plev(2) at 16.
     const PPIH_OFFSET: usize = 14;
     const PLEV_OFFSET: usize = 16;
+
+    /// Patch a big-endian u32 in place at `off`.
+    fn patch_u32(buf: &mut [u8], off: usize, val: u32) {
+        buf[off..off + 4].copy_from_slice(&val.to_be_bytes());
+    }
 
     /// Patch a big-endian u16 in place at `off`.
     fn patch_u16(buf: &mut [u8], off: usize, val: u16) {
@@ -1262,6 +1291,54 @@ mod tests {
             format!("{err}").contains("Plev high byte"),
             "expected reserved-Plev rejection, got {err}"
         );
+    }
+
+    #[test]
+    fn lcod_offset_points_at_lcod_field() {
+        let buf = build_zero_codestream_4x1();
+        // The helper sets Lcod = 0 (VBR).
+        assert_eq!(
+            u32::from_be_bytes([
+                buf[LCOD_OFFSET],
+                buf[LCOD_OFFSET + 1],
+                buf[LCOD_OFFSET + 2],
+                buf[LCOD_OFFSET + 3]
+            ]),
+            0
+        );
+    }
+
+    #[test]
+    fn decode_accepts_matching_cbr_lcod() {
+        // Patch Lcod to the exact SOC-to-EOC byte count: a CBR stream that
+        // truthfully describes its own length decodes normally.
+        let mut buf = build_zero_codestream_4x1();
+        let len = buf.len() as u32;
+        patch_u32(&mut buf, LCOD_OFFSET, len);
+        let img = decode_buf(buf).expect("matching Lcod decodes");
+        assert_eq!(img.planes[0].data, vec![128u8; 4]);
+    }
+
+    #[test]
+    fn decode_rejects_mismatched_cbr_lcod() {
+        // A non-zero Lcod that disagrees with the actual length is an
+        // internally inconsistent CBR self-description (Table 11).
+        let mut buf = build_zero_codestream_4x1();
+        let wrong = buf.len() as u32 + 7;
+        patch_u32(&mut buf, LCOD_OFFSET, wrong);
+        let err = decode_buf(buf).unwrap_err();
+        assert!(
+            format!("{err}").contains("Lcod"),
+            "expected Lcod-mismatch rejection, got {err}"
+        );
+    }
+
+    #[test]
+    fn decode_accepts_vbr_lcod_zero() {
+        // Lcod = 0 (VBR) imposes no length self-check.
+        let buf = build_zero_codestream_4x1();
+        let img = decode_buf(buf).expect("VBR Lcod=0 decodes");
+        assert_eq!(img.planes[0].data, vec![128u8; 4]);
     }
 
     fn build_zero_codestream_2x2() -> Vec<u8> {

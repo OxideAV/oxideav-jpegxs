@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased — round 376 (CBR Lcod self-length conformance enforced at decode)
+
+The decoder now validates the picture header's `Lcod` field — "the size
+of the entire codestream in bytes from SOC to EOC, including all markers,
+if constant-bitrate coding is used; 0 if variable-bitrate coding is used"
+(ISO/IEC 21122-1:2022 Table 11). A non-zero `Lcod` is a CBR
+self-description that must equal the codestream's actual SOC-to-EOC byte
+count (the EOC marker ends at `eoc_offset + 2`); a mismatch is rejected.
+`Lcod = 0` (VBR, what this crate's encoder emits) imposes no check.
+
+* +4 tests (569 → 573).
+
 ## Unreleased — round 376 (sublevel coded-size bound Ssl,max enforced at decode)
 
 The decoder now enforces the sublevel coded-domain bound: the SOC-to-EOC
