@@ -46,6 +46,36 @@ pub(crate) fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<JpegXsIm
     let cdt = cs.cdt.clone();
     let wgt = cs.wgt.clone();
 
+    // Profile / level conformance (ISO/IEC 21122-2:2019 Annex A). The
+    // picture header carries a `Ppih` profile indicator (Table A.5) and a
+    // `Plev` level/sublevel indicator (Tables A.12/A.13). A conforming
+    // decoder validates the codestream against whatever it declares:
+    //
+    //  * `Ppih = 0x0000` is `Profile::Unrestricted` — no structural
+    //    constraints, so the check is a no-op.
+    //  * A non-zero `Ppih` that maps to a known profile (`from_ppih`)
+    //    pins the component count, bit-depth set, chroma format,
+    //    decomposition counts, `Qpih`, slice height and column mode the
+    //    stream may use; [`crate::profile::check_codestream`] rejects a
+    //    stream whose header contradicts its own profile claim.
+    //  * A non-zero `Ppih` that maps to no profile is reserved for
+    //    ISO/IEC — a value a conforming encoder cannot emit — so we
+    //    reject it rather than decode under an unknown profile.
+    //
+    // [`crate::profile::check_level`] independently bounds the picture's
+    // `Wf` / `Hf` / `Wf×Hf` against the declared level's `Wmax` / `Hmax`
+    // / `Lmax` (Table A.6); a reserved `Plev` high byte is rejected.
+    match crate::profile::Profile::from_ppih(pih.ppih) {
+        Some(profile) => crate::profile::check_codestream(&cs, profile)?,
+        None => {
+            return Err(Error::invalid(format!(
+                "jpegxs decoder: Ppih=0x{:04X} is reserved for ISO/IEC use (Table A.5)",
+                pih.ppih
+            )));
+        }
+    }
+    crate::profile::check_level(&cs)?;
+
     if pih.qpih > 1 {
         return Err(Error::Unsupported(format!(
             "jpegxs decoder: Qpih == {} reserved for ISO/IEC use (Table A.10)",
@@ -1141,6 +1171,93 @@ mod tests {
                 vf.planes[0].data
             );
         }
+    }
+
+    /// Byte offset of the PIH `Ppih` field inside a codestream built by
+    /// the `build_zero_codestream_*` helpers: SOC(2) + CAP marker(2) +
+    /// Lcap(2) + PIH marker(2) + Lpih(2) + Lcod(4) = 14, then Ppih(2) at
+    /// 14, Plev(2) at 16.
+    const PPIH_OFFSET: usize = 14;
+    const PLEV_OFFSET: usize = 16;
+
+    /// Patch a big-endian u16 in place at `off`.
+    fn patch_u16(buf: &mut [u8], off: usize, val: u16) {
+        buf[off..off + 2].copy_from_slice(&val.to_be_bytes());
+    }
+
+    /// Decode `buf` through the registry decoder, returning the result.
+    fn decode_buf(buf: Vec<u8>) -> Result<JpegXsImage> {
+        decode_codestream(&buf, None)
+    }
+
+    #[test]
+    fn ppih_offset_points_at_ppih_field() {
+        // Sanity-check the offset constant against the helper layout: the
+        // unpatched stream carries Ppih = 0 (Unrestricted) at PPIH_OFFSET.
+        let buf = build_zero_codestream_4x1();
+        assert_eq!(
+            u16::from_be_bytes([buf[PPIH_OFFSET], buf[PPIH_OFFSET + 1]]),
+            0
+        );
+        assert_eq!(
+            u16::from_be_bytes([buf[PLEV_OFFSET], buf[PLEV_OFFSET + 1]]),
+            0
+        );
+    }
+
+    #[test]
+    fn decode_rejects_reserved_ppih() {
+        // 0x9999 maps to no profile (Profile::from_ppih → None), so a
+        // conforming decoder rejects it rather than decode under an
+        // unknown profile (ISO/IEC 21122-2 Table A.5).
+        let mut buf = build_zero_codestream_4x1();
+        patch_u16(&mut buf, PPIH_OFFSET, 0x9999);
+        let err = decode_buf(buf).unwrap_err();
+        assert!(
+            format!("{err}").contains("reserved for ISO/IEC"),
+            "expected reserved-Ppih rejection, got {err}"
+        );
+    }
+
+    #[test]
+    fn decode_rejects_profile_violating_stream() {
+        // The 4×1 luma stream codes a single slice of one image row
+        // (Hsl=1, NL,y=0). Every constrained profile fixes the slice
+        // height at 16 image rows (Table A.1/A.2/A.3 "Slice height = 16"),
+        // so declaring the Light 422.10 profile (0x1500) contradicts the
+        // stream's own slice geometry — a decoder that honours the
+        // declared profile must reject it (ISO/IEC 21122-2 Annex A).
+        let mut buf = build_zero_codestream_4x1();
+        patch_u16(&mut buf, PPIH_OFFSET, 0x1500);
+        let err = decode_buf(buf).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Light 422.10") && msg.contains("image rows"),
+            "expected Light-422.10 slice-height conformance rejection, got {msg}"
+        );
+    }
+
+    #[test]
+    fn decode_accepts_unrestricted_profile_stream() {
+        // The baseline stream declares Ppih = 0 (Unrestricted) and decodes
+        // to the mid-grey row — the conformance wiring must be a no-op for
+        // the unrestricted profile.
+        let buf = build_zero_codestream_4x1();
+        let img = decode_buf(buf).expect("unrestricted stream decodes");
+        assert_eq!(img.planes[0].data, vec![128u8; 4]);
+    }
+
+    #[test]
+    fn decode_rejects_reserved_plev_high_byte() {
+        // Plev high byte 0xFF is reserved (Level::from_plev_high → None),
+        // so check_level rejects the stream (Table A.6 / A.12).
+        let mut buf = build_zero_codestream_4x1();
+        patch_u16(&mut buf, PLEV_OFFSET, 0xFF00);
+        let err = decode_buf(buf).unwrap_err();
+        assert!(
+            format!("{err}").contains("Plev high byte"),
+            "expected reserved-Plev rejection, got {err}"
+        );
     }
 
     fn build_zero_codestream_2x2() -> Vec<u8> {

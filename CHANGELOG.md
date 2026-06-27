@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased — round 376 (profile / level conformance enforced at decode)
+
+The decoder now validates every codestream against the profile (`Ppih`,
+Table A.5) and level/sublevel (`Plev`, Tables A.12/A.13) it declares,
+per ISO/IEC 21122-2:2019 Annex A. Previously `Ppih` / `Plev` were parsed
+and surfaced through `probe()` but never enforced during `decode`:
+
+* A non-zero `Ppih` mapping to a known profile runs
+  `profile::check_codestream`, rejecting a stream whose header
+  contradicts its own profile claim (component count, bit-depth set,
+  chroma format, `NL,x` / `NL,y`, `Qpih`, slice height, column mode).
+* A non-zero `Ppih` mapping to no profile is reserved for ISO/IEC and is
+  rejected rather than decoded under an unknown profile.
+* `Ppih = 0` (Unrestricted) keeps the check a no-op.
+* `profile::check_level` bounds `Wf` / `Hf` / `Wf×Hf` against the
+  declared level's `Wmax` / `Hmax` / `Lmax` (Table A.6) and rejects a
+  reserved `Plev` high byte.
+
+* +5 tests (559 → 564).
+
 ## Unreleased — round 371 (Sd>0 CWD × NLT path-intersection coverage)
 
 Adds a round-trip exercising CWD decomposition suppression (`Sd > 0`)
