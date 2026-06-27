@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased — round 376 (CTS-marker presence is fully determined by Cpih)
+
+The codestream parser already required a CTS marker when `Cpih=3`; it now
+also enforces the converse half of the Table A.2 rule — "the CTS marker
+shall not be present otherwise" — rejecting a CTS segment carried by any
+`Cpih ≠ 3` stream. Reworked `cts_method_surfaces_body_errors` (which had
+relied on a now-illegal Cpih=0 + CTS layout) onto a valid Cpih=3
+Star-Tetrix shell with a malformed CTS body.
+
+* +1 test (584 → 585).
+
 ## Unreleased — round 376 (CAP capabilities marker — emission + conformance)
 
 The CAP marker declares which optional decoder tools are required to

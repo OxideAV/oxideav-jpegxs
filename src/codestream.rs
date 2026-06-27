@@ -341,10 +341,19 @@ pub fn parse(buf: &[u8]) -> Result<Codestream> {
 
     let cdt = cdt.ok_or_else(|| Error::invalid("jpegxs: missing mandatory CDT segment"))?;
     let wgt = wgt.ok_or_else(|| Error::invalid("jpegxs: missing mandatory WGT segment"))?;
+    // CTS presence is fully determined by Cpih (Table A.2): the CTS
+    // marker is "Mandatory if Cpih=3, shall not be present otherwise."
     if pih.cpih == 3 && cts.is_none() {
         return Err(Error::invalid(
             "jpegxs: Cpih=3 requires CTS marker (Star-Tetrix)",
         ));
+    }
+    if pih.cpih != 3 && cts.is_some() {
+        return Err(Error::invalid(format!(
+            "jpegxs: CTS marker present with Cpih={} — the CTS marker shall not be present unless \
+             Cpih=3 (Table A.2)",
+            pih.cpih
+        )));
     }
 
     // We have just consumed the first SLH marker. Parse its body and
@@ -744,6 +753,35 @@ mod tests {
     }
 
     #[test]
+    fn rejects_cts_present_with_cpih_not_3() {
+        // CTS "shall not be present" unless Cpih=3 (Table A.2). Build a
+        // Cpih=0 single-luma stream that nonetheless carries a CTS marker.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0xff, 0x10]);
+        buf.extend_from_slice(&[0xff, 0x50]);
+        buf.extend_from_slice(&2u16.to_be_bytes());
+        buf.extend_from_slice(&[0xff, 0x12]);
+        buf.extend_from_slice(&26u16.to_be_bytes());
+        buf.extend_from_slice(&build_pih_body(1, 4, 3, 0)); // Cpih = 0
+        buf.extend_from_slice(&[0xff, 0x13]);
+        buf.extend_from_slice(&4u16.to_be_bytes());
+        buf.extend_from_slice(&[8, 0x11]);
+        buf.extend_from_slice(&[0xff, 0x14]);
+        buf.extend_from_slice(&2u16.to_be_bytes());
+        push_cts(&mut buf, 3, 1, 2); // CTS present — illegal for Cpih≠3
+        buf.extend_from_slice(&[0xff, 0x20]);
+        buf.extend_from_slice(&4u16.to_be_bytes());
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        buf.extend_from_slice(&[0xff, 0x11]);
+        let err = parse(&buf).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("CTS marker present") && msg.contains("Cpih=0"),
+            "expected CTS-forbidden rejection, got {msg}"
+        );
+    }
+
+    #[test]
     fn parses_optional_segments() {
         let mut buf = Vec::new();
         buf.extend_from_slice(&[0xff, 0x10]);
@@ -911,23 +949,28 @@ mod tests {
 
     #[test]
     fn cts_method_surfaces_body_errors() {
-        // Build a Cpih ∈ {0, 1, 2} codestream that carries an
-        // (illegal-content) CTS so the parser keeps the body in
-        // `cs.cts` without rejecting it. Use Cpih=2 (YCgCo, not
-        // gated by the parser's Star-Tetrix-CTS-required check).
+        // CTS is legal only with Cpih=3 (Table A.2), so build a valid
+        // Star-Tetrix shell (Cpih=3, Nc=4, CRG present) but give it a CTS
+        // with an illegal Reserved nibble. The top-level parser keeps the
+        // CTS body opaque (in `cs.cts`); the typed `cts()` accessor is
+        // what surfaces the §A.4.8 Reserved-nibble error.
         let mut buf = Vec::new();
         buf.extend_from_slice(&[0xff, 0x10]);
         buf.extend_from_slice(&[0xff, 0x50]);
         buf.extend_from_slice(&2u16.to_be_bytes());
         buf.extend_from_slice(&[0xff, 0x12]);
         buf.extend_from_slice(&26u16.to_be_bytes());
-        buf.extend_from_slice(&build_pih_body(1, 4, 3, 0));
+        buf.extend_from_slice(&build_pih_body(4, 4, 3, 3)); // Cpih = 3
         buf.extend_from_slice(&[0xff, 0x13]);
-        buf.extend_from_slice(&4u16.to_be_bytes());
-        buf.extend_from_slice(&[8, 0x11]);
+        buf.extend_from_slice(&((2 * 4 + 2) as u16).to_be_bytes());
+        for _ in 0..4 {
+            buf.extend_from_slice(&[8, 0x11]);
+        }
         buf.extend_from_slice(&[0xff, 0x14]);
         buf.extend_from_slice(&2u16.to_be_bytes());
-        // Reserved nibble forced non-zero (illegal per §A.4.8).
+        // CRG is mandatory for Cpih=3 (Table A.2): RGGB pattern.
+        push_crg(&mut buf, &[(0, 0), (32768, 0), (0, 32768), (32768, 32768)]);
+        // CTS with the Reserved nibble forced non-zero (illegal per §A.4.8).
         buf.extend_from_slice(&[0xff, 0x18]);
         buf.extend_from_slice(&4u16.to_be_bytes());
         buf.push(0x10); // Reserved=1, Cf=0
