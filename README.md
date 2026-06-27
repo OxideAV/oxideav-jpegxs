@@ -127,6 +127,41 @@ regime (Annex C.5.3.3) whose per-line buffer bound holds by construction —
 so its streams pass the gate while a malformed `Rl = 0` stream that mixes
 raw and non-raw within a band is rejected.
 
+The decoder also enforces a layer of **profile / level / sublevel
+conformance** drawn from the codestream's own declarations (ISO/IEC
+21122-2 Annex A + 21122-1 Tables 11 / A.5 / A.8):
+
+- The `Ppih` profile indicator (Table A.5) is validated: a non-zero value
+  mapping to a known profile runs the full `check_codestream` constraint
+  set (component count, bit-depth set, chroma format, `NL,x` / `NL,y`,
+  `Qpih`, slice height, column mode), and a reserved (unmappable) `Ppih`
+  is rejected rather than decoded under an unknown profile.
+- The `Plev` level/sublevel indicator bounds the picture against the
+  level's `Wmax` / `Hmax` / `Lmax` (Table A.6) and the sublevel's coded
+  size `Ssl,max = ⌊Lmax × Nbpp / 8⌋` (§A.4.1, verified against every entry
+  of Tables A.8–A.11), rejecting a reserved `Plev` high byte and the
+  `Full` sublevel paired with an unrestricted profile (§A.4.2).
+- A non-zero CBR `Lcod` must match the actual SOC-to-EOC byte count
+  (Table 11); the picture dimensions must satisfy `Wf ≥ max_i(sx)·2^NL,x`
+  and `Hf ≥ max_i(sy)·2^NL,y`; and a `Cw > 0` precinct grid whose
+  rightmost column would be a sub-LL-sample sliver (`Wf umod Cs` in
+  `(0, max_i(sx)·2^NL,x)`) is rejected — the encoder likewise refuses to
+  emit one.
+- The CAP capabilities marker (§A.4.3, Table A.5) is now both **emitted**
+  by the encoder (cap[] bits reflecting Star-Tetrix / NLT / vertical
+  subsampling / CWD / lossless / raw-mode-switch usage) and **validated**
+  by the decoder, which aborts on any set capability bit it does not
+  implement (bit 0, bit 7, reserved bits ≥ 9).
+- Table A.8's "additional constraints" beyond the `(Bw, Fq)` pairing: the
+  `(B[0], 0)` lossless case requires a uniform component bit depth, and
+  `(18, 6)` requires a NLT marker plus CAP bit 2 or 3. (The `(20, 8)`
+  CAP-bits-must-be-0 rule is deliberately not enforced — the
+  high-bit-depth NLT path runs the wavelet domain at `Bw = 20` for
+  precision headroom, a combination Table A.8 does not tabulate; see the
+  NLT@Bw=20 docs gap.)
+- The CTS marker presence is fully Cpih-determined: mandatory for
+  `Cpih = 3` and rejected for any other `Cpih` (Table A.2).
+
 ### Encoder
 
 A planar encoder covering the same feature matrix, lossless (`q = 0`)
