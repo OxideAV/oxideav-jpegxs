@@ -5445,12 +5445,69 @@ fn encode_planar_inner_bd(
     Ok(out)
 }
 
+/// Build the CAP marker `cap[]` byte array (the bytes after `Lcap`) for
+/// the tools this configuration uses, per ISO/IEC 21122-1:2022 Table A.5
+/// (MSB-first bit numbering; bit 0 is intentionally unused).
+///
+///  * bit 1 — Star-Tetrix transform + CTS marker (`Cpih == 3`)
+///  * bit 2 — quadratic non-linear transform (NLT `Tnlt = 1`)
+///  * bit 3 — extended non-linear transform (NLT `Tnlt = 2`)
+///  * bit 4 — a component with `sy[i] > 1` is present (vertical subsampling)
+///  * bit 5 — component-dependent wavelet decomposition (CWD, `Sd > 0`)
+///  * bit 6 — lossless decoding (`q == 0`, integer reversible path)
+///  * bit 8 — packet-based raw-mode switch (`Rl = 1`, always set by this
+///    encoder — it selects the bitplane-count coding mode per packet)
+///
+/// `Lcap` is then `2 + cap_bytes.len()`. The trailing byte is guaranteed
+/// non-zero because bit 8 (always set) lives in byte 1, so the §A.4.3
+/// minimality rule ("for Lcap>2 the last byte is not all zero") holds.
+fn build_cap_bytes(cfg: &EncodeConfig) -> Vec<u8> {
+    // Two bytes cover bits 0..=15; bit 8 (always set) forces byte 1 to be
+    // present and non-zero.
+    let mut bits = [false; 16];
+    bits[1] = cfg.cpih == 3;
+    if let Some(nlt) = cfg.nlt {
+        match nlt {
+            NltParams::Quadratic { .. } => bits[2] = true,
+            NltParams::Extended { .. } => bits[3] = true,
+        }
+    }
+    bits[4] = cfg.sy.iter().any(|&s| s > 1);
+    bits[5] = cfg.sd > 0;
+    bits[6] = cfg.q == 0;
+    // The encoder always signals Rl = 1 (per-packet raw-mode selection),
+    // so the packet-based raw-mode-switch capability is always required.
+    bits[8] = true;
+
+    let mut bytes = [0u8; 2];
+    for (i, &set) in bits.iter().enumerate() {
+        if set {
+            bytes[i / 8] |= 1 << (7 - (i % 8));
+        }
+    }
+    // Shrink Lcap so the last cap byte is not all zero (§A.4.3). Byte 1
+    // is always non-zero here (bit 8), so both bytes are always emitted;
+    // the loop keeps the helper correct if bit 8 ever becomes optional.
+    let mut len = bytes.len();
+    while len > 0 && bytes[len - 1] == 0 {
+        len -= 1;
+    }
+    bytes[..len].to_vec()
+}
+
 fn write_main_header(out: &mut Vec<u8>, cfg: &EncodeConfig) -> Result<()> {
     // SOC.
     out.extend_from_slice(&[0xff, 0x10]);
-    // CAP — Lcap = 2 (no capability bits).
+    // CAP — the capabilities marker declares the optional decoder tools
+    // required to decode this codestream (ISO/IEC 21122-1:2022 §A.4.3,
+    // Table A.5). cap[] is built from the tools this configuration
+    // actually uses; Lcap is shrunk so the last cap byte is never all
+    // zero (the §A.4.3 minimality rule).
     out.extend_from_slice(&[0xff, 0x50]);
-    out.extend_from_slice(&2u16.to_be_bytes());
+    let cap_bytes = build_cap_bytes(cfg);
+    let lcap = 2u16 + cap_bytes.len() as u16;
+    out.extend_from_slice(&lcap.to_be_bytes());
+    out.extend_from_slice(&cap_bytes);
     // PIH — Lpih = 26, body = 24 bytes.
     out.extend_from_slice(&[0xff, 0x12]);
     out.extend_from_slice(&26u16.to_be_bytes());
@@ -12819,6 +12876,67 @@ mod tests {
         assert!(
             msg.contains("rightmost precinct") && msg.contains("Table 11"),
             "expected Table 11 rightmost-precinct rejection, got {msg}"
+        );
+    }
+
+    /// The encoder emits a CAP marker whose cap[] bits reflect the tools
+    /// the stream actually uses (ISO/IEC 21122-1:2022 Table A.5). A plain
+    /// lossless luma stream sets only bit 6 (lossless) and bit 8 (the
+    /// always-on per-packet raw-mode switch).
+    #[test]
+    fn r376_encoder_cap_lossless_luma() {
+        let cs = encode_planar(8, 8, 1, 0, 1, 0, &[vec![0u8; 64]]).expect("encode luma");
+        let parsed = crate::codestream::parse(&cs).expect("parse luma codestream");
+        let caps = parsed.capabilities();
+        assert!(caps.lossless, "q=0 must set the lossless bit");
+        assert!(caps.raw_mode_switch, "Rl=1 must set the raw-mode bit");
+        assert!(!caps.star_tetrix);
+        assert!(!caps.nlt_quadratic);
+        assert!(!caps.nlt_extended);
+        assert!(!caps.cwd);
+        assert!(!caps.vertical_subsampling);
+        // No unsupported bit is ever emitted.
+        assert!(crate::capabilities::unsupported_cap_bits(&parsed.cap).is_empty());
+    }
+
+    /// The quadratic NLT entry point sets CAP bit 2; a 4:2:0 chroma
+    /// component sets bit 4 (vertical subsampling); a lossy stream clears
+    /// the lossless bit.
+    #[test]
+    fn r376_encoder_cap_nlt_quadratic() {
+        let cs = encode_planar_nlt_quadratic(8, 8, 1, 0, 1, 0, 1, 0, &[vec![0u8; 64]])
+            .expect("encode NLT quadratic");
+        let parsed = crate::codestream::parse(&cs).expect("parse NLT codestream");
+        let caps = parsed.capabilities();
+        assert!(caps.nlt_quadratic, "Tnlt=1 must set the quadratic-NLT bit");
+        assert!(!caps.lossless, "q>0 must clear the lossless bit");
+        assert!(caps.raw_mode_switch);
+        assert!(crate::capabilities::unsupported_cap_bits(&parsed.cap).is_empty());
+    }
+
+    /// A 4:2:0 luma+chroma stream (sy=2 on the chroma planes) sets the
+    /// vertical-subsampling CAP bit (bit 4).
+    #[test]
+    fn r376_encoder_cap_vertical_subsampling() {
+        let y = vec![0u8; 16 * 16];
+        let c = vec![0u8; 8 * 8];
+        let cs = encode_planar_subsampled(
+            16,
+            16,
+            3,
+            0,
+            1,
+            1,
+            0,
+            &[1, 2, 2],
+            &[1, 2, 2],
+            &[y, c.clone(), c],
+        )
+        .expect("encode 4:2:0");
+        let parsed = crate::codestream::parse(&cs).expect("parse 4:2:0 codestream");
+        assert!(
+            parsed.capabilities().vertical_subsampling,
+            "sy>1 must set the vertical-subsampling bit"
         );
     }
 

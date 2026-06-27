@@ -109,6 +109,25 @@ pub fn parse_capabilities_lossy(cap_body: &[u8]) -> Capabilities {
     decode_known_bits(cap_body)
 }
 
+/// Bit indices this decoder implements (Table A.5). Bit 0 is
+/// "intentionally unused" (§A.4.3 Note 3); bit 7 and every bit ≥ 9 are
+/// reserved for future ISO/IEC purposes.
+const IMPLEMENTED_CAP_BITS: &[usize] = &[1, 2, 3, 4, 5, 6, 8];
+
+/// Return the indices of every cap[] bit that is set but **not**
+/// implemented by this decoder — bit 0, bit 7, or any reserved bit ≥ 9.
+///
+/// Per §A.4.3 ("If a decoder encounters a capability it does not
+/// implement, it should abort decoding"), the presence of any such bit
+/// means the codestream requires a tool this decoder cannot provide, so
+/// the caller must reject the stream rather than silently mis-decode.
+pub fn unsupported_cap_bits(cap_body: &[u8]) -> Vec<usize> {
+    let total_bits = cap_body.len() * 8;
+    (0..total_bits)
+        .filter(|&i| bit(cap_body, i) && !IMPLEMENTED_CAP_BITS.contains(&i))
+        .collect()
+}
+
 fn decode_known_bits(cap_body: &[u8]) -> Capabilities {
     Capabilities {
         star_tetrix: bit(cap_body, 1),
@@ -228,6 +247,27 @@ mod tests {
         let caps = parse_capabilities_lossy(&[0x40, 0x00]);
         assert!(caps.star_tetrix);
         assert!(!caps.raw_mode_switch);
+    }
+
+    #[test]
+    fn unsupported_bits_empty_for_implemented_set() {
+        // Bits 1..=6 (byte0) + bit 8 (byte1 MSB) are all implemented.
+        // byte0 = 0b0111_1110 = 0x7E, byte1 = 0b1000_0000 = 0x80.
+        assert!(unsupported_cap_bits(&[0x7E, 0x80]).is_empty());
+        // Empty cap[] → nothing unsupported.
+        assert!(unsupported_cap_bits(&[]).is_empty());
+    }
+
+    #[test]
+    fn unsupported_bits_flags_bit7_and_reserved() {
+        // Bit 7 is reserved: byte0 = 0b0000_0001 = 0x01 → bit 7 set.
+        assert_eq!(unsupported_cap_bits(&[0x01]), vec![7]);
+        // Bit 0 (unused) set: byte0 = 0b1000_0000 = 0x80.
+        assert_eq!(unsupported_cap_bits(&[0x80]), vec![0]);
+        // A reserved bit ≥ 9: byte1 = 0b0100_0000 → bit 9 set.
+        assert_eq!(unsupported_cap_bits(&[0x00, 0x40]), vec![9]);
+        // Mixed: bit 1 (impl) + bit 7 (reserved) in byte0 = 0x41.
+        assert_eq!(unsupported_cap_bits(&[0x41]), vec![7]);
     }
 
     #[test]

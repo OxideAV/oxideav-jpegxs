@@ -46,6 +46,20 @@ pub(crate) fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<JpegXsIm
     let cdt = cs.cdt.clone();
     let wgt = cs.wgt.clone();
 
+    // Capabilities conformance (ISO/IEC 21122-1:2022 §A.4.3). The CAP
+    // marker declares which optional decoder tools are required to decode
+    // this codestream (Table A.5). If it sets a bit this decoder does not
+    // implement — bit 0 (unused), bit 7, or any reserved bit ≥ 9 — the
+    // stream requires a tool we cannot provide, so abort rather than
+    // silently mis-decode.
+    let unsupported = crate::capabilities::unsupported_cap_bits(&cs.cap);
+    if !unsupported.is_empty() {
+        return Err(Error::Unsupported(format!(
+            "jpegxs decoder: CAP marker requires capability bit(s) {unsupported:?} that this \
+             decoder does not implement (Table A.5 / §A.4.3)"
+        )));
+    }
+
     // Profile / level conformance (ISO/IEC 21122-2:2019 Annex A). The
     // picture header carries a `Ppih` profile indicator (Table A.5) and a
     // `Plev` level/sublevel indicator (Tables A.12/A.13). A conforming
@@ -1393,6 +1407,29 @@ mod tests {
         assert!(
             format!("{err}").contains("Hf=1 below the minimum"),
             "expected Hf-minimum rejection, got {err}"
+        );
+    }
+
+    #[test]
+    fn decode_rejects_unsupported_cap_bit() {
+        // Rebuild the 4×1 fixture with a CAP marker that sets reserved
+        // bit 7 (cap byte 0x01, Lcap=3). The decoder must abort per
+        // §A.4.3 ("a capability it does not implement").
+        let base = build_zero_codestream_4x1();
+        // base layout: SOC(2) + [CAP marker 2 + Lcap 2 = 4] + rest.
+        // Replace the empty CAP segment (bytes 2..6: ff 50 00 02) with a
+        // one-byte CAP body declaring reserved bit 7.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&base[0..2]); // SOC
+        buf.extend_from_slice(&[0xff, 0x50]); // CAP
+        buf.extend_from_slice(&3u16.to_be_bytes()); // Lcap = 3
+        buf.push(0x01); // cap[]: bit 7 (reserved) set
+        buf.extend_from_slice(&base[6..]); // PIH onward unchanged
+        let err = decode_buf(buf).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("CAP marker requires capability") && msg.contains('7'),
+            "expected unsupported-CAP-bit rejection, got {msg}"
         );
     }
 

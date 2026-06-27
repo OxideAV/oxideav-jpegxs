@@ -77,7 +77,9 @@ pub mod registry;
 #[cfg(feature = "registry")]
 pub use registry::{__oxideav_entry, make_decoder, register, register_codecs, register_containers};
 
-pub use capabilities::{parse_capabilities, parse_capabilities_lossy, Capabilities};
+pub use capabilities::{
+    parse_capabilities, parse_capabilities_lossy, unsupported_cap_bits, Capabilities,
+};
 pub use codestream::{Codestream, Slice};
 pub use com::{
     parse_com, ComMarker, TCOM_COPYRIGHT, TCOM_ENCODER_VENDOR, TCOM_VENDOR_SPECIFIC_MIN,

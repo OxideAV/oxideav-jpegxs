@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased — round 376 (CAP capabilities marker — emission + conformance)
+
+The CAP marker declares which optional decoder tools are required to
+decode a codestream (ISO/IEC 21122-1:2022 §A.4.3, Table A.5). Two halves:
+
+* **Encoder** now builds a real `cap[]` bit array reflecting the tools it
+  uses, replacing the previous always-empty `Lcap = 2`: bit 1
+  (Star-Tetrix, `Cpih=3`), bit 2 / 3 (quadratic / extended NLT), bit 4
+  (a component with `sy>1`), bit 5 (CWD, `Sd>0`), bit 6 (lossless,
+  `q=0`), bit 8 (per-packet raw-mode switch, always — the encoder signals
+  `Rl=1`). `Lcap` is shrunk so the last byte is never all-zero.
+* **Decoder** rejects a stream whose CAP sets a bit it does not implement
+  — bit 0 (unused), bit 7, or any reserved bit ≥ 9 — per §A.4.3 ("abort
+  on a capability it does not implement"). New
+  `capabilities::unsupported_cap_bits` (re-exported).
+
+* +6 tests (578 → 584).
+
 ## Unreleased — round 376 (Cw rightmost-precinct conformance, both directions)
 
 Enforces the Table 11 / §B.5-Note-1 `Cw` constraint that "all bands of
