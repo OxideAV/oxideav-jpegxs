@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased — round 376 (picture-dimension vs decomposition conformance)
+
+The decoder now enforces the Wf / Hf picture-dimension ranges of
+ISO/IEC 21122-1:2022 Table 11:
+
+```text
+  Wf ≥ max_i(sx[i]) × 2^NL,x
+  Hf ≥ max_i(sy[i]) × 2^NL,y
+```
+
+A picture smaller than one fully-decomposed low-frequency sample in any
+component cannot carry the LL band the header declares, so the geometry
+is internally inconsistent and the stream is rejected.
+
+* +4 tests (573 → 577).
+
 ## Unreleased — round 376 (CBR Lcod self-length conformance enforced at decode)
 
 The decoder now validates the picture header's `Lcod` field — "the size

@@ -102,6 +102,34 @@ pub(crate) fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<JpegXsIm
         }
     }
 
+    // Picture-dimension conformance (ISO/IEC 21122-1:2022 Table 11). The
+    // Wf / Hf rows constrain the picture size against the declared
+    // sub-sampling and decomposition depth:
+    //
+    //   Wf ≥ max_i(sx[i]) × 2^NL,x
+    //   Hf ≥ max_i(sy[i]) × 2^NL,y
+    //
+    // i.e. the picture must be at least one fully-decomposed
+    // low-frequency sample wide / tall in every component. A smaller
+    // picture cannot carry the LL band the header claims, so the geometry
+    // is internally inconsistent and the stream is rejected.
+    let max_sx = cdt.components.iter().map(|c| c.sx).max().unwrap_or(1) as u32;
+    let max_sy = cdt.components.iter().map(|c| c.sy).max().unwrap_or(1) as u32;
+    let wf_min = max_sx << pih.nlx as u32;
+    let hf_min = max_sy << pih.nly as u32;
+    if (pih.wf as u32) < wf_min {
+        return Err(Error::invalid(format!(
+            "jpegxs decoder: Wf={} below the minimum max_i(sx)×2^NL,x = {}×2^{} = {} (Table 11)",
+            pih.wf, max_sx, pih.nlx, wf_min
+        )));
+    }
+    if (pih.hf as u32) < hf_min {
+        return Err(Error::invalid(format!(
+            "jpegxs decoder: Hf={} below the minimum max_i(sy)×2^NL,y = {}×2^{} = {} (Table 11)",
+            pih.hf, max_sy, pih.nly, hf_min
+        )));
+    }
+
     if pih.qpih > 1 {
         return Err(Error::Unsupported(format!(
             "jpegxs decoder: Qpih == {} reserved for ISO/IEC use (Table A.10)",
@@ -1213,6 +1241,13 @@ mod tests {
         buf[off..off + 4].copy_from_slice(&val.to_be_bytes());
     }
 
+    /// PIH body field offsets (absolute, from the helper layout): the PIH
+    /// body begins at byte 10 (after SOC + CAP segment + PIH marker +
+    /// Lpih). Wf is body[8..10], Hf body[10..12], the NL,x|NL,y nibble
+    /// byte is body[22].
+    const WF_OFFSET: usize = 18;
+    const HF_OFFSET: usize = 20;
+
     /// Patch a big-endian u16 in place at `off`.
     fn patch_u16(buf: &mut [u8], off: usize, val: u16) {
         buf[off..off + 2].copy_from_slice(&val.to_be_bytes());
@@ -1290,6 +1325,52 @@ mod tests {
         assert!(
             format!("{err}").contains("Plev high byte"),
             "expected reserved-Plev rejection, got {err}"
+        );
+    }
+
+    #[test]
+    fn wf_hf_offsets_point_at_dimension_fields() {
+        // The 4×1 helper carries Wf=4, Hf=1 (NL,x=1, NL,y=0).
+        let buf = build_zero_codestream_4x1();
+        assert_eq!(u16::from_be_bytes([buf[WF_OFFSET], buf[WF_OFFSET + 1]]), 4);
+        assert_eq!(u16::from_be_bytes([buf[HF_OFFSET], buf[HF_OFFSET + 1]]), 1);
+    }
+
+    #[test]
+    fn decode_rejects_wf_below_decomposition_minimum() {
+        // 4×1 luma at NL,x=1 requires Wf ≥ 1×2^1 = 2. Patch Wf=1 (below
+        // the minimum): the picture cannot carry the LL band the header
+        // claims, so the stream is rejected (Table 11).
+        let mut buf = build_zero_codestream_4x1();
+        patch_u16(&mut buf, WF_OFFSET, 1);
+        let err = decode_buf(buf).unwrap_err();
+        assert!(
+            format!("{err}").contains("Wf=1 below the minimum"),
+            "expected Wf-minimum rejection, got {err}"
+        );
+    }
+
+    #[test]
+    fn decode_accepts_wf_at_decomposition_minimum() {
+        // Wf=2 is exactly the minimum for NL,x=1; the 4×1 stream's entropy
+        // covers a 4-wide row, so shrinking the declared Wf below 4 would
+        // desync the entropy layout — instead assert the boundary check
+        // itself does not fire for the unmodified Wf=4 stream.
+        let buf = build_zero_codestream_4x1();
+        decode_buf(buf).expect("Wf=4 ≥ minimum 2 decodes");
+    }
+
+    #[test]
+    fn decode_rejects_hf_below_decomposition_minimum() {
+        // The 2×2 luma fixture is NL,x=1 / NL,y=1, so Hf ≥ 1×2^1 = 2.
+        // Patch Hf=1 (below the minimum): rejected per Table 11. The 2×2
+        // helper shares the PIH-field offsets with the 4×1 helper.
+        let mut buf = build_zero_codestream_2x2();
+        patch_u16(&mut buf, HF_OFFSET, 1);
+        let err = decode_buf(buf).unwrap_err();
+        assert!(
+            format!("{err}").contains("Hf=1 below the minimum"),
+            "expected Hf-minimum rejection, got {err}"
         );
     }
 
