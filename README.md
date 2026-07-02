@@ -117,6 +117,25 @@ Significance coding (`D[p,b] & 2`, Table C.5) is exercised end-to-end with
 encoder emits one `Z` bit per group and the decoder dispatches each to its
 `g / Ss` group span, round-tripping luma and RGB-with-RCT at `Ns ∈ {2, 3}`.
 
+Both **run modes** (`Rm`, Annex A.4.4 Table A.12) are emitted and decoded.
+`Rm = 0` (runs indicate zero prediction residuals) is the default: an
+insignificant significance group in vertical prediction reconstructs to
+`M = mtop` (the predictor), so the significance-flag encoder keeps a group
+significant whenever its predecessor `M > T`. `Rm = 1` (runs indicate zero
+coefficients) instead reconstructs an insignificant group to `M = T[p,b]`
+(`Δm = T − mtop`, Table C.13) regardless of the predictor, so both its
+bitplane-count VLC residual and its data are elided; a group is
+insignificant iff *all* its code groups satisfy `M ≤ T`. The
+`encode_planar_run_mode1` entry point (with `_highbd` / `_subsampled`
+compositions) drives `Rm = 1` across luma, RGB-with-RCT, high bit depth
+(`B[i] = 12`), 4:2:0 chroma, multi-significance-group (`Ns > 1`), deep
+odd-dimension cascades (`NL = 3`), and the `q = 0..=6` truncation ladder,
+each self-decoding bit-exactly at `q = 0`. The vertical-prediction
+`Rm = 1` decode branch is pinned by hand-built packet-body tests
+(`Mtop = (5, 4)` insignificant → `M = (0, 0)` under `Rm = 1` versus
+`M = (5, 4)` under `Rm = 0`). The reserved `Rm ∈ {2, 3}` are rejected on
+both the encode (`EncodeConfig::validate`) and decode (PIH parse) sides.
+
 When the picture-header `Rl = 0`, the decoder also enforces the Annex C.3
 raw-mode-consistency rule: a band's raw-mode flag `Dr[p,s]` must be
 identical across every packet that includes the band within a precinct
@@ -334,6 +353,7 @@ interleaved RGB, and generalised planar input, with `_lossy`,
 `_subsampled_nlt_quadratic`, `_subsampled_nlt_extended`,
 `_subsampled_nlt_quadratic_highbd`, `_subsampled_nlt_extended_highbd`,
 `_hsl_qslice`,
+`_run_mode1`, `_run_mode1_highbd`, `_run_mode1_subsampled`,
 `_qpr_rpr`, and `*_target_bytes` variants for the feature axes above. See
 the module docs for the exact signatures and scope per entry point.
 

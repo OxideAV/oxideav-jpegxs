@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased — round 382 (run mode Rm=1 — significance-dispatch + geometry coverage)
+
+Coverage deepening the `Rm = 1` significance path across the axes it must
+compose with:
+
+* **Multiple significance groups** (`Ns > 1`) — a 140-wide band at
+  `NL = 2` (LL width 35 `> Ng·Ss = 32`) exercises the per-group `Z`
+  dispatch under the zero-coefficient run mode.
+* **Deep odd-dimension cascade** (`NL = 3`, 67×83) — the §B.1
+  ceiling-sized band geometry and the cross-line vertical predictor
+  compose with `Rm = 1`.
+* **Truncation ladder** (`q = 0..=6`) — every quantization step decodes
+  through the standard path (the `M = T` insignificant reconstruction
+  never demands data the encoder omitted, so all length-conformance
+  gates pass), bit-exact at `q = 0`.
+
+* +3 tests (598 → 601). README documents the run-mode surface.
+
 ## Unreleased — round 382 (run mode Rm=1 — high-bit-depth + chroma-subsampled compositions)
 
 `Rm = 1` now composes with the two orthogonal feature axes the rest of

@@ -11687,6 +11687,59 @@ mod tests {
         assert_eq!(img.planes[2].data, cr, "Cr");
     }
 
+    /// `Rm = 1` with **multiple significance groups per band line**
+    /// (`Ns[p,b] = ⌈Wpb / (Ng·Ss)⌉ > 1`): a band wider than `Ng·Ss = 32`
+    /// code positions emits one `Z` bit per group, and under `Rm = 1` each
+    /// insignificant group independently collapses to `M = T`. Confirms the
+    /// per-group Z dispatch composes with the zero-coefficient run mode.
+    #[test]
+    fn rm1_multi_sig_group_ns2_round_trips() {
+        let (w, h) = (140u16, 64u16);
+        let px = make_vertical_structure(w as usize, h as usize);
+        // LL band at NL=2 is ceil(ceil(140/2)/2) = 35 > 32 → Ns = 2.
+        let ll = (w as usize).div_ceil(2).div_ceil(2);
+        assert!(ll.div_ceil(32) >= 2, "expected Ns>=2, got LL width {ll}");
+        let cs = encode_planar_run_mode1(w, h, 1, 0, 2, 2, 0, std::slice::from_ref(&px))
+            .expect("encode Rm=1 Ns=2");
+        assert_eq!(crate::codestream::parse(&cs).unwrap().pih.rm, 1);
+        let img = decode_codestream(&cs, None).expect("decode Rm=1 Ns=2");
+        assert_eq!(img.planes[0].data, px, "Rm=1 Ns=2 round-trip");
+    }
+
+    /// `Rm = 1` at a deeper wavelet cascade (`NL = 3`) with odd picture
+    /// dimensions: the §B.1 ceiling-sized band geometry and the cross-line
+    /// vertical predictor both compose with the zero-coefficient run mode.
+    #[test]
+    fn rm1_deep_cascade_odd_dims_round_trips() {
+        let (w, h) = (67u16, 83u16);
+        let px = make_vertical_structure(w as usize, h as usize);
+        let cs = encode_planar_run_mode1(w, h, 1, 0, 3, 3, 0, std::slice::from_ref(&px))
+            .expect("encode Rm=1 NL=3 odd");
+        assert_eq!(crate::codestream::parse(&cs).unwrap().pih.rm, 1);
+        let img = decode_codestream(&cs, None).expect("decode Rm=1 NL=3 odd");
+        assert_eq!(img.planes[0].data, px, "Rm=1 NL=3 odd-dim round-trip");
+    }
+
+    /// `Rm = 1` self-consistency across the truncation ladder: for every
+    /// `q ∈ 0..=6` the stream round-trips through the standard decode path
+    /// (bit-exact at `q = 0`, and always internally consistent — the
+    /// insignificant-group `M = T` reconstruction never demands data the
+    /// encoder did not emit, so the length-conformance gates all pass).
+    #[test]
+    fn rm1_truncation_ladder_all_q_decode() {
+        let (w, h) = (64u16, 96u16);
+        let px = make_vertical_structure(w as usize, h as usize);
+        for q in 0u8..=6 {
+            let cs = encode_planar_run_mode1(w, h, 1, 0, 2, 2, q, std::slice::from_ref(&px))
+                .unwrap_or_else(|e| panic!("encode Rm=1 q={q}: {e}"));
+            let img =
+                decode_codestream(&cs, None).unwrap_or_else(|e| panic!("decode Rm=1 q={q}: {e}"));
+            if q == 0 {
+                assert_eq!(img.planes[0].data, px, "Rm=1 q=0 bit-exact");
+            }
+        }
+    }
+
     /// `Rm = 2` / `Rm = 3` are reserved (Table A.12) — the config validator
     /// rejects them before any bytes are emitted.
     #[test]
