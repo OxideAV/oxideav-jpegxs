@@ -269,6 +269,29 @@ struct EncodeConfig {
     /// needed — this is a pure encoder rate-allocation lever. The
     /// bitstream-wire impact is only the per-precinct `R` byte.
     r_precincts: Vec<u8>,
+    /// Run mode (`Rm`, Annex A.4.4 Table A.12). Selects the interpretation
+    /// of an insignificant significance group in the *vertical-prediction*
+    /// bitplane-count mode (Table C.13):
+    ///
+    /// * `0` — runs indicate zero *prediction residuals*: an insignificant
+    ///   group reconstructs to `M = mtop` (the vertical predictor), so the
+    ///   data sub-packet may still carry its coefficients when `mtop > T`.
+    ///   The significance-flag computation therefore keeps a group
+    ///   *significant* whenever its predecessor's `M > T` (otherwise the
+    ///   reconstructed `M = mtop > T` would demand coefficient data the
+    ///   "insignificant" label omits).
+    /// * `1` — runs indicate zero *coefficients*: an insignificant group
+    ///   reconstructs to `M = T[p,b]` regardless of the predictor, so the
+    ///   data sub-packet omits it (`M > T` is false) and no VLC residual is
+    ///   coded either. A group is insignificant iff *all* its code groups
+    ///   satisfy `M ≤ T` (i.e. contain only zero quantization indices),
+    ///   which drops the `Rm = 0` predecessor guard and compresses the
+    ///   all-zero groups that vertically follow non-zero ones.
+    ///
+    /// The no-prediction mode (Table C.14) is `Rm`-independent (`mtop = T`,
+    /// so an insignificant group is always `M = T`). Values `2`/`3` are
+    /// reserved (rejected by [`EncodeConfig::validate`]). Default `0`.
+    rm: u8,
 }
 
 impl EncodeConfig {
@@ -277,6 +300,14 @@ impl EncodeConfig {
             return Err(Error::invalid(format!(
                 "jpegxs encoder: picture dimensions must be >= 2, got {}x{}",
                 self.width, self.height
+            )));
+        }
+        // Rm (Annex A.4.4 Table A.12): only 0 (zero prediction residual) and
+        // 1 (zero coefficients) are defined; 2/3 are reserved.
+        if self.rm > 1 {
+            return Err(Error::Unsupported(format!(
+                "jpegxs encoder: Rm must be 0 or 1 (Table A.12), got {}",
+                self.rm
             )));
         }
         // Round 9 (r91): Sd>0 enables Nc up to 8 (Annex A.4.1 hard cap).
@@ -953,6 +984,7 @@ pub fn encode_planar_star_tetrix_highbd(
         Vec::new(), // q_precincts: no per-precinct override
         Vec::new(), // r_precincts: no per-precinct R[p] override
         &byte_planes,
+        0, // rm = 0 (zero-prediction-residual significance)
     )
 }
 
@@ -1075,6 +1107,7 @@ pub fn encode_planar_star_tetrix_highbd_lossy(
         Vec::new(), // q_precincts: no per-precinct override
         Vec::new(), // r_precincts: no per-precinct R[p] override
         &byte_planes,
+        0, // rm = 0 (zero-prediction-residual significance)
     )
 }
 
@@ -1150,6 +1183,7 @@ pub fn encode_planar_sd_star_tetrix_highbd(
         Vec::new(), // q_precincts
         Vec::new(), // r_precincts
         &byte_planes,
+        0, // rm = 0 (zero-prediction-residual significance)
     )
 }
 
@@ -1241,6 +1275,7 @@ pub fn encode_planar_star_tetrix_highbd_annex_h(
         Vec::new(), // q_precincts
         Vec::new(), // r_precincts
         &byte_planes,
+        0, // rm = 0 (zero-prediction-residual significance)
     )
 }
 
@@ -1315,6 +1350,69 @@ pub fn encode_planar_lossy(
     let fq = 0; // integer-transform path; quantisation via T[p,b], Fq=0 (Table A.8)
     encode_planar_inner(
         width, height, nc, cpih, nlx, nly, fq, q, &sx, &sy, 0, 0, 0, 0, planes,
+    )
+}
+
+/// Run-mode-1 (`Rm = 1`) entry point — signals the ISO/IEC 21122-1:2022
+/// Table A.12 "runs indicate zero coefficients" significance
+/// interpretation.
+///
+/// Identical to [`encode_planar_lossy`] (8-bit planar, `Cpih ∈ {0, 1}`,
+/// linear scaling, deadzone quantiser) except that the picture header
+/// carries `Rm = 1` and the vertical-prediction significance coding drops
+/// the `Rm = 0` predecessor guard: a code group is insignificant iff *all*
+/// its coefficients are zero after truncation (`M ≤ T`), and the decoder
+/// reconstructs such a group as `M = T[p,b]` (Table C.13, `Δm = T − mtop`)
+/// so both its VLC bitplane-count residual and its data are elided. On
+/// content with vertical structure — a non-zero band region followed by an
+/// all-zero one — this compresses at least as well as `Rm = 0` (never
+/// worse, since the encoder still picks the smallest per-band `D[p,b]`
+/// form) while remaining bit-exact for `q = 0`.
+///
+/// `q` is the precinct quantization step (`0..=15`; `0` = lossless).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_run_mode1(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    q: u8,
+    planes: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    let sx = vec![1u8; nc as usize];
+    let sy = vec![1u8; nc as usize];
+    encode_planar_inner_bd(
+        width,
+        height,
+        nc,
+        8,
+        cpih,
+        nlx,
+        nly,
+        0, // fq = 0 (integer transform; quantisation via T[p,b])
+        q,
+        &sx,
+        &sy,
+        0,
+        0,
+        0,
+        0,
+        None,
+        Vec::new(),
+        Vec::new(),
+        0,          // cw
+        0,          // sd
+        0,          // fs
+        0,          // hsl
+        0,          // qpih (deadzone)
+        0,          // rp
+        Vec::new(), // q_slices
+        Vec::new(), // q_precincts
+        Vec::new(), // r_precincts
+        planes,
+        1, // rm = 1 (zero-coefficient significance)
     )
 }
 
@@ -1671,6 +1769,7 @@ pub fn encode_planar_highbd(
         Vec::new(), // q_precincts: no per-precinct override
         Vec::new(), // r_precincts: no per-precinct R[p] override
         &byte_planes,
+        0, // rm = 0 (zero-prediction-residual significance)
     )
 }
 
@@ -1771,6 +1870,7 @@ pub fn encode_planar_highbd_lossy(
         Vec::new(), // q_precincts: no per-precinct override
         Vec::new(), // r_precincts: no per-precinct R[p] override
         &byte_planes,
+        0, // rm = 0 (zero-prediction-residual significance)
     )
 }
 
@@ -1862,6 +1962,7 @@ pub fn encode_planar_subsampled_highbd(
         Vec::new(), // q_precincts: no per-precinct override
         Vec::new(), // r_precincts: no per-precinct R[p] override
         &byte_planes,
+        0, // rm = 0 (zero-prediction-residual significance)
     )
 }
 
@@ -1951,6 +2052,7 @@ pub fn encode_planar_subsampled_highbd_lossy(
         Vec::new(), // q_precincts: no per-precinct override
         Vec::new(), // r_precincts: no per-precinct R[p] override
         &byte_planes,
+        0, // rm = 0 (zero-prediction-residual significance)
     )
 }
 
@@ -2095,6 +2197,7 @@ pub fn encode_planar_subsampled_highbd_annex_h(
         Vec::new(), // q_precincts
         Vec::new(), // r_precincts
         &byte_planes,
+        0, // rm = 0 (zero-prediction-residual significance)
     )
 }
 
@@ -3573,6 +3676,7 @@ pub fn encode_planar_hsl_qslice_rp_highbd(
         Vec::new(), // q_precincts: no per-precinct override
         Vec::new(), // r_precincts: no per-precinct R[p] override
         &byte_planes,
+        0, // rm = 0 (zero-prediction-residual significance)
     )
 }
 
@@ -4822,6 +4926,7 @@ pub fn encode_planar_nlt_quadratic_highbd(
         Vec::new(), // q_precincts: no per-precinct override
         Vec::new(), // r_precincts: no per-precinct R[p] override
         &byte_planes,
+        0, // rm = 0 (zero-prediction-residual significance)
     )
 }
 
@@ -4914,6 +5019,7 @@ pub fn encode_planar_subsampled_nlt_quadratic_highbd(
         Vec::new(), // q_precincts: no per-precinct override
         Vec::new(), // r_precincts: no per-precinct R[p] override
         &byte_planes,
+        0, // rm = 0 (zero-prediction-residual significance)
     )
 }
 
@@ -5036,6 +5142,7 @@ pub fn encode_planar_nlt_extended_highbd(
         Vec::new(), // q_precincts: no per-precinct override
         Vec::new(), // r_precincts: no per-precinct R[p] override
         &byte_planes,
+        0, // rm = 0 (zero-prediction-residual significance)
     )
 }
 
@@ -5139,6 +5246,7 @@ pub fn encode_planar_subsampled_nlt_extended_highbd(
         Vec::new(), // q_precincts: no per-precinct override
         Vec::new(), // r_precincts: no per-precinct R[p] override
         &byte_planes,
+        0, // rm = 0 (zero-prediction-residual significance)
     )
 }
 
@@ -5223,6 +5331,9 @@ fn encode_planar_inner_nlt(
     planes: &[Vec<u8>],
 ) -> Result<Vec<u8>> {
     // 8-bit path: B[i] = 8, Bw = 8 (or 18 with NLT pre-distortion).
+    // Run mode fixed at Rm = 0 (zero-prediction-residual significance) for
+    // the NLT/generic funnel; the Rm = 1 entry point calls
+    // `encode_planar_inner_bd` directly.
     encode_planar_inner_bd(
         width,
         height,
@@ -5252,6 +5363,7 @@ fn encode_planar_inner_nlt(
         q_precincts,
         r_precincts,
         planes,
+        0, // rm = 0 (zero-prediction-residual significance)
     )
 }
 
@@ -5296,6 +5408,7 @@ fn encode_planar_inner_bd(
     q_precincts: Vec<u8>,
     r_precincts: Vec<u8>,
     planes: &[Vec<u8>],
+    rm: u8,
 ) -> Result<Vec<u8>> {
     if !(8..=16).contains(&bd) {
         return Err(Error::Unsupported(format!(
@@ -5391,6 +5504,7 @@ fn encode_planar_inner_bd(
         q_slices,
         q_precincts,
         r_precincts,
+        rm,
     };
     cfg.validate()?;
     // Build per-band gains and priorities after validation so beta_key /
@@ -5650,8 +5764,11 @@ fn write_pih_body(out: &mut Vec<u8>, cfg: &EncodeConfig) {
     // automatically because each packet's chosen size never exceeds its raw
     // size. Signal `Rl = 1` so the construction is conformant and the
     // decoder's Annex C.3 consistency gate does not reject the encoder's own
-    // streams. `Lh`/`Rm` stay 0.
-    out.push((1 << 6) | ((cfg.qpih & 0x03) << 4) | ((cfg.fs & 0x03) << 2));
+    // streams. `Lh` stays 0. `Rm` (bits 1:0, Table A.12) selects the
+    // insignificant-group interpretation in vertical prediction — the
+    // encoder emits `Rm = 0` (zero prediction residual) by default and
+    // `Rm = 1` (zero coefficients) via the run-mode-1 entry point.
+    out.push((1 << 6) | ((cfg.qpih & 0x03) << 4) | ((cfg.fs & 0x03) << 2) | (cfg.rm & 0x03));
 }
 
 /// Build a slice-local `EncodeConfig` whose `q` is overridden by the
@@ -8167,10 +8284,22 @@ fn build_packet_body_with_m(
                         // above the emitted data — keep such groups
                         // significant so the VLC carries the true
                         // (negative) residual instead.
-                        if let Some(pred) = vert_predecessor {
-                            let pred_m = &pred[entry_idx];
-                            if pred_m[g0..g1.min(pred_m.len())].iter().any(|&m| m > t) {
-                                return true;
+                        //
+                        // Under Rm = 1 (runs indicate zero coefficients)
+                        // the decoder instead reconstructs an
+                        // insignificant group as M = T[p,b] (Δm = T − mtop,
+                        // Table C.13) regardless of the predictor, so the
+                        // data sub-packet omits it and this guard is not
+                        // needed — an all-zero group vertically following a
+                        // non-zero one is flagged insignificant and its VLC
+                        // residual is elided, which the Rm = 0 guard would
+                        // have spent bits on.
+                        if cfg.rm != 1 {
+                            if let Some(pred) = vert_predecessor {
+                                let pred_m = &pred[entry_idx];
+                                if pred_m[g0..g1.min(pred_m.len())].iter().any(|&m| m > t) {
+                                    return true;
+                                }
                             }
                         }
                         false
@@ -11278,6 +11407,153 @@ mod tests {
         assert_eq!(img.planes[0].data, pixels, "Ns=2 NL=2 round-trip");
     }
 
+    // === Run mode Rm=1 (Annex A.4.4 Table A.12, C.6.5) =================
+
+    /// Content with strong vertical structure at the top and an all-zero
+    /// (flat) region below — the case where `Rm = 1`'s zero-coefficient
+    /// significance elides more than `Rm = 0`'s zero-residual guard.
+    fn make_vertical_structure(w: usize, h: usize) -> Vec<u8> {
+        let mut px = vec![128u8; w * h];
+        for y in 0..(h / 3).max(1) {
+            for x in 0..w {
+                px[y * w + x] = if (x + y) & 1 == 0 { 40 } else { 200 };
+            }
+        }
+        px
+    }
+
+    /// `Rm = 1` luma round-trips losslessly and the PIH carries the run
+    /// mode (`rm == 1`, Table A.12).
+    #[test]
+    fn rm1_luma_lossless_round_trips_and_signals() {
+        let (w, h) = (64u16, 64u16);
+        let px = make_vertical_structure(w as usize, h as usize);
+        let cs = encode_planar_run_mode1(w, h, 1, 0, 2, 2, 0, std::slice::from_ref(&px))
+            .expect("encode Rm=1 luma");
+        let parsed = crate::codestream::parse(&cs).expect("parse Rm=1 codestream");
+        assert_eq!(parsed.pih.rm, 1, "PIH should report Rm=1");
+        let img = decode_codestream(&cs, None).expect("decode Rm=1 luma");
+        assert_eq!(img.planes[0].data, px, "Rm=1 luma lossless round-trip");
+    }
+
+    /// `Rm = 1` never encodes larger than `Rm = 0` on the same content: the
+    /// per-band `D[p,b]` picker keeps the smallest form, and dropping the
+    /// zero-residual guard only ever removes VLC residuals + data bytes for
+    /// all-zero groups that vertically follow non-zero ones.
+    #[test]
+    fn rm1_no_larger_than_rm0() {
+        let (w, h) = (64u16, 96u16);
+        let px = make_vertical_structure(w as usize, h as usize);
+        let rm0 = encode_planar(w, h, 1, 0, 2, 2, std::slice::from_ref(&px)).expect("Rm=0");
+        let rm1 =
+            encode_planar_run_mode1(w, h, 1, 0, 2, 2, 0, std::slice::from_ref(&px)).expect("Rm=1");
+        assert!(
+            rm1.len() <= rm0.len(),
+            "Rm=1 ({} B) must not exceed Rm=0 ({} B)",
+            rm1.len(),
+            rm0.len()
+        );
+        // Both are bit-exact lossless.
+        assert_eq!(
+            decode_codestream(&rm1, None).expect("dec Rm=1").planes[0].data,
+            px
+        );
+        assert_eq!(
+            decode_codestream(&rm0, None).expect("dec Rm=0").planes[0].data,
+            px
+        );
+    }
+
+    /// `Rm = 1` composes with the reversible colour transform (`Cpih = 1`)
+    /// across three components, lossless.
+    #[test]
+    fn rm1_rgb_rct_lossless_round_trips() {
+        let (w, h) = (64u16, 64u16);
+        let base = make_vertical_structure(w as usize, h as usize);
+        let r = base.clone();
+        let g: Vec<u8> = base.iter().map(|&v| v.saturating_add(5)).collect();
+        let b: Vec<u8> = base.iter().map(|&v| v.saturating_sub(5)).collect();
+        let planes = [r.clone(), g.clone(), b.clone()];
+        let cs = encode_planar_run_mode1(w, h, 3, 1, 2, 2, 0, &planes).expect("encode Rm=1 RGB");
+        assert_eq!(crate::codestream::parse(&cs).unwrap().pih.rm, 1);
+        let img = decode_codestream(&cs, None).expect("decode Rm=1 RGB");
+        assert_eq!(img.planes[0].data, r, "R plane");
+        assert_eq!(img.planes[1].data, g, "G plane");
+        assert_eq!(img.planes[2].data, b, "B plane");
+    }
+
+    /// `Rm = 1` lossy (`q > 0`) round-trips within a PSNR floor — the
+    /// insignificant-group `M = T` reconstruction is exactly the zero the
+    /// data sub-packet would have decoded anyway.
+    #[test]
+    fn rm1_lossy_round_trips_within_psnr() {
+        let (w, h) = (64u16, 64u16);
+        let px = make_vertical_structure(w as usize, h as usize);
+        let cs = encode_planar_run_mode1(w, h, 1, 0, 2, 2, 2, std::slice::from_ref(&px))
+            .expect("encode Rm=1 lossy");
+        assert_eq!(crate::codestream::parse(&cs).unwrap().pih.rm, 1);
+        let img = decode_codestream(&cs, None).expect("decode Rm=1 lossy");
+        let mut sse = 0.0f64;
+        for (a, b) in px.iter().zip(img.planes[0].data.iter()) {
+            let d = *a as f64 - *b as f64;
+            sse += d * d;
+        }
+        let mse = sse / (w as f64 * h as f64);
+        let psnr = 10.0 * (255.0f64 * 255.0 / mse).log10();
+        assert!(
+            psnr >= 25.0,
+            "Rm=1 lossy PSNR {psnr:.2} dB below 25 dB floor"
+        );
+    }
+
+    /// `Rm = 2` / `Rm = 3` are reserved (Table A.12) — the config validator
+    /// rejects them before any bytes are emitted.
+    #[test]
+    fn rm_reserved_values_rejected() {
+        let px = vec![128u8; 8 * 8];
+        // Reach the validator via a hand-built config (the public entry
+        // points only ever set 0 or 1).
+        let cfg = EncodeConfig {
+            width: 8,
+            height: 8,
+            nc: 1,
+            bit_depth: 8,
+            bw: 8,
+            ng: 4,
+            ss: 8,
+            br: 8,
+            nlx: 1,
+            nly: 1,
+            cpih: 0,
+            qpih: 0,
+            fs: 0,
+            fq: 0,
+            q: 0,
+            sx: vec![1],
+            sy: vec![1],
+            cts_e1: 0,
+            cts_e2: 0,
+            cts_cf: 0,
+            st_ct: 0,
+            nlt: None,
+            band_gains: vec![],
+            band_priorities: vec![],
+            rp: 0,
+            cw: 0,
+            sd: 0,
+            hsl: 0,
+            q_slices: Vec::new(),
+            q_precincts: Vec::new(),
+            r_precincts: Vec::new(),
+            rm: 2,
+        };
+        let _ = &px;
+        assert!(
+            cfg.validate().is_err(),
+            "Rm=2 must be rejected (Table A.12)"
+        );
+    }
+
     /// `Ns > 1` composed with three-component RGB + the reversible colour
     /// transform (Cpih = 1): each colour plane independently carries
     /// multi-significance-group band lines, and the inverse RCT recombines
@@ -12724,6 +13000,7 @@ mod tests {
             q_slices: Vec::new(),
             q_precincts: Vec::new(),
             r_precincts: Vec::new(),
+            rm: 0,
         };
         let entries = vec![
             PerBandEntry {

@@ -1119,6 +1119,148 @@ mod tests {
         assert_eq!(band_m(&dec), vec![3, 3]);
     }
 
+    /// Run mode `Rm = 1` (Table A.12 / C.6.5): an insignificant significance
+    /// group in the vertical-prediction bitplane-count mode reconstructs to
+    /// `M = T[p,b]` — `Δm = T − mtop` — **regardless of the predictor**,
+    /// unlike `Rm = 0` which infers `M = mtop`. The data sub-packet then
+    /// omits the group (`M = T` is not `> T`).
+    ///
+    /// Geometry: 1 band, `wpb = 8` → `Ncg = 2`, `Ss = 8` → `Ns = 1` (one
+    /// significance group covering both code groups), `D = 3` (significance
+    /// with vertical prediction), `Dr = 0`. The precinct above carries the
+    /// predictor `Mtop = (5, 4)` (both `> T = 0`); under `Rm = 1` the whole
+    /// group is signalled insignificant (`Z = 1`) yet still collapses to
+    /// `M = 0`.
+    #[test]
+    fn rm1_vertical_insignificant_group_reconstructs_to_t() {
+        let geom = PrecinctGeometry {
+            bands: vec![BandGeometry {
+                wpb: 8,
+                gain: 0,
+                priority: 0,
+                l0: 0,
+                l1: 1,
+                exists: true,
+            }],
+            ng: 4,
+            ss: 8,
+            br: 4,
+            fs: 0,
+            rm: 1,
+            rl: 0,
+            lh: 0,
+            short_packet_header: true,
+        };
+        let layout = PacketLayout {
+            entries: vec![PacketEntry { band: 0, line: 0 }],
+        };
+        // D = 3 → significance + vertical prediction.
+        let precinct = PrecinctHeader {
+            lprc: 1,
+            q: 0,
+            r: 0,
+            d: vec![0b11],
+            header_bytes: 0,
+        };
+        // Predecessor last-line counts both exceed T → mtop = [5, 4].
+        let top = PrecinctTop {
+            last_m: vec![vec![5u8, 4]],
+            t: vec![0u8],
+        };
+        // Significance sub-packet: 1 bit = 1 (Z = 1, insignificant group),
+        // padded to 0x80. Count sub-packet: no VLC (Δm implied). Data: none.
+        let body: Vec<u8> = vec![0x80];
+        let packet = PacketHeader {
+            dr: 0,
+            ldat: 0,
+            lcnt: 0,
+            lsgn: 0,
+            short_form: true,
+            header_bytes: 5,
+        };
+        let mut state = PrecinctState::default();
+        let dec = decode_packet_body(
+            &body,
+            &geom,
+            &precinct,
+            &packet,
+            &layout,
+            &mut state,
+            Some(&top),
+        )
+        .expect("Rm=1 insignificant vertical-prediction decode");
+        assert_eq!(dec.bytes_consumed, 1);
+        // Rm=1: both code groups collapse to M = T = 0 (not the [5, 4]
+        // predictor that Rm=0 would have inferred).
+        assert_eq!(band_m(&dec), vec![0, 0]);
+        assert!(dec.bands[0].v.iter().all(|&v| v == 0));
+    }
+
+    /// Companion contrast: the identical `Mtop = [5, 4]` predecessor and an
+    /// insignificant group under `Rm = 0` instead reconstructs `M = mtop`,
+    /// so the data sub-packet carries both groups' coefficients. This pins
+    /// the `Rm` branch as behaviourally load-bearing (Table C.13).
+    #[test]
+    fn rm0_vertical_insignificant_group_reconstructs_to_mtop() {
+        let geom = PrecinctGeometry {
+            bands: vec![BandGeometry {
+                wpb: 8,
+                gain: 0,
+                priority: 0,
+                l0: 0,
+                l1: 1,
+                exists: true,
+            }],
+            ng: 4,
+            ss: 8,
+            br: 4,
+            fs: 0,
+            rm: 0,
+            rl: 0,
+            lh: 0,
+            short_packet_header: true,
+        };
+        let layout = PacketLayout {
+            entries: vec![PacketEntry { band: 0, line: 0 }],
+        };
+        let precinct = PrecinctHeader {
+            lprc: 1,
+            q: 0,
+            r: 0,
+            d: vec![0b11],
+            header_bytes: 0,
+        };
+        let top = PrecinctTop {
+            last_m: vec![vec![5u8, 4]],
+            t: vec![0u8],
+        };
+        // Significance byte 0x80 (Z = 1). Data sub-packet (Fs=0, Table C.8):
+        // each group with M>T emits Ng signs + (M−T)·Ng magnitude bits =
+        // Ng·(1 + M − T). g0: 4·(1+5) = 24 bits; g1: 4·(1+4) = 20 bits;
+        // total 44 bits → 6 bytes (all-zero coefficients → all-zero bits).
+        let body: Vec<u8> = vec![0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let packet = PacketHeader {
+            dr: 0,
+            ldat: 6,
+            lcnt: 0,
+            lsgn: 0,
+            short_form: true,
+            header_bytes: 5,
+        };
+        let mut state = PrecinctState::default();
+        let dec = decode_packet_body(
+            &body,
+            &geom,
+            &precinct,
+            &packet,
+            &layout,
+            &mut state,
+            Some(&top),
+        )
+        .expect("Rm=0 insignificant vertical-prediction decode");
+        assert_eq!(band_m(&dec), vec![5, 4]);
+    }
+
     /// Vertical prediction selected at a first-line band with NO
     /// predecessor (`top = None`) is a malformed codestream per §C.6.1 /
     /// §C.6.3 (vertical prediction is forbidden at the topmost precinct

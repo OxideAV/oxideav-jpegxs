@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased — round 382 (run mode Rm=1 — encoder emission + decode-path coverage)
+
+The decoder has long carried the `Rm = 1` (Table A.12, "runs indicate
+zero coefficients") branch of the vertical-prediction bitplane-count
+decoder (C.6.5 Table C.13, `Δm = T − mtop` for an insignificant group),
+but no encoder ever produced an `Rm = 1` stream, so that branch was
+never exercised end-to-end. This round closes the loop:
+
+* **Encoder** — `EncodeConfig` gains an `rm` field (default 0), emitted
+  in the PIH `Lh:Rl:Qpih:Fs:Rm` byte. When `rm == 1` the significance
+  computation drops the `Rm = 0` predecessor guard: a code group is
+  insignificant iff *all* its coefficients are zero after truncation
+  (`M ≤ T`), and the decoder then reconstructs it to `M = T[p,b]`
+  (data + VLC residual both elided). The new
+  `encode_planar_run_mode1(w, h, nc, cpih, nlx, nly, q, planes)` entry
+  point (8-bit planar, `Cpih ∈ {0, 1}`, lossless / lossy) selects it.
+  `EncodeConfig::validate` rejects the reserved `Rm ∈ {2, 3}`.
+* **Coverage** — round-trip tests (luma, RGB+RCT, lossy PSNR) confirm
+  `Rm = 1` self-decodes bit-exactly at `q = 0`, plus two hand-built
+  packet-body decode tests that pin the branch as behaviourally
+  load-bearing: the same `Mtop = (5, 4)` insignificant group
+  reconstructs to `M = (0, 0)` under `Rm = 1` versus `M = (5, 4)` under
+  `Rm = 0`. `Rm = 1` never encodes larger than `Rm = 0` on the same
+  content (the per-band `D[p,b]` picker keeps the smallest form).
+
+* +7 tests (589 → 596).
+
 ## Unreleased — round 376 (Full sublevel requires a non-unrestricted profile)
 
 Enforces §A.4.2: "The Full sublevel shall only be used if the profile
