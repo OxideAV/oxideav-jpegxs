@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased — round 382 (run mode Rm=1 — high-bit-depth + chroma-subsampled compositions)
+
+`Rm = 1` now composes with the two orthogonal feature axes the rest of
+the crate carries, matching the established composition pattern:
+
+* `encode_planar_run_mode1_highbd(w, h, nc, cpih, nlx, nly, bd, planes)`
+  — `B[i] ∈ 9..=16`, `u16`-LE planes. `Rm` gates only the
+  insignificant-group `M` reconstruction, which is bit-depth-independent,
+  so the zero-coefficient significance runs over the wider `Bw = bd`
+  wavelet domain unchanged (verified bit-exact at `B[i] = 12`).
+* `encode_planar_run_mode1_subsampled(w, h, nc, cpih, nlx, nly, q, sx,
+  sy, planes)` — 4:2:2 / 4:2:0 sampling. A `sy = 2` component decomposes
+  one vertical level shallower, so the insignificant-group logic runs
+  across the mixed-depth band cascade (verified bit-exact for 4:2:0).
+
+* +2 tests (596 → 598).
+
 ## Unreleased — round 382 (run mode Rm=1 — encoder emission + decode-path coverage)
 
 The decoder has long carried the `Rm = 1` (Table A.12, "runs indicate

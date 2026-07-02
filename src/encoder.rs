@@ -1416,6 +1416,135 @@ pub fn encode_planar_run_mode1(
     )
 }
 
+/// Run-mode-1 (`Rm = 1`) high-bit-depth entry point — the `Rm = 1`
+/// composition of [`encode_planar_highbd`]. Component bit depth
+/// `bd ∈ 9..=16`, `u16`-LE planes, `Cpih ∈ {0, 1}`, lossless. The
+/// zero-coefficient significance semantics operate on the wider (`Bw = bd`)
+/// wavelet coefficients unchanged (`Rm` gates only the insignificant-group
+/// `M` reconstruction, which is bit-depth-independent).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_run_mode1_highbd(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    bd: u8,
+    planes: &[Vec<u16>],
+) -> Result<Vec<u8>> {
+    if !(9..=16).contains(&bd) {
+        return Err(Error::Unsupported(format!(
+            "jpegxs encoder: encode_planar_run_mode1_highbd requires B[i] in 9..=16, got {bd}"
+        )));
+    }
+    if cpih != 0 && cpih != 1 {
+        return Err(Error::Unsupported(format!(
+            "jpegxs encoder: encode_planar_run_mode1_highbd supports Cpih in {{0, 1}}, got {cpih}"
+        )));
+    }
+    let max_sample: u16 = ((1u32 << bd) - 1) as u16;
+    let mut byte_planes: Vec<Vec<u8>> = Vec::with_capacity(planes.len());
+    for (i, p) in planes.iter().enumerate() {
+        let mut bytes = Vec::with_capacity(p.len() * 2);
+        for &s in p {
+            if s > max_sample {
+                return Err(Error::invalid(format!(
+                    "jpegxs encoder: plane {i} sample {s} exceeds B[i]={bd} max {max_sample}"
+                )));
+            }
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        byte_planes.push(bytes);
+    }
+    let sx = vec![1u8; nc as usize];
+    let sy = vec![1u8; nc as usize];
+    encode_planar_inner_bd(
+        width,
+        height,
+        nc,
+        bd,
+        cpih,
+        nlx,
+        nly,
+        0, // fq = 0 (lossless)
+        0, // q = 0 (lossless)
+        &sx,
+        &sy,
+        0,
+        0,
+        0,
+        0,
+        None,
+        Vec::new(),
+        Vec::new(),
+        0,          // cw
+        0,          // sd
+        0,          // fs
+        0,          // hsl
+        0,          // qpih (deadzone)
+        0,          // rp
+        Vec::new(), // q_slices
+        Vec::new(), // q_precincts
+        Vec::new(), // r_precincts
+        &byte_planes,
+        1, // rm = 1 (zero-coefficient significance)
+    )
+}
+
+/// Run-mode-1 (`Rm = 1`) chroma-subsampled entry point — the `Rm = 1`
+/// composition of [`encode_planar_subsampled`]. `sx`/`sy` give the
+/// per-component sampling factors (`∈ {1, 2}`); `Cpih ∈ {0}` (RCT is
+/// rejected on sub-sampled inputs per Annex F.2). `q` is the precinct
+/// quantization step (`0` = lossless). A `sy = 2` component decomposes one
+/// vertical level shallower, so the `Rm = 1` insignificant-group logic runs
+/// across the mixed-depth band cascade.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_run_mode1_subsampled(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    q: u8,
+    sx: &[u8],
+    sy: &[u8],
+    planes: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    encode_planar_inner_bd(
+        width,
+        height,
+        nc,
+        8,
+        cpih,
+        nlx,
+        nly,
+        0, // fq = 0 (integer transform)
+        q,
+        sx,
+        sy,
+        0,
+        0,
+        0,
+        0,
+        None,
+        Vec::new(),
+        Vec::new(),
+        0,          // cw
+        0,          // sd
+        0,          // fs
+        0,          // hsl
+        0,          // qpih (deadzone)
+        0,          // rp
+        Vec::new(), // q_slices
+        Vec::new(), // q_precincts
+        Vec::new(), // r_precincts
+        planes,
+        1, // rm = 1 (zero-coefficient significance)
+    )
+}
+
 /// High-precision lossy entry point — the ISO/IEC 21122-1:2022 Table A.8
 /// `(Bw = 20, Fq = 8)` regular case.
 ///
@@ -11504,6 +11633,58 @@ mod tests {
             psnr >= 25.0,
             "Rm=1 lossy PSNR {psnr:.2} dB below 25 dB floor"
         );
+    }
+
+    /// `Rm = 1` composed with high bit depth (`B[i] = 12`, `u16`-LE planes):
+    /// the zero-coefficient significance operates on the wider wavelet
+    /// domain and self-decodes bit-exactly.
+    #[test]
+    fn rm1_highbd_12bit_lossless_round_trips() {
+        let (w, h) = (48u16, 64u16);
+        let base = make_vertical_structure(w as usize, h as usize);
+        let plane: Vec<u16> = base.iter().map(|&v| (v as u16) << 4).collect();
+        let cs = encode_planar_run_mode1_highbd(w, h, 1, 0, 2, 2, 12, std::slice::from_ref(&plane))
+            .expect("encode Rm=1 12-bit");
+        let parsed = crate::codestream::parse(&cs).expect("parse");
+        assert_eq!(parsed.pih.rm, 1, "PIH Rm=1");
+        assert_eq!(parsed.pih.bw, 12, "Bw = B[i] = 12");
+        let img = decode_codestream(&cs, None).expect("decode Rm=1 12-bit");
+        let out: Vec<u16> = img.planes[0]
+            .data
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(out, plane, "Rm=1 12-bit lossless round-trip");
+    }
+
+    /// `Rm = 1` composed with 4:2:0 chroma sub-sampling: a `sy = 2`
+    /// component decomposes one vertical level shallower, so the
+    /// insignificant-group reconstruction runs across the mixed-depth
+    /// cascade. Lossless self-decode.
+    #[test]
+    fn rm1_subsampled_420_lossless_round_trips() {
+        let (w, h) = (64u16, 64u16);
+        let luma = make_vertical_structure(w as usize, h as usize);
+        let cw = (w / 2) as usize;
+        let ch = (h / 2) as usize;
+        let mut cb = vec![128u8; cw * ch];
+        let mut cr = vec![110u8; cw * ch];
+        for y in 0..ch / 3 {
+            for x in 0..cw {
+                cb[y * cw + x] = if x & 1 == 0 { 90 } else { 160 };
+                cr[y * cw + x] = if x & 1 == 0 { 150 } else { 70 };
+            }
+        }
+        let sx = [1u8, 2, 2];
+        let sy = [1u8, 2, 2];
+        let planes = [luma.clone(), cb.clone(), cr.clone()];
+        let cs = encode_planar_run_mode1_subsampled(w, h, 3, 0, 2, 2, 0, &sx, &sy, &planes)
+            .expect("encode Rm=1 4:2:0");
+        assert_eq!(crate::codestream::parse(&cs).unwrap().pih.rm, 1);
+        let img = decode_codestream(&cs, None).expect("decode Rm=1 4:2:0");
+        assert_eq!(img.planes[0].data, luma, "luma");
+        assert_eq!(img.planes[1].data, cb, "Cb");
+        assert_eq!(img.planes[2].data, cr, "Cr");
     }
 
     /// `Rm = 2` / `Rm = 3` are reserved (Table A.12) — the config validator
