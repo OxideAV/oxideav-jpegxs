@@ -1,5 +1,7 @@
 # oxideav-jpegxs
 
+[![CI](https://github.com/OxideAV/oxideav-jpegxs/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-jpegxs/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-jpegxs.svg)](https://crates.io/crates/oxideav-jpegxs) [![docs.rs](https://docs.rs/oxideav-jpegxs/badge.svg)](https://docs.rs/oxideav-jpegxs) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust **JPEG XS** — ISO/IEC 21122 low-latency image codec for
 production / IP video (SMPTE ST 2110-22, AES67-style live workflows).
 Built clean-room from the ISO/IEC 21122 specification documents under
