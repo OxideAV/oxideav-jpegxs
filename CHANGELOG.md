@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased — round 398 (transport: Exif box in the JPEG XS Header box)
+
+Recognises the last defined box that was previously silently dropped: the
+`exif` box (ISO/IEC 21122-3:2019 A.5.4 Table A.2) inside the JPEG XS
+Header superbox (`jp2h`).
+
+* **Reader** surfaces the opaque EXIF payload as `HeaderBox::exif`
+  (`Option<Vec<u8>>`); the EXIF contents themselves stay opaque.
+* **Writer** gains `JxsFileBuilder::exif(...)`, emitting the box inside
+  `jp2h` after the Channel Definition box.
+
+* +2 tests (616 → 618). Every box the 21122-3 Annex A file format defines
+  is now recognised by the parser.
+
 ## Unreleased — round 398 (transport: `bmdm` Buffer Model Description box)
 
 Completes all five ISO/IEC 21122-3:2019 A.5.3 boxes of the JPEG XS Video

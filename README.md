@@ -290,9 +290,10 @@ box next, Header box before the first Contiguous Codestream box), skips
 unknown boxes (A.6), and surfaces typed bodies for the File Type box,
 Image Header box (`ihdr`, with the Table A.17 sign-flag / varying-depth /
 bit-depth decoding), Colour Specification box (`colr` CICP code points),
-Channel Definition box (`cdef`), Profile/Level box (`jxpl`), and the
-**Video Information box** (`jpvi`, A.5.3.2) from the Video Support
-superbox. The `jpvi` decode is a fully typed `VideoInformation` view of
+Channel Definition box (`cdef`), the Exif box (`exif`, opaque payload),
+Profile/Level box (`jxpl`), and the **Video Information box** (`jpvi`,
+A.5.3.2) from the Video Support superbox. Every box the 21122-3 Annex A
+file format defines is recognised. The `jpvi` decode is a fully typed `VideoInformation` view of
 Table A.5: `brat` max bit rate, the `frat` frame-rate rational with its
 `InterlaceMode` (Table A.7) / `FrameRateDenominator` (1.000 / 1.001,
 Table A.8) / numerator sub-fields and the `frat = 0` unknown sentinel,

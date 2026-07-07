@@ -33,6 +33,8 @@ pub const TBOX_IMAGE_HEADER: u32 = 0x6968_6472;
 pub const TBOX_COLOUR: u32 = 0x636F_6C72;
 /// Channel Definition box type `'cdef'` (A.5.4.4, 0x6364_6566).
 pub const TBOX_CHANNEL_DEF: u32 = 0x6364_6566;
+/// Exif box type `'exif'` (A.5.4 Table A.2, 0x6578_6966).
+pub const TBOX_EXIF: u32 = 0x6578_6966;
 /// Contiguous Codestream box type `'jp2c'` (A.5.5, 0x6A70_3263).
 pub const TBOX_CODESTREAM: u32 = 0x6A70_3263;
 /// JPEG XS Video Support (super)box type `'jpvs'` (A.5.3, 0x6A70_7673).
@@ -1026,6 +1028,9 @@ pub struct HeaderBox {
     pub colour_specs: Vec<ColourSpec>,
     /// Optional Channel Definition box (A.5.4.4).
     pub channel_def: Option<ChannelDefinition>,
+    /// Optional Exif box payload (A.5.4 Table A.2), if present. The EXIF
+    /// contents themselves are opaque to this parser.
+    pub exif: Option<Vec<u8>>,
 }
 
 impl HeaderBox {
@@ -1048,6 +1053,7 @@ impl HeaderBox {
         let image_header = ImageHeader::parse(first.payload(buf))?;
         let mut colour_specs = Vec::new();
         let mut channel_def = None;
+        let mut exif = None;
         for s in &inner[1..] {
             match s.tbox {
                 TBOX_COLOUR => colour_specs.push(ColourSpec::parse(s.payload(buf))?),
@@ -1058,6 +1064,9 @@ impl HeaderBox {
                         ));
                     }
                     channel_def = Some(ChannelDefinition::parse(s.payload(buf))?);
+                }
+                TBOX_EXIF if exif.is_none() => {
+                    exif = Some(s.payload(buf).to_vec());
                 }
                 // A.6: skip and ignore boxes we do not recognise.
                 _ => {}
@@ -1074,6 +1083,7 @@ impl HeaderBox {
             image_header,
             colour_specs,
             channel_def,
+            exif,
         })
     }
 }
@@ -1294,6 +1304,7 @@ pub struct JxsFileBuilder {
     cicp: Cicp,
     colourspace_unknown: u8,
     channels: Option<Vec<ChannelDef>>,
+    exif: Option<Vec<u8>>,
     profile_level: Option<ProfileLevel>,
     video_info: Option<VideoInformation>,
     buffer_model: Option<BufferModelDescription>,
@@ -1310,6 +1321,7 @@ impl JxsFileBuilder {
             cicp,
             colourspace_unknown: 0,
             channels: None,
+            exif: None,
             profile_level: None,
             video_info: None,
             buffer_model: None,
@@ -1327,6 +1339,13 @@ impl JxsFileBuilder {
     /// Add a Channel Definition box (A.5.4.4).
     pub fn channels(mut self, channels: Vec<ChannelDef>) -> Self {
         self.channels = Some(channels);
+        self
+    }
+
+    /// Add an Exif box (A.5.4 Table A.2) inside the JPEG XS Header box,
+    /// carrying the given opaque EXIF payload.
+    pub fn exif(mut self, exif: Vec<u8>) -> Self {
+        self.exif = Some(exif);
         self
     }
 
@@ -1442,6 +1461,9 @@ impl JxsFileBuilder {
                 cdef.extend_from_slice(&c.assoc.to_be_bytes());
             }
             serialize_box(&mut jp2h, TBOX_CHANNEL_DEF, &cdef);
+        }
+        if let Some(exif) = &self.exif {
+            serialize_box(&mut jp2h, TBOX_EXIF, exif);
         }
         serialize_box(&mut file, TBOX_HEADER, &jp2h);
 
@@ -2265,6 +2287,30 @@ mod writer_tests {
                 TBOX_TRANSPORT_PARAMS
             ]
         );
+    }
+
+    // ---- Exif box (A.5.4 Table A.2) ----
+
+    #[test]
+    fn builder_round_trips_exif_box() {
+        let cs = luma_cs();
+        let exif = b"Exif\x00\x00II*\x00\x08\x00\x00\x00".to_vec();
+        let file = JxsFileBuilder::new(srgb())
+            .exif(exif.clone())
+            .build(&cs)
+            .unwrap();
+        let parsed = parse_jxs_file(&file).unwrap();
+        assert_eq!(parsed.header.exif.as_deref(), Some(exif.as_slice()));
+        // The Exif box lives inside jp2h and does not disturb decode.
+        assert!(decode_jxs_file(&file).is_ok());
+    }
+
+    #[test]
+    fn parse_without_exif_yields_none() {
+        let cs = luma_cs();
+        let file = write_jxs_file(&cs).unwrap();
+        let parsed = parse_jxs_file(&file).unwrap();
+        assert!(parsed.header.exif.is_none());
     }
 
     #[test]
