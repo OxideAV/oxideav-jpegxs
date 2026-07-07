@@ -103,7 +103,9 @@ pub use encoder::{
 pub use error::{JpegXsError, Result};
 pub use fileformat::{
     decode_jxs_file, is_jxs_file, parse_jxs_file, write_jxs_file, ChannelDef, ChannelDefinition,
-    Cicp, ColourSpec, FileType, HeaderBox, ImageHeader, JxsFile, JxsFileBuilder, ProfileLevel,
+    Cicp, ColourSpec, FileType, FrameRate, FrameRateDenominator, HeaderBox, ImageHeader,
+    InterlaceMode, JxsFile, JxsFileBuilder, ProfileLevel, SampleCharacteristics, SamplingStructure,
+    TimeCode, VideoInformation,
 };
 pub use image::{JpegXsImage, JpegXsPlane};
 pub use markers::Marker;

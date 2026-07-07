@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased — round 398 (transport: JPEG XS Video Information box `jpvi`)
+
+Closes the mandatory-but-missing `jpvi` box inside the JPEG XS Video
+Support superbox (ISO/IEC 21122-3:2019 A.5.3.2). Previously the `jpvs`
+superbox carried only the `jxpl` Profile/Level box — a non-conforming
+layout, since A.5.3.1 makes both `jpvi` and `jxpl` mandatory whenever a
+`jpvs` is present.
+
+* **New typed `VideoInformation` box** (Table A.5 — `brat` / `frat` /
+  `schar` / `tcod`, 14 bytes) with full sub-field decode:
+  * `frat` (Table A.6): `InterlaceMode` (Table A.7, reserved value 3
+    rejected), `FrameRateDenominator` (Table A.8, 1.000 / 1.001, other
+    values rejected), 16-bit numerator, and the `frat == 0` "unknown"
+    sentinel modelled as `FrameRate::Unknown`.
+  * `schar` (Table A.9): `Valid_Flag` gating, 4-bit `Sample_Bitdepth`,
+    and `SamplingStructure` (Table A.10 — reserved 3 / 7–15 rejected;
+    `Valid_Flag == 0` requires all sub-fields zero).
+  * `tcod`: `HH:MM:SS:FF` with range enforcement (HH 0–23, MM 0–59,
+    SS 0–59, FF 1–60); `brat == 0` rejected (Table A.5 range 1…2³²−1).
+* **Reader** (`parse_jxs_file`) now extracts the `jpvi` box from the
+  `jpvs` superbox into `JxsFile::video_info` (order-tolerant per A.6).
+* **Writer** (`JxsFileBuilder`) gains `video_information(...)`. Emitting a
+  `jpvs` now always produces a conforming superbox — `jpvi` first, `jxpl`
+  second (A.5.3 ordering) — synthesising a minimal-conforming default
+  (`VideoInformation::unknown` / `Unrestricted` `jxpl`) for whichever the
+  caller omits. This fixes the prior `jxpl`-only `jpvs` output.
+* Public API adds `VideoInformation`, `FrameRate`, `InterlaceMode`,
+  `FrameRateDenominator`, `SampleCharacteristics`, `SamplingStructure`,
+  `TimeCode`.
+
+* +7 tests (601 → 608). README documents the `jpvi` transport surface.
+
 ## Unreleased — round 382 (run mode Rm=1 — significance-dispatch + geometry coverage)
 
 Coverage deepening the `Rm = 1` significance path across the axes it must

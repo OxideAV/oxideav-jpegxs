@@ -290,7 +290,15 @@ box next, Header box before the first Contiguous Codestream box), skips
 unknown boxes (A.6), and surfaces typed bodies for the File Type box,
 Image Header box (`ihdr`, with the Table A.17 sign-flag / varying-depth /
 bit-depth decoding), Colour Specification box (`colr` CICP code points),
-Channel Definition box (`cdef`), and Profile/Level box (`jxpl`).
+Channel Definition box (`cdef`), Profile/Level box (`jxpl`), and the
+**Video Information box** (`jpvi`, A.5.3.2) from the Video Support
+superbox. The `jpvi` decode is a fully typed `VideoInformation` view of
+Table A.5: `brat` max bit rate, the `frat` frame-rate rational with its
+`InterlaceMode` (Table A.7) / `FrameRateDenominator` (1.000 / 1.001,
+Table A.8) / numerator sub-fields and the `frat = 0` unknown sentinel,
+the `schar` sample characteristics (`Valid_Flag`, 4-bit `Sample_Bitdepth`,
+`SamplingStructure` Table A.10), and the `tcod` `HH:MM:SS:FF` time code —
+each with the spec's reserved-value and range rejections.
 
 `decode_jxs_file` extracts the embedded codestream, cross-checks the
 `ihdr` geometry against the codestream picture header (A.5.4.2 rejects
@@ -303,7 +311,13 @@ A matching writer round-trips the wrapper: `JxsFileBuilder` /
 `write_jxs_file` serialize a conforming box file around an encoded
 codestream — deriving the `ihdr` geometry from the picture header,
 carrying a CICP colour specification, and optionally emitting a Channel
-Definition box and a `jpvs`/`jxpl` Profile-and-Level box.
+Definition box and a JPEG XS Video Support superbox (`jpvs`). When a
+`jpvs` is emitted it is **always conforming**: A.5.3.1 makes both the
+`jpvi` Video Information box and the `jxpl` Profile/Level box mandatory,
+so the builder emits them in the A.5.3 order (`jpvi` first, `jxpl`
+second), synthesising a minimal-conforming default (`VideoInformation::
+unknown` / `Unrestricted` `jxpl`) for whichever the caller omits via
+`video_information(...)` / `profile_level(...)`.
 
 ### Profile / level surface
 

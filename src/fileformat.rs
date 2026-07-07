@@ -37,6 +37,8 @@ pub const TBOX_CHANNEL_DEF: u32 = 0x6364_6566;
 pub const TBOX_CODESTREAM: u32 = 0x6A70_3263;
 /// JPEG XS Video Support (super)box type `'jpvs'` (A.5.3, 0x6A70_7673).
 pub const TBOX_VIDEO_SUPPORT: u32 = 0x6A70_7673;
+/// JPEG XS Video Information box type `'jpvi'` (A.5.3.2, 0x6A70_7669).
+pub const TBOX_VIDEO_INFO: u32 = 0x6A70_7669;
 /// JPEG XS Profile and Level box type `'jxpl'` (A.5.3.3, 0x6A78_706C).
 pub const TBOX_PROFILE_LEVEL: u32 = 0x6A78_706C;
 /// Intellectual Property box type `'jp2i'` (A.5.6, 0x6A70_3269).
@@ -494,6 +496,300 @@ impl ProfileLevel {
     }
 }
 
+/// Interlace mode of the coded frame (A.5.3.2 Table A.7 — the top two bits
+/// of the `frat` field). Field value 3 is reserved and rejected on parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterlaceMode {
+    /// 0 — progressive frame (frame contains one full-height picture).
+    Progressive,
+    /// 1 — interlaced frame, picture is the first video field.
+    InterlacedFirstField,
+    /// 2 — interlaced frame, picture is the second video field.
+    InterlacedSecondField,
+}
+
+/// Frame-rate denominator selector (A.5.3.2 Table A.8): only the two
+/// standardised values are legal; 0 and 3–63 are reserved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameRateDenominator {
+    /// 1 — denominator value 1.000 (integer / PAL rates).
+    Integer,
+    /// 2 — denominator value 1.001 (NTSC pulldown rates).
+    Ntsc,
+}
+
+/// Frame rate carried by the `frat` field (A.5.3.2 Table A.6). A `frat`
+/// value of 0 means the frame rate is unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameRate {
+    /// `frat == 0` — frame rate unknown.
+    Unknown,
+    /// Rational `numerator / denominator` frame rate with interlace
+    /// signalling. The effective field rate is twice this when interlaced.
+    Known {
+        /// Progressive / interlaced field-order signalling.
+        interlace: InterlaceMode,
+        /// Denominator selector (1.000 or 1.001).
+        denominator: FrameRateDenominator,
+        /// Frame-rate numerator (Table A.6 `Framerate_Numerator`).
+        numerator: u16,
+    },
+}
+
+/// Sampling structure of the image (A.5.3.2 Table A.10 — the low nibble of
+/// the `schar` field). Field values 3 and 7–15 are reserved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SamplingStructure {
+    /// 0 — 4:2:2 (YCbCr), `Nc = 3`.
+    Yuv422,
+    /// 1 — 4:4:4 (YCbCr), `Nc = 3`.
+    Yuv444,
+    /// 2 — 4:4:4 (RGB), `Nc = 3`.
+    Rgb444,
+    /// 4 — 4:2:2:4 (YCbCr + auxiliary), `Nc = 4`.
+    YuvAux422,
+    /// 5 — 4:4:4:4 (YCbCr + auxiliary), `Nc = 4`.
+    YuvAux444,
+    /// 6 — 4:4:4:4 (RGB + auxiliary), `Nc = 4`.
+    RgbAux444,
+}
+
+/// Sample characteristics carried by the `schar` field (A.5.3.2 Table A.9).
+/// When `Valid_Flag` is 0 all sub-fields shall be 0 ([`Self::Invalid`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleCharacteristics {
+    /// `Valid_Flag == 0`: sample characteristics not signalled.
+    Invalid,
+    /// `Valid_Flag == 1`: bit depth and sampling structure are valid.
+    Valid {
+        /// `Sample_Bitdepth` — component bit depth minus 1 (4-bit field,
+        /// so 0–15; mirrors the `ihdr` BPC low bits).
+        bitdepth_minus1: u8,
+        /// `Sampling_Structure` — chroma / auxiliary sampling.
+        sampling: SamplingStructure,
+    },
+}
+
+/// Time code of the coded frame (A.5.3.2 `tcod`, `HHMMSSFF`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeCode {
+    /// Hours (0–23).
+    pub hours: u8,
+    /// Minutes (0–59).
+    pub minutes: u8,
+    /// Seconds (0–59).
+    pub seconds: u8,
+    /// Frame count within the second (1–60).
+    pub frames: u8,
+}
+
+/// JPEG XS Video Information box contents (`'jpvi'`, A.5.3.2 Table A.5). It
+/// specifies frame rate, field coding, sample characteristics, time code
+/// and maximum bit rate for a JPEG XS codestream used in a video stream.
+/// This box is mandatory inside a JPEG XS Video Support superbox (A.5.3.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoInformation {
+    /// `brat` — maximum instantaneous bit rate in Mbit/s (1 … 2³²−1).
+    pub max_bit_rate: u32,
+    /// `frat` — frame rate and interlace signalling.
+    pub frame_rate: FrameRate,
+    /// `schar` — sample characteristics (bit depth + sampling structure).
+    pub sample: SampleCharacteristics,
+    /// `tcod` — time code (`HH:MM:SS:FF`).
+    pub timecode: TimeCode,
+}
+
+impl VideoInformation {
+    /// A minimal conforming Video Information box carrying no useful
+    /// signalling: the smallest legal bit rate (1 Mbit/s), an unknown frame
+    /// rate, invalid sample characteristics, and time code `00:00:00:01`
+    /// (`FF` has no 0 value, Table A.5). Used when a JPEG XS Video Support
+    /// superbox must be emitted but the caller supplied no video metadata.
+    pub fn unknown() -> Self {
+        VideoInformation {
+            max_bit_rate: 1,
+            frame_rate: FrameRate::Unknown,
+            sample: SampleCharacteristics::Invalid,
+            timecode: TimeCode {
+                hours: 0,
+                minutes: 0,
+                seconds: 0,
+                frames: 1,
+            },
+        }
+    }
+
+    /// Parse the 14-byte `DBox` of a JPEG XS Video Information box
+    /// (A.5.3.2 Table A.5: `brat` 4 B, `frat` 4 B, `schar` 2 B, `tcod` 4 B).
+    pub fn parse(body: &[u8]) -> Result<VideoInformation> {
+        if body.len() != 14 {
+            return Err(JpegXsError::invalid(
+                "jxs jpvi: body must be exactly 14 bytes (brat, frat, schar, tcod)",
+            ));
+        }
+        let brat = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+        // brat is 1 … 2³²−1 (Table A.5): 0 is not a legal maximum bit rate.
+        if brat == 0 {
+            return Err(JpegXsError::invalid(
+                "jxs jpvi: brat (max bit rate) must be non-zero (A.5.3.2)",
+            ));
+        }
+
+        let frat = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+        let frame_rate = if frat == 0 {
+            FrameRate::Unknown
+        } else {
+            let interlace = match frat >> 30 {
+                0 => InterlaceMode::Progressive,
+                1 => InterlaceMode::InterlacedFirstField,
+                2 => InterlaceMode::InterlacedSecondField,
+                _ => {
+                    return Err(JpegXsError::invalid(
+                        "jxs jpvi: frat Interlace_Mode value 3 is reserved (Table A.7)",
+                    ));
+                }
+            };
+            let denominator = match (frat >> 24) & 0x3f {
+                1 => FrameRateDenominator::Integer,
+                2 => FrameRateDenominator::Ntsc,
+                _ => {
+                    return Err(JpegXsError::invalid(
+                        "jxs jpvi: frat Framerate_Denominator is reserved (Table A.8)",
+                    ));
+                }
+            };
+            FrameRate::Known {
+                interlace,
+                denominator,
+                numerator: (frat & 0xffff) as u16,
+            }
+        };
+
+        let schar = u16::from_be_bytes([body[8], body[9]]);
+        let sample = if schar & 0x8000 == 0 {
+            // Valid_Flag == 0: all schar sub-fields shall be 0.
+            if schar != 0 {
+                return Err(JpegXsError::invalid(
+                    "jxs jpvi: schar Valid_Flag is 0 but sub-fields are non-zero (A.5.3.2)",
+                ));
+            }
+            SampleCharacteristics::Invalid
+        } else {
+            let bitdepth_minus1 = ((schar >> 4) & 0x0f) as u8;
+            let sampling = match schar & 0x0f {
+                0 => SamplingStructure::Yuv422,
+                1 => SamplingStructure::Yuv444,
+                2 => SamplingStructure::Rgb444,
+                4 => SamplingStructure::YuvAux422,
+                5 => SamplingStructure::YuvAux444,
+                6 => SamplingStructure::RgbAux444,
+                _ => {
+                    return Err(JpegXsError::invalid(
+                        "jxs jpvi: schar Sampling_Structure is reserved (Table A.10)",
+                    ));
+                }
+            };
+            SampleCharacteristics::Valid {
+                bitdepth_minus1,
+                sampling,
+            }
+        };
+
+        let timecode = TimeCode {
+            hours: body[8 + 2],
+            minutes: body[8 + 3],
+            seconds: body[8 + 4],
+            frames: body[8 + 5],
+        };
+        // tcod ranges (A.5.3.2): HH 0-23, MM 0-59, SS 0-59, FF 1-60.
+        if timecode.hours > 23
+            || timecode.minutes > 59
+            || timecode.seconds > 59
+            || timecode.frames < 1
+            || timecode.frames > 60
+        {
+            return Err(JpegXsError::invalid(
+                "jxs jpvi: tcod field out of range (HH 0-23, MM 0-59, SS 0-59, FF 1-60)",
+            ));
+        }
+
+        Ok(VideoInformation {
+            max_bit_rate: brat,
+            frame_rate,
+            sample,
+            timecode,
+        })
+    }
+
+    /// Serialize the 14-byte `DBox` of a JPEG XS Video Information box.
+    /// Rejects out-of-range values a conforming box cannot carry.
+    pub fn to_bytes(&self) -> Result<[u8; 14]> {
+        if self.max_bit_rate == 0 {
+            return Err(JpegXsError::invalid(
+                "jxs jpvi: brat (max bit rate) must be non-zero (A.5.3.2)",
+            ));
+        }
+        let frat: u32 = match self.frame_rate {
+            FrameRate::Unknown => 0,
+            FrameRate::Known {
+                interlace,
+                denominator,
+                numerator,
+            } => {
+                let im = match interlace {
+                    InterlaceMode::Progressive => 0u32,
+                    InterlaceMode::InterlacedFirstField => 1,
+                    InterlaceMode::InterlacedSecondField => 2,
+                };
+                let den = match denominator {
+                    FrameRateDenominator::Integer => 1u32,
+                    FrameRateDenominator::Ntsc => 2,
+                };
+                (im << 30) | (den << 24) | u32::from(numerator)
+            }
+        };
+        let schar: u16 = match self.sample {
+            SampleCharacteristics::Invalid => 0,
+            SampleCharacteristics::Valid {
+                bitdepth_minus1,
+                sampling,
+            } => {
+                if bitdepth_minus1 > 0x0f {
+                    return Err(JpegXsError::invalid(
+                        "jxs jpvi: schar Sample_Bitdepth exceeds the 4-bit field (Table A.9)",
+                    ));
+                }
+                let ss = match sampling {
+                    SamplingStructure::Yuv422 => 0u16,
+                    SamplingStructure::Yuv444 => 1,
+                    SamplingStructure::Rgb444 => 2,
+                    SamplingStructure::YuvAux422 => 4,
+                    SamplingStructure::YuvAux444 => 5,
+                    SamplingStructure::RgbAux444 => 6,
+                };
+                0x8000 | (u16::from(bitdepth_minus1) << 4) | ss
+            }
+        };
+        let tc = self.timecode;
+        if tc.hours > 23 || tc.minutes > 59 || tc.seconds > 59 || tc.frames < 1 || tc.frames > 60 {
+            return Err(JpegXsError::invalid(
+                "jxs jpvi: tcod field out of range (HH 0-23, MM 0-59, SS 0-59, FF 1-60)",
+            ));
+        }
+
+        let mut out = [0u8; 14];
+        out[0..4].copy_from_slice(&self.max_bit_rate.to_be_bytes());
+        out[4..8].copy_from_slice(&frat.to_be_bytes());
+        out[8..10].copy_from_slice(&schar.to_be_bytes());
+        // tcod (HHMMSSFF) — four contiguous bytes.
+        out[10] = tc.hours;
+        out[11] = tc.minutes;
+        out[12] = tc.seconds;
+        out[13] = tc.frames;
+        Ok(out)
+    }
+}
+
 /// A parsed JPEG XS Header superbox (A.5.4): the mandatory Image Header,
 /// one or more Colour Specification boxes, and an optional Channel
 /// Definition box.
@@ -570,6 +866,9 @@ pub struct JxsFile {
     /// Optional Profile and Level box (A.5.3.3), if a JPEG XS Video
     /// Support superbox carried one.
     pub profile_level: Option<ProfileLevel>,
+    /// Optional Video Information box (A.5.3.2), if a JPEG XS Video
+    /// Support superbox carried one.
+    pub video_info: Option<VideoInformation>,
     /// Byte span of the `DBox` of the first Contiguous Codestream box.
     codestream_span: BoxSpan,
 }
@@ -631,6 +930,7 @@ pub fn parse_jxs_file(buf: &[u8]) -> Result<JxsFile> {
     let mut header: Option<HeaderBox> = None;
     let mut codestream_span: Option<BoxSpan> = None;
     let mut profile_level: Option<ProfileLevel> = None;
+    let mut video_info: Option<VideoInformation> = None;
     for s in iter {
         match s.tbox {
             TBOX_HEADER => {
@@ -653,12 +953,20 @@ pub fn parse_jxs_file(buf: &[u8]) -> Result<JxsFile> {
                 codestream_span = Some(*s);
             }
             TBOX_VIDEO_SUPPORT => {
-                // Optional superbox; pull out the jxpl Profile/Level box
-                // if present (A.5.3.3). Other inner boxes are ignored.
+                // Optional superbox; pull out the jpvi Video Information
+                // (A.5.3.2) and jxpl Profile/Level (A.5.3.3) boxes if
+                // present. Read is order-tolerant (A.6); other inner boxes
+                // (bmdm / dmon / jptp) are ignored.
                 let inner = parse_boxes(buf, s.payload_start, s.payload_start + s.payload_len)?;
                 for is in &inner {
-                    if is.tbox == TBOX_PROFILE_LEVEL && profile_level.is_none() {
-                        profile_level = Some(ProfileLevel::parse(is.payload(buf))?);
+                    match is.tbox {
+                        TBOX_VIDEO_INFO if video_info.is_none() => {
+                            video_info = Some(VideoInformation::parse(is.payload(buf))?);
+                        }
+                        TBOX_PROFILE_LEVEL if profile_level.is_none() => {
+                            profile_level = Some(ProfileLevel::parse(is.payload(buf))?);
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -677,6 +985,7 @@ pub fn parse_jxs_file(buf: &[u8]) -> Result<JxsFile> {
         file_type,
         header,
         profile_level,
+        video_info,
         codestream_span,
     })
 }
@@ -738,6 +1047,7 @@ pub struct JxsFileBuilder {
     colourspace_unknown: u8,
     channels: Option<Vec<ChannelDef>>,
     profile_level: Option<ProfileLevel>,
+    video_info: Option<VideoInformation>,
 }
 
 impl JxsFileBuilder {
@@ -750,6 +1060,7 @@ impl JxsFileBuilder {
             colourspace_unknown: 0,
             channels: None,
             profile_level: None,
+            video_info: None,
         }
     }
 
@@ -765,12 +1076,24 @@ impl JxsFileBuilder {
         self
     }
 
-    /// Add a JPEG XS Video Support superbox carrying a Profile/Level box
-    /// (A.5.3.3). The `jpvi` video-information box that A.5.3.1 marks
-    /// mandatory inside `jpvs` is out of scope here, so this is emitted
-    /// only when the caller asks for the profile/level wrapper.
+    /// Add a Profile/Level box (`jxpl`, A.5.3.3) to the JPEG XS Video
+    /// Support superbox. Setting this (or [`Self::video_information`])
+    /// causes a conforming `jpvs` superbox to be emitted — A.5.3.1 makes
+    /// both the `jpvi` Video Information box and the `jxpl` Profile/Level
+    /// box mandatory inside `jpvs`, so a default `jpvi`
+    /// ([`VideoInformation::unknown`]) and/or a default `jxpl`
+    /// (`Unrestricted` / `0x0000`) is synthesised for whichever the caller
+    /// did not supply.
     pub fn profile_level(mut self, ppih: u16, plev: u16) -> Self {
         self.profile_level = Some(ProfileLevel { ppih, plev });
+        self
+    }
+
+    /// Add a Video Information box (`jpvi`, A.5.3.2) to the JPEG XS Video
+    /// Support superbox. See [`Self::profile_level`] for the emission
+    /// rules — the two boxes are co-mandatory inside `jpvs`.
+    pub fn video_information(mut self, info: VideoInformation) -> Self {
+        self.video_info = Some(info);
         self
     }
 
@@ -844,9 +1167,21 @@ impl JxsFileBuilder {
         }
         serialize_box(&mut file, TBOX_HEADER, &jp2h);
 
-        // Optional JPEG XS Video Support superbox (jpvs) carrying jxpl.
-        if let Some(pl) = &self.profile_level {
+        // Optional JPEG XS Video Support superbox (jpvs). A.5.3.1 makes
+        // both the jpvi Video Information box and the jxpl Profile/Level
+        // box mandatory inside jpvs, and A.5.3 fixes their order (jpvi
+        // first, jxpl second). If the caller supplied only one, synthesise
+        // a conforming default for the other so the emitted superbox is
+        // always valid.
+        if self.profile_level.is_some() || self.video_info.is_some() {
             let mut jpvs = Vec::new();
+            // jpvi — Video Information box (first).
+            let info = self.video_info.unwrap_or_else(VideoInformation::unknown);
+            serialize_box(&mut jpvs, TBOX_VIDEO_INFO, &info.to_bytes()?);
+            // jxpl — Profile and Level box (second).
+            let pl = self
+                .profile_level
+                .unwrap_or(ProfileLevel { ppih: 0, plev: 0 });
             let mut jxpl = Vec::new();
             jxpl.extend_from_slice(&pl.ppih.to_be_bytes());
             jxpl.extend_from_slice(&pl.plev.to_be_bytes());
@@ -1281,5 +1616,189 @@ mod writer_tests {
         let got = parsed.header.colour_specs[0].cicp.unwrap();
         assert!(got.full_range);
         assert_eq!(got.colour_primaries, 9);
+    }
+
+    fn luma_cs() -> Vec<u8> {
+        let (w, h) = (4u16, 4u16);
+        let pixels = vec![64u8; (w * h) as usize];
+        crate::encoder::encode_planar(w, h, 1, 0, 1, 1, std::slice::from_ref(&pixels)).unwrap()
+    }
+
+    // ---- JPEG XS Video Information box (jpvi, A.5.3.2) ----
+
+    #[test]
+    fn jpvi_round_trips_known_frame_rate() {
+        // 23.98 fps NTSC pulldown (num=24, denom=1.001), first field,
+        // 8-bit 4:4:4 YCbCr, timecode 01:02:03:04, 500 Mbit/s.
+        let info = VideoInformation {
+            max_bit_rate: 500,
+            frame_rate: FrameRate::Known {
+                interlace: InterlaceMode::InterlacedFirstField,
+                denominator: FrameRateDenominator::Ntsc,
+                numerator: 24,
+            },
+            sample: SampleCharacteristics::Valid {
+                bitdepth_minus1: 7,
+                sampling: SamplingStructure::Yuv444,
+            },
+            timecode: TimeCode {
+                hours: 1,
+                minutes: 2,
+                seconds: 3,
+                frames: 4,
+            },
+        };
+        let bytes = info.to_bytes().unwrap();
+        assert_eq!(bytes.len(), 14);
+        assert_eq!(VideoInformation::parse(&bytes).unwrap(), info);
+    }
+
+    #[test]
+    fn jpvi_frat_subfield_layout() {
+        // Interlace=2 (bits 31-30), denom=1 (bits 29-24), num=30 (low 16).
+        let info = VideoInformation {
+            max_bit_rate: 1,
+            frame_rate: FrameRate::Known {
+                interlace: InterlaceMode::InterlacedSecondField,
+                denominator: FrameRateDenominator::Integer,
+                numerator: 30,
+            },
+            sample: SampleCharacteristics::Invalid,
+            timecode: TimeCode {
+                hours: 0,
+                minutes: 0,
+                seconds: 0,
+                frames: 1,
+            },
+        };
+        let bytes = info.to_bytes().unwrap();
+        let frat = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        assert_eq!(frat >> 30, 2);
+        assert_eq!((frat >> 24) & 0x3f, 1);
+        assert_eq!(frat & 0xffff, 30);
+        // Framerate_Reserved (bits 23-16) must be 0.
+        assert_eq!((frat >> 16) & 0xff, 0);
+    }
+
+    #[test]
+    fn jpvi_unknown_frame_rate_and_invalid_sample_are_zero() {
+        let info = VideoInformation::unknown();
+        let bytes = info.to_bytes().unwrap();
+        // frat == 0 (unknown), schar == 0 (invalid).
+        assert_eq!(&bytes[4..8], &[0, 0, 0, 0]);
+        assert_eq!(&bytes[8..10], &[0, 0]);
+        assert_eq!(VideoInformation::parse(&bytes).unwrap(), info);
+    }
+
+    #[test]
+    fn jpvi_rejects_reserved_and_out_of_range() {
+        let base = VideoInformation::unknown().to_bytes().unwrap();
+        // brat == 0 is illegal.
+        let mut b = base;
+        b[0..4].copy_from_slice(&0u32.to_be_bytes());
+        assert!(VideoInformation::parse(&b).is_err());
+        // Interlace_Mode == 3 reserved.
+        let mut b = base;
+        b[4] = 0xC1; // interlace=3, denom bits partly set
+        assert!(VideoInformation::parse(&b).is_err());
+        // Framerate_Denominator == 0 reserved (with non-zero frat).
+        let mut b = base;
+        b[4..8].copy_from_slice(&0x0000_0018u32.to_be_bytes()); // denom=0, num=24
+        assert!(VideoInformation::parse(&b).is_err());
+        // schar Valid_Flag=0 but sub-fields non-zero.
+        let mut b = base;
+        b[8..10].copy_from_slice(&0x0070u16.to_be_bytes());
+        assert!(VideoInformation::parse(&b).is_err());
+        // Sampling_Structure == 3 reserved (Valid_Flag set).
+        let mut b = base;
+        b[8..10].copy_from_slice(&0x8003u16.to_be_bytes());
+        assert!(VideoInformation::parse(&b).is_err());
+        // tcod FF == 0 out of range.
+        let mut b = base;
+        b[13] = 0;
+        assert!(VideoInformation::parse(&b).is_err());
+        // tcod HH == 24 out of range.
+        let mut b = base;
+        b[10] = 24;
+        assert!(VideoInformation::parse(&b).is_err());
+        // Wrong length.
+        assert!(VideoInformation::parse(&base[..13]).is_err());
+    }
+
+    #[test]
+    fn builder_emits_conforming_jpvs_with_both_boxes() {
+        let cs = luma_cs();
+        let info = VideoInformation {
+            max_bit_rate: 250,
+            frame_rate: FrameRate::Known {
+                interlace: InterlaceMode::Progressive,
+                denominator: FrameRateDenominator::Integer,
+                numerator: 60,
+            },
+            sample: SampleCharacteristics::Valid {
+                bitdepth_minus1: 9,
+                sampling: SamplingStructure::Rgb444,
+            },
+            timecode: TimeCode {
+                hours: 10,
+                minutes: 20,
+                seconds: 30,
+                frames: 40,
+            },
+        };
+        let file = JxsFileBuilder::new(srgb())
+            .video_information(info)
+            .profile_level(0x3A40, 0x2400)
+            .build(&cs)
+            .unwrap();
+        let parsed = parse_jxs_file(&file).unwrap();
+        assert_eq!(parsed.video_info.unwrap(), info);
+        let pl = parsed.profile_level.unwrap();
+        assert_eq!(pl.ppih, 0x3A40);
+        assert_eq!(pl.plev, 0x2400);
+        // A.5.3: jpvi shall be the first box in jpvs, jxpl the second.
+        let jpvs = parse_boxes(&file, 0, file.len())
+            .unwrap()
+            .into_iter()
+            .find(|s| s.tbox == TBOX_VIDEO_SUPPORT)
+            .unwrap();
+        let inner = parse_boxes(
+            &file,
+            jpvs.payload_start,
+            jpvs.payload_start + jpvs.payload_len,
+        )
+        .unwrap();
+        assert_eq!(inner[0].tbox, TBOX_VIDEO_INFO);
+        assert_eq!(inner[1].tbox, TBOX_PROFILE_LEVEL);
+    }
+
+    #[test]
+    fn builder_synthesises_mandatory_jpvi_when_only_profile_level_set() {
+        // Setting only profile_level must still yield a conforming jpvs:
+        // a default jpvi (VideoInformation::unknown) is synthesised.
+        let cs = luma_cs();
+        let file = JxsFileBuilder::new(srgb())
+            .profile_level(0x1234, 0x5678)
+            .build(&cs)
+            .unwrap();
+        let parsed = parse_jxs_file(&file).unwrap();
+        assert_eq!(parsed.video_info.unwrap(), VideoInformation::unknown());
+        assert_eq!(parsed.profile_level.unwrap().ppih, 0x1234);
+        // Round-trips through decode.
+        assert!(decode_jxs_file(&file).is_ok());
+    }
+
+    #[test]
+    fn builder_synthesises_default_profile_level_when_only_video_info_set() {
+        let cs = luma_cs();
+        let file = JxsFileBuilder::new(srgb())
+            .video_information(VideoInformation::unknown())
+            .build(&cs)
+            .unwrap();
+        let parsed = parse_jxs_file(&file).unwrap();
+        // Default jxpl is Unrestricted (0x0000 / 0x0000).
+        let pl = parsed.profile_level.unwrap();
+        assert_eq!(pl.ppih, 0);
+        assert_eq!(pl.plev, 0);
     }
 }
