@@ -305,7 +305,11 @@ ST 2086 primaries + white point, `Lmin`/`Lmax` luminance and the
 CTA-861-G `MCLL`/`MFALL` content light levels, with the 0…50000
 chromaticity and `Lmin < Lmax` range checks) and the **Video Transport
 Parameter box** (`jptp`, A.5.3.6 — `Slgs` slice-group size / `Rsync`
-parallel units, with the reserved `Tseq` / `MTU` fields fixed at 0).
+parallel units, with the reserved `Tseq` / `MTU` fields fixed at 0). The
+**Buffer Model Description box** (`bmdm`, A.5.3.4 — `Tbmd` model type +
+`Ncg,hz` / `Ncg,vt` blanking-period coefficient-group counts) completes
+the five A.5.3 Video Support boxes; only the buffer-model *bounds* (which
+need a transmission-channel rate) stay out of scope, not the metadata.
 
 `decode_jxs_file` extracts the embedded codestream, cross-checks the
 `ihdr` geometry against the codestream picture header (A.5.4.2 rejects

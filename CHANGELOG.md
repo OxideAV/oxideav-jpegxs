@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased — round 398 (transport: `bmdm` Buffer Model Description box)
+
+Completes all five ISO/IEC 21122-3:2019 A.5.3 boxes of the JPEG XS Video
+Support superbox (`jpvi`, `jxpl`, `bmdm`, `dmon`, `jptp`).
+
+* **Buffer Model Description box** (`bmdm`, A.5.3.4, Table A.12 — 6
+  bytes): typed `BufferModelDescription` (`Tbmd` model type 0/1/2,
+  `Ncg,hz` / `Ncg,vt` blanking-period coefficient-group counts). The
+  `Tbmd` domain and the `Rd == 0` reserved field are enforced on both
+  parse and serialize.
+* **Reader** extracts it into `JxsFile::buffer_model`. **Writer** gains
+  `buffer_model(...)`; the box is emitted after `jxpl` and before `dmon`
+  per the Figure A.7 order (`jpvi`, `jxpl`, `bmdm`, `dmon`, `jptp`).
+* Public API adds `BufferModelDescription`.
+
+* +2 tests (614 → 616).
+
 ## Unreleased — round 398 (transport: `dmon` + `jptp` Video Support boxes)
 
 Completes the four ISO/IEC 21122-3:2019 A.5.3 boxes contained in the JPEG

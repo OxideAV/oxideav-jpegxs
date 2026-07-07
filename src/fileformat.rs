@@ -41,6 +41,8 @@ pub const TBOX_VIDEO_SUPPORT: u32 = 0x6A70_7673;
 pub const TBOX_VIDEO_INFO: u32 = 0x6A70_7669;
 /// JPEG XS Profile and Level box type `'jxpl'` (A.5.3.3, 0x6A78_706C).
 pub const TBOX_PROFILE_LEVEL: u32 = 0x6A78_706C;
+/// Buffer Model Description box type `'bmdm'` (A.5.3.4, 0x626D_646D).
+pub const TBOX_BUFFER_MODEL: u32 = 0x626D_646D;
 /// Mastering Display Metadata box type `'dmon'` (A.5.3.5, 0x646D_6F6E).
 pub const TBOX_MASTERING_DISPLAY: u32 = 0x646D_6F6E;
 /// JPEG XS Video Transport Parameter box type `'jptp'` (A.5.3.6, 0x6A70_7470).
@@ -794,6 +796,65 @@ impl VideoInformation {
     }
 }
 
+/// Buffer Model Description box contents (`'bmdm'`, A.5.3.4 Table A.12).
+/// Stores the buffer-model metadata (type + blanking-period coefficient
+/// group counts) needed to test a codestream against the ISO/IEC 21122-2
+/// buffer model. 6 bytes: `Tbmd` (8), `Rd` (8), `Ncg,hz` (16), `Ncg,vt`
+/// (16), big-endian.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BufferModelDescription {
+    /// `Tbmd` — buffer model type (0, 1 or 2; ISO/IEC 21122-2).
+    pub model_type: u8,
+    /// `Ncg,hz` — coefficient groups spanning a horizontal blanking period.
+    pub ncg_horizontal: u16,
+    /// `Ncg,vt` — coefficient groups spanning a vertical blanking period.
+    pub ncg_vertical: u16,
+}
+
+impl BufferModelDescription {
+    /// Parse the 6-byte `DBox` of a Buffer Model Description box. `Tbmd`
+    /// shall be 0/1/2 and `Rd` shall be 0 (Table A.12); other values are
+    /// reserved and rejected.
+    pub fn parse(body: &[u8]) -> Result<BufferModelDescription> {
+        if body.len() != 6 {
+            return Err(JpegXsError::invalid(
+                "jxs bmdm: body must be exactly 6 bytes (A.5.3.4)",
+            ));
+        }
+        let model_type = body[0];
+        if model_type > 2 {
+            return Err(JpegXsError::invalid(
+                "jxs bmdm: Tbmd must be 0, 1 or 2 (Table A.12)",
+            ));
+        }
+        // Rd shall be 0; all other values reserved.
+        if body[1] != 0 {
+            return Err(JpegXsError::invalid("jxs bmdm: Rd must be 0 (Table A.12)"));
+        }
+        Ok(BufferModelDescription {
+            model_type,
+            ncg_horizontal: u16::from_be_bytes([body[2], body[3]]),
+            ncg_vertical: u16::from_be_bytes([body[4], body[5]]),
+        })
+    }
+
+    /// Serialize the 6-byte `DBox` (`Rd` = 0 by construction). Rejects a
+    /// `Tbmd` outside 0/1/2.
+    pub fn to_bytes(&self) -> Result<[u8; 6]> {
+        if self.model_type > 2 {
+            return Err(JpegXsError::invalid(
+                "jxs bmdm: Tbmd must be 0, 1 or 2 (Table A.12)",
+            ));
+        }
+        let mut out = [0u8; 6];
+        out[0] = self.model_type;
+        // out[1] = Rd = 0.
+        out[2..4].copy_from_slice(&self.ncg_horizontal.to_be_bytes());
+        out[4..6].copy_from_slice(&self.ncg_vertical.to_be_bytes());
+        Ok(out)
+    }
+}
+
 /// Mastering Display Metadata box contents (`'dmon'`, A.5.3.5 Figure A.11).
 /// The chromaticity primaries and white point mirror the fields of SMPTE
 /// ST 2086; `MCLL` / `MFALL` are the CTA-861-G content light levels. All
@@ -1033,6 +1094,8 @@ pub struct JxsFile {
     /// Optional Video Information box (A.5.3.2), if a JPEG XS Video
     /// Support superbox carried one.
     pub video_info: Option<VideoInformation>,
+    /// Optional Buffer Model Description box (A.5.3.4).
+    pub buffer_model: Option<BufferModelDescription>,
     /// Optional Mastering Display Metadata box (A.5.3.5).
     pub mastering_display: Option<MasteringDisplayMetadata>,
     /// Optional Video Transport Parameter box (A.5.3.6).
@@ -1099,6 +1162,7 @@ pub fn parse_jxs_file(buf: &[u8]) -> Result<JxsFile> {
     let mut codestream_span: Option<BoxSpan> = None;
     let mut profile_level: Option<ProfileLevel> = None;
     let mut video_info: Option<VideoInformation> = None;
+    let mut buffer_model: Option<BufferModelDescription> = None;
     let mut mastering_display: Option<MasteringDisplayMetadata> = None;
     let mut transport_params: Option<VideoTransportParameters> = None;
     for s in iter {
@@ -1136,6 +1200,9 @@ pub fn parse_jxs_file(buf: &[u8]) -> Result<JxsFile> {
                         TBOX_PROFILE_LEVEL if profile_level.is_none() => {
                             profile_level = Some(ProfileLevel::parse(is.payload(buf))?);
                         }
+                        TBOX_BUFFER_MODEL if buffer_model.is_none() => {
+                            buffer_model = Some(BufferModelDescription::parse(is.payload(buf))?);
+                        }
                         TBOX_MASTERING_DISPLAY if mastering_display.is_none() => {
                             mastering_display =
                                 Some(MasteringDisplayMetadata::parse(is.payload(buf))?);
@@ -1164,6 +1231,7 @@ pub fn parse_jxs_file(buf: &[u8]) -> Result<JxsFile> {
         header,
         profile_level,
         video_info,
+        buffer_model,
         mastering_display,
         transport_params,
         codestream_span,
@@ -1228,6 +1296,7 @@ pub struct JxsFileBuilder {
     channels: Option<Vec<ChannelDef>>,
     profile_level: Option<ProfileLevel>,
     video_info: Option<VideoInformation>,
+    buffer_model: Option<BufferModelDescription>,
     mastering_display: Option<MasteringDisplayMetadata>,
     transport_params: Option<VideoTransportParameters>,
 }
@@ -1243,6 +1312,7 @@ impl JxsFileBuilder {
             channels: None,
             profile_level: None,
             video_info: None,
+            buffer_model: None,
             mastering_display: None,
             transport_params: None,
         }
@@ -1278,6 +1348,14 @@ impl JxsFileBuilder {
     /// rules — the two boxes are co-mandatory inside `jpvs`.
     pub fn video_information(mut self, info: VideoInformation) -> Self {
         self.video_info = Some(info);
+        self
+    }
+
+    /// Add a Buffer Model Description box (`bmdm`, A.5.3.4) to the JPEG XS
+    /// Video Support superbox. Implies a `jpvs` (see
+    /// [`Self::profile_level`]).
+    pub fn buffer_model(mut self, desc: BufferModelDescription) -> Self {
+        self.buffer_model = Some(desc);
         self
     }
 
@@ -1375,6 +1453,7 @@ impl JxsFileBuilder {
         // always valid.
         if self.profile_level.is_some()
             || self.video_info.is_some()
+            || self.buffer_model.is_some()
             || self.mastering_display.is_some()
             || self.transport_params.is_some()
         {
@@ -1390,7 +1469,10 @@ impl JxsFileBuilder {
             jxpl.extend_from_slice(&pl.ppih.to_be_bytes());
             jxpl.extend_from_slice(&pl.plev.to_be_bytes());
             serialize_box(&mut jpvs, TBOX_PROFILE_LEVEL, &jxpl);
-            // Optional dmon / jptp boxes follow jxpl (Figure A.7 order).
+            // Optional bmdm / dmon / jptp boxes follow jxpl (Figure A.7).
+            if let Some(desc) = &self.buffer_model {
+                serialize_box(&mut jpvs, TBOX_BUFFER_MODEL, &desc.to_bytes()?);
+            }
             if let Some(meta) = &self.mastering_display {
                 serialize_box(&mut jpvs, TBOX_MASTERING_DISPLAY, &meta.to_bytes()?);
             }
@@ -2090,10 +2172,60 @@ mod writer_tests {
         assert!(VideoTransportParameters::parse(&base[..5]).is_err());
     }
 
+    // ---- Buffer Model Description box (bmdm, A.5.3.4) ----
+
+    #[test]
+    fn bmdm_round_trips() {
+        let desc = BufferModelDescription {
+            model_type: 2,
+            ncg_horizontal: 12345,
+            ncg_vertical: 678,
+        };
+        let bytes = desc.to_bytes().unwrap();
+        assert_eq!(bytes.len(), 6);
+        // Rd (byte 1) is 0 by construction.
+        assert_eq!(bytes[1], 0);
+        assert_eq!(BufferModelDescription::parse(&bytes).unwrap(), desc);
+    }
+
+    #[test]
+    fn bmdm_rejects_reserved_fields() {
+        let base = BufferModelDescription {
+            model_type: 0,
+            ncg_horizontal: 1,
+            ncg_vertical: 1,
+        }
+        .to_bytes()
+        .unwrap();
+        // Tbmd == 3 reserved.
+        let mut b = base;
+        b[0] = 3;
+        assert!(BufferModelDescription::parse(&b).is_err());
+        // Rd != 0 reserved.
+        let mut b = base;
+        b[1] = 1;
+        assert!(BufferModelDescription::parse(&b).is_err());
+        // Wrong length.
+        assert!(BufferModelDescription::parse(&base[..5]).is_err());
+        // Constructor-side Tbmd validation.
+        assert!(BufferModelDescription {
+            model_type: 4,
+            ncg_horizontal: 0,
+            ncg_vertical: 0,
+        }
+        .to_bytes()
+        .is_err());
+    }
+
     #[test]
     fn builder_emits_all_jpvs_boxes_in_order() {
         let cs = luma_cs();
         let meta = bt709_dmon();
+        let bmdm = BufferModelDescription {
+            model_type: 1,
+            ncg_horizontal: 64,
+            ncg_vertical: 8,
+        };
         let params = VideoTransportParameters {
             slice_group_size: 2,
             parallel_units: 4,
@@ -2101,14 +2233,16 @@ mod writer_tests {
         let file = JxsFileBuilder::new(srgb())
             .video_information(VideoInformation::unknown())
             .profile_level(0x3540, 0x1000)
+            .buffer_model(bmdm)
             .mastering_display(meta)
             .transport_parameters(params)
             .build(&cs)
             .unwrap();
         let parsed = parse_jxs_file(&file).unwrap();
+        assert_eq!(parsed.buffer_model.unwrap(), bmdm);
         assert_eq!(parsed.mastering_display.unwrap(), meta);
         assert_eq!(parsed.transport_params.unwrap(), params);
-        // Figure A.7 order inside jpvs: jpvi, jxpl, dmon, jptp.
+        // Figure A.7 order inside jpvs: jpvi, jxpl, bmdm, dmon, jptp.
         let jpvs = parse_boxes(&file, 0, file.len())
             .unwrap()
             .into_iter()
@@ -2126,6 +2260,7 @@ mod writer_tests {
             vec![
                 TBOX_VIDEO_INFO,
                 TBOX_PROFILE_LEVEL,
+                TBOX_BUFFER_MODEL,
                 TBOX_MASTERING_DISPLAY,
                 TBOX_TRANSPORT_PARAMS
             ]
