@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased — round 398 (transport: `dmon` + `jptp` Video Support boxes)
+
+Completes the four ISO/IEC 21122-3:2019 A.5.3 boxes contained in the JPEG
+XS Video Support superbox that this document defines: after `jpvi` /
+`jxpl`, the two remaining optional boxes are now typed.
+
+* **Mastering Display Metadata box** (`dmon`, A.5.3.5, Figure A.11 — 28
+  bytes): typed `MasteringDisplayMetadata` covering the SMPTE ST 2086
+  primaries (green `c0` / blue `c1` / red `c2`), white point, `Lmin` /
+  `Lmax` display luminance and the CTA-861-G `MCLL` / `MFALL` content
+  light levels. Enforces the spec ranges — chromaticity 0…50000, `Lmin <
+  Lmax`. Verified against the Table A.13 Rec. BT.709 defaults.
+* **Video Transport Parameter box** (`jptp`, A.5.3.6, Table A.15 — 6
+  bytes): typed `VideoTransportParameters` (`Slgs` slice-group size,
+  `Rsync` parallel units); the `Tseq` (Table A.14) and `MTU` fields are
+  fixed at 0 and any other value is rejected as reserved.
+* **Reader** extracts both into `JxsFile::mastering_display` /
+  `transport_params`. **Writer** gains `mastering_display(...)` /
+  `transport_parameters(...)`; both boxes are emitted after `jxpl` in the
+  Figure A.7 order (`jpvi`, `jxpl`, `dmon`, `jptp`), and either one alone
+  still triggers a conforming `jpvs` (mandatory `jpvi` / `jxpl`
+  synthesised).
+* Public API adds `MasteringDisplayMetadata`, `VideoTransportParameters`.
+
+* +6 tests (608 → 614).
+
 ## Unreleased — round 398 (transport: JPEG XS Video Information box `jpvi`)
 
 Closes the mandatory-but-missing `jpvi` box inside the JPEG XS Video

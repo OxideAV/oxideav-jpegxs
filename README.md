@@ -298,7 +298,14 @@ Table A.5: `brat` max bit rate, the `frat` frame-rate rational with its
 Table A.8) / numerator sub-fields and the `frat = 0` unknown sentinel,
 the `schar` sample characteristics (`Valid_Flag`, 4-bit `Sample_Bitdepth`,
 `SamplingStructure` Table A.10), and the `tcod` `HH:MM:SS:FF` time code —
-each with the spec's reserved-value and range rejections.
+each with the spec's reserved-value and range rejections. The two
+remaining optional Video Support boxes this document defines are also
+typed: the **Mastering Display Metadata box** (`dmon`, A.5.3.5 — SMPTE
+ST 2086 primaries + white point, `Lmin`/`Lmax` luminance and the
+CTA-861-G `MCLL`/`MFALL` content light levels, with the 0…50000
+chromaticity and `Lmin < Lmax` range checks) and the **Video Transport
+Parameter box** (`jptp`, A.5.3.6 — `Slgs` slice-group size / `Rsync`
+parallel units, with the reserved `Tseq` / `MTU` fields fixed at 0).
 
 `decode_jxs_file` extracts the embedded codestream, cross-checks the
 `ihdr` geometry against the codestream picture header (A.5.4.2 rejects
@@ -317,7 +324,9 @@ Definition box and a JPEG XS Video Support superbox (`jpvs`). When a
 so the builder emits them in the A.5.3 order (`jpvi` first, `jxpl`
 second), synthesising a minimal-conforming default (`VideoInformation::
 unknown` / `Unrestricted` `jxpl`) for whichever the caller omits via
-`video_information(...)` / `profile_level(...)`.
+`video_information(...)` / `profile_level(...)`. The optional `dmon` /
+`jptp` boxes (`mastering_display(...)` / `transport_parameters(...)`)
+follow `jxpl` in the Figure A.7 order.
 
 ### Profile / level surface
 

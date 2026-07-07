@@ -41,6 +41,10 @@ pub const TBOX_VIDEO_SUPPORT: u32 = 0x6A70_7673;
 pub const TBOX_VIDEO_INFO: u32 = 0x6A70_7669;
 /// JPEG XS Profile and Level box type `'jxpl'` (A.5.3.3, 0x6A78_706C).
 pub const TBOX_PROFILE_LEVEL: u32 = 0x6A78_706C;
+/// Mastering Display Metadata box type `'dmon'` (A.5.3.5, 0x646D_6F6E).
+pub const TBOX_MASTERING_DISPLAY: u32 = 0x646D_6F6E;
+/// JPEG XS Video Transport Parameter box type `'jptp'` (A.5.3.6, 0x6A70_7470).
+pub const TBOX_TRANSPORT_PARAMS: u32 = 0x6A70_7470;
 /// Intellectual Property box type `'jp2i'` (A.5.6, 0x6A70_3269).
 pub const TBOX_IPR: u32 = 0x6A70_3269;
 /// XML box type `'xml\040'` (A.5.7, 0x786D_6C20).
@@ -790,6 +794,166 @@ impl VideoInformation {
     }
 }
 
+/// Mastering Display Metadata box contents (`'dmon'`, A.5.3.5 Figure A.11).
+/// The chromaticity primaries and white point mirror the fields of SMPTE
+/// ST 2086; `MCLL` / `MFALL` are the CTA-861-G content light levels. All
+/// fields are big-endian unsigned integers, 28 bytes total.
+///
+/// Chromaticity coordinates are normalised in increments of 0.00002 (CIE
+/// 1931), range 0…50000. Primary index `c0` is the green primary, `c1` the
+/// blue, `c2` the red (A.5.3.5). Luminance values are in 0.0001 cd/m²
+/// increments (`Lmin < Lmax`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MasteringDisplayMetadata {
+    /// `Xc0`, `Yc0` — green primary chromaticity (0…50000).
+    pub primary_green: (u16, u16),
+    /// `Xc1`, `Yc1` — blue primary chromaticity (0…50000).
+    pub primary_blue: (u16, u16),
+    /// `Xc2`, `Yc2` — red primary chromaticity (0…50000).
+    pub primary_red: (u16, u16),
+    /// `Xwp`, `Ywp` — white point chromaticity (0…50000).
+    pub white_point: (u16, u16),
+    /// `Lmin` — minimum display luminance (×0.0001 cd/m²).
+    pub min_luminance: u32,
+    /// `Lmax` — maximum display luminance (×0.0001 cd/m²); `> Lmin`.
+    pub max_luminance: u32,
+    /// `MCLL` — Maximum Content Light Level (0x0000 if unknown).
+    pub max_content_light_level: u16,
+    /// `MFALL` — Maximum Frame Average Light Level (0x0000 if unknown).
+    pub max_frame_avg_light_level: u16,
+}
+
+impl MasteringDisplayMetadata {
+    fn coord_in_range((x, y): (u16, u16)) -> bool {
+        x <= 50_000 && y <= 50_000
+    }
+
+    /// Parse the 28-byte `DBox` of a Mastering Display Metadata box.
+    pub fn parse(body: &[u8]) -> Result<MasteringDisplayMetadata> {
+        if body.len() != 28 {
+            return Err(JpegXsError::invalid(
+                "jxs dmon: body must be exactly 28 bytes (A.5.3.5)",
+            ));
+        }
+        let u16at = |i: usize| u16::from_be_bytes([body[i], body[i + 1]]);
+        let u32at = |i: usize| u32::from_be_bytes([body[i], body[i + 1], body[i + 2], body[i + 3]]);
+        let out = MasteringDisplayMetadata {
+            primary_green: (u16at(0), u16at(2)),
+            primary_blue: (u16at(4), u16at(6)),
+            primary_red: (u16at(8), u16at(10)),
+            white_point: (u16at(12), u16at(14)),
+            min_luminance: u32at(16),
+            max_luminance: u32at(20),
+            max_content_light_level: u16at(24),
+            max_frame_avg_light_level: u16at(26),
+        };
+        // Chromaticity coordinates shall be in 0…50000 (A.5.3.5).
+        if !Self::coord_in_range(out.primary_green)
+            || !Self::coord_in_range(out.primary_blue)
+            || !Self::coord_in_range(out.primary_red)
+            || !Self::coord_in_range(out.white_point)
+        {
+            return Err(JpegXsError::invalid(
+                "jxs dmon: chromaticity coordinate out of range 0…50000 (A.5.3.5)",
+            ));
+        }
+        // Lmin shall be less than Lmax (A.5.3.5).
+        if out.min_luminance >= out.max_luminance {
+            return Err(JpegXsError::invalid(
+                "jxs dmon: Lmin must be less than Lmax (A.5.3.5)",
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Serialize the 28-byte `DBox`. Rejects out-of-range values.
+    pub fn to_bytes(&self) -> Result<[u8; 28]> {
+        if !Self::coord_in_range(self.primary_green)
+            || !Self::coord_in_range(self.primary_blue)
+            || !Self::coord_in_range(self.primary_red)
+            || !Self::coord_in_range(self.white_point)
+        {
+            return Err(JpegXsError::invalid(
+                "jxs dmon: chromaticity coordinate out of range 0…50000 (A.5.3.5)",
+            ));
+        }
+        if self.min_luminance >= self.max_luminance {
+            return Err(JpegXsError::invalid(
+                "jxs dmon: Lmin must be less than Lmax (A.5.3.5)",
+            ));
+        }
+        let mut out = [0u8; 28];
+        let mut put16 = |i: usize, v: u16| out[i..i + 2].copy_from_slice(&v.to_be_bytes());
+        put16(0, self.primary_green.0);
+        put16(2, self.primary_green.1);
+        put16(4, self.primary_blue.0);
+        put16(6, self.primary_blue.1);
+        put16(8, self.primary_red.0);
+        put16(10, self.primary_red.1);
+        put16(12, self.white_point.0);
+        put16(14, self.white_point.1);
+        out[16..20].copy_from_slice(&self.min_luminance.to_be_bytes());
+        out[20..24].copy_from_slice(&self.max_luminance.to_be_bytes());
+        out[24..26].copy_from_slice(&self.max_content_light_level.to_be_bytes());
+        out[26..28].copy_from_slice(&self.max_frame_avg_light_level.to_be_bytes());
+        Ok(out)
+    }
+}
+
+/// JPEG XS Video Transport Parameter box contents (`'jptp'`, A.5.3.6
+/// Table A.15). Advises a packet-transport decoder on slice-to-core
+/// assignment and reorder-buffer sizing. 6 bytes: `Slgs` (16), `Rsync`
+/// (8), `Tseq` (8), `MTU` (16), big-endian.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoTransportParameters {
+    /// `Slgs` — contiguous slices suggested per processing unit (0 = no
+    /// suggestion).
+    pub slice_group_size: u16,
+    /// `Rsync` — suggested parallel decoding units (0 = no suggestion).
+    pub parallel_units: u8,
+}
+
+impl VideoTransportParameters {
+    /// Parse the 6-byte `DBox` of a Video Transport Parameter box. `Tseq`
+    /// and `MTU` shall both be 0 (Table A.14 / A.15); non-zero is rejected.
+    pub fn parse(body: &[u8]) -> Result<VideoTransportParameters> {
+        if body.len() != 6 {
+            return Err(JpegXsError::invalid(
+                "jxs jptp: body must be exactly 6 bytes (A.5.3.6)",
+            ));
+        }
+        let slice_group_size = u16::from_be_bytes([body[0], body[1]]);
+        let parallel_units = body[2];
+        let tseq = body[3];
+        let mtu = u16::from_be_bytes([body[4], body[5]]);
+        // Tseq: only 0 is defined; all other values reserved (Table A.14).
+        if tseq != 0 {
+            return Err(JpegXsError::invalid(
+                "jxs jptp: Tseq must be 0 (Table A.14)",
+            ));
+        }
+        // MTU shall be 0 (Table A.15); all other values reserved.
+        if mtu != 0 {
+            return Err(JpegXsError::invalid(
+                "jxs jptp: MTU field must be 0 (Table A.15)",
+            ));
+        }
+        Ok(VideoTransportParameters {
+            slice_group_size,
+            parallel_units,
+        })
+    }
+
+    /// Serialize the 6-byte `DBox` (`Tseq` = 0, `MTU` = 0 by construction).
+    pub fn to_bytes(&self) -> [u8; 6] {
+        let mut out = [0u8; 6];
+        out[0..2].copy_from_slice(&self.slice_group_size.to_be_bytes());
+        out[2] = self.parallel_units;
+        // out[3] = Tseq = 0, out[4..6] = MTU = 0.
+        out
+    }
+}
+
 /// A parsed JPEG XS Header superbox (A.5.4): the mandatory Image Header,
 /// one or more Colour Specification boxes, and an optional Channel
 /// Definition box.
@@ -869,6 +1033,10 @@ pub struct JxsFile {
     /// Optional Video Information box (A.5.3.2), if a JPEG XS Video
     /// Support superbox carried one.
     pub video_info: Option<VideoInformation>,
+    /// Optional Mastering Display Metadata box (A.5.3.5).
+    pub mastering_display: Option<MasteringDisplayMetadata>,
+    /// Optional Video Transport Parameter box (A.5.3.6).
+    pub transport_params: Option<VideoTransportParameters>,
     /// Byte span of the `DBox` of the first Contiguous Codestream box.
     codestream_span: BoxSpan,
 }
@@ -931,6 +1099,8 @@ pub fn parse_jxs_file(buf: &[u8]) -> Result<JxsFile> {
     let mut codestream_span: Option<BoxSpan> = None;
     let mut profile_level: Option<ProfileLevel> = None;
     let mut video_info: Option<VideoInformation> = None;
+    let mut mastering_display: Option<MasteringDisplayMetadata> = None;
+    let mut transport_params: Option<VideoTransportParameters> = None;
     for s in iter {
         match s.tbox {
             TBOX_HEADER => {
@@ -966,6 +1136,14 @@ pub fn parse_jxs_file(buf: &[u8]) -> Result<JxsFile> {
                         TBOX_PROFILE_LEVEL if profile_level.is_none() => {
                             profile_level = Some(ProfileLevel::parse(is.payload(buf))?);
                         }
+                        TBOX_MASTERING_DISPLAY if mastering_display.is_none() => {
+                            mastering_display =
+                                Some(MasteringDisplayMetadata::parse(is.payload(buf))?);
+                        }
+                        TBOX_TRANSPORT_PARAMS if transport_params.is_none() => {
+                            transport_params =
+                                Some(VideoTransportParameters::parse(is.payload(buf))?);
+                        }
                         _ => {}
                     }
                 }
@@ -986,6 +1164,8 @@ pub fn parse_jxs_file(buf: &[u8]) -> Result<JxsFile> {
         header,
         profile_level,
         video_info,
+        mastering_display,
+        transport_params,
         codestream_span,
     })
 }
@@ -1048,6 +1228,8 @@ pub struct JxsFileBuilder {
     channels: Option<Vec<ChannelDef>>,
     profile_level: Option<ProfileLevel>,
     video_info: Option<VideoInformation>,
+    mastering_display: Option<MasteringDisplayMetadata>,
+    transport_params: Option<VideoTransportParameters>,
 }
 
 impl JxsFileBuilder {
@@ -1061,6 +1243,8 @@ impl JxsFileBuilder {
             channels: None,
             profile_level: None,
             video_info: None,
+            mastering_display: None,
+            transport_params: None,
         }
     }
 
@@ -1094,6 +1278,22 @@ impl JxsFileBuilder {
     /// rules — the two boxes are co-mandatory inside `jpvs`.
     pub fn video_information(mut self, info: VideoInformation) -> Self {
         self.video_info = Some(info);
+        self
+    }
+
+    /// Add a Mastering Display Metadata box (`dmon`, A.5.3.5) to the JPEG
+    /// XS Video Support superbox. Implies a `jpvs` (see
+    /// [`Self::profile_level`]).
+    pub fn mastering_display(mut self, meta: MasteringDisplayMetadata) -> Self {
+        self.mastering_display = Some(meta);
+        self
+    }
+
+    /// Add a Video Transport Parameter box (`jptp`, A.5.3.6) to the JPEG
+    /// XS Video Support superbox. Implies a `jpvs` (see
+    /// [`Self::profile_level`]).
+    pub fn transport_parameters(mut self, params: VideoTransportParameters) -> Self {
+        self.transport_params = Some(params);
         self
     }
 
@@ -1173,7 +1373,11 @@ impl JxsFileBuilder {
         // first, jxpl second). If the caller supplied only one, synthesise
         // a conforming default for the other so the emitted superbox is
         // always valid.
-        if self.profile_level.is_some() || self.video_info.is_some() {
+        if self.profile_level.is_some()
+            || self.video_info.is_some()
+            || self.mastering_display.is_some()
+            || self.transport_params.is_some()
+        {
             let mut jpvs = Vec::new();
             // jpvi — Video Information box (first).
             let info = self.video_info.unwrap_or_else(VideoInformation::unknown);
@@ -1186,6 +1390,13 @@ impl JxsFileBuilder {
             jxpl.extend_from_slice(&pl.ppih.to_be_bytes());
             jxpl.extend_from_slice(&pl.plev.to_be_bytes());
             serialize_box(&mut jpvs, TBOX_PROFILE_LEVEL, &jxpl);
+            // Optional dmon / jptp boxes follow jxpl (Figure A.7 order).
+            if let Some(meta) = &self.mastering_display {
+                serialize_box(&mut jpvs, TBOX_MASTERING_DISPLAY, &meta.to_bytes()?);
+            }
+            if let Some(params) = &self.transport_params {
+                serialize_box(&mut jpvs, TBOX_TRANSPORT_PARAMS, &params.to_bytes());
+            }
             serialize_box(&mut file, TBOX_VIDEO_SUPPORT, &jpvs);
         }
 
@@ -1800,5 +2011,140 @@ mod writer_tests {
         let pl = parsed.profile_level.unwrap();
         assert_eq!(pl.ppih, 0);
         assert_eq!(pl.plev, 0);
+    }
+
+    // ---- Mastering Display Metadata box (dmon, A.5.3.5) ----
+
+    fn bt709_dmon() -> MasteringDisplayMetadata {
+        // Table A.13 default values (Rec. ITU-R BT.709-5).
+        MasteringDisplayMetadata {
+            primary_green: (0x3A98, 0x7530),
+            primary_blue: (0x1D4C, 0x0BB8),
+            primary_red: (0x7D00, 0x4074),
+            white_point: (0x3D13, 0x4042),
+            min_luminance: 0x0000_0064,
+            max_luminance: 0x000F_4240,
+            max_content_light_level: 0,
+            max_frame_avg_light_level: 0,
+        }
+    }
+
+    #[test]
+    fn dmon_round_trips_bt709_defaults() {
+        let meta = bt709_dmon();
+        let bytes = meta.to_bytes().unwrap();
+        assert_eq!(bytes.len(), 28);
+        assert_eq!(MasteringDisplayMetadata::parse(&bytes).unwrap(), meta);
+    }
+
+    #[test]
+    fn dmon_rejects_out_of_range_and_bad_luminance() {
+        let base = bt709_dmon().to_bytes().unwrap();
+        // Chromaticity coordinate > 50000 (Xc0 at bytes 0..2).
+        let mut b = base;
+        b[0..2].copy_from_slice(&50_001u16.to_be_bytes());
+        assert!(MasteringDisplayMetadata::parse(&b).is_err());
+        // Lmin >= Lmax.
+        let mut b = base;
+        b[16..20].copy_from_slice(&0x00FF_FFFFu32.to_be_bytes());
+        assert!(MasteringDisplayMetadata::parse(&b).is_err());
+        // Wrong length.
+        assert!(MasteringDisplayMetadata::parse(&base[..27]).is_err());
+        // Constructor-side validation.
+        let mut bad = bt709_dmon();
+        bad.white_point = (60_000, 0);
+        assert!(bad.to_bytes().is_err());
+    }
+
+    // ---- Video Transport Parameter box (jptp, A.5.3.6) ----
+
+    #[test]
+    fn jptp_round_trips() {
+        let params = VideoTransportParameters {
+            slice_group_size: 4,
+            parallel_units: 8,
+        };
+        let bytes = params.to_bytes();
+        assert_eq!(bytes.len(), 6);
+        // Tseq and MTU are 0 by construction.
+        assert_eq!(&bytes[3..6], &[0, 0, 0]);
+        assert_eq!(VideoTransportParameters::parse(&bytes).unwrap(), params);
+    }
+
+    #[test]
+    fn jptp_rejects_reserved_tseq_and_mtu() {
+        let base = VideoTransportParameters {
+            slice_group_size: 1,
+            parallel_units: 1,
+        }
+        .to_bytes();
+        // Tseq (byte 3) non-zero is reserved.
+        let mut b = base;
+        b[3] = 1;
+        assert!(VideoTransportParameters::parse(&b).is_err());
+        // MTU (bytes 4..6) non-zero is reserved.
+        let mut b = base;
+        b[4..6].copy_from_slice(&1500u16.to_be_bytes());
+        assert!(VideoTransportParameters::parse(&b).is_err());
+        // Wrong length.
+        assert!(VideoTransportParameters::parse(&base[..5]).is_err());
+    }
+
+    #[test]
+    fn builder_emits_all_jpvs_boxes_in_order() {
+        let cs = luma_cs();
+        let meta = bt709_dmon();
+        let params = VideoTransportParameters {
+            slice_group_size: 2,
+            parallel_units: 4,
+        };
+        let file = JxsFileBuilder::new(srgb())
+            .video_information(VideoInformation::unknown())
+            .profile_level(0x3540, 0x1000)
+            .mastering_display(meta)
+            .transport_parameters(params)
+            .build(&cs)
+            .unwrap();
+        let parsed = parse_jxs_file(&file).unwrap();
+        assert_eq!(parsed.mastering_display.unwrap(), meta);
+        assert_eq!(parsed.transport_params.unwrap(), params);
+        // Figure A.7 order inside jpvs: jpvi, jxpl, dmon, jptp.
+        let jpvs = parse_boxes(&file, 0, file.len())
+            .unwrap()
+            .into_iter()
+            .find(|s| s.tbox == TBOX_VIDEO_SUPPORT)
+            .unwrap();
+        let inner = parse_boxes(
+            &file,
+            jpvs.payload_start,
+            jpvs.payload_start + jpvs.payload_len,
+        )
+        .unwrap();
+        let types: Vec<u32> = inner.iter().map(|s| s.tbox).collect();
+        assert_eq!(
+            types,
+            vec![
+                TBOX_VIDEO_INFO,
+                TBOX_PROFILE_LEVEL,
+                TBOX_MASTERING_DISPLAY,
+                TBOX_TRANSPORT_PARAMS
+            ]
+        );
+    }
+
+    #[test]
+    fn builder_dmon_alone_synthesises_mandatory_boxes() {
+        // A dmon box alone still yields a conforming jpvs (jpvi + jxpl
+        // synthesised).
+        let cs = luma_cs();
+        let file = JxsFileBuilder::new(srgb())
+            .mastering_display(bt709_dmon())
+            .build(&cs)
+            .unwrap();
+        let parsed = parse_jxs_file(&file).unwrap();
+        assert!(parsed.video_info.is_some());
+        assert!(parsed.profile_level.is_some());
+        assert_eq!(parsed.mastering_display.unwrap(), bt709_dmon());
+        assert!(decode_jxs_file(&file).is_ok());
     }
 }
