@@ -245,6 +245,29 @@ enum Outcome {
     Fail(String),
 }
 
+/// ISO/IEC 21122-4:2020 Annex C — profile test codestream sets (ETS).
+/// Each profile's decoder conformance is judged on its whole set: §B.8
+/// fails the profile if **any** stream in the set deviates on any
+/// sample. The two `4444` sets plus the Unrestricted set carry the
+/// four-component (`Nc = 4`) codestreams.
+const PROFILE_SETS: &[(&str, &[u32])] = &[
+    ("C.1 Light subline 422.10", &[2, 20, 28, 36, 48, 50]),
+    ("C.2 Light 422.10", &[3, 12, 21, 29, 37, 49, 51]),
+    ("C.3 Light 444.12", &[4, 13, 22, 30, 38, 52, 53]),
+    ("C.4 Main 422.10", &[5, 14, 23, 31, 39, 54, 66]),
+    ("C.5 Main 444.12", &[6, 11, 15, 24, 32, 40, 55, 56]),
+    (
+        "C.6 Main 4444.12 (Nc=4)",
+        &[8, 17, 26, 34, 42, 44, 46, 57, 58, 59],
+    ),
+    ("C.7 High 444.12", &[7, 16, 25, 33, 41, 60, 61]),
+    (
+        "C.8 High 4444.12 (Nc=4)",
+        &[9, 18, 27, 35, 43, 45, 47, 62, 63, 64],
+    ),
+    ("C.10 Unrestricted", &[10, 19, 64, 65]),
+];
+
 /// Decode + compare one stream. A codestream that uses a not-yet-decodable
 /// tool surfaces as `Unsupported` (not `Fail`).
 fn run_stream(dir: &Path, n: u32) -> Outcome {
@@ -294,10 +317,12 @@ fn iso_21122_4_conformance_vectors() {
     );
     let (mut pass, mut unsup, mut fail) = (0u32, 0u32, 0u32);
     let mut failures = Vec::new();
+    let mut passed_streams: Vec<u32> = Vec::new();
     for n in &streams {
         match run_stream(&dir, *n) {
             Outcome::Pass => {
                 pass += 1;
+                passed_streams.push(*n);
                 eprintln!("  stream {n}: PASS");
             }
             Outcome::Unsupported(m) => {
@@ -315,6 +340,29 @@ fn iso_21122_4_conformance_vectors() {
         "ISO/IEC 21122-4: {pass} pass, {unsup} unsupported, {fail} fail / {} streams",
         streams.len()
     );
+    // Per-profile ETS verdicts (Annex C / §B.8): a profile conforms only
+    // if every stream of its test codestream set reconstructs exactly.
+    for (name, set) in PROFILE_SETS {
+        let present: Vec<u32> = set
+            .iter()
+            .copied()
+            .filter(|n| streams.contains(n))
+            .collect();
+        if present.is_empty() {
+            eprintln!("  ETS {name}: no streams present");
+            continue;
+        }
+        let ok = present
+            .iter()
+            .filter(|n| passed_streams.contains(n))
+            .count();
+        let verdict = if ok == present.len() { "PASS" } else { "FAIL" };
+        eprintln!(
+            "  ETS {name}: {verdict} ({ok}/{} streams of {:?})",
+            present.len(),
+            present
+        );
+    }
     assert!(fail == 0, "conformance failures: {failures:?}");
 }
 

@@ -11677,6 +11677,104 @@ mod tests {
         assert_eq!(img.planes[2].data, b, "B plane");
     }
 
+    // === Four components with RCT: Annex F Table F.1 pass-through =====
+
+    /// Build four distinct 8-bit planes: RGB content plus a
+    /// binary-noise-like 4th plane (the alpha-or-K shape the ISO/IEC
+    /// 21122-4 four-component vector carries).
+    fn make_rgba_planes(w: usize, h: usize) -> [Vec<u8>; 4] {
+        let base = make_vertical_structure(w, h);
+        let r = base.clone();
+        let g: Vec<u8> = base.iter().map(|&v| v.saturating_add(9)).collect();
+        let b: Vec<u8> = base.iter().map(|&v| v.saturating_sub(7)).collect();
+        let a: Vec<u8> = (0..w * h)
+            .map(|i| {
+                if i.wrapping_mul(2654435761) & 0x100 != 0 {
+                    255
+                } else {
+                    0
+                }
+            })
+            .collect();
+        [r, g, b, a]
+    }
+
+    /// `Nc = 4` with `Cpih = 1`: the RCT covers components 0..2 and the
+    /// 4th component is the Table F.1 pass-through (`Ω[3] = O[3]`) — it
+    /// still runs the full entropy / dequant / DWT / Annex G pipeline.
+    /// Lossless round-trip must be bit-exact on all four planes.
+    #[test]
+    fn four_component_rct_pass_through_lossless_round_trips() {
+        let (w, h) = (48u16, 32u16);
+        let [r, g, b, a] = make_rgba_planes(w as usize, h as usize);
+        let planes = [r.clone(), g.clone(), b.clone(), a.clone()];
+        let cs = encode_planar(w, h, 4, 1, 2, 2, &planes).expect("encode Nc=4 Cpih=1");
+        let parsed = crate::codestream::parse(&cs).expect("parse");
+        assert_eq!(parsed.pih.nc, 4, "PIH Nc=4");
+        assert_eq!(parsed.pih.cpih, 1, "PIH Cpih=1");
+        let img = decode_codestream(&cs, None).expect("decode Nc=4 Cpih=1");
+        assert_eq!(img.planes.len(), 4);
+        assert_eq!(img.planes[0].data, r, "R plane");
+        assert_eq!(img.planes[1].data, g, "G plane");
+        assert_eq!(img.planes[2].data, b, "B plane");
+        assert_eq!(img.planes[3].data, a, "pass-through 4th plane");
+    }
+
+    /// The same four-component RCT layout at `NL = 1/1` with several
+    /// precinct rows and an odd width — the geometry family of the
+    /// conformance four-component stream (odd-width level-1 bands whose
+    /// last code group carries meaningless tail positions, decoded
+    /// through the picture-level cascade rather than any per-precinct
+    /// synthesis). Bit-exact on all four planes.
+    #[test]
+    fn four_component_rct_nl1_odd_width_multi_precinct_round_trips() {
+        let (w, h) = (33u16, 12u16);
+        let [r, g, b, a] = make_rgba_planes(w as usize, h as usize);
+        let planes = [r.clone(), g.clone(), b.clone(), a.clone()];
+        let cs = encode_planar(w, h, 4, 1, 1, 1, &planes).expect("encode Nc=4 NL=1/1");
+        let img = decode_codestream(&cs, None).expect("decode Nc=4 NL=1/1");
+        assert_eq!(img.planes.len(), 4);
+        assert_eq!(img.planes[0].data, r, "R plane");
+        assert_eq!(img.planes[1].data, g, "G plane");
+        assert_eq!(img.planes[2].data, b, "B plane");
+        assert_eq!(img.planes[3].data, a, "pass-through 4th plane");
+    }
+
+    /// Lossy `Nc = 4` `Cpih = 1`: the pass-through component is subject
+    /// to the same truncation ladder as the RCT trio; each plane must
+    /// stay above the PSNR floor and the decode must keep 4 planes.
+    #[test]
+    fn four_component_rct_lossy_holds_psnr_floor() {
+        let (w, h) = (64u16, 48u16);
+        let base = make_vertical_structure(w as usize, h as usize);
+        let r = base.clone();
+        let g: Vec<u8> = base.iter().map(|&v| v.saturating_add(9)).collect();
+        let b: Vec<u8> = base.iter().map(|&v| v.saturating_sub(7)).collect();
+        // A smooth ramp for the 4th plane: binary noise has no lossy
+        // PSNR guarantee, a gradient does.
+        let a: Vec<u8> = (0..w as usize * h as usize)
+            .map(|i| ((i % w as usize) * 255 / (w as usize - 1)) as u8)
+            .collect();
+        let planes = [r.clone(), g.clone(), b.clone(), a.clone()];
+        let cs =
+            encode_planar_lossy(w, h, 4, 1, 2, 2, 2, &planes).expect("encode Nc=4 Cpih=1 lossy");
+        let img = decode_codestream(&cs, None).expect("decode Nc=4 Cpih=1 lossy");
+        assert_eq!(img.planes.len(), 4);
+        for (k, orig) in [&r, &g, &b, &a].into_iter().enumerate() {
+            let mut sse = 0.0f64;
+            for (x, y) in orig.iter().zip(img.planes[k].data.iter()) {
+                let d = *x as f64 - *y as f64;
+                sse += d * d;
+            }
+            let mse = sse / (w as f64 * h as f64);
+            let psnr = 10.0 * (255.0f64 * 255.0 / mse).log10();
+            assert!(
+                psnr >= 25.0,
+                "component {k} lossy PSNR {psnr:.2} dB below 25 dB floor"
+            );
+        }
+    }
+
     /// `Rm = 1` lossy (`q > 0`) round-trips within a PSNR floor — the
     /// insignificant-group `M = T` reconstruction is exactly the zero the
     /// data sub-packet would have decoded anyway.
