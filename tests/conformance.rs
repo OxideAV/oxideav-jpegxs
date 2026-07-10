@@ -175,10 +175,13 @@ fn compare_image(
             reference.len()
         ));
     }
-    // Our planes carry one byte/sample when the picture wavelet precision
-    // Bw ≤ 8, else two little-endian bytes/sample (see JpegXsPlane docs).
-    let bytes_per_sample = if img.bit_depth <= 8 { 1 } else { 2 };
     for (k, (plane, refc)) in img.planes.iter().zip(reference.iter()).enumerate() {
+        // The decoder packs each plane at the *component* precision B[i]
+        // (`decoder.rs`: one byte/sample when B[i] ≤ 8, else two
+        // little-endian bytes) — not at the picture-wide `Bw`
+        // (`img.bit_depth`), which can be 20 even for an 8-bit component.
+        // The reference `.h` precision equals B[i], so use it per plane.
+        let bytes_per_sample = if refc.precision <= 8 { 1 } else { 2 };
         let stride_samples = plane.stride / bytes_per_sample;
         let plane_w = stride_samples;
         let plane_h = if stride_samples == 0 {
