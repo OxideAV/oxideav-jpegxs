@@ -344,8 +344,44 @@ depths, `Qpih`, slice-height, column-mode caps). Buffer-model bounds
 (Annexes B/C/D) are out of scope — they require a transmission-channel
 rate not observable from the codestream.
 
+### ISO/IEC 21122-4 conformance
+
+The decoder is exercised against the official **ISO/IEC 21122-4:2020**
+decoder conformance codestreams (the 65-stream, 1.4 GB reference-vector
+set — codestreams paired with sample-exact reference decoded images). The
+`tests/conformance.rs` harness is an opt-in gate: point
+`OXIDEAV_JXS_CONFORMANCE_DIR` at the unpacked attachment set and it decodes
+each `N.jxs`, then compares every reconstructed component plane
+sample-by-sample against its `pgx` reference (§B.8 — a pass is exact
+equality on every sample; per §B.6 the normative RCT / Star-Tetrix inverse
+is applied while non-normative YCbCr→RGB and 4:2:2→4:4:4 upsampling are
+not, so planes are compared at native subsampled resolution). Without the
+directory the harness self-tests the `pgx` reader against synthetic
+fixtures, so CI stays green without the archives (catalogued, with
+per-file SHA-256, in `docs/image/jpegxs/conformance/`).
+
+Wiring these vectors in surfaced — and fixed — a structural bug in the
+multi-component packet layout: Annex B.7 Table B.4 codes all components of
+a `(β, line)` **jointly in one packet** (the new-packet flag `r` resets per
+`(λ, β)`, not per component), where the planner had emitted one packet per
+band. The per-component split only round-tripped against this crate's own
+encoder; real codestreams desynced at the first precinct. Both directions
+now group jointly, and the encoder commits one bitplane-count `D[p,b]` mode
+per packet group so its single-mode packet body matches the per-band `D`
+the decoder dispatches on. Streams that use `Bw = 20 / Fq = 8` regular
+coding across the Main 422.10 (66), High 444.12 (61), and Unrestricted
+(63, 65) profiles — plus the 8-bit-component / `Bw = 20` case (62) — now
+reconstruct bit-exactly. The one remaining known gap is a localized decode
+error in the **independent 4th component** of a 4-component `Cpih = 1`
+stream (64): its RCT components 0/1/2 are sample-exact, but the pass-through
+alpha-like channel diverges at an interior pixel.
+
 ### Not yet covered
 
+- ISO/IEC 21122-4 stream 64: the independent 4th component of a
+  4-component RCT (`Cpih = 1`) picture diverges at an interior sample
+  (components 0/1/2 are bit-exact); the pass-through channel's decode
+  needs a targeted fix.
 - Bit depths above 16 (would need a `u32` plane format).
 - All Annex H example tables are transcribed and wired through both the 8-bit
   and the high-bit-depth (`B[i] ∈ 9..=16`) encode paths: the 4:4:4 RCT tables
