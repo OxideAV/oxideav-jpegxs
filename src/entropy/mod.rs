@@ -506,13 +506,16 @@ pub struct PacketSignInfo<'a> {
 /// non-zero quantization-index magnitude** `v[p,λ,b,Ng×g+k] != 0`,
 /// iterating every member `k ∈ 0..Ng` of every code group
 /// `g ∈ 0..Ncg[p,b]` of every included `(band, line)` entry. Positions
-/// past the band width `Wpb[p,b]` carry no sign bit — they are the
-/// "meaningless coefficients near the right edge" of Table C.9 NOTE 2
-/// that the magnitude loop already skips (`xpos >= wpb`). The
-/// accumulated bits are padded up to the next byte boundary (`pad(8)`),
-/// giving `Lsgn[p,s]` exclusive of any optional trailing filler bytes —
-/// the same way [`decode_packet_body`]'s sign sub-packet loop consumes
-/// it, so the count is exact.
+/// past the band width `Wpb[p,b]` — the "meaningless coefficients near
+/// the right edge" of Table C.9 NOTE 2 — *also* carry a sign bit
+/// whenever their transmitted magnitude is non-zero. The
+/// [`PacketSignInfo`] view holds only the stored (in-band) magnitudes,
+/// so this inference counts no tail bits; it is exact for encoder-built
+/// packets (this crate's encoder forces tails to zero, as NOTE 2
+/// advises) and a lower bound otherwise — any tail sign bits appear as
+/// legal trailing filler to the ≥-bound consumers. The accumulated bits
+/// are padded up to the next byte boundary (`pad(8)`), giving
+/// `Lsgn[p,s]` exclusive of any optional trailing filler bytes.
 ///
 /// Bands that do not exist are skipped, matching the decode loop's
 /// `if !band.exists { continue; }`. Bits accumulate in `u64` so an

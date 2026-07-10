@@ -32,8 +32,10 @@
 //!    (`Fs == 0`) followed by `(M − T) × Ng` magnitude bits MSB-first.
 //!    Padded to byte + filler to `Ldat[p,s]`.
 //! 4. **Sign** sub-packet (Table C.9). Only when `Fs == 1`. One bit
-//!    per non-zero `v[p,λ,b,Ng×g+k]`. Padded + filler to
-//!    `Lsgn[p,s]`.
+//!    per non-zero `v[p,λ,b,Ng×g+k]` — including the "meaningless"
+//!    tail positions `Wpb ≤ Ng×g+k < Ncg×Ng` of a band whose width is
+//!    not a multiple of `Ng`, whenever their transmitted magnitude is
+//!    non-zero (Table C.9 NOTE 2). Padded + filler to `Lsgn[p,s]`.
 //!
 //! Vertical-prediction predecessor:
 //!
@@ -355,7 +357,18 @@ pub fn decode_packet_body(
     }
 
     // === Data sub-packet =================================================
+    //
+    // Table C.8 transmits coefficients in whole code groups of `Ng`, so
+    // a band whose `Wpb` is not a multiple of `Ng` carries "meaningless"
+    // tail coefficients past its right edge in the last code group. The
+    // decoder discards their magnitudes, but Table C.9 NOTE 2 makes the
+    // sign sub-packet include a sign bit for every such tail coefficient
+    // whose transmitted magnitude is non-zero — so the tail magnitudes
+    // must be tracked (per packet entry) for the sign pass to stay
+    // bit-aligned. `tail_v[e]` holds the decoded magnitudes of entry
+    // `e`'s positions `Wpb .. Ncg*Ng` (at most `Ng - 1` of them).
     let ldat = packet.ldat as usize;
+    let mut tail_v: Vec<Vec<u32>> = vec![Vec::new(); layout.entries.len()];
     {
         let buf_dat = buf
             .get(total_consumed..total_consumed + ldat)
@@ -363,7 +376,7 @@ pub fn decode_packet_body(
                 Error::invalid("jpegxs entropy: packet body truncated at data sub-packet")
             })?;
         let mut reader = BitReader::new(buf_dat);
-        for entry in &layout.entries {
+        for (e, entry) in layout.entries.iter().enumerate() {
             let bi = entry.band as usize;
             let band = &geom.bands[bi];
             if !band.exists {
@@ -374,6 +387,8 @@ pub fn decode_packet_body(
             let t = truncation[bi] as u32;
             let coef = &mut prev_state.coefficients[bi];
             let line_offset = line_index * (band.wpb as usize);
+            let tail_len = (ncg * geom.ng as usize).saturating_sub(band.wpb as usize);
+            tail_v[e] = vec![0u32; tail_len];
             for g in 0..ncg {
                 let m = coef.m[line_index * ncg + g] as u32;
                 // Reset magnitudes for this group (per Table C.8:
@@ -404,6 +419,13 @@ pub fn decode_packet_body(
                             let xpos = g * geom.ng as usize + k;
                             if xpos < band.wpb as usize {
                                 coef.v[line_offset + xpos] |= d << plane;
+                            } else {
+                                // Meaningless tail coefficient: the
+                                // magnitude is discarded, but whether it
+                                // is non-zero decides a sign bit in the
+                                // Fs = 1 sign sub-packet (Table C.9
+                                // NOTE 2).
+                                tail_v[e][xpos - band.wpb as usize] |= d << plane;
                             }
                         }
                     }
@@ -429,7 +451,7 @@ pub fn decode_packet_body(
                 Error::invalid("jpegxs entropy: packet body truncated at sign sub-packet")
             })?;
         let mut reader = BitReader::new(buf_sgn);
-        for entry in &layout.entries {
+        for (e, entry) in layout.entries.iter().enumerate() {
             let bi = entry.band as usize;
             let band = &geom.bands[bi];
             if !band.exists {
@@ -443,6 +465,15 @@ pub fn decode_packet_body(
                 for k in 0..geom.ng as usize {
                     let xpos = g * geom.ng as usize + k;
                     if xpos >= band.wpb as usize {
+                        // Meaningless tail coefficient of the last code
+                        // group (Wpb not a multiple of Ng). Table C.9
+                        // NOTE 2: the sign sub-packet carries a sign bit
+                        // for it whenever its transmitted magnitude is
+                        // non-zero. Consume and discard the bit so the
+                        // following bands' signs stay aligned.
+                        if tail_v[e][xpos - band.wpb as usize] != 0 {
+                            let _ = reader.read_bit()?;
+                        }
                         continue;
                     }
                     if coef.v[line_offset + xpos] != 0 {
@@ -1259,6 +1290,106 @@ mod tests {
         )
         .expect("Rm=0 insignificant vertical-prediction decode");
         assert_eq!(band_m(&dec), vec![5, 4]);
+    }
+
+    /// Table C.9 NOTE 2: a band whose `Wpb` is not a multiple of `Ng`
+    /// transmits "meaningless" tail coefficients in its last code group,
+    /// and the `Fs = 1` sign sub-packet carries a sign bit for every such
+    /// tail coefficient whose transmitted magnitude is non-zero. A decoder
+    /// that skips those bits desynchronises every following sign in the
+    /// same sub-packet (ISO/IEC 21122-4 stream 64 hits exactly this: the
+    /// shifted bit only becomes visible at the next negative sign, in the
+    /// 4th component).
+    ///
+    /// Fixture: two bands in one packet. Band 0 has `Wpb = 7` (`Ncg = 2`,
+    /// `Ng = 4` → one tail position at xpos 7) with a **non-zero tail
+    /// magnitude** on the wire; band 1 (`Wpb = 4`) follows with a negative
+    /// coefficient. `T = 0`, `D = 0`, `Dr = 0`, `Fs = 1`.
+    ///
+    /// Bitplane-count sub-packet: `M = [1, 1]` (band 0), `[1]` (band 1);
+    /// VLC(mtop=0, T=0) is unary → "10 10 10" → 0xA8, `Lcnt = 1`.
+    ///
+    /// Data sub-packet (one plane per group, 4 bits each):
+    ///   band 0 g=0: coefs [1,0,1,0] → "1010";
+    ///   band 0 g=1: coefs [1,1,1] + tail magnitude 1 → "1111";
+    ///   band 1 g=0: coefs [0,1,0,0] → "0100".
+    ///   → 0xAF 0x40, `Ldat = 2`.
+    ///
+    /// Sign sub-packet, one bit per non-zero magnitude **including the
+    /// tail** (Table C.9 NOTE 2):
+    ///   band 0: x0 (+) x2 (−) x4 (+) x5 (+) x6 (+), tail (+);
+    ///   band 1: x1 (−).
+    ///   → "0100001" → 0x42, `Lsgn = 1`.
+    ///
+    /// A decoder that drops the tail bit reads band 1's sign from the
+    /// tail's position (0) and decodes +1 instead of −1.
+    #[test]
+    fn fs1_sign_bits_for_nonzero_tail_coefficients() {
+        let geom = PrecinctGeometry {
+            bands: vec![
+                BandGeometry {
+                    wpb: 7,
+                    gain: 0,
+                    priority: 0,
+                    l0: 0,
+                    l1: 1,
+                    exists: true,
+                },
+                BandGeometry {
+                    wpb: 4,
+                    gain: 0,
+                    priority: 0,
+                    l0: 0,
+                    l1: 1,
+                    exists: true,
+                },
+            ],
+            ng: 4,
+            ss: 8,
+            br: 4,
+            fs: 1,
+            rm: 0,
+            rl: 0,
+            lh: 0,
+            short_packet_header: true,
+        };
+        let layout = PacketLayout {
+            entries: vec![
+                PacketEntry { band: 0, line: 0 },
+                PacketEntry { band: 1, line: 0 },
+            ],
+        };
+        let precinct = PrecinctHeader {
+            lprc: 1,
+            q: 0,
+            r: 0,
+            d: vec![0, 0],
+            header_bytes: 0,
+        };
+        let body: Vec<u8> = vec![0xA8, 0xAF, 0x40, 0x42];
+        let packet = PacketHeader {
+            dr: 0,
+            ldat: 2,
+            lcnt: 1,
+            lsgn: 1,
+            short_form: true,
+            header_bytes: 5,
+        };
+        let mut state = PrecinctState::default();
+        let dec = decode_packet_body(&body, &geom, &precinct, &packet, &layout, &mut state, None)
+            .expect("Fs=1 non-zero-tail sign decode");
+        assert_eq!(dec.bytes_consumed, 4);
+
+        let band0 = &dec.bands[0];
+        assert_eq!(band0.m, vec![1, 1]);
+        assert_eq!(band0.v, vec![1u32, 0, 1, 0, 1, 1, 1]);
+        assert_eq!(band0.s, vec![0u8, 0, 1, 0, 0, 0, 0]);
+
+        // Band 1's sign must come AFTER the tail's sign bit: −1 at x=1.
+        let band1 = &dec.bands[1];
+        assert_eq!(band1.m, vec![1]);
+        assert_eq!(band1.v, vec![0u32, 1, 0, 0]);
+        assert_eq!(band1.s, vec![0u8, 1, 0, 0]);
     }
 
     /// Vertical prediction selected at a first-line band with NO
