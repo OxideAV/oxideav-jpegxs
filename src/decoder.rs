@@ -27,7 +27,7 @@ use crate::codestream;
 use crate::colour_transform::{inverse_rct, inverse_star_tetrix};
 use crate::crg::cfa_pattern_type;
 use crate::dequant::dequantize_precinct;
-use crate::dwt::{inverse_2d, inverse_cascade_2d};
+use crate::dwt::inverse_cascade_2d;
 use crate::entropy::packet_body::{PrecinctState, PrecinctTop};
 use crate::entropy::{
     check_raw_mode_consistency, decode_packet_body, parse_packet_header, parse_precinct_header,
@@ -967,10 +967,11 @@ fn synthesise_precinct(
     let nly = plan.nly as u32;
     let nbeta = plan.n_beta;
     let nc = plan.nc as u32;
-    // Round 5: Per-component synthesis. For each component i, gather
-    // the (LL, HL, LH, HH) bands of that component and do a single-
-    // level inverse 2-D DWT (or the corresponding 1-D variant for
-    // NL,y == 0). Multi-level cascade arrives in round 6.
+    // Streaming per-precinct synthesis — `NL,y = 0` only. A
+    // single-column precinct row is a complete horizontal transform
+    // unit, so per-precinct == picture-level here. Any `NL,y >= 1`
+    // layout takes the gather/cascade path instead (the Annex E
+    // vertical 5/3 filter crosses precinct boundaries).
 
     let py = precinct_plan.p as usize; // np_x == 1
     let wp = precinct_plan.wp as usize;
@@ -1012,86 +1013,12 @@ fn synthesise_precinct(
             continue;
         }
 
-        if nlx == 1 && nly == 1 {
-            // Per-component 4-band inverse 2-D DWT.
-            // For sub-sampled components (e.g. 4:2:0 chroma at sy=2),
-            // the per-component effective vertical decomposition level
-            // is N'L,y[i] = NL,y - log2(sy[i]) = 0 — i.e. the LH/HH
-            // bands are absent. We handle that with the NLY=0 path
-            // below.
-            let nly_i = if sy_i == 2 { 0 } else { 1 };
-            if nly_i == 0 {
-                // Only the LL and HL bands exist — single-row 1-D
-                // horizontal inverse synthesis (same as the NL,y == 0,
-                // NL,x == 1 case).
-                inverse_synth_1d(
-                    precinct_plan,
-                    band_id,
-                    nbeta,
-                    &dequant,
-                    py,
-                    hp_i,
-                    wp_i,
-                    wc_i,
-                    samples_i,
-                )?;
-            } else {
-                // Standard 4-band 2-D synthesis.
-                let b_ll = band_id(0);
-                let b_hl = band_id(1);
-                let b_lh = band_id(2);
-                let b_hh = band_id(3);
-                if !precinct_plan.geometry.bands[b_ll].exists {
-                    continue;
-                }
-                let ll = &dequant[b_ll];
-                let hl = &dequant[b_hl];
-                let lh = &dequant[b_lh];
-                let hh = &dequant[b_hh];
-                // For partial bottom precincts (e.g. odd-height
-                // pictures where the last precinct only covers 1 pixel
-                // row), some bands carry fewer rows than `hp_i`
-                // expects. Pad them with zero rows so the 2-D
-                // synthesis runs at the full precinct height; the
-                // post-DWT row-copy clips at `target_row >= Hf / sy_i`
-                // so synthesised samples beyond the picture boundary
-                // are dropped.
-                let ll_w_e = wp_i.div_ceil(2);
-                let hl_w_e = wp_i / 2;
-                let ll_h_e = hp_i.div_ceil(2);
-                let lh_h_e = hp_i / 2;
-                let pad_to = |buf: &[i32], want: usize| -> Vec<i32> {
-                    if buf.len() == want {
-                        buf.to_vec()
-                    } else {
-                        let mut v = buf.to_vec();
-                        v.resize(want, 0);
-                        v
-                    }
-                };
-                let ll_p = pad_to(ll, ll_w_e * ll_h_e);
-                let hl_p = pad_to(hl, hl_w_e * ll_h_e);
-                let lh_p = pad_to(lh, ll_w_e * lh_h_e);
-                let hh_p = pad_to(hh, hl_w_e * lh_h_e);
-                let mut out = vec![0i32; wp_i * hp_i];
-                inverse_2d(wp_i, hp_i, &ll_p, &hl_p, &lh_p, &hh_p, &mut out)?;
-                let row_offset = py * hp_i;
-                let hf_rows = (pih.hf as usize).div_ceil(sy_i);
-                for line in 0..hp_i {
-                    let target_row = row_offset + line;
-                    if target_row >= hf_rows {
-                        break;
-                    }
-                    if target_row >= samples_i.len() / wc_i {
-                        break;
-                    }
-                    let dst = &mut samples_i[target_row * wc_i..target_row * wc_i + wp_i];
-                    let src = &out[line * wp_i..line * wp_i + wp_i];
-                    dst.copy_from_slice(src);
-                }
-            }
-            continue;
-        }
+        // NL,x == 1 && NL,y == 1 is unreachable here: any NL,y >= 1
+        // layout routes through the picture-level gather/cascade path
+        // (see `multi_level` in `decode_codestream`) because the Annex E
+        // vertical 5/3 synthesis crosses precinct boundaries. This
+        // streaming function only ever sees NL,y == 0.
+        debug_assert_eq!(nly, 0, "streaming synthesis requires NL,y == 0");
 
         if nlx == 1 && nly == 0 {
             inverse_synth_1d(

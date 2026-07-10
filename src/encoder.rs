@@ -7117,10 +7117,12 @@ fn write_slice(out: &mut Vec<u8>, cfg: &EncodeConfig, planes_u8: &[Vec<u8>]) -> 
     Ok(())
 }
 
-/// Single-level streaming encode (NL=1/1). Mirrors the decoder's
-/// per-precinct synthesis path, including chroma sub-sampling — for
-/// `sy[i] = 2` components the per-precinct strip has only one row
-/// (`hp_i = 1`) and only the LL/HL bands exist (1-D horizontal DWT).
+/// Single-level streaming encode (`NL,y = 0`, `NL,x <= 1`). One
+/// single-column precinct row is a complete horizontal transform unit,
+/// so per-precinct == picture-level here. `NL,y >= 1` layouts must not
+/// reach this function — the Annex E vertical 5/3 filter crosses
+/// precinct boundaries, so they take the picture-level cascade encoder
+/// (see `multi_level` at the call site).
 fn encode_precinct_single_level(
     cfg: &EncodeConfig,
     comp_planes: &[Vec<i32>],
@@ -7128,6 +7130,13 @@ fn encode_precinct_single_level(
     y1: usize,
     hp_real: usize,
 ) -> Result<Vec<u8>> {
+    if cfg.nly != 0 {
+        return Err(Error::invalid(
+            "jpegxs encoder: streaming single-level path requires NL,y = 0 \
+             (NL,y >= 1 takes the picture-level cascade)"
+                .to_string(),
+        ));
+    }
     let w = cfg.width as usize;
     let h_full = cfg.height as usize;
     let nc = cfg.nc as usize;
