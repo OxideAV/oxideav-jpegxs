@@ -6963,12 +6963,23 @@ fn write_slice(out: &mut Vec<u8>, cfg: &EncodeConfig, planes_u8: &[Vec<u8>]) -> 
         8u32 * (cfg.cw as u32) * max_sx * (1u32 << nlx)
     };
     let np_x: usize = ((w as u32).div_ceil(cs)) as usize;
-    // Route everything with nlx > 1 or nly > 1 through the cascade path,
+    // Route everything with nlx > 1 or nly >= 1 through the cascade path,
     // including asymmetric (nlx != nly) configurations. Cw > 0 (Np,x > 1)
     // also forces the cascade path because per-precinct DWT does not
     // commute with multi-precinct-per-row layout (precinct boundaries
     // reflect at the band level, not the sample level).
-    let multi_level = nlx > 1 || nly > 1 || np_x > 1 || cfg.sd > 0;
+    //
+    // NL,y = 1 previously took a per-precinct streaming forward DWT that
+    // reflected the 5/3 vertical filter at every 2-line precinct
+    // boundary. That is not the Annex E transform: the DWT is
+    // picture-level, so the vertical filter must run across precinct
+    // boundaries (symmetric extension exists at the picture edges only).
+    // The streams it emitted only round-tripped against the matching
+    // per-precinct decoder path and would mis-decode on a conforming
+    // decoder — so every NL,y >= 1 layout now takes the picture-level
+    // cascade. The streaming path remains for NL,y = 0, where one
+    // precinct row is a complete horizontal transform unit.
+    let multi_level = nlx > 1 || nly >= 1 || np_x > 1 || cfg.sd > 0;
     let hp_pow = 1u32 << nly;
     let np_y = (h as u32).div_ceil(hp_pow) as usize;
 

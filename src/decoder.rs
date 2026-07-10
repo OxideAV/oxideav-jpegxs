@@ -282,7 +282,18 @@ pub(crate) fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<JpegXsIm
     // sample level — only the picture-level cascade DWT is correct).
     // Sd > 0 also forces the gather path because the suppressed-component
     // band data is copied directly into samples there.
-    let multi_level = pih.nlx > 1 || pih.nly > 1 || plan.np_x > 1 || sd > 0;
+    //
+    // NL,y >= 1 (any vertical decomposition) also forces the gather path:
+    // the Annex E inverse DWT is a picture-level transform, so the 5/3
+    // vertical synthesis of a precinct's boundary rows reads coefficient
+    // rows owned by the precincts above/below. A per-precinct vertical
+    // synthesis would instead reflect at every 2-line precinct boundary
+    // (Annex E.5 symmetric extension belongs to the *picture* edges
+    // only), which mis-reconstructs every interior boundary row of a
+    // real multi-precinct picture. The streaming per-precinct fast path
+    // is exact only for NL,y = 0, where a single-column precinct row is
+    // a complete horizontal synthesis unit.
+    let multi_level = pih.nlx > 1 || pih.nly >= 1 || plan.np_x > 1 || sd > 0;
 
     // Allocate per-component sample buffers sized at Wc[i] × Hc[i].
     let wf = pih.wf as usize;
