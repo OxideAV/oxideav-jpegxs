@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased — round 408 (full ISO/IEC 21122-4 decoder conformance: 65/65 bit-exact)
+
+Two decode-path fixes take the ISO/IEC 21122-4:2020 conformance run from
+45 to **65 of 65 codestreams bit-exact** (streams 2–66, every profile /
+level / sublevel in the published vector set, including the 4-component
+`Cpih = 1` stream 64 whose pass-through 4th component had one diverging
+interior region).
+
+* **`Fs = 1` sign sub-packet: tail coefficients carry sign bits**
+  (ISO/IEC 21122-1:2022 Table C.9 NOTE 2). The data sub-packet codes
+  whole `Ng`-wide code groups, so a band with `Wpb umod Ng != 0`
+  transmits "meaningless" tail coefficients past its right edge; each
+  non-zero tail magnitude also carries a sign bit in the sign
+  sub-packet. The decoder skipped those bits, desynchronising every
+  following sign in the packet — invisible until the next negative
+  coefficient. Fixes stream 64 (two sign flips in the 4th component's
+  2047-wide level-1 band) and 12 further vectors that failed the same
+  way (45 → 58 passes). The data sub-packet now records tail
+  magnitudes per packet entry and the sign pass consumes one bit per
+  non-zero tail; hand-built packet-body regression added.
+* **`NL,y >= 1` always takes the picture-level cascade DWT** in both
+  directions. The `NL = 1/1` layout previously used a per-precinct
+  streaming DWT on both sides, reflecting the 5/3 vertical filter at
+  every interior 2-line precinct boundary; Annex E defines a
+  picture-level transform with symmetric extension at the picture edges
+  only. It self-round-tripped, but every real multi-precinct `NL,y = 1`
+  stream diverged from output row 1 down. Streams 29 / 30 / 37–41 (the
+  `NL,x = 1 / NL,y = 1` vectors) now decode bit-exact (58 → 65 passes).
+  The streaming fast path remains for `NL,y = 0`, where one
+  single-column precinct row is a complete horizontal transform unit.
+
+* +1 test (618 → 619).
+
 ## Unreleased — round 398 (transport: Exif box in the JPEG XS Header box)
 
 Recognises the last defined box that was previously silently dropped: the

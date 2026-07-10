@@ -360,28 +360,42 @@ directory the harness self-tests the `pgx` reader against synthetic
 fixtures, so CI stays green without the archives (catalogued, with
 per-file SHA-256, in `docs/image/jpegxs/conformance/`).
 
-Wiring these vectors in surfaced — and fixed — a structural bug in the
-multi-component packet layout: Annex B.7 Table B.4 codes all components of
-a `(β, line)` **jointly in one packet** (the new-packet flag `r` resets per
-`(λ, β)`, not per component), where the planner had emitted one packet per
-band. The per-component split only round-tripped against this crate's own
-encoder; real codestreams desynced at the first precinct. Both directions
-now group jointly, and the encoder commits one bitplane-count `D[p,b]` mode
-per packet group so its single-mode packet body matches the per-band `D`
-the decoder dispatches on. Streams that use `Bw = 20 / Fq = 8` regular
-coding across the Main 422.10 (66), High 444.12 (61), and Unrestricted
-(63, 65) profiles — plus the 8-bit-component / `Bw = 20` case (62) — now
-reconstruct bit-exactly. The one remaining known gap is a localized decode
-error in the **independent 4th component** of a 4-component `Cpih = 1`
-stream (64): its RCT components 0/1/2 are sample-exact, but the pass-through
-alpha-like channel diverges at an interior pixel.
+**The decoder reconstructs all 65 published conformance codestreams
+(streams 2–66) bit-exact — 65 pass / 0 unsupported / 0 fail** — covering
+every profile / level / sublevel in the vector set, including the
+4-component (`Nc = 4`, `Cpih = 1`) stream 64 whose 4th component is the
+RCT's pass-through partner (Annex F Table F.1: `Ω[3] = O[3]`, no colour
+math, but the full entropy / dequant / DWT / Annex G scaling pipeline).
+
+Wiring these vectors in surfaced — and fixed — three structural bugs the
+crate's self-roundtrips could never catch:
+
+- **Joint multi-component packets**: Annex B.7 Table B.4 codes all
+  components of a `(β, line)` jointly in one packet (the new-packet flag
+  `r` resets per `(λ, β)`, not per component), where the planner had
+  emitted one packet per band. Both directions now group jointly, and the
+  encoder commits one bitplane-count `D[p,b]` mode per packet group.
+- **`Fs = 1` sign bits for meaningless tail coefficients** (Table C.9
+  NOTE 2): a band whose `Wpb` is not a multiple of `Ng` transmits
+  "meaningless" tail coefficients in its last code group, and each
+  non-zero tail magnitude carries a sign bit in the sign sub-packet.
+  Skipping them desynchronised every following sign in the packet —
+  invisible until the next negative coefficient, which is exactly the
+  stream-64 "4th component diverges at an interior pixel" signature (two
+  displaced sign bits in its 2047-wide level-1 band) and the failure mode
+  of 12 further odd-width `Fs = 1` vectors.
+- **`NL,y ≥ 1` is picture-level DWT territory**: the `NL = 1/1` layout
+  used a per-precinct streaming DWT (both directions) that reflected the
+  5/3 vertical filter at every interior 2-line precinct boundary. Annex E
+  defines a picture-level transform — symmetric extension exists at the
+  picture edges only — so every real multi-precinct `NL,y = 1` stream
+  (conformance 29 / 30 / 37–41) diverged from output row 1 down. All
+  `NL,y ≥ 1` layouts now take the gather/cascade path; the streaming fast
+  path remains for `NL,y = 0` where one single-column precinct row is a
+  complete horizontal transform unit.
 
 ### Not yet covered
 
-- ISO/IEC 21122-4 stream 64: the independent 4th component of a
-  4-component RCT (`Cpih = 1`) picture diverges at an interior sample
-  (components 0/1/2 are bit-exact); the pass-through channel's decode
-  needs a targeted fix.
 - Bit depths above 16 (would need a `u32` plane format).
 - All Annex H example tables are transcribed and wired through both the 8-bit
   and the high-bit-depth (`B[i] ∈ 9..=16`) encode paths: the 4:4:4 RCT tables
