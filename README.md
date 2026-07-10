@@ -20,13 +20,19 @@ matrix. JPEG XS has no inter-frame state, so each picture is independent.
 
 End-to-end decode of the multi-component subset:
 
-- `Nc ∈ {1, 2, 3, 4}` components; `(sx, sy) ∈ {1, 2}` per component
-  (4:4:4 / 4:2:2 / 4:2:0), with §B.1 ceiling-sized planes so odd picture
-  dimensions are legal.
+- `Nc ∈ 1..=8` components (the full Annex A.4.3 range, both directions —
+  e.g. luma+alpha, RGB+alpha, or eight independent planes); `(sx, sy) ∈
+  {1, 2}` per component (4:4:4 / 4:2:2 / 4:2:0), with §B.1 ceiling-sized
+  planes so odd picture dimensions are legal.
 - `Cw ≥ 0` precincts per row (`Cw = 0` single-precinct-per-row;
   `Cw > 0` splits each row into `⌈Wf / Cs⌉` precincts).
 - `Cpih ∈ {0, 1, 3}` — no transform, reversible RGB↔YCbCr (Annex F.3),
-  or Star-Tetrix (Annex F.5) for 4-component CFA images.
+  or Star-Tetrix (Annex F.5) for 4-component CFA images. Per Table F.1
+  the transforms act on a fixed operand window (`c < 3` for RCT, `c < 4`
+  for Star-Tetrix); every trailing component is a pass-through
+  (`Ω[c] = O[c]`) that still runs the full entropy / dequant / DWT /
+  Annex G pipeline — pinned end-to-end by `Nc = 4` and `Nc = 5`
+  RCT-plus-alpha round-trips and the 4-component conformance vectors.
 - `Qpih ∈ {0, 1}` deadzone / uniform inverse quantizer; `Fq ∈ {0, 8}`
   lossless / regular; `Bw ∈ {8, 18, 20}`; `B[i]` up to 16-bit. The
   uniform inverse quantizer (Annex D.3 Neumann-series reconstruction) is
@@ -366,6 +372,11 @@ every profile / level / sublevel in the vector set, including the
 4-component (`Nc = 4`, `Cpih = 1`) stream 64 whose 4th component is the
 RCT's pass-through partner (Annex F Table F.1: `Ω[3] = O[3]`, no colour
 math, but the full entropy / dequant / DWT / Annex G scaling pipeline).
+The harness also reports per-profile **ETS verdicts** (Annex C / §B.8: a
+profile conforms only if every stream of its test codestream set is
+sample-exact) — all nine sets pass, including the two four-component
+ones (C.6 Main 4444.12 at 10/10, C.8 High 4444.12 at 10/10) and C.10
+Unrestricted (4/4).
 
 Wiring these vectors in surfaced — and fixed — three structural bugs the
 crate's self-roundtrips could never catch:

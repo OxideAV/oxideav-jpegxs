@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased — round 408 (four-component end-to-end + Nc 1..=8 + hygiene)
+
+* **Four-component end-to-end coverage** that runs on CI without the
+  1.4 GB vector set: `Nc = 4` / `Cpih = 1` lossless bit-exact
+  round-trips (RCT trio + Table F.1 pass-through 4th plane) at
+  `NL = 2/2`, the `NL = 1/1` odd-width multi-precinct-row geometry
+  family of conformance stream 64, and a lossy `q = 2` run holding a
+  ≥ 25 dB floor on all four planes.
+* **Annex C ETS reporting** in `tests/conformance.rs`: per-profile test
+  codestream set verdicts (§B.8 — any deviating stream fails the whole
+  set). All nine sets pass, including C.6 Main 4444.12 (10/10), C.8
+  High 4444.12 (10/10), and C.10 Unrestricted (4/4).
+* **Encoder accepts the full Annex A.4.3 range `Nc = 1..=8`** (was
+  {1, 3, 4} without Sd): the pipeline was already generic in `Nc`, and
+  new round-trips pin `Nc = 2` luma+alpha, `Nc = 5` `Cpih = 1` (the
+  pass-through covers *both* trailing components), and the `Nc = 8`
+  upper bound.
+* **Hygiene**: the now-dead per-precinct 2-D DWT branches (the
+  precinct-boundary-reflecting transform the conformance vectors proved
+  non-conformant) are deleted from the decoder's streaming path and
+  rejected at entry by the encoder's streaming path.
+
+* +6 tests (619 → 625).
+
 ## Unreleased — round 408 (full ISO/IEC 21122-4 decoder conformance: 65/65 bit-exact)
 
 Two decode-path fixes take the ISO/IEC 21122-4:2020 conformance run from
