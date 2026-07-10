@@ -310,16 +310,16 @@ impl EncodeConfig {
                 self.rm
             )));
         }
-        // Round 9 (r91): Sd>0 enables Nc up to 8 (Annex A.4.1 hard cap).
-        // Otherwise stay on the pre-r91 supported set of {1, 3, 4}.
-        let allowed_nc = if self.sd > 0 {
-            (4..=8).contains(&self.nc)
-        } else {
-            matches!(self.nc, 1 | 3 | 4)
-        };
-        if !allowed_nc {
-            return Err(Error::Unsupported(format!(
-                "jpegxs encoder: Nc must be 1/3/4 (or 4..=8 with Sd>0), got {}",
+        // Annex A.4.3: Nc is a u(8) picture-header field with range 1..=8.
+        // Every pipeline stage (joint packet grouping, per-component DWT,
+        // colour-transform operand windows with pass-through for the
+        // trailing components, Annex G scaling) iterates over Nc
+        // generically, so the encoder accepts the full spec range. Sd>0
+        // additionally requires Nc >= 4 (checked in the Sd block below);
+        // the Cpih operand-window minimums are checked above.
+        if !(1..=8).contains(&self.nc) {
+            return Err(Error::invalid(format!(
+                "jpegxs encoder: Nc must be 1..=8 (Annex A.4.3), got {}",
                 self.nc
             )));
         }
@@ -760,9 +760,9 @@ pub fn encode_image(img: &JpegXsImage) -> Result<Vec<u8>> {
             img.bit_depth
         )));
     }
-    if !matches!(img.num_components, 1 | 3) {
-        return Err(Error::Unsupported(format!(
-            "jpegxs encoder round 3: Nc must be 1 or 3, got {}",
+    if !(1..=8).contains(&img.num_components) {
+        return Err(Error::invalid(format!(
+            "jpegxs encoder: Nc must be 1..=8 (Annex A.4.3), got {}",
             img.num_components
         )));
     }
@@ -9417,9 +9417,10 @@ mod tests {
         assert!(encode_planar(32, 32, 1, 0, 6, 6, std::slice::from_ref(&pixels)).is_err());
         // NL,y > NL,x is not legal per spec.
         assert!(encode_planar(32, 32, 1, 0, 1, 2, std::slice::from_ref(&pixels)).is_err());
-        // Nc=2 not yet supported.
-        let two = vec![pixels.clone(), pixels.clone()];
-        assert!(encode_planar(32, 32, 2, 0, 1, 1, &two).is_err());
+        // Nc=0 and Nc=9 are outside the Annex A.4.3 u(8) range 1..=8.
+        assert!(encode_planar(32, 32, 0, 0, 1, 1, &[]).is_err());
+        let nine = vec![pixels.clone(); 9];
+        assert!(encode_planar(32, 32, 9, 0, 1, 1, &nine).is_err());
         // Cpih=1 with Nc=1 invalid.
         assert!(encode_planar(32, 32, 1, 1, 1, 1, &[pixels]).is_err());
     }
@@ -11747,6 +11748,63 @@ mod tests {
         assert_eq!(img.planes[1].data, g, "G plane");
         assert_eq!(img.planes[2].data, b, "B plane");
         assert_eq!(img.planes[3].data, a, "pass-through 4th plane");
+    }
+
+    /// `Nc = 2` (luma + alpha, `Cpih = 0`): the smallest multi-component
+    /// layout outside the RGB family. Both planes are independent coded
+    /// components; lossless round-trip must be bit-exact.
+    #[test]
+    fn two_component_lossless_round_trips() {
+        let (w, h) = (48u16, 32u16);
+        let [_, _, l, a] = make_rgba_planes(w as usize, h as usize);
+        let planes = [l.clone(), a.clone()];
+        let cs = encode_planar(w, h, 2, 0, 2, 2, &planes).expect("encode Nc=2");
+        assert_eq!(crate::codestream::parse(&cs).unwrap().pih.nc, 2);
+        let img = decode_codestream(&cs, None).expect("decode Nc=2");
+        assert_eq!(img.planes.len(), 2);
+        assert_eq!(img.planes[0].data, l, "luma plane");
+        assert_eq!(img.planes[1].data, a, "alpha plane");
+    }
+
+    /// `Nc = 5` with `Cpih = 1`: Table F.1's pass-through covers *every*
+    /// component `c >= 3`, not just a single 4th — components 3 and 4
+    /// both bypass the RCT and round-trip bit-exact.
+    #[test]
+    fn five_component_rct_double_pass_through_round_trips() {
+        let (w, h) = (48u16, 32u16);
+        let [r, g, b, a] = make_rgba_planes(w as usize, h as usize);
+        let k: Vec<u8> = a.iter().map(|&v| 255 - v).collect();
+        let planes = [r.clone(), g.clone(), b.clone(), a.clone(), k.clone()];
+        let cs = encode_planar(w, h, 5, 1, 2, 2, &planes).expect("encode Nc=5 Cpih=1");
+        let img = decode_codestream(&cs, None).expect("decode Nc=5 Cpih=1");
+        assert_eq!(img.planes.len(), 5);
+        assert_eq!(img.planes[0].data, r, "R plane");
+        assert_eq!(img.planes[1].data, g, "G plane");
+        assert_eq!(img.planes[2].data, b, "B plane");
+        assert_eq!(img.planes[3].data, a, "pass-through component 3");
+        assert_eq!(img.planes[4].data, k, "pass-through component 4");
+    }
+
+    /// `Nc = 8` (`Cpih = 0`): the Annex A.4.3 upper bound. All eight
+    /// independent components round-trip bit-exact.
+    #[test]
+    fn eight_component_lossless_round_trips() {
+        let (w, h) = (32u16, 24u16);
+        let base = make_vertical_structure(w as usize, h as usize);
+        let planes: Vec<Vec<u8>> = (0..8u8)
+            .map(|i| {
+                base.iter()
+                    .map(|&v| v.rotate_left(i as u32).wrapping_add(i * 13))
+                    .collect()
+            })
+            .collect();
+        let cs = encode_planar(w, h, 8, 0, 2, 2, &planes).expect("encode Nc=8");
+        assert_eq!(crate::codestream::parse(&cs).unwrap().pih.nc, 8);
+        let img = decode_codestream(&cs, None).expect("decode Nc=8");
+        assert_eq!(img.planes.len(), 8);
+        for (k, plane) in planes.iter().enumerate() {
+            assert_eq!(&img.planes[k].data, plane, "component {k}");
+        }
     }
 
     /// Lossy `Nc = 4` `Cpih = 1`: the pass-through component is subject
