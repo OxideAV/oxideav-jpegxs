@@ -7358,20 +7358,23 @@ fn encode_precinct_single_level(
         emit_packet(&mut entropy, cfg, &first_entries)?;
     }
 
-    // Proxy levels: β=1 (HL, G=1), β=2 (LH, G=1), β=3 (HH, G=2).
-    // One packet per (β, i) entry, gated by per-component existence and lines.
+    // Proxy levels: β=1 (HL, G=1), β=2 (LH, G=1), β=3 (HH, G=2). Per Annex
+    // B.7 Table B.4 all existing components of a (β, line) are coded JOINTLY
+    // in ONE packet (`r` resets per (λ, β), not per component; Tables
+    // B.5–B.9). Accumulate every component's entry for this β and emit a
+    // single packet — the decoder's plan groups identically.
     for beta_idx in 1usize..=3 {
+        // When the picture-level NL,y = 0 (β1 = 2), every component's HL
+        // band was already grouped into the first packet above; do not
+        // re-emit it as a standalone proxy packet. (At NL,y = 1 the HL band
+        // — including a 4:2:0 chroma component's — stays a proxy packet.)
+        if beta_idx == 1 && picture_nly0 {
+            continue;
+        }
+        let mut entries: Vec<PerBandEntry> = Vec::new();
         for (i, cb) in comp_bands.iter().enumerate() {
             // Existence per component.
             if beta_idx >= 2 && cb.nly_i == 0 {
-                continue;
-            }
-            // When the picture-level NL,y = 0 (β1 = 2), every component's
-            // HL band was already grouped into the first packet above; do
-            // not re-emit it as a standalone proxy packet. (At NL,y = 1 the
-            // HL band — including a 4:2:0 chroma component's — stays a proxy
-            // packet.)
-            if beta_idx == 1 && picture_nly0 {
                 continue;
             }
             let lines_real = if beta_idx == 1 {
@@ -7390,11 +7393,13 @@ fn encode_precinct_single_level(
             // Gain per sub-band type: HL/LH=1, HH=2.
             let gain: u8 = if beta_idx <= 2 { 1 } else { 2 };
             let line_data = band_buf[..wpb].to_vec();
-            let entries = vec![PerBandEntry {
+            entries.push(PerBandEntry {
                 wpb: wpb as u32,
                 line: BandLineSlice::Direct(line_data),
                 t: t_for_band(gain, beta_idx as u32, i),
-            }];
+            });
+        }
+        if !entries.is_empty() {
             emit_packet(&mut entropy, cfg, &entries)?;
         }
     }
@@ -7782,19 +7787,28 @@ fn encode_precinct_cascade(
             });
         }
     }
-    // Proxy levels.
+    // Proxy levels. Per Annex B.7 Table B.4 the "start a new packet" flag
+    // `r` is set once per (λ, β) — before the component loop — and cleared
+    // after the first included component, so all existing, non-subsampled-
+    // out components of a (β, line) are coded JOINTLY in one packet (Tables
+    // B.5–B.9: e.g. β = 5 at 5/2 4:4:4 → the single packet `(15, 16, 17)`).
+    // The multi-entry PacketJob path (used already by the first packet)
+    // carries them together; the decoder's plan
+    // ([`crate::slice_walker::compute_packet_layouts`]) groups identically.
     {
         let mut beta0 = beta1;
-        // Track per-(comp, beta) whether we've already seen a packet for
-        // that band in this precinct (to mark first-line packets, which
-        // can never use vertical prediction).
-        let mut first_seen: std::collections::HashSet<(usize, u32)> =
-            std::collections::HashSet::new();
+        // Track per-β whether a packet for that band type has already been
+        // emitted in this precinct (to mark first-line packets, which can
+        // never use vertical prediction). All components of a β first
+        // appear together at the same line, so a per-β flag is exact.
+        let mut first_seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
         while beta0 < nbeta_pic {
             let key0 = beta_key(beta0, cfg.nlx, cfg.nly);
             let pow_pic = pow_h(cfg.nly, key0.dy);
             for lambda_within in 0..pow_pic {
                 for beta in beta0..(beta0 + 3).min(nbeta_pic) {
+                    let mut entries: Vec<PerBandEntry> = Vec::new();
+                    let mut coords: Vec<(usize, u32)> = Vec::new();
                     for i in 0..n_decomposed {
                         let s_idx = (beta as usize) * n_decomposed + i;
                         let s = &slices[s_idx];
@@ -7808,18 +7822,21 @@ fn encode_precinct_cascade(
                         }
                         let comp_line = pic_grid_line / sy_i.max(1);
                         if let Some(line_data) = extract_band_line(s, comp_line) {
-                            let key = (i, beta);
-                            let is_first = first_seen.insert(key);
-                            jobs.push(PacketJob {
-                                entries: vec![PerBandEntry {
-                                    wpb: s.wpb as u32,
-                                    line: BandLineSlice::Direct(line_data),
-                                    t: t_for_band(beta, i),
-                                }],
-                                coords: vec![key],
-                                first_line_in_precinct: is_first,
+                            entries.push(PerBandEntry {
+                                wpb: s.wpb as u32,
+                                line: BandLineSlice::Direct(line_data),
+                                t: t_for_band(beta, i),
                             });
+                            coords.push((i, beta));
                         }
+                    }
+                    if !entries.is_empty() {
+                        let is_first = first_seen.insert(beta);
+                        jobs.push(PacketJob {
+                            entries,
+                            coords,
+                            first_line_in_precinct: is_first,
+                        });
                     }
                 }
             }
@@ -7979,16 +7996,48 @@ fn encode_precinct_cascade(
         });
     }
 
-    // Phase 3 — per band, commit D[p,b] ∈ {0,1,2,3} by total bytes.
-    // D encodes (sig_bit=D>>1, pred_bit=D&1) per the precinct header.
-    // Pick the combination with the lowest total byte count.
-    let mut d_per_band: std::collections::HashMap<(usize, u32), u8> =
-        std::collections::HashMap::new();
+    // Phase 3 — commit D[p,b] ∈ {0,1,2,3} by total bytes, but ONE value
+    // per *packet group*. Every band coded together in a single packet
+    // must share the same D: `build_packet_body_with_m` codes the whole
+    // packet body with one bitplane-count mode, while the precinct header
+    // carries D[p,b] per band and the decoder dispatches each band's
+    // sub-packet contribution on its own D[p,b]. If two bands of one
+    // packet disagreed on D, the single-mode body would not match the
+    // per-band header and the decoder would desync.
+    //
+    // Table B.4 groups (a) the first β1 filter types of every component
+    // into packet 0, and (b) each proxy β (all components, every line)
+    // into its own packets. So the packet-group key is: the first-packet
+    // group for β < β1, the β itself for wavelet proxy bands, and a
+    // per-band-unique key for the Sd tail (each coded in its own packet).
+    let group_key = |coord: &(usize, u32)| -> u32 {
+        let (i, beta) = *coord;
+        if i >= n_decomposed {
+            0x4000_0000 | (i as u32) // Sd tail: one packet per band
+        } else if beta < beta1 {
+            u32::MAX // first packet: β < β1 of every component
+        } else {
+            beta // proxy level: all components of a β share a packet
+        }
+    };
+    // Sum each D-option's byte total per packet group.
+    let mut g00: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    let mut g01: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    let mut g10: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    let mut g11: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
     for coord in sizes_d00.keys() {
-        let s00 = sizes_d00[coord];
-        let s01 = sizes_d01.get(coord).copied().unwrap_or(usize::MAX);
-        let s10 = sizes_d10.get(coord).copied().unwrap_or(usize::MAX);
-        let s11 = sizes_d11.get(coord).copied().unwrap_or(usize::MAX);
+        let g = group_key(coord);
+        *g00.entry(g).or_insert(0) += sizes_d00[coord];
+        *g01.entry(g).or_insert(0) += sizes_d01.get(coord).copied().unwrap_or(usize::MAX / 2);
+        *g10.entry(g).or_insert(0) += sizes_d10.get(coord).copied().unwrap_or(usize::MAX / 2);
+        *g11.entry(g).or_insert(0) += sizes_d11.get(coord).copied().unwrap_or(usize::MAX / 2);
+    }
+    let mut d_per_group: std::collections::HashMap<u32, u8> = std::collections::HashMap::new();
+    for g in g00.keys() {
+        let s00 = g00[g];
+        let s01 = g01.get(g).copied().unwrap_or(usize::MAX);
+        let s10 = g10.get(g).copied().unwrap_or(usize::MAX);
+        let s11 = g11.get(g).copied().unwrap_or(usize::MAX);
         let best = s00.min(s01).min(s10).min(s11);
         let d = if s11 == best {
             3u8 // sig=1, pred=1
@@ -7999,6 +8048,12 @@ fn encode_precinct_cascade(
         } else {
             0u8 // sig=0, pred=0
         };
+        d_per_group.insert(*g, d);
+    }
+    let mut d_per_band: std::collections::HashMap<(usize, u32), u8> =
+        std::collections::HashMap::new();
+    for coord in sizes_d00.keys() {
+        let d = d_per_group.get(&group_key(coord)).copied().unwrap_or(0);
         d_per_band.insert(*coord, d);
     }
 

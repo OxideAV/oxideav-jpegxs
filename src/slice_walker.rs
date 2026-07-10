@@ -981,6 +981,15 @@ fn compute_packet_layouts(
         let lines_in_level = pow;
         for lambda_within in 0..lines_in_level {
             for beta in beta0..(beta0 + 3).min(nbeta_u) {
+                // Table B.4 sets the "start a new packet" flag `r = 1`
+                // once per (λ, β) — *before* the component loop — and
+                // clears it (`r = 0`) after the first included component.
+                // Every existing, non-subsampled-out component of this
+                // (β, line) therefore shares ONE packet, coded jointly
+                // (Tables B.5–B.9: e.g. β = 5 at 5/2 4:4:4 yields the
+                // single packet `(15, 16, 17)`). Accumulate all such
+                // components into one layout rather than one packet each.
+                let mut pkt: Vec<PacketEntry> = Vec::new();
                 for i in 0..n_decomposed {
                     let b = (n_decomposed * beta + i) as usize;
                     if b >= bands.len() || !bands[b].exists {
@@ -1011,10 +1020,13 @@ fn compute_packet_layouts(
                     // so `entry.line - band.l0` yields a band-grid row
                     // index when consumed in entropy / packet_body.
                     let line_band = line_image / sy_i_safe;
-                    layouts.push(vec![PacketEntry {
+                    pkt.push(PacketEntry {
                         band: b as u16,
                         line: line_band as u16,
-                    }]);
+                    });
+                }
+                if !pkt.is_empty() {
+                    layouts.push(pkt);
                 }
             }
         }
