@@ -3026,6 +3026,75 @@ pub fn encode_planar_hsl_target_bytes(
     Ok((cs, q_slices))
 }
 
+/// Round-415 **constant-bitrate** entry point: emit a codestream of
+/// *exactly* `target_bytes` bytes whose picture header declares that
+/// size in `Lcod` (21122-1 Table 11 — "size of the entire codestream in
+/// bytes ... if constant-bitrate coding is used").
+///
+/// The rate allocation is [`pick_q_slices_for_target_bytes`] (the
+/// per-slice `Q[p]` ladder search maximising quality within the
+/// budget), which lands *at or under* the target; the remaining gap is
+/// closed with vendor-specific COM extension segments before the first
+/// SLH ([`crate::signalling::pad_to_size`], §A.4.10 — a conforming
+/// decoder skips unknown extension types, and this crate's decoder
+/// output is byte-identical with or without the padding). A residual
+/// gap of `1..=5` bytes is smaller than the smallest COM segment, so in
+/// that case the allocation is re-run against `target_bytes − 6`, which
+/// guarantees a paddable (`≥ 6`-byte) gap. `Lcod` is then set — and
+/// verified against the actual SOC-to-EOC byte count — via
+/// [`crate::signalling::declare_cbr`].
+///
+/// Same input shape as [`encode_planar_hsl_target_bytes`] (8-bit
+/// planar 4:4:4, `Cpih ∈ {0, 1}`, `hsl` slice rows). Returns the
+/// exactly-`target_bytes` CBR stream plus the per-slice `Q[p]` vector
+/// the allocation chose. Errors when even the coarsest allocation
+/// (`Q = 15` everywhere) cannot fit `target_bytes − 6`.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_cbr_target_bytes(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    hsl: u16,
+    target_bytes: usize,
+    planes: &[Vec<u8>],
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let (mut cs, mut q_slices) = encode_planar_hsl_target_bytes(
+        width,
+        height,
+        nc,
+        cpih,
+        nlx,
+        nly,
+        hsl,
+        target_bytes,
+        planes,
+    )?;
+    let gap = target_bytes - cs.len();
+    if (1..=5).contains(&gap) {
+        // The gap is smaller than the smallest COM segment (6 bytes).
+        // Re-allocate against target − 6: the new stream is ≤ target − 6,
+        // so the new gap is ≥ 6 and paddable.
+        let (cs2, q2) = encode_planar_hsl_target_bytes(
+            width,
+            height,
+            nc,
+            cpih,
+            nlx,
+            nly,
+            hsl,
+            target_bytes - 6,
+            planes,
+        )?;
+        cs = cs2;
+        q_slices = q2;
+    }
+    crate::signalling::declare_cbr_padded(&mut cs, target_bytes)?;
+    Ok((cs, q_slices))
+}
+
 /// Round-212 helper — image-row ranges of every slice the encoder
 /// will emit, in top-down `Yslh = 0..n_slices` order.
 ///

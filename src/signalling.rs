@@ -251,6 +251,127 @@ pub fn declare_vbr(buf: &mut [u8]) -> Result<()> {
     patch_and_verify(buf, body + LCOD_REL, &0u32.to_be_bytes())
 }
 
+/// Locate the first SLH marker (`FF20`) by walking the marker chain
+/// from SOC — the insertion point for header-extension segments, since
+/// §A.4.10 requires any COM segment to precede the first slice header.
+fn first_slh_offset(buf: &[u8]) -> Result<usize> {
+    if buf.len() < 4 || buf[0] != 0xff || buf[1] != 0x10 {
+        return Err(Error::invalid(
+            "jpegxs signalling: buffer does not start with SOC (FF10)",
+        ));
+    }
+    let mut pos = 2usize;
+    loop {
+        if pos + 2 > buf.len() {
+            return Err(Error::invalid(
+                "jpegxs signalling: marker chain ended before an SLH marker",
+            ));
+        }
+        if buf[pos] != 0xff {
+            return Err(Error::invalid(format!(
+                "jpegxs signalling: expected a marker at offset {pos}, got 0x{:02X}",
+                buf[pos]
+            )));
+        }
+        match buf[pos + 1] {
+            0x20 => return Ok(pos),
+            0x11 => {
+                return Err(Error::invalid(
+                    "jpegxs signalling: reached EOC before an SLH marker",
+                ));
+            }
+            _ => {
+                if pos + 4 > buf.len() {
+                    return Err(Error::invalid(
+                        "jpegxs signalling: marker segment truncated before its length field",
+                    ));
+                }
+                let len = u16::from_be_bytes([buf[pos + 2], buf[pos + 3]]) as usize;
+                if len < 2 || pos + 2 + len > buf.len() {
+                    return Err(Error::invalid(format!(
+                        "jpegxs signalling: marker 0xFF{:02X} at offset {pos} has invalid \
+                         segment length {len}",
+                        buf[pos + 1]
+                    )));
+                }
+                pos += 2 + len;
+            }
+        }
+    }
+}
+
+/// The smallest possible COM segment: marker (2) + `Lcom` (2, counting
+/// itself) + `Tcom` (2) with an empty `Dcom` — 6 bytes on the wire.
+const COM_MIN_SEGMENT: usize = 6;
+/// The largest possible COM segment: marker (2) + the 16-bit `Lcom`
+/// maximum of 65535 — 65537 bytes on the wire.
+const COM_MAX_SEGMENT: usize = 2 + 0xffff;
+
+/// Grow the codestream to exactly `target` bytes by inserting
+/// vendor-specific COM extension segments (21122-1 §A.4.10, Table A.22
+/// — zero or more COM segments may appear, each before the first slice
+/// header) in front of the first SLH. The padding `Tcom` is
+/// [`crate::com::TCOM_VENDOR_SPECIFIC_MIN`] with an all-zero `Dcom`;
+/// a conforming decoder skips unknown extension types, and this crate's
+/// decoder output is byte-identical with or without the padding.
+///
+/// Errors — leaving the buffer unchanged — when `target` is smaller
+/// than the current stream or the gap is `1..=5` bytes (smaller than
+/// the smallest COM segment; re-run the rate allocation against
+/// `target − 6` to open a paddable gap, as
+/// [`crate::encoder::encode_planar_cbr_target_bytes`] does).
+pub fn pad_to_size(buf: &mut Vec<u8>, target: usize) -> Result<()> {
+    let Some(mut gap) = target.checked_sub(buf.len()) else {
+        return Err(Error::invalid(format!(
+            "jpegxs signalling: cannot pad a {}-byte codestream down to {target} bytes",
+            buf.len()
+        )));
+    };
+    if gap == 0 {
+        return Ok(());
+    }
+    if gap < COM_MIN_SEGMENT {
+        return Err(Error::invalid(format!(
+            "jpegxs signalling: a {gap}-byte gap cannot be COM-padded (the smallest \
+             extension segment is {COM_MIN_SEGMENT} bytes)"
+        )));
+    }
+    let slh = first_slh_offset(buf)?;
+    let mut pad = Vec::with_capacity(gap);
+    while gap > 0 {
+        // One segment covers the whole remaining gap when it fits;
+        // otherwise emit a maximal segment, shrunk by the minimum
+        // segment size when the remainder would be an unpaddable 1..=5
+        // bytes.
+        let seg = if gap <= COM_MAX_SEGMENT {
+            gap
+        } else if gap - COM_MAX_SEGMENT >= COM_MIN_SEGMENT {
+            COM_MAX_SEGMENT
+        } else {
+            COM_MAX_SEGMENT - COM_MIN_SEGMENT
+        };
+        pad.extend_from_slice(&[0xff, 0x15]); // COM marker
+        pad.extend_from_slice(&((seg - 2) as u16).to_be_bytes()); // Lcom
+        pad.extend_from_slice(&crate::com::TCOM_VENDOR_SPECIFIC_MIN.to_be_bytes()); // Tcom
+        pad.resize(pad.len() + (seg - COM_MIN_SEGMENT), 0); // Dcom (zero filler)
+        gap -= seg;
+    }
+    buf.splice(slh..slh, pad);
+    debug_assert_eq!(buf.len(), target);
+    Ok(())
+}
+
+/// Constant-bitrate emission: pad the codestream to exactly `target`
+/// bytes ([`pad_to_size`]) and declare the resulting SOC-to-EOC byte
+/// count in `Lcod` ([`declare_cbr`]). The combination turns any
+/// rate-allocated (`≤ target`) stream into a self-describing CBR stream
+/// of exactly `target` bytes — the fixed-size-per-picture regime that
+/// constant-bitrate transport (21122-1 Table 11) expects.
+pub fn declare_cbr_padded(buf: &mut Vec<u8>, target: usize) -> Result<()> {
+    pad_to_size(buf, target)?;
+    declare_cbr(buf)
+}
+
 /// The eight non-unrestricted profiles in preference order for
 /// [`pick_profile`]: the Light family (smallest decoder smoothing
 /// buffer, Table A.2), then Main (Table A.1), then High (Table A.3),
@@ -981,5 +1102,101 @@ mod tests {
         // entry point emits are themselves a verifiable declaration.
         let buf = encode_profile_shaped();
         verify_declarations(&buf).expect("legacy defaults verify");
+    }
+
+    #[test]
+    fn pad_to_size_inserts_com_and_preserves_decode() {
+        let base = encode_profile_shaped();
+        let baseline = decode_ok(&base);
+        for gap in [6usize, 7, 100, 65537, 65538, 65540, 131074] {
+            let mut buf = base.clone();
+            let target = base.len() + gap;
+            pad_to_size(&mut buf, target).unwrap_or_else(|e| panic!("gap {gap}: {e}"));
+            assert_eq!(buf.len(), target, "gap {gap}: exact size");
+            // The padding parses as COM segments and the decode is
+            // byte-identical to the unpadded stream.
+            let cs = codestream::parse(&buf).unwrap_or_else(|e| panic!("gap {gap}: {e}"));
+            assert!(!cs.com.is_empty(), "gap {gap}: COM present");
+            for com in cs.com().unwrap() {
+                assert_eq!(com.tcom, crate::com::TCOM_VENDOR_SPECIFIC_MIN);
+            }
+            let img = decode_ok(&buf);
+            for (a, b) in img.planes.iter().zip(baseline.planes.iter()) {
+                assert_eq!(a.data, b.data, "gap {gap}: decode unchanged");
+            }
+        }
+    }
+
+    #[test]
+    fn pad_to_size_rejects_unpaddable_gaps() {
+        let base = encode_profile_shaped();
+        // Zero gap is a no-op.
+        let mut buf = base.clone();
+        pad_to_size(&mut buf, base.len()).expect("zero gap");
+        assert_eq!(buf, base);
+        // Gaps 1..=5 are smaller than the smallest COM segment.
+        for gap in 1usize..=5 {
+            let mut buf = base.clone();
+            assert!(
+                pad_to_size(&mut buf, base.len() + gap).is_err(),
+                "gap {gap}"
+            );
+            assert_eq!(buf, base, "gap {gap}: buffer unchanged on error");
+        }
+        // Shrinking is impossible.
+        let mut buf = base.clone();
+        assert!(pad_to_size(&mut buf, base.len() - 1).is_err());
+    }
+
+    #[test]
+    fn declare_cbr_padded_produces_self_describing_stream() {
+        let mut buf = encode_profile_shaped();
+        let target = buf.len() + 64;
+        declare_cbr_padded(&mut buf, target).expect("cbr padded");
+        assert_eq!(buf.len(), target);
+        let cs = codestream::parse(&buf).unwrap();
+        assert_eq!(cs.pih.lcod as usize, target);
+        decode_ok(&buf);
+    }
+
+    #[test]
+    fn encode_planar_cbr_target_bytes_hits_exact_sizes() {
+        let w = 64usize;
+        let h = 64usize;
+        let planes = vec![plane(w, h, 1), plane(w, h, 2), plane(w, h, 3)];
+        // Establish the lossless size: every target above it exercises
+        // pure padding; targets at +1..=+5 exercise the re-allocation
+        // fallback (the gap is smaller than the smallest COM segment).
+        let lossless = encoder::encode_planar_hsl(w as u16, h as u16, 3, 1, 5, 1, 0, 8, &planes)
+            .expect("lossless size probe");
+        let base = lossless.len();
+        for target in [base, base + 3, base + 6, base + 11, base + 999] {
+            let (buf, q_slices) = encoder::encode_planar_cbr_target_bytes(
+                w as u16, h as u16, 3, 1, 5, 1, 8, target, &planes,
+            )
+            .unwrap_or_else(|e| panic!("target {target}: {e}"));
+            assert_eq!(buf.len(), target, "target {target}: exact CBR size");
+            let cs = codestream::parse(&buf).unwrap();
+            assert_eq!(cs.pih.lcod as usize, target, "target {target}: Lcod");
+            // 64 rows at NL,y = 1 → Np,y = 32 precinct rows; Hsl = 8 →
+            // 4 slices, one Q[p] each.
+            assert_eq!(q_slices.len(), 4, "target {target}: one Q per slice");
+            verify_declarations(&buf).unwrap_or_else(|e| panic!("target {target}: {e}"));
+            // The CBR stream still reconstructs (bit-exactly when the
+            // allocation stayed lossless — every target ≥ base + 6 pads
+            // the lossless stream itself).
+            let img = decode_ok(&buf);
+            if target >= base + 6 || target == base {
+                for (i, p) in img.planes.iter().enumerate() {
+                    assert_eq!(p.data, planes[i], "target {target}: plane {i}");
+                }
+            }
+        }
+        // A target below the coarsest allocation is impossible and must
+        // error rather than emit an overweight stream.
+        assert!(encoder::encode_planar_cbr_target_bytes(
+            w as u16, h as u16, 3, 1, 5, 1, 8, 64, &planes,
+        )
+        .is_err());
     }
 }

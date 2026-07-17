@@ -36,7 +36,20 @@
   bit-exact plane compare (plus out-of-profile rejection coverage for
   bit depth / chroma / Qpih / NL,y and a lossy `q = 2` case).
 
-* +19 tests (625 → 644).
+* **Constant-bitrate emission** — `signalling::pad_to_size` /
+  `declare_cbr_padded` grow a codestream to an exact byte size with
+  vendor-specific COM extension segments before the first SLH (§A.4.10
+  permits zero or more; a conforming decoder skips unknown extension
+  types, and this crate's decode is byte-identical with or without the
+  padding), and `encoder::encode_planar_cbr_target_bytes` composes the
+  per-slice `Q[p]` rate allocation with the padding + `Lcod`
+  declaration to emit a stream of *exactly* `target_bytes` bytes that
+  truthfully self-describes its CBR size — the fixed-size-per-picture
+  regime constant-bitrate transport expects. An unpaddable residual gap
+  of 1..=5 bytes (below the 6-byte minimum COM segment) re-runs the
+  allocation against `target − 6`, guaranteeing a paddable gap.
+
+* +23 tests (625 → 648).
 
 ## Unreleased — round 408 (four-component end-to-end + Nc 1..=8 + hygiene)
 
