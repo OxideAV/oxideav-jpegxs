@@ -3095,6 +3095,62 @@ pub fn encode_planar_cbr_target_bytes(
     Ok((cs, q_slices))
 }
 
+/// High-bit-depth companion to [`encode_planar_cbr_target_bytes`]:
+/// exact-size constant-bitrate emission over the `u16`-LE plane format
+/// (`bd ∈ 9..=16`), driven by the per-slice `Q[p]` + picture-level
+/// `R[p]` rate allocation of
+/// [`pick_q_slices_rp_for_target_bytes_highbd`]. Same COM-padding and
+/// `Lcod` regime (21122-1 Table 11 / §A.4.10), including the
+/// `target − 6` re-allocation when the residual gap is smaller than
+/// the minimum COM segment. Returns the exactly-`target_bytes` stream
+/// plus the chosen `(q_slices, rp)`.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_cbr_target_bytes_highbd(
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    bd: u8,
+    hsl: u16,
+    target_bytes: usize,
+    planes: &[Vec<u16>],
+) -> Result<(Vec<u8>, Vec<u8>, u8)> {
+    let (mut cs, mut q_slices, mut rp) = encode_planar_hsl_qslice_rp_target_bytes_highbd(
+        width,
+        height,
+        nc,
+        cpih,
+        nlx,
+        nly,
+        bd,
+        hsl,
+        target_bytes,
+        planes,
+    )?;
+    let gap = target_bytes - cs.len();
+    if (1..=5).contains(&gap) {
+        let (cs2, q2, rp2) = encode_planar_hsl_qslice_rp_target_bytes_highbd(
+            width,
+            height,
+            nc,
+            cpih,
+            nlx,
+            nly,
+            bd,
+            hsl,
+            target_bytes - 6,
+            planes,
+        )?;
+        cs = cs2;
+        q_slices = q2;
+        rp = rp2;
+    }
+    crate::signalling::declare_cbr_padded(&mut cs, target_bytes)?;
+    Ok((cs, q_slices, rp))
+}
+
 /// Round-212 helper — image-row ranges of every slice the encoder
 /// will emit, in top-down `Yslh = 0..n_slices` order.
 ///

@@ -81,7 +81,12 @@
   over-capacity `Dcom` payloads. With this, every marker of
   21122-1:2022 Annex A that an encoder may emit is writable.
 
-* +31 tests (625 → 656).
+* **`encode_planar_cbr_target_bytes_highbd`** — exact-size CBR over the
+  high-bit-depth (`B[i] ∈ 9..=16`, `u16`-LE) plane format, driven by
+  the per-slice `Q[p]` + `R[p]` high-bit-depth rate allocation, with
+  the same COM-padding / `Lcod` regime as the 8-bit entry point.
+
+* +32 tests (625 → 657).
 
 ## Unreleased — round 408 (four-component end-to-end + Nc 1..=8 + hygiene)
 

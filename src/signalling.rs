@@ -1249,6 +1249,48 @@ mod tests {
     }
 
     #[test]
+    fn encode_planar_cbr_target_bytes_highbd_hits_exact_sizes() {
+        let w = 64usize;
+        let h = 64usize;
+        let bd = 10u8;
+        let planes: Vec<Vec<u16>> = (0..3).map(|i| plane16(w, h, bd, i + 40)).collect();
+        // Lossless size probe for the same layout.
+        let lossless = encoder::encode_planar_hsl_qslice_rp_highbd(
+            w as u16,
+            h as u16,
+            3,
+            1,
+            5,
+            1,
+            bd,
+            8,
+            &[0, 0, 0, 0],
+            0,
+            &planes,
+        )
+        .expect("lossless probe");
+        let base = lossless.len();
+        for target in [base, base + 4, base + 6, base + 777] {
+            let (buf, q_slices, _rp) = encoder::encode_planar_cbr_target_bytes_highbd(
+                w as u16, h as u16, 3, 1, 5, 1, bd, 8, target, &planes,
+            )
+            .unwrap_or_else(|e| panic!("target {target}: {e}"));
+            assert_eq!(buf.len(), target, "target {target}: exact CBR size");
+            let cs = codestream::parse(&buf).unwrap();
+            assert_eq!(cs.pih.lcod as usize, target, "target {target}: Lcod");
+            assert_eq!(q_slices.len(), 4, "target {target}: one Q per slice");
+            verify_declarations(&buf).unwrap_or_else(|e| panic!("target {target}: {e}"));
+            let img = decode_ok(&buf);
+            if target >= base + 6 || target == base {
+                for (i, p) in img.planes.iter().enumerate() {
+                    let expect: Vec<u8> = planes[i].iter().flat_map(|&s| s.to_le_bytes()).collect();
+                    assert_eq!(p.data, expect, "target {target}: plane {i}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn encode_planar_cbr_target_bytes_hits_exact_sizes() {
         let w = 64usize;
         let h = 64usize;
