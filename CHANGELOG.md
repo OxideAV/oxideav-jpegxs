@@ -62,7 +62,19 @@
   profile targets. The local FIPS 180-4 SHA-256 is itself pinned by
   known-answer tests.
 
-* +25 tests (625 → 650).
+* **`jxpl` box consistency (Part-3 A.5.3.3)** — the Profile/Level box
+  duplicates the PIH `Ppih` / `Plev` ("Profile of the codestream ...
+  redundant as it is also included within the bitstream"), so the
+  `JxsFileBuilder` now synthesises its `jxpl` default from the wrapped
+  codestream's own declarations (previously always 0/0), and both
+  `build` and `decode_jxs_file` enforce a consistency gate: a box field
+  contradicting a non-zero codestream declaration is rejected (like the
+  A.5.4.2 geometry mismatches); a known-profile / known-level box claim
+  over an undeclared (`Ppih = 0`) stream is verified through the Part-2
+  gates; unknown (future-profile) code points remain tolerated as
+  advisory metadata.
+
+* +29 tests (625 → 654).
 
 ## Unreleased — round 408 (four-component end-to-end + Nc 1..=8 + hygiene)
 

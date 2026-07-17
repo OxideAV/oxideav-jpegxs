@@ -1277,7 +1277,90 @@ pub fn decode_jxs_file(buf: &[u8]) -> Result<crate::image::JpegXsImage> {
             cs.pih.height()
         )));
     }
+    // Cross-check the jxpl Profile/Level box (when present) against the
+    // codestream declarations it duplicates (A.5.3.3 — "Profile of the
+    // codestream" / "Level of the codestream": the box is a redundant
+    // early-parse copy of the PIH fields).
+    if let Some(pl) = &file.profile_level {
+        check_jxpl_consistency(&cs, codestream.len(), pl)?;
+    }
     crate::decode_jpeg_xs(codestream)
+}
+
+/// Enforce that a `jxpl` Profile/Level box (A.5.3.3) does not
+/// misdescribe the codestream it accompanies. The box duplicates the
+/// PIH `Ppih` / `Plev` fields ("Profile of the codestream ... Level of
+/// the codestream" — A.5.3.3 calls the information redundant with the
+/// bitstream), so:
+///
+/// * When the codestream itself declares a non-zero `Ppih` / `Plev`,
+///   a non-zero box field must repeat it exactly — a differing value
+///   is a contradictory file, rejected like the A.5.4.2 geometry
+///   mismatches. (A zero box field alongside a declared codestream is
+///   tolerated as "no early-parse hint".)
+/// * When the codestream declares nothing (`Ppih = 0` / `Plev = 0`)
+///   and the box maps to a *known* 21122-2 profile / level, the claim
+///   is verified against the stream through the same
+///   [`crate::profile`] gates the decoder applies to PIH declarations
+///   — a file that advertises a profile its stream does not satisfy is
+///   rejected.
+/// * A box value that maps to no known profile / level is tolerated:
+///   the box is advisory metadata and a future profile must not make
+///   old files undecodable (unlike the PIH `Ppih`, whose reserved
+///   values a conforming *encoder* cannot emit).
+fn check_jxpl_consistency(
+    cs: &crate::codestream::Codestream,
+    codestream_len: usize,
+    pl: &ProfileLevel,
+) -> Result<()> {
+    if pl.ppih != 0 {
+        if cs.pih.ppih != 0 {
+            if pl.ppih != cs.pih.ppih {
+                return Err(JpegXsError::invalid(format!(
+                    "jxs file: jxpl Ppih=0x{:04X} disagrees with codestream Ppih=0x{:04X} \
+                     (A.5.3.3 — the box duplicates the codestream field)",
+                    pl.ppih, cs.pih.ppih
+                )));
+            }
+        } else if let Some(profile) = crate::profile::Profile::from_ppih(pl.ppih) {
+            crate::profile::check_codestream(cs, profile).map_err(|e| {
+                JpegXsError::invalid(format!(
+                    "jxs file: jxpl claims profile {} but the codestream does not satisfy \
+                     it: {e}",
+                    profile.name()
+                ))
+            })?;
+        }
+    }
+    if pl.plev != 0 {
+        if cs.pih.plev != 0 {
+            if pl.plev != cs.pih.plev {
+                return Err(JpegXsError::invalid(format!(
+                    "jxs file: jxpl Plev=0x{:04X} disagrees with codestream Plev=0x{:04X} \
+                     (A.5.3.3 — the box duplicates the codestream field)",
+                    pl.plev, cs.pih.plev
+                )));
+            }
+        } else if crate::profile::Level::from_plev_high(pl.plev).is_some() {
+            // Verify the level / sublevel claim against the stream by
+            // substituting the box's Plev into a probe header and
+            // running the decoder's own gates.
+            let mut probe = cs.clone();
+            probe.pih.plev = pl.plev;
+            probe.pih.ppih = if pl.ppih != 0 { pl.ppih } else { cs.pih.ppih };
+            crate::profile::check_level(&probe).map_err(|e| {
+                JpegXsError::invalid(format!(
+                    "jxs file: jxpl claims a level the codestream does not satisfy: {e}"
+                ))
+            })?;
+            crate::profile::check_codestream_size(&probe, codestream_len).map_err(|e| {
+                JpegXsError::invalid(format!(
+                    "jxs file: jxpl claims a sublevel the codestream does not satisfy: {e}"
+                ))
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// Serialize one box: `LBox(4) | TBox(4) | DBox`, big-endian (A.3
@@ -1483,10 +1566,19 @@ impl JxsFileBuilder {
             // jpvi — Video Information box (first).
             let info = self.video_info.unwrap_or_else(VideoInformation::unknown);
             serialize_box(&mut jpvs, TBOX_VIDEO_INFO, &info.to_bytes()?);
-            // jxpl — Profile and Level box (second).
-            let pl = self
-                .profile_level
-                .unwrap_or(ProfileLevel { ppih: 0, plev: 0 });
+            // jxpl — Profile and Level box (second). A.5.3.3 defines the
+            // box fields as "Profile of the codestream" / "Level of the
+            // codestream" — a redundant early-parse copy of the PIH
+            // fields — so the synthesised default mirrors whatever the
+            // codestream itself declares, and a caller-supplied value is
+            // held to the same consistency gate `decode_jxs_file`
+            // enforces (an emitted file must not misdescribe its own
+            // stream).
+            let pl = self.profile_level.unwrap_or(ProfileLevel {
+                ppih: cs.pih.ppih,
+                plev: cs.pih.plev,
+            });
+            check_jxpl_consistency(&cs, codestream.len(), &pl)?;
             let mut jxpl = Vec::new();
             jxpl.extend_from_slice(&pl.ppih.to_be_bytes());
             jxpl.extend_from_slice(&pl.plev.to_be_bytes());
@@ -1878,6 +1970,124 @@ mod writer_tests {
         }
     }
 
+    /// A profile-shaped, fully-declared codestream: Main 444.12 (8-bit
+    /// member of its bit-depth set), 16-image-row slices, CBR Lcod.
+    fn declared_codestream() -> (Vec<u8>, Vec<Vec<u8>>) {
+        let (w, h) = (32usize, 32usize);
+        let planes: Vec<Vec<u8>> = (0..3)
+            .map(|c| (0..w * h).map(|i| (i * 7 + c * 29) as u8).collect())
+            .collect();
+        let mut cs =
+            crate::encoder::encode_planar_hsl(w as u16, h as u16, 3, 1, 2, 1, 0, 8, &planes)
+                .unwrap();
+        crate::signalling::declare_profile(&mut cs, crate::profile::Profile::Main444_12).unwrap();
+        crate::signalling::declare_level_sublevel(
+            &mut cs,
+            crate::profile::Level::L2k1,
+            crate::profile::Sublevel::Sublev3bpp,
+        )
+        .unwrap();
+        (cs, planes)
+    }
+
+    #[test]
+    fn jxpl_defaults_mirror_codestream_declarations() {
+        // A.5.3.3 — the box duplicates the PIH fields, so the builder's
+        // synthesised jxpl mirrors a declared codestream.
+        let (cs, planes) = declared_codestream();
+        let file = JxsFileBuilder::new(srgb())
+            .video_information(VideoInformation::unknown())
+            .build(&cs)
+            .unwrap();
+        let parsed = parse_jxs_file(&file).unwrap();
+        let pl = parsed.profile_level.unwrap();
+        assert_eq!(pl.ppih, crate::profile::Profile::Main444_12.ppih());
+        assert_eq!(pl.plev, 0x1004); // 2k-1 | Sublev3bpp
+        let img = decode_jxs_file(&file).unwrap();
+        for (c, plane) in planes.iter().enumerate() {
+            assert_eq!(&img.planes[c].data, plane, "component {c}");
+        }
+    }
+
+    #[test]
+    fn jxpl_contradicting_codestream_rejected_on_build() {
+        // The codestream declares Main 444.12; a caller-supplied jxpl
+        // naming a different known profile misdescribes the stream.
+        let (cs, _) = declared_codestream();
+        let err = JxsFileBuilder::new(srgb())
+            .profile_level(crate::profile::Profile::Light444_12.ppih(), 0)
+            .build(&cs)
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("disagrees with codestream Ppih"),
+            "expected jxpl/PIH contradiction, got {err}"
+        );
+    }
+
+    #[test]
+    fn jxpl_contradicting_codestream_rejected_on_decode() {
+        // Patch the emitted jxpl payload to a different known profile:
+        // the reader must reject the contradictory file.
+        let (cs, _) = declared_codestream();
+        let mut file = JxsFileBuilder::new(srgb())
+            .video_information(VideoInformation::unknown())
+            .build(&cs)
+            .unwrap();
+        let tag = TBOX_PROFILE_LEVEL.to_be_bytes();
+        let pos = file
+            .windows(4)
+            .position(|w| w == tag)
+            .expect("jxpl box present");
+        let want = crate::profile::Profile::Main444_12.ppih().to_be_bytes();
+        assert_eq!(&file[pos + 4..pos + 6], &want, "payload follows the tag");
+        let other = crate::profile::Profile::High444_12.ppih().to_be_bytes();
+        file[pos + 4..pos + 6].copy_from_slice(&other);
+        let err = decode_jxs_file(&file).unwrap_err();
+        assert!(
+            format!("{err}").contains("disagrees with codestream Ppih"),
+            "expected jxpl/PIH contradiction, got {err}"
+        );
+    }
+
+    #[test]
+    fn jxpl_claim_over_undeclared_stream_is_verified() {
+        // The codestream declares nothing (Ppih = 0). A jxpl naming a
+        // known profile is verified against the stream: a single
+        // whole-picture slice violates every profile's 16-image-row
+        // slice rule, so the claim is rejected...
+        let (w, h) = (32u16, 32u16);
+        let planes: Vec<Vec<u8>> = (0..3)
+            .map(|c| {
+                (0..(w as usize * h as usize))
+                    .map(|i| (i * 3 + c * 11) as u8)
+                    .collect()
+            })
+            .collect();
+        let single_slice = crate::encoder::encode_planar(w, h, 3, 1, 2, 1, &planes).unwrap();
+        let err = JxsFileBuilder::new(srgb())
+            .profile_level(crate::profile::Profile::Main444_12.ppih(), 0)
+            .build(&single_slice)
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("does not satisfy"),
+            "expected unsatisfied-claim rejection, got {err}"
+        );
+        // ... while the same claim over a stream that satisfies the
+        // profile (16-image-row slices) is accepted and decodable, and
+        // an unknown (future-profile) code point stays tolerated.
+        let sliced = crate::encoder::encode_planar_hsl(w, h, 3, 1, 2, 1, 0, 8, &planes).unwrap();
+        let file = JxsFileBuilder::new(srgb())
+            .profile_level(crate::profile::Profile::Main444_12.ppih(), 0)
+            .build(&sliced)
+            .unwrap();
+        decode_jxs_file(&file).unwrap();
+        let file = JxsFileBuilder::new(srgb())
+            .profile_level(0x7777, 0x7700)
+            .build(&single_slice)
+            .unwrap();
+        decode_jxs_file(&file).unwrap();
+    }
+
     #[test]
     fn write_high_bit_depth_sets_bpc() {
         // 12-bit luma: BPC low-7 == 11.
@@ -1937,6 +2147,19 @@ mod writer_tests {
         let (w, h) = (4u16, 4u16);
         let pixels = vec![64u8; (w * h) as usize];
         crate::encoder::encode_planar(w, h, 1, 0, 1, 1, std::slice::from_ref(&pixels)).unwrap()
+    }
+
+    /// A luma codestream that *satisfies* the Main-family profile
+    /// constraints (mono 4:0:0, 8-bit, `NL = 2/1`, 16-image-row slices)
+    /// so a known-profile `jxpl` claim passes the A.5.3.3 consistency
+    /// gate.
+    fn profile_shaped_luma_cs() -> Vec<u8> {
+        let (w, h) = (32u16, 32u16);
+        let pixels: Vec<u8> = (0..(w as usize * h as usize))
+            .map(|i| (i * 5) as u8)
+            .collect();
+        crate::encoder::encode_planar_hsl(w, h, 1, 0, 2, 1, 0, 8, std::slice::from_ref(&pixels))
+            .unwrap()
     }
 
     // ---- JPEG XS Video Information box (jpvi, A.5.3.2) ----
@@ -2042,7 +2265,9 @@ mod writer_tests {
 
     #[test]
     fn builder_emits_conforming_jpvs_with_both_boxes() {
-        let cs = luma_cs();
+        // The jxpl names Main 444.12 (a known profile), so the wrapped
+        // stream must satisfy it — profile_shaped_luma_cs does.
+        let cs = profile_shaped_luma_cs();
         let info = VideoInformation {
             max_bit_rate: 250,
             frame_rate: FrameRate::Known {
@@ -2241,7 +2466,9 @@ mod writer_tests {
 
     #[test]
     fn builder_emits_all_jpvs_boxes_in_order() {
-        let cs = luma_cs();
+        // The jxpl names Main 422.10 (a known profile), so the wrapped
+        // stream must satisfy it — profile_shaped_luma_cs does.
+        let cs = profile_shaped_luma_cs();
         let meta = bt709_dmon();
         let bmdm = BufferModelDescription {
             model_type: 1,
