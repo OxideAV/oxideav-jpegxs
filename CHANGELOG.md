@@ -49,7 +49,20 @@
   of 1..=5 bytes (below the 6-byte minimum COM segment) re-runs the
   allocation against `target − 6`, guaranteeing a paddable gap.
 
-* +23 tests (625 → 648).
+* **Encoder conformance pinning** (`tests/encoder_conformance.rs`) —
+  21122-4 defines decoder conformance only, so the encoder side pins
+  the strongest checkable equivalent per stream: a SHA-256 of the
+  emitted bytes (wire-format changes must deliberately update the
+  table; `OXIDEAV_JXS_PRINT_HASHES=1` regenerates), a self-decode
+  through the conformance-gated decoder (bit-exact for every lossless
+  case, bounded-error for the NLT quadratic approximation), and
+  `verify_declarations` truth for every claimed Ppih / Plev / Lcod.
+  The 15-stream matrix spans `Cpih ∈ {0, 1, 3}`, 4:2:0 sub-sampling,
+  `B[i] = 12`, NLT quadratic, `Rm = 1`, exact-size CBR, and all eight
+  profile targets. The local FIPS 180-4 SHA-256 is itself pinned by
+  known-answer tests.
+
+* +25 tests (625 → 650).
 
 ## Unreleased — round 408 (four-component end-to-end + Nc 1..=8 + hygiene)
 
