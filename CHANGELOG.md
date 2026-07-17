@@ -86,7 +86,13 @@
   the per-slice `Q[p]` + `R[p]` high-bit-depth rate allocation, with
   the same COM-padding / `Lcod` regime as the 8-bit entry point.
 
-* +32 tests (625 → 657).
+* **Coverage tails** — the profile matrix additionally pins the
+  4:2:2:4 chroma class (Table A.1's other four-component sampling
+  bucket) through `encode_planar_for_profile`, and `probe` is pinned to
+  surface the declared `Ppih` / `Plev` from both a bare signed
+  codestream and its box-wrapped file.
+
+* +33 tests (625 → 658).
 
 ## Unreleased — round 408 (four-component end-to-end + Nc 1..=8 + hygiene)
 

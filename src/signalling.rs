@@ -922,6 +922,20 @@ mod tests {
                 sx: &[1, 1, 1, 1],
                 sy: &[1, 1, 1, 1],
             },
+            // Main 4444.12 again with the 4:2:2:4 chroma class (three
+            // 4:2:2 planes + a full-resolution fourth, Table A.1) — the
+            // other four-component sampling bucket.
+            ProfileCase {
+                profile: Profile::Main4444_12,
+                nc: 4,
+                cpih: 0,
+                nlx: 2,
+                nly: 1,
+                bd: 10,
+                qpih: 1,
+                sx: &[1, 2, 2, 1],
+                sy: &[1, 1, 1, 1],
+            },
         ];
         let w = 64usize;
         let h = 64usize;

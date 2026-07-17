@@ -85,6 +85,34 @@ mod tests {
     }
 
     #[test]
+    fn probe_reports_declared_profile_level_and_cbr() {
+        // A signed codestream (round 415): probe surfaces the declared
+        // Ppih / Plev from both the bare stream and the box-wrapped
+        // file (whose jxpl mirrors the PIH declarations).
+        let (w, h) = (32u16, 32u16);
+        let planes: Vec<Vec<u8>> = (0..3)
+            .map(|c| {
+                (0..(w as usize * h as usize))
+                    .map(|i| (i * 13 + c * 7) as u8)
+                    .collect()
+            })
+            .collect();
+        let mut cs = crate::encoder::encode_planar_hsl(w, h, 3, 1, 2, 1, 0, 8, &planes).unwrap();
+        let (profile, level, sublevel) =
+            crate::signalling::declare_auto(&mut cs, true).expect("declare");
+        let bare = probe(&cs).expect("probe bare");
+        assert_eq!(bare.profile, profile.ppih());
+        assert_eq!(
+            bare.level,
+            ((level.plev_high_byte() as u16) << 8) | sublevel.plev_low_byte() as u16
+        );
+        let file = crate::fileformat::write_jxs_file(&cs).unwrap();
+        let wrapped = probe(&file).expect("probe wrapped");
+        assert_eq!(wrapped.profile, bare.profile);
+        assert_eq!(wrapped.level, bare.level);
+    }
+
+    #[test]
     fn probe_rejects_garbage_and_truncated_box() {
         assert!(probe(&[]).is_none());
         assert!(probe(&[0x00, 0x01, 0x02]).is_none());
