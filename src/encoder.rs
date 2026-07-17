@@ -4121,6 +4121,169 @@ pub fn encode_planar_hsl_qslice_rp_target_bytes_highbd(
     Ok((cs, q_slices, rp))
 }
 
+/// Round-415 **profile-targeting** entry point: encode a picture whose
+/// codestream *claims and satisfies* a named ISO/IEC 21122-2:2019
+/// profile (Tables A.1 / A.2 / A.3), with the level / sublevel
+/// (Tables A.6 / A.7) picked to the tightest verified fit and an
+/// optional CBR `Lcod` self-description (21122-1 Table 11).
+///
+/// Every non-unrestricted 21122-2 profile mandates a slice height of
+/// **16 image rows** — a constraint no other entry point family
+/// composes with chroma sub-sampling and high bit depth at once — so
+/// this entry point derives `Hsl = 16 / 2^NL,y` precinct rows from the
+/// profile row itself and funnels the full composition (per-component
+/// `(sx, sy)` × `B[i] ∈ 8..=12` × multi-slice × `Qpih`) through the
+/// common encoding core. After encoding, the stream is signed via
+/// [`crate::signalling`]: `Ppih` is set to the target profile, `Plev`
+/// to the smallest level admitting `Wf × Hf` and the smallest sublevel
+/// admitting the coded size, and (when `cbr` is set) `Lcod` to the
+/// SOC-to-EOC byte count. Each declaration is **verified through the
+/// decoder's own conformance gates** before it is kept, so the returned
+/// stream provably satisfies every constraint it claims; a
+/// configuration outside the profile (wrong chroma format, bit depth,
+/// `NL` range, `Qpih`, ...) is rejected with the violated-constraint
+/// diagnostic instead of emitting a false claim.
+///
+/// Input planes are `u16` samples regardless of `bd` (one entry point
+/// across the whole profile bit-depth matrix): `bd = 8` packs one byte
+/// per sample, `bd ∈ 9..=16` two little-endian bytes, each validated
+/// against `2^bd − 1`. Plane `i` carries `⌈Wf/sx[i]⌉ × ⌈Hf/sy[i]⌉`
+/// samples. `q = 0` is lossless (bit-exact self-roundtrip); `q ∈ 1..=15`
+/// engages the deadzone / uniform (per `qpih`) lossy path.
+///
+/// Returns the signed codestream plus the picked `(Level, Sublevel)`.
+/// [`Profile::Unrestricted`] is rejected — an unrestricted stream needs
+/// no profile shaping; use any other entry point plus
+/// [`crate::signalling::declare_auto`].
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_for_profile(
+    profile: crate::profile::Profile,
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    bd: u8,
+    qpih: u8,
+    q: u8,
+    sx: &[u8],
+    sy: &[u8],
+    cbr: bool,
+    planes: &[Vec<u16>],
+) -> Result<(Vec<u8>, crate::profile::Level, crate::profile::Sublevel)> {
+    if matches!(profile, crate::profile::Profile::Unrestricted) {
+        return Err(Error::invalid(
+            "jpegxs encoder: encode_planar_for_profile requires a non-unrestricted profile \
+             (for an unrestricted stream use any entry point plus signalling::declare_auto)",
+        ));
+    }
+    if sx.len() != nc as usize || sy.len() != nc as usize {
+        return Err(Error::invalid(format!(
+            "jpegxs encoder: sx/sy must have length nc={nc}, got sx={}, sy={}",
+            sx.len(),
+            sy.len()
+        )));
+    }
+    // Slice height in precinct rows from the profile's mandated
+    // 16-image-row slices (Tables A.1–A.3): one precinct row spans
+    // 2^NL,y image rows.
+    let lim = profile.limits();
+    let rows_per_precinct = 1u32 << nly;
+    if lim.slice_height % rows_per_precinct != 0 {
+        return Err(Error::invalid(format!(
+            "jpegxs encoder: profile {} slice height of {} image rows is not a multiple of \
+             the 2^NL,y = {rows_per_precinct} rows per precinct",
+            profile.name(),
+            lim.slice_height
+        )));
+    }
+    let hsl = (lim.slice_height / rows_per_precinct) as u16;
+    // Pack the u16 sample planes into the wire plane format for `bd`.
+    let byte_planes: Vec<Vec<u8>> = if bd == 8 {
+        let mut out: Vec<Vec<u8>> = Vec::with_capacity(planes.len());
+        for (i, p) in planes.iter().enumerate() {
+            let want = (width as usize).div_ceil(sx[i] as usize)
+                * (height as usize).div_ceil(sy[i] as usize);
+            if p.len() != want {
+                return Err(Error::invalid(format!(
+                    "jpegxs encoder: encode_planar_for_profile plane {i} sample count {} != \
+                     Wc*Hc {want} (sx={}, sy={})",
+                    p.len(),
+                    sx[i],
+                    sy[i]
+                )));
+            }
+            let mut bytes = Vec::with_capacity(p.len());
+            for &s in p {
+                if s > 0xff {
+                    return Err(Error::invalid(format!(
+                        "jpegxs encoder: encode_planar_for_profile plane {i} sample {s} \
+                         exceeds B[i]=8 max 255"
+                    )));
+                }
+                bytes.push(s as u8);
+            }
+            out.push(bytes);
+        }
+        out
+    } else {
+        pack_subsampled_u16_planes(
+            width,
+            height,
+            bd,
+            sx,
+            sy,
+            planes,
+            "encode_planar_for_profile",
+        )?
+    };
+    let mut buf = encode_planar_inner_bd(
+        width,
+        height,
+        nc,
+        bd,
+        cpih,
+        nlx,
+        nly,
+        0, // fq = 0: integer-transform regular path (Table A.8), lossy via T[p,b]
+        q,
+        sx,
+        sy,
+        0,
+        0,
+        0,
+        0,
+        None,
+        Vec::new(),
+        Vec::new(),
+        0, // cw = 0: single full-width precinct column (every profile's baseline)
+        0, // sd = 0
+        0, // fs = 0
+        hsl,
+        qpih,
+        0,          // rp = 0
+        Vec::new(), // q_slices
+        Vec::new(), // q_precincts
+        Vec::new(), // r_precincts
+        &byte_planes,
+        0, // rm = 0
+    )?;
+    // Sign the stream: profile first (§A.4.2 makes the Full sublevel
+    // profile-dependent), then the tightest level / sublevel, then the
+    // CBR self-description. Each declaration re-verifies through the
+    // decoder's gates and fails loudly instead of emitting a false
+    // claim.
+    crate::signalling::declare_profile(&mut buf, profile)?;
+    let level = crate::signalling::pick_level(width as u32, height as u32);
+    let sublevel = crate::signalling::pick_sublevel(buf.len(), level, profile);
+    crate::signalling::declare_level_sublevel(&mut buf, level, sublevel)?;
+    if cbr {
+        crate::signalling::declare_cbr(&mut buf)?;
+    }
+    Ok((buf, level, sublevel))
+}
+
 /// Round-108 uniform-inverse-quantizer entry point (`Qpih = 1`).
 ///
 /// Same shape as [`encode_planar_lossy`] but sets the picture-header

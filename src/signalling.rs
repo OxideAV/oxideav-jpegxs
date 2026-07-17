@@ -613,6 +613,368 @@ mod tests {
         decode_ok(&buf);
     }
 
+    /// Deterministic `u16` test plane bounded to `bd` bits.
+    fn plane16(w: usize, h: usize, bd: u8, seed: u32) -> Vec<u16> {
+        let mask = ((1u32 << bd) - 1) as u16;
+        let mut v = Vec::with_capacity(w * h);
+        let mut s = seed.wrapping_mul(2246822519).wrapping_add(31);
+        for y in 0..h {
+            for x in 0..w {
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                v.push((((x * 7 + y * 11) as u32 ^ (s >> 20)) as u16) & mask);
+            }
+        }
+        v
+    }
+
+    /// Pack a `u16` sample plane the way the encoder does: one byte per
+    /// sample for `bd = 8`, two little-endian bytes for `bd > 8`.
+    fn pack(p: &[u16], bd: u8) -> Vec<u8> {
+        if bd == 8 {
+            p.iter().map(|&s| s as u8).collect()
+        } else {
+            p.iter().flat_map(|&s| s.to_le_bytes()).collect()
+        }
+    }
+
+    /// One row of the 21122-2:2019 profile matrix: a configuration that
+    /// satisfies the profile, exercised losslessly end-to-end.
+    struct ProfileCase {
+        profile: Profile,
+        nc: u8,
+        cpih: u8,
+        nlx: u8,
+        nly: u8,
+        bd: u8,
+        qpih: u8,
+        sx: &'static [u8],
+        sy: &'static [u8],
+    }
+
+    #[test]
+    fn encode_planar_for_profile_covers_every_2019_profile() {
+        // One satisfying configuration per non-unrestricted profile of
+        // ISO/IEC 21122-2:2019 Tables A.1 / A.2 / A.3. Each stream is
+        // encoded losslessly, signed (Ppih + Plev + CBR Lcod), decoded
+        // through the crate's conformance-gated decoder, and compared
+        // bit-exactly against the input planes.
+        let cases = [
+            // Light 422.10 — 4:2:2, 10-bit, DZQ only, NL,y <= 1.
+            ProfileCase {
+                profile: Profile::Light422_10,
+                nc: 3,
+                cpih: 0,
+                nlx: 2,
+                nly: 1,
+                bd: 10,
+                qpih: 0,
+                sx: &[1, 2, 2],
+                sy: &[1, 1, 1],
+            },
+            // Light 444.12 — 4:4:4, 12-bit, DZQ only; RCT is core.
+            ProfileCase {
+                profile: Profile::Light444_12,
+                nc: 3,
+                cpih: 1,
+                nlx: 2,
+                nly: 1,
+                bd: 12,
+                qpih: 0,
+                sx: &[1, 1, 1],
+                sy: &[1, 1, 1],
+            },
+            // Light-Subline 422.10 — NL,y = 0, uniform quantizer
+            // permitted, Cs = Wf <= 2048.
+            ProfileCase {
+                profile: Profile::LightSubline422_10,
+                nc: 3,
+                cpih: 0,
+                nlx: 3,
+                nly: 0,
+                bd: 8,
+                qpih: 1,
+                sx: &[1, 2, 2],
+                sy: &[1, 1, 1],
+            },
+            // Main 422.10 — 4:2:2, 10-bit, uniform quantizer.
+            ProfileCase {
+                profile: Profile::Main422_10,
+                nc: 3,
+                cpih: 0,
+                nlx: 2,
+                nly: 1,
+                bd: 10,
+                qpih: 1,
+                sx: &[1, 2, 2],
+                sy: &[1, 1, 1],
+            },
+            // Main 444.12 — 4:4:4, 12-bit.
+            ProfileCase {
+                profile: Profile::Main444_12,
+                nc: 3,
+                cpih: 1,
+                nlx: 2,
+                nly: 1,
+                bd: 12,
+                qpih: 0,
+                sx: &[1, 1, 1],
+                sy: &[1, 1, 1],
+            },
+            // Main 4444.12 — 4:4:4:4 four-component.
+            ProfileCase {
+                profile: Profile::Main4444_12,
+                nc: 4,
+                cpih: 0,
+                nlx: 2,
+                nly: 1,
+                bd: 12,
+                qpih: 0,
+                sx: &[1, 1, 1, 1],
+                sy: &[1, 1, 1, 1],
+            },
+            // High 444.12 — NL,y up to 2 (Hsl = 4 precinct rows).
+            ProfileCase {
+                profile: Profile::High444_12,
+                nc: 3,
+                cpih: 1,
+                nlx: 2,
+                nly: 2,
+                bd: 12,
+                qpih: 1,
+                sx: &[1, 1, 1],
+                sy: &[1, 1, 1],
+            },
+            // High 4444.12 — four components at NL,y = 2.
+            ProfileCase {
+                profile: Profile::High4444_12,
+                nc: 4,
+                cpih: 0,
+                nlx: 2,
+                nly: 2,
+                bd: 12,
+                qpih: 1,
+                sx: &[1, 1, 1, 1],
+                sy: &[1, 1, 1, 1],
+            },
+        ];
+        let w = 64usize;
+        let h = 64usize;
+        for case in &cases {
+            let name = case.profile.name();
+            let planes: Vec<Vec<u16>> = (0..case.nc as usize)
+                .map(|i| {
+                    plane16(
+                        w.div_ceil(case.sx[i] as usize),
+                        h.div_ceil(case.sy[i] as usize),
+                        case.bd,
+                        i as u32 + 1,
+                    )
+                })
+                .collect();
+            let (buf, level, sublevel) = encoder::encode_planar_for_profile(
+                case.profile,
+                w as u16,
+                h as u16,
+                case.nc,
+                case.cpih,
+                case.nlx,
+                case.nly,
+                case.bd,
+                case.qpih,
+                0, // q = 0: lossless
+                case.sx,
+                case.sy,
+                true, // CBR Lcod
+                &planes,
+            )
+            .unwrap_or_else(|e| panic!("{name}: encode failed: {e}"));
+            // 64×64 fits 2k-1 and the tiny stream fits the 3 bpp
+            // sublevel bound for every case.
+            assert_eq!(level, Level::L2k1, "{name}");
+            assert_eq!(sublevel, Sublevel::Sublev3bpp, "{name}");
+            let cs = codestream::parse(&buf).unwrap();
+            assert_eq!(cs.pih.ppih, case.profile.ppih(), "{name}");
+            assert_eq!(cs.pih.plev, 0x1004, "{name}");
+            assert_eq!(cs.pih.lcod as usize, buf.len(), "{name}");
+            // Slice height: 16 image rows on the wire (Hsl precinct
+            // rows × 2^NL,y).
+            assert_eq!(
+                (cs.pih.hsl as u32) << case.nly,
+                16,
+                "{name}: profile slice height"
+            );
+            // The claim also survives the independent verifier.
+            verify_declarations(&buf).unwrap_or_else(|e| panic!("{name}: verify failed: {e}"));
+            // And the decoder (which runs the same gates) reconstructs
+            // bit-exactly.
+            let img = decode_ok(&buf);
+            assert_eq!(img.planes.len(), case.nc as usize, "{name}");
+            for (i, p) in img.planes.iter().enumerate() {
+                assert_eq!(
+                    p.data,
+                    pack(&planes[i], case.bd),
+                    "{name}: plane {i} bit-exact"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn encode_planar_for_profile_rejects_out_of_profile_configs() {
+        let w = 64usize;
+        let h = 64usize;
+        let mk = |bd: u8| {
+            vec![
+                plane16(w, h, bd, 1),
+                plane16(w, h, bd, 2),
+                plane16(w, h, bd, 3),
+            ]
+        };
+        let all1 = [1u8, 1, 1];
+        // 12-bit input into a .10 profile → bit-depth constraint.
+        let err = encoder::encode_planar_for_profile(
+            Profile::Main422_10,
+            w as u16,
+            h as u16,
+            3,
+            0,
+            2,
+            1,
+            12,
+            0,
+            0,
+            &all1,
+            &all1,
+            false,
+            &mk(12),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("bit depth"),
+            "expected bit-depth rejection, got {err}"
+        );
+        // 4:4:4 chroma into a 422 profile → chroma-format constraint.
+        let err = encoder::encode_planar_for_profile(
+            Profile::Light422_10,
+            w as u16,
+            h as u16,
+            3,
+            0,
+            2,
+            1,
+            8,
+            0,
+            0,
+            &all1,
+            &all1,
+            false,
+            &mk(8),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("chroma"),
+            "expected chroma rejection, got {err}"
+        );
+        // Uniform quantizer into a DZQ-only Light profile → Qpih
+        // constraint.
+        let err = encoder::encode_planar_for_profile(
+            Profile::Light444_12,
+            w as u16,
+            h as u16,
+            3,
+            0,
+            2,
+            1,
+            8,
+            1,
+            0,
+            &all1,
+            &all1,
+            false,
+            &mk(8),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("Qpih"),
+            "expected Qpih rejection, got {err}"
+        );
+        // NL,y = 2 into a Main profile (max 1) → decomposition
+        // constraint.
+        let err = encoder::encode_planar_for_profile(
+            Profile::Main444_12,
+            w as u16,
+            h as u16,
+            3,
+            0,
+            2,
+            2,
+            8,
+            0,
+            0,
+            &all1,
+            &all1,
+            false,
+            &mk(8),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("NL,y"),
+            "expected NL,y rejection, got {err}"
+        );
+        // Unrestricted is not a shapeable target.
+        let err = encoder::encode_planar_for_profile(
+            Profile::Unrestricted,
+            w as u16,
+            h as u16,
+            3,
+            0,
+            2,
+            1,
+            8,
+            0,
+            0,
+            &all1,
+            &all1,
+            false,
+            &mk(8),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("non-unrestricted"));
+    }
+
+    #[test]
+    fn encode_planar_for_profile_lossy_stream_still_verifies() {
+        // A lossy (q = 2) Main 422.10 stream: the declarations hold and
+        // the stream decodes through the gated decoder.
+        let w = 64usize;
+        let h = 64usize;
+        let planes = vec![
+            plane16(w, h, 10, 1),
+            plane16(w / 2, h, 10, 2),
+            plane16(w / 2, h, 10, 3),
+        ];
+        let (buf, _, _) = encoder::encode_planar_for_profile(
+            Profile::Main422_10,
+            w as u16,
+            h as u16,
+            3,
+            0,
+            2,
+            1,
+            10,
+            1,
+            2,
+            &[1, 2, 2],
+            &[1, 1, 1],
+            true,
+            &planes,
+        )
+        .expect("lossy profile encode");
+        verify_declarations(&buf).expect("lossy declarations verify");
+        let img = decode_ok(&buf);
+        assert_eq!(img.planes.len(), 3);
+    }
+
     #[test]
     fn verify_declarations_accepts_every_legacy_stream() {
         // The all-zero (VBR / unrestricted) defaults every encoder

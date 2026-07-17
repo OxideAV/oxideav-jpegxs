@@ -24,8 +24,19 @@
 * **`Level::plev_high_byte` / `Sublevel::plev_low_byte`** — the exact
   inverses of the Table A.12 / A.13 parsers, round-trip-pinned over
   every defined level / sublevel.
+* **`encode_planar_for_profile`** — profile-targeting encoder entry
+  point. Every non-unrestricted 21122-2 profile mandates 16-image-row
+  slices, a constraint no other entry point family composed with chroma
+  sub-sampling and high bit depth at once; this entry derives
+  `Hsl = 16 / 2^NL,y` from the profile row, funnels the full
+  `(sx, sy) × B[i] × Hsl × Qpih` composition through the common core,
+  and signs the result (Ppih + tightest Plev + optional CBR Lcod), each
+  claim verified through the decoder's gates. All eight 2019 profiles
+  are pinned end-to-end: encode → verified declarations → gated decode →
+  bit-exact plane compare (plus out-of-profile rejection coverage for
+  bit depth / chroma / Qpih / NL,y and a lossy `q = 2` case).
 
-* +16 tests (625 → 641).
+* +19 tests (625 → 644).
 
 ## Unreleased — round 408 (four-component end-to-end + Nc 1..=8 + hygiene)
 

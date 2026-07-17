@@ -90,8 +90,8 @@ pub use crg::{cfa_pattern_type, parse_crg, CrgEntry, CrgMarker};
 pub use cts::{parse_cts, CtsExtent, CtsMarker};
 pub use cwd::{parse_cwd, CwdMarker};
 pub use encoder::{
-    encode_image, encode_luma_8bit, encode_planar_cw, encode_planar_hsl_qslice,
-    encode_planar_hsl_qslice_rp, encode_planar_hsl_qslice_rp_highbd,
+    encode_image, encode_luma_8bit, encode_planar_cw, encode_planar_for_profile,
+    encode_planar_hsl_qslice, encode_planar_hsl_qslice_rp, encode_planar_hsl_qslice_rp_highbd,
     encode_planar_hsl_qslice_rp_target_bytes, encode_planar_hsl_qslice_rp_target_bytes_highbd,
     encode_planar_hsl_target_bytes, encode_planar_lossy_annex_h, encode_planar_qpr,
     encode_planar_qpr_rpr, encode_planar_qpr_rpr_target_bytes, encode_planar_rp_target_bytes,
