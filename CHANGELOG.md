@@ -74,7 +74,14 @@
   gates; unknown (future-profile) code points remain tolerated as
   advisory metadata.
 
-* +29 tests (625 → 654).
+* **`signalling::insert_com`** — general COM extension-segment writer
+  (§A.4.10 Tables A.22 / A.23): encoder-vendor / copyright strings and
+  vendor-specific payloads, inserted before the first SLH. Rejects
+  insertion into a CBR-declared stream (it would falsify `Lcod`) and
+  over-capacity `Dcom` payloads. With this, every marker of
+  21122-1:2022 Annex A that an encoder may emit is writable.
+
+* +31 tests (625 → 656).
 
 ## Unreleased — round 408 (four-component end-to-end + Nc 1..=8 + hygiene)
 

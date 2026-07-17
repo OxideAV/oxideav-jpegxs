@@ -122,7 +122,8 @@ pub use profile::{
 };
 pub use signalling::{
     declare_auto, declare_cbr, declare_cbr_padded, declare_level_sublevel, declare_profile,
-    declare_vbr, pad_to_size, pick_level, pick_profile, pick_sublevel, verify_declarations,
+    declare_vbr, insert_com, pad_to_size, pick_level, pick_profile, pick_sublevel,
+    verify_declarations,
 };
 pub use slice_header::SliceHeader;
 pub use slice_walker::{parse_wgt, BandWeight};

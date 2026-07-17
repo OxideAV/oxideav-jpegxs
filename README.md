@@ -274,6 +274,59 @@ requirement is `Nc ≥ 4` (four transform inputs). RCT (`Cpih = 1`) keeps the
 stricter `Nc − Sd ≥ 3` guard (no tabulated RCT-with-suppressed-output
 example).
 
+The encoder also emits **verified conformance signalling** (the
+`signalling` module). Every entry point historically wrote `Ppih = 0` /
+`Plev = 0` / `Lcod = 0` — conforming but claiming nothing (ISO/IEC
+21122-2 §A.2.2 / §A.5 exclude the unrestricted profile / level as
+conformance points). The signalling layer patches the three PIH fields
+in place in any already-encoded codestream and **verifies each claim
+through the decoder's own gates** (`check_codestream` / `check_level` /
+`check_codestream_size` / the Table-11 `Lcod` match) before keeping it,
+so a false declaration cannot be emitted: `declare_profile` (Table A.5
+`Ppih`), `declare_level_sublevel` (Tables A.12 / A.13 `Plev`, incl. the
+§A.4.2 Full-sublevel-requires-profile rule), `declare_cbr` /
+`declare_vbr` (Table 11 `Lcod`), the tightest-fit pickers
+`pick_profile` / `pick_level` / `pick_sublevel`, and `declare_auto`.
+`insert_com` writes COM extension segments (§A.4.10 — encoder-vendor /
+copyright strings, vendor-specific data), completing write coverage of
+every Annex A marker an encoder may emit.
+
+On top of that sit two conformance-grade entry points:
+
+- **`encode_planar_for_profile`** targets a named ISO/IEC 21122-2:2019
+  profile. Every non-unrestricted profile mandates 16-image-row slices
+  — a constraint no other entry point family composed with chroma
+  sub-sampling and high bit depth at once — so it derives
+  `Hsl = 16 / 2^NL,y` from the profile row, funnels the full
+  `(sx, sy) × B[i] × Hsl × Qpih` composition through the common core,
+  and signs the result (`Ppih` + tightest `Plev` + optional CBR
+  `Lcod`). All eight 2019 profiles are pinned end-to-end: encode →
+  verified declarations → gated decode → bit-exact plane compare.
+- **`encode_planar_cbr_target_bytes`** emits a stream of *exactly*
+  `target_bytes` bytes: the per-slice `Q[p]` rate allocation lands at
+  or under the budget, COM padding closes the gap (re-allocating
+  against `target − 6` when the residue is smaller than the 6-byte
+  minimum segment), and `Lcod` truthfully declares the size.
+
+The Part-3 wrapper keeps the declarations consistent: the
+`JxsFileBuilder` synthesises its `jxpl` Profile/Level box from the
+wrapped codestream's own `Ppih` / `Plev` (A.5.3.3 defines the box as a
+redundant early-parse copy of the PIH fields), and both `build` and
+`decode_jxs_file` reject a box that contradicts a non-zero codestream
+declaration, verify a known-profile box claim over an undeclared stream
+through the Part-2 gates, and tolerate unknown (future-profile) code
+points as advisory metadata.
+
+**Encoder conformance pinning** (`tests/encoder_conformance.rs`):
+ISO/IEC 21122-4 defines decoder conformance only, so the encoder side
+pins the strongest checkable equivalent per stream — a SHA-256 of the
+emitted bytes (wire-format changes must deliberately update the table),
+a self-decode through the conformance-gated decoder (bit-exact for
+every lossless case), and declaration truth for every claimed `Ppih` /
+`Plev` / `Lcod`. The 15-stream matrix spans `Cpih ∈ {0, 1, 3}`, 4:2:0
+sub-sampling, `B[i] = 12`, NLT quadratic, `Rm = 1`, exact-size CBR, and
+all eight profile targets.
+
 ### Codestream parser
 
 The marker-chain parser per ISO/IEC 21122-1:2022 Annex A recognises:
@@ -407,7 +460,8 @@ crate's self-roundtrips could never catch:
 
 ### Not yet covered
 
-- Bit depths above 16 (would need a `u32` plane format).
+- Bit depths above 16 (would need a `u32` plane format; B > 16 also has
+  no published decode vector to validate against).
 - All Annex H example tables are transcribed and wired through both the 8-bit
   and the high-bit-depth (`B[i] ∈ 9..=16`) encode paths: the 4:4:4 RCT tables
   (H.1–H.3, `encode_planar_lossy_annex_h`), the subsampled 4:2:2 / 4:2:0 tables
@@ -445,8 +499,15 @@ interleaved RGB, and generalised planar input, with `_lossy`,
 `_subsampled_nlt_quadratic_highbd`, `_subsampled_nlt_extended_highbd`,
 `_hsl_qslice`,
 `_run_mode1`, `_run_mode1_highbd`, `_run_mode1_subsampled`,
-`_qpr_rpr`, and `*_target_bytes` variants for the feature axes above. See
-the module docs for the exact signatures and scope per entry point.
+`_qpr_rpr`, `_for_profile` (profile-targeted + signed),
+`_cbr_target_bytes` (exact-size CBR), and `*_target_bytes` variants for
+the feature axes above. See the module docs for the exact signatures and
+scope per entry point.
+
+The `signalling` module (`declare_profile` / `declare_level_sublevel` /
+`declare_cbr` / `declare_auto` / `pick_*` / `pad_to_size` /
+`insert_com` / `verify_declarations`) upgrades any encoded codestream
+to a verified self-describing one — see the Encoder section above.
 
 The crate also registers a software decoder through the standard
 `oxideav-core` registry path.

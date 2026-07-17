@@ -372,6 +372,51 @@ pub fn declare_cbr_padded(buf: &mut Vec<u8>, target: usize) -> Result<()> {
     declare_cbr(buf)
 }
 
+/// Insert one COM extension marker segment (21122-1 §A.4.10, Tables
+/// A.22 / A.23) before the first slice header — e.g. an encoder-vendor
+/// string ([`crate::com::TCOM_ENCODER_VENDOR`], `dcom` a
+/// zero-terminated ISO/IEC 10646 string), a copyright statement
+/// ([`crate::com::TCOM_COPYRIGHT`]), or vendor-specific data
+/// (`Tcom ≥ 0x8000`).
+///
+/// `dcom` may be at most `65531` bytes (`Lcom` is 16-bit and counts
+/// itself plus the two `Tcom` bytes). Insertion into a CBR-declared
+/// stream (non-zero `Lcod`) is rejected because it would change the
+/// declared byte count — insert extension segments first, then call
+/// [`declare_cbr`] / [`declare_cbr_padded`]. On failure the buffer is
+/// unchanged.
+pub fn insert_com(buf: &mut Vec<u8>, tcom: u16, dcom: &[u8]) -> Result<()> {
+    if dcom.len() > 0xffff - 4 {
+        return Err(Error::invalid(format!(
+            "jpegxs signalling: COM Dcom payload of {} bytes exceeds the 16-bit Lcom \
+             capacity of {} bytes",
+            dcom.len(),
+            0xffff - 4
+        )));
+    }
+    let body = pih_body_offset(buf)?;
+    let lcod = u32::from_be_bytes([
+        buf[body + LCOD_REL],
+        buf[body + LCOD_REL + 1],
+        buf[body + LCOD_REL + 2],
+        buf[body + LCOD_REL + 3],
+    ]);
+    if lcod != 0 {
+        return Err(Error::invalid(
+            "jpegxs signalling: inserting a COM segment into a CBR-declared stream would \
+             falsify its Lcod — insert first, then declare_cbr",
+        ));
+    }
+    let slh = first_slh_offset(buf)?;
+    let mut seg = Vec::with_capacity(6 + dcom.len());
+    seg.extend_from_slice(&[0xff, 0x15]); // COM marker
+    seg.extend_from_slice(&((4 + dcom.len()) as u16).to_be_bytes()); // Lcom
+    seg.extend_from_slice(&tcom.to_be_bytes()); // Tcom
+    seg.extend_from_slice(dcom); // Dcom
+    buf.splice(slh..slh, seg);
+    Ok(())
+}
+
 /// The eight non-unrestricted profiles in preference order for
 /// [`pick_profile`]: the Light family (smallest decoder smoothing
 /// buffer, Table A.2), then Main (Table A.1), then High (Table A.3),
@@ -1102,6 +1147,50 @@ mod tests {
         // entry point emits are themselves a verifiable declaration.
         let buf = encode_profile_shaped();
         verify_declarations(&buf).expect("legacy defaults verify");
+    }
+
+    #[test]
+    fn insert_com_carries_vendor_and_copyright_strings() {
+        let base = encode_profile_shaped();
+        let baseline = decode_ok(&base);
+        let mut buf = base.clone();
+        insert_com(&mut buf, crate::com::TCOM_ENCODER_VENDOR, b"oxideav\0").expect("vendor");
+        insert_com(&mut buf, crate::com::TCOM_COPYRIGHT, b"example\0").expect("copyright");
+        let cs = codestream::parse(&buf).unwrap();
+        let coms = cs.com().unwrap();
+        assert_eq!(coms.len(), 2);
+        // Segments appear in insertion order: each insertion lands
+        // directly before the first SLH, i.e. after every previously
+        // inserted segment.
+        assert_eq!(coms[0].tcom, crate::com::TCOM_ENCODER_VENDOR);
+        assert_eq!(coms[0].dcom, b"oxideav\0");
+        assert_eq!(coms[1].tcom, crate::com::TCOM_COPYRIGHT);
+        assert_eq!(coms[1].dcom, b"example\0");
+        // Decode is unchanged, and a CBR declaration afterwards holds.
+        let img = decode_ok(&buf);
+        for (a, b) in img.planes.iter().zip(baseline.planes.iter()) {
+            assert_eq!(a.data, b.data);
+        }
+        declare_cbr(&mut buf).expect("cbr after com");
+        decode_ok(&buf);
+    }
+
+    #[test]
+    fn insert_com_rejects_cbr_streams_and_oversize_payloads() {
+        let mut buf = encode_profile_shaped();
+        declare_cbr(&mut buf).expect("cbr");
+        let before = buf.clone();
+        let err = insert_com(&mut buf, 0x8000, b"x").unwrap_err();
+        assert!(
+            format!("{err}").contains("Lcod"),
+            "expected CBR rejection, got {err}"
+        );
+        assert_eq!(buf, before);
+        declare_vbr(&mut buf).expect("vbr");
+        insert_com(&mut buf, 0x8000, b"x").expect("legal after vbr");
+        // Oversized Dcom.
+        let big = vec![0u8; 0xffff - 3];
+        assert!(insert_com(&mut buf, 0x8000, &big).is_err());
     }
 
     #[test]
