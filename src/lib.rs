@@ -68,6 +68,7 @@ pub mod output;
 pub mod picture_header;
 pub mod probe;
 pub mod profile;
+pub mod signalling;
 pub mod slice_header;
 pub mod slice_walker;
 
@@ -117,6 +118,10 @@ pub use profile::{
     check_codestream as check_profile, check_codestream_size, check_level, classify_chroma,
     column_width, max_codestream_size, ChromaFormat, ColumnMode, Level, Profile, ProfileLimits,
     QpihAllowed, Sublevel,
+};
+pub use signalling::{
+    declare_auto, declare_cbr, declare_level_sublevel, declare_profile, declare_vbr, pick_level,
+    pick_profile, pick_sublevel, verify_declarations,
 };
 pub use slice_header::SliceHeader;
 pub use slice_walker::{parse_wgt, BandWeight};

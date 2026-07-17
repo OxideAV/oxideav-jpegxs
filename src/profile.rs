@@ -309,6 +309,24 @@ impl Level {
         })
     }
 
+    /// Encode this level as the high byte of the `Plev` field (Table
+    /// A.12) — the exact inverse of [`Level::from_plev_high`]. The
+    /// returned byte goes into `Plev >> 8`; the low byte carries the
+    /// sublevel ([`Sublevel::plev_low_byte`]).
+    pub fn plev_high_byte(self) -> u8 {
+        match self {
+            Level::Unrestricted => 0x00,
+            Level::L2k1 => 0x10,
+            Level::L4k1 => 0x20,
+            Level::L4k2 => 0x24,
+            Level::L4k3 => 0x28,
+            Level::L8k1 => 0x30,
+            Level::L8k2 => 0x34,
+            Level::L8k3 => 0x38,
+            Level::L10k1 => 0x40,
+        }
+    }
+
     /// Maximum picture width `Wmax` in sampling-grid points
     /// (`None` for Unrestricted).
     pub fn max_width(self) -> Option<u32> {
@@ -409,6 +427,21 @@ impl Sublevel {
             return Some(Sublevel::Unrestricted);
         }
         None
+    }
+
+    /// Encode this sublevel as the low byte of the `Plev` field (Table
+    /// A.13) — the exact inverse of [`Sublevel::from_plev_low_byte`].
+    /// The returned byte goes into `Plev & 0x00ff`; the high byte
+    /// carries the level ([`Level::plev_high_byte`]).
+    pub fn plev_low_byte(self) -> u8 {
+        match self {
+            Sublevel::Unrestricted => 0x00,
+            Sublevel::Full => 0x80,
+            Sublevel::Sublev12bpp => 0x10,
+            Sublevel::Sublev9bpp => 0x0c,
+            Sublevel::Sublev6bpp => 0x08,
+            Sublevel::Sublev3bpp => 0x04,
+        }
     }
 
     /// Nominal bits-per-pixel `Nbpp` per Table A.7. `Full` returns
@@ -1547,5 +1580,45 @@ mod tests {
         let mut cs = make_cs(Profile::Unrestricted, 1, 8, &[(1, 1)], 1, 0, 0, 4, 1, 0, 1);
         cs.pih.plev = 0x0000; // unrestricted level + sublevel
         check_codestream_size(&cs, usize::MAX).expect("unrestricted: no size bound");
+    }
+
+    #[test]
+    fn plev_high_byte_roundtrips_every_level() {
+        // Table A.12 — plev_high_byte is the exact inverse of
+        // from_plev_high over the nine defined levels.
+        for level in [
+            Level::Unrestricted,
+            Level::L2k1,
+            Level::L4k1,
+            Level::L4k2,
+            Level::L4k3,
+            Level::L8k1,
+            Level::L8k2,
+            Level::L8k3,
+            Level::L10k1,
+        ] {
+            let plev = (level.plev_high_byte() as u16) << 8;
+            assert_eq!(Level::from_plev_high(plev), Some(level), "{level:?}");
+        }
+    }
+
+    #[test]
+    fn plev_low_byte_roundtrips_every_sublevel() {
+        // Table A.13 — plev_low_byte is the exact inverse of
+        // from_plev_low_byte over the six defined sublevels.
+        for sub in [
+            Sublevel::Unrestricted,
+            Sublevel::Full,
+            Sublevel::Sublev12bpp,
+            Sublevel::Sublev9bpp,
+            Sublevel::Sublev6bpp,
+            Sublevel::Sublev3bpp,
+        ] {
+            assert_eq!(
+                Sublevel::from_plev_low_byte(sub.plev_low_byte()),
+                Some(sub),
+                "{sub:?}"
+            );
+        }
     }
 }

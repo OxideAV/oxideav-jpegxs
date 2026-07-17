@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased — round 415 (encoder conformance signalling: Ppih / Plev / Lcod)
+
+* **New `signalling` module** — encoder-side profile / level / sublevel
+  / CBR declarations (ISO/IEC 21122-1:2022 Table 11 / §A.4.4 +
+  ISO/IEC 21122-2:2019 Annex A). Every encoder entry point used to emit
+  `Ppih = 0` / `Plev = 0` / `Lcod = 0` (unrestricted / VBR — conforming
+  but claiming nothing, and §A.2.2 / §A.5 exclude those values as
+  conformance points). The new module patches the three fields in place
+  in an already-encoded codestream and **verifies each claim through the
+  decoder's own gates** (`check_codestream` / `check_level` /
+  `check_codestream_size` / the Table-11 `Lcod` match) before keeping
+  it, restoring the buffer on failure — a false declaration cannot be
+  emitted:
+  * `declare_profile` — non-zero `Ppih` (Table A.5);
+  * `declare_level_sublevel` — `Plev` (Tables A.12 / A.13, incl. the
+    §A.4.2 Full-sublevel-requires-profile rule);
+  * `declare_cbr` / `declare_vbr` — `Lcod` CBR self-description;
+  * `pick_profile` / `pick_level` / `pick_sublevel` — tightest verified
+    claims (Light → Main → High preference; ascending Table A.6 levels;
+    ascending Table A.7 bpp ladder);
+  * `declare_auto` — all of the above in one call.
+* **`Level::plev_high_byte` / `Sublevel::plev_low_byte`** — the exact
+  inverses of the Table A.12 / A.13 parsers, round-trip-pinned over
+  every defined level / sublevel.
+
+* +16 tests (625 → 641).
+
 ## Unreleased — round 408 (four-component end-to-end + Nc 1..=8 + hygiene)
 
 * **Four-component end-to-end coverage** that runs on CI without the
