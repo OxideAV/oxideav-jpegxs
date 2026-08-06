@@ -193,6 +193,60 @@ pub fn is_jxs_file(buf: &[u8]) -> bool {
     buf.len() >= SIGNATURE_BOX.len() && buf[..SIGNATURE_BOX.len()] == SIGNATURE_BOX
 }
 
+// ---------------------------------------------------------------------
+// Media Type registrations — ISO/IEC 21122-3:2019 §A.7 / §C.5 / §C.6 /
+// §D.2 (each following IETF RFC 6838).
+// ---------------------------------------------------------------------
+
+/// Media Type of the box-based JXS still-image file format (§A.7.2).
+/// Registered magic: the 12-byte Signature box ([`SIGNATURE_BOX`]);
+/// registered file extension: `jxs`.
+pub const MEDIA_TYPE_JXS: &str = "image/jxs";
+
+/// Media Type of a raw ISO/IEC 21122-1 codestream transported outside
+/// any file format (§D.2.2 — e.g. an RTP payload). Registered magic:
+/// the 4-byte prefix `FF10 FF50` (SOC immediately followed by CAP, the
+/// mandatory 21122-1 Annex A marker order); registered file extension:
+/// `jxsc`.
+pub const MEDIA_TYPE_CODESTREAM: &str = "image/jxsc";
+
+/// Media Type of an ISO/IEC 23008-12 (HEIF) file whose major brand
+/// relates to a JPEG XS coded *image item* (§C.5.2). No registered
+/// magic; registered file extension: `jxsi`. This crate does not parse
+/// HEIF — the constant completes the Part-3 registration surface.
+pub const MEDIA_TYPE_HEIF_IMAGE: &str = "image/jxsi";
+
+/// Media Type of an ISO/IEC 23008-12 (HEIF) file whose major brand
+/// relates to a JPEG XS coded *image sequence* (§C.6.2). No registered
+/// magic; registered file extension: `jxss`. This crate does not parse
+/// HEIF — the constant completes the Part-3 registration surface.
+pub const MEDIA_TYPE_HEIF_SEQUENCE: &str = "image/jxss";
+
+/// The §D.2.2 registered magic of a bare codestream: SOC (`FF10`)
+/// immediately followed by CAP (`FF50`) — the mandatory ISO/IEC 21122-1
+/// Annex A marker order, so every conforming codestream starts with it.
+pub const CODESTREAM_MAGIC: [u8; 4] = [0xff, 0x10, 0xff, 0x50];
+
+/// Classify a byte buffer by the two magic-number-bearing ISO/IEC
+/// 21122-3 Media Type registrations: the §A.7.2 JXS box file (12-byte
+/// Signature box) and the §D.2.2 bare codestream (`FF10 FF50`).
+///
+/// Returns [`MEDIA_TYPE_JXS`], [`MEDIA_TYPE_CODESTREAM`], or `None`
+/// when neither registered magic matches (including the HEIF
+/// registrations §C.5 / §C.6, which declare no magic — a HEIF reader
+/// must resolve those from the FileTypeBox brand instead).
+pub fn media_type(buf: &[u8]) -> Option<&'static str> {
+    if is_jxs_file(buf) {
+        Some(MEDIA_TYPE_JXS)
+    } else if buf.len() >= CODESTREAM_MAGIC.len()
+        && buf[..CODESTREAM_MAGIC.len()] == CODESTREAM_MAGIC
+    {
+        Some(MEDIA_TYPE_CODESTREAM)
+    } else {
+        None
+    }
+}
+
 /// File Type box contents (A.5.2 Table A.4): the brand, minor version and
 /// compatibility list.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2538,6 +2592,28 @@ mod writer_tests {
         let file = write_jxs_file(&cs).unwrap();
         let parsed = parse_jxs_file(&file).unwrap();
         assert!(parsed.header.exif.is_none());
+    }
+
+    #[test]
+    fn media_type_classifies_the_registered_magics() {
+        // §D.2.2 — a bare codestream starts SOC + CAP.
+        let cs = luma_cs();
+        assert_eq!(&cs[..4], &CODESTREAM_MAGIC);
+        assert_eq!(media_type(&cs), Some(MEDIA_TYPE_CODESTREAM));
+        // §A.7.2 — the box file starts with the Signature box.
+        let file = write_jxs_file(&cs).unwrap();
+        assert_eq!(media_type(&file), Some(MEDIA_TYPE_JXS));
+        // No registered magic: truncated prefixes, plain garbage, and a
+        // SOC not followed by CAP (not the registered §D.2.2 magic).
+        assert_eq!(media_type(&cs[..2]), None);
+        assert_eq!(media_type(&file[..8]), None);
+        assert_eq!(media_type(b"not a jxs"), None);
+        assert_eq!(media_type(&[0xff, 0x10, 0xff, 0x12]), None);
+        // The registration strings themselves.
+        assert_eq!(MEDIA_TYPE_JXS, "image/jxs");
+        assert_eq!(MEDIA_TYPE_CODESTREAM, "image/jxsc");
+        assert_eq!(MEDIA_TYPE_HEIF_IMAGE, "image/jxsi");
+        assert_eq!(MEDIA_TYPE_HEIF_SEQUENCE, "image/jxss");
     }
 
     #[test]

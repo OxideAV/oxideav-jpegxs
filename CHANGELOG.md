@@ -34,6 +34,13 @@
   `profile_cbr_exact_target_main422_10` row pins the one-call
   composition (rate-allocated 4:2:2 10-bit under Main 422.10, exactly
   7000 bytes, verified declarations) by SHA-256.
+* **ISO/IEC 21122-3 Media Type registrations** (§A.7.2 / §C.5.2 /
+  §C.6.2 / §D.2.2, RFC 6838): `fileformat::media_type` classifies a
+  buffer by the two registered magics — `image/jxs` (Signature box) and
+  `image/jxsc` (the `FF10 FF50` SOC + CAP codestream prefix, exposed as
+  `CODESTREAM_MAGIC`) — and the HEIF-side `image/jxsi` / `image/jxss`
+  registrations are exposed as constants (HEIF parsing stays out of
+  scope).
 
 ## Unreleased — round 415 (encoder conformance signalling: Ppih / Plev / Lcod)
 

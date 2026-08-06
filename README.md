@@ -388,6 +388,15 @@ registry `Decoder` accepts either a bare codestream or a box-wrapped
 `.jxs` file, routing on the leading signature; `is_jxs_file`
 discriminates the two.
 
+The four 21122-3 **Media Type registrations** (RFC 6838) are also
+surfaced: `media_type` classifies a buffer by the two registered magics
+— `image/jxs` (§A.7.2, the 12-byte Signature box) and `image/jxsc`
+(§D.2.2, the `FF10 FF50` SOC + CAP prefix of a bare codestream carried
+outside any file format, e.g. as an RTP payload) — and the HEIF-side
+`image/jxsi` / `image/jxss` (§C.5.2 / §C.6.2, no registered magic;
+HEIF parsing itself is out of this crate's scope) are exposed as
+constants.
+
 A matching writer round-trips the wrapper: `JxsFileBuilder` /
 `write_jxs_file` serialize a conforming box file around an encoded
 codestream — deriving the `ihdr` geometry from the picture header,
