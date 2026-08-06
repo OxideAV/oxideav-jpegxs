@@ -30,6 +30,10 @@
   whenever the allocation stays lossless), a half-size lossy squeeze
   with verified declarations, unreachable-target and
   unrestricted-profile rejections.
+* Encoder conformance pinning grows to a 16-stream matrix: a
+  `profile_cbr_exact_target_main422_10` row pins the one-call
+  composition (rate-allocated 4:2:2 10-bit under Main 422.10, exactly
+  7000 bytes, verified declarations) by SHA-256.
 
 ## Unreleased — round 415 (encoder conformance signalling: Ppih / Plev / Lcod)
 

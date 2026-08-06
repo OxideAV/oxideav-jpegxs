@@ -333,9 +333,9 @@ pins the strongest checkable equivalent per stream — a SHA-256 of the
 emitted bytes (wire-format changes must deliberately update the table),
 a self-decode through the conformance-gated decoder (bit-exact for
 every lossless case), and declaration truth for every claimed `Ppih` /
-`Plev` / `Lcod`. The 15-stream matrix spans `Cpih ∈ {0, 1, 3}`, 4:2:0
-sub-sampling, `B[i] = 12`, NLT quadratic, `Rm = 1`, exact-size CBR, and
-all eight profile targets.
+`Plev` / `Lcod`. The 16-stream matrix spans `Cpih ∈ {0, 1, 3}`, 4:2:0
+sub-sampling, `B[i] = 12`, NLT quadratic, `Rm = 1`, exact-size CBR, all
+eight profile targets, and the CBR × profile one-call composition.
 
 ### Codestream parser
 

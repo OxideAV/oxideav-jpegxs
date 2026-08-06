@@ -242,6 +242,10 @@ const PINNED: &[(&str, &str)] = &[
         "profile_high4444_12",
         "4840fe9964afa18dd5db6c9f4e9ad855fed4b78f839cf644e9db7937597fb30b",
     ),
+    (
+        "profile_cbr_exact_target_main422_10",
+        "f1288e5336d3ee84e17ae8083fa82b7c0f933d3f97c6ff40a5351598c995a41d",
+    ),
 ];
 
 fn pinned_hash(name: &str) -> &'static str {
@@ -496,4 +500,36 @@ fn pinned_encoder_streams() {
         let expect: Vec<Vec<u8>> = planes.iter().map(|p| pack16(p, case.bd)).collect();
         assert_decodes_to(case.name, &buf, &expect);
     }
+
+    // --- CBR × profile one-call composition: exact-size CBR that also
+    // claims (and satisfies) Main 422.10 — rate-allocated per
+    // 16-image-row slice over the 4:2:2 10-bit layout, COM-padded, and
+    // signed with Ppih + the tightest Plev fit of the CBR size + Lcod.
+    let yuv422_10: Vec<Vec<u16>> = vec![
+        plane16(W, H, 10, 31),
+        plane16(W / 2, H, 10, 32),
+        plane16(W / 2, H, 10, 33),
+    ];
+    let target = 7000usize;
+    let (buf, _level, _sublevel, q_slices) = encoder::encode_planar_for_profile_cbr_target_bytes(
+        Profile::Main422_10,
+        W as u16,
+        H as u16,
+        3,
+        0,
+        2,
+        1,
+        10,
+        1,
+        &[1, 2, 2],
+        &[1, 1, 1],
+        target,
+        &yuv422_10,
+    )
+    .unwrap();
+    assert_eq!(buf.len(), target);
+    assert_eq!(q_slices.len(), 4); // 64 rows / 16-row slices
+    signalling::verify_declarations(&buf).unwrap();
+    check_pin("profile_cbr_exact_target_main422_10", &buf);
+    oxideav_jpegxs::decode_jpeg_xs(&buf).unwrap();
 }
