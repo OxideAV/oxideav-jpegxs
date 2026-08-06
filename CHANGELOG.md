@@ -60,10 +60,13 @@
   verify_declarations / full decode, with decoded-geometry consistency
   asserts), `jxs_file` (Part-3 box parser + wrapped decode), and
   `roundtrip` (structured encoder-config + planes from fuzzer bytes;
-  every accepted configuration must decode, bit-exactly at `q = 0`) —
-  plus a `seed_gen` bin that writes feature-spanning corpus seeds.
-  Bounded campaigns (~19 min, ~1.16 M executions total) run clean after
-  the two fixes above.
+  every accepted configuration must decode, bit-exactly at `q = 0`,
+  across four entry-point axes: generic sub-sampled, `Qpih = 1`,
+  `Rm = 1`, explicit multi-slice) — plus a `seed_gen` bin that writes
+  feature-spanning corpus seeds. Bounded campaigns (~26 min, ~1.37 M
+  executions total) run clean after the two fixes above, and the
+  official ISO/IEC 21122-4 vector suite was re-run against the
+  decode-path change: 65/65 bit-exact, 9/9 ETS sets PASS.
 
 ## Unreleased — round 415 (encoder conformance signalling: Ppih / Plev / Lcod)
 
