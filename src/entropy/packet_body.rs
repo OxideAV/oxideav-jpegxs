@@ -213,10 +213,26 @@ pub fn decode_packet_body(
             // to stay exact for any future widening. The cap is `i32`
             // so the VLC paths (which may produce a negative
             // mtop + Δm) reject under- and over-flow uniformly.
-            let m_max: i32 = if geom.br >= 8 {
-                255
-            } else {
-                (1i32 << geom.br) - 1
+            //
+            // The bound additionally intersects with the 32-bit
+            // quantization-index representation: a magnitude with `M`
+            // bitplanes reconstructs to `(v << T) + r < 2^M` (Annex
+            // D.2), so `M ≤ 31` is the largest count the coefficient
+            // pipeline represents exactly. A conforming encoder cannot
+            // reach it — quantization indices derive from `Bw ≤ 20`-bit
+            // nominal wavelet data (Table A.8) whose 5/3 dynamic-range
+            // growth stays well below 31 bits — but with `Br = 8` the
+            // Table C.12 syntactic range reaches 255, and a malformed
+            // count of e.g. 200 would drive the per-plane magnitude
+            // accumulation `d << plane` past the 32-bit coefficient
+            // width (fuzz-surfaced, round 438).
+            let m_max: i32 = {
+                let br_cap: i32 = if geom.br >= 8 {
+                    255
+                } else {
+                    (1i32 << geom.br) - 1
+                };
+                br_cap.min(31)
             };
 
             // Vertical predictor source line.
@@ -232,7 +248,7 @@ pub fn decode_packet_body(
                     let m = reader.read_bits(geom.br)? as i32;
                     if m > m_max {
                         return Err(Error::invalid(format!(
-                            "jpegxs entropy: raw bitplane count {m} exceeds 2^Br - 1 = {m_max} (Table C.12)"
+                            "jpegxs entropy: raw bitplane count {m} exceeds the maximum {m_max} (Table C.12 min(2^Br - 1, 31))"
                         )));
                     }
                     coef.m[line_index * ncg + g] = m as u8;
@@ -264,7 +280,7 @@ pub fn decode_packet_body(
                     let m = mtop + delta_m;
                     if !(0..=m_max).contains(&m) {
                         return Err(Error::invalid(format!(
-                            "jpegxs entropy: decoded M[p,λ,b,g] = {m} outside 0..=2^Br-1 = {m_max} (Table C.14)"
+                            "jpegxs entropy: decoded M[p,λ,b,g] = {m} outside 0..={m_max} (Table C.14 min(2^Br-1, 31))"
                         )));
                     }
                     coef.m[line_index * ncg + g] = m as u8;
@@ -338,7 +354,7 @@ pub fn decode_packet_body(
                     let m = mtop + delta_m;
                     if !(0..=m_max).contains(&m) {
                         return Err(Error::invalid(format!(
-                            "jpegxs entropy: decoded vertical M[p,λ,b,g] = {m} outside 0..=2^Br-1 = {m_max} (Table C.13)"
+                            "jpegxs entropy: decoded vertical M[p,λ,b,g] = {m} outside 0..={m_max} (Table C.13 min(2^Br-1, 31))"
                         )));
                     }
                     coef.m[line_index * ncg + g] = m as u8;
@@ -989,6 +1005,67 @@ mod tests {
             msg.contains("2^Br-1") && msg.contains("16"),
             "unexpected error message: {msg}"
         );
+    }
+
+    /// A raw-mode bitplane count above the 32-bit representability cap
+    /// must be rejected (fuzz-surfaced, round 438). With `Br = 8` the
+    /// Table C.12 syntactic range reaches 255, but a magnitude with
+    /// `M > 31` bitplanes cannot be represented by the 32-bit
+    /// quantization-index pipeline (`(v << T) + r < 2^M`, Annex D.2) —
+    /// and a conforming encoder cannot produce one from `Bw ≤ 20`-bit
+    /// nominal wavelet data. Without the cap the per-plane magnitude
+    /// accumulation `d << plane` overflows.
+    ///
+    /// Geometry: 1 band, `wpb = 4` → `Ncg = 1`, raw mode (`Dr = 1`),
+    /// count byte `200`, and a data sub-packet long enough that the
+    /// decoder would reach the overflowing shift if the count survived.
+    #[test]
+    fn raw_bitplane_count_above_32bit_representability_rejected() {
+        let geom = PrecinctGeometry {
+            bands: vec![BandGeometry {
+                wpb: 4,
+                gain: 0,
+                priority: 0,
+                l0: 0,
+                l1: 1,
+                exists: true,
+            }],
+            ng: 4,
+            ss: 8,
+            br: 8,
+            fs: 0,
+            rm: 0,
+            rl: 0,
+            lh: 0,
+            short_packet_header: true,
+        };
+        let layout = PacketLayout {
+            entries: vec![PacketEntry { band: 0, line: 0 }],
+        };
+        let precinct = PrecinctHeader {
+            lprc: 1,
+            q: 0,
+            r: 0,
+            d: vec![0],
+            header_bytes: 0,
+        };
+        // Bitplane-count sub-packet (raw): one Br=8 code = 200.
+        // Followed by a generously sized data sub-packet of zeros.
+        let mut body: Vec<u8> = vec![200];
+        body.extend_from_slice(&[0u8; 128]);
+        let packet = PacketHeader {
+            dr: 1,
+            ldat: 128,
+            lcnt: 1,
+            lsgn: 0,
+            short_form: true,
+            header_bytes: 5,
+        };
+        let mut state = PrecinctState::default();
+        let err = decode_packet_body(&body, &geom, &precinct, &packet, &layout, &mut state, None)
+            .expect_err("M = 200 must be rejected above the 32-bit representability cap");
+        let msg = format!("{err}");
+        assert!(msg.contains("200"), "unexpected error message: {msg}");
     }
 
     /// Cross-precinct vertical prediction (Annex C.6.3 Table C.11):

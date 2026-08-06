@@ -41,6 +41,29 @@
   `CODESTREAM_MAGIC`) — and the HEIF-side `image/jxsi` / `image/jxss`
   registrations are exposed as constants (HEIF parsing stays out of
   scope).
+* **Two fuzz-surfaced hardening fixes** (from the new `fuzz/` harness):
+  * The encoder now enforces the Table 11 minimum picture dimensions
+    (`Wf ≥ max_i(sx)·2^NL,x`, `Hf ≥ max_i(sy)·2^NL,y`) that the decoder
+    always gated — previously e.g. a 3-wide picture with a `sx = 2`
+    component at `NL,x = 1` encoded into a stream no conforming decoder
+    (including this crate's) would accept.
+  * The bitplane-count range gate now intersects the Tables C.12–C.14
+    `0..=2^Br − 1` bound with the 32-bit quantization-index
+    representability cap `M ≤ 31` (Annex D.2 reconstructs
+    `(v << T) + r < 2^M`; a conforming encoder cannot exceed it from
+    `Bw ≤ 20`-bit nominal wavelet data) — with `Br = 8` a malformed
+    count of e.g. 200 previously drove the per-plane magnitude
+    accumulation past the coefficient width (a debug-build panic /
+    release-build wrong-value shift).
+* **`fuzz/` harness** (cargo-fuzz, separate workspace): three targets —
+  `decode` (arbitrary bytes through media-type / probe /
+  verify_declarations / full decode, with decoded-geometry consistency
+  asserts), `jxs_file` (Part-3 box parser + wrapped decode), and
+  `roundtrip` (structured encoder-config + planes from fuzzer bytes;
+  every accepted configuration must decode, bit-exactly at `q = 0`) —
+  plus a `seed_gen` bin that writes feature-spanning corpus seeds.
+  Bounded campaigns (~19 min, ~1.16 M executions total) run clean after
+  the two fixes above.
 
 ## Unreleased — round 415 (encoder conformance signalling: Ppih / Plev / Lcod)
 

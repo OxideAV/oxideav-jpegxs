@@ -398,6 +398,34 @@ impl EncodeConfig {
                 self.nlx, self.nly
             )));
         }
+        // Picture-dimension conformance (ISO/IEC 21122-1:2022 Table 11):
+        //
+        //   Wf ≥ max_i(sx[i]) × 2^NL,x
+        //   Hf ≥ max_i(sy[i]) × 2^NL,y
+        //
+        // — the picture must be at least one fully-decomposed
+        // low-frequency sample wide / tall in every component. The
+        // decoder rejects smaller geometry as internally inconsistent
+        // (it cannot carry the LL band the header claims), so the
+        // encoder must refuse to emit it. Mirrors the decode-side gate
+        // (fuzz-surfaced round 438: a 3-wide picture with a sx=2
+        // component at NL,x=1 encoded fine but could not decode).
+        let max_sx = self.sx.iter().copied().max().unwrap_or(1) as u32;
+        let max_sy = self.sy.iter().copied().max().unwrap_or(1) as u32;
+        let wf_min = max_sx << self.nlx as u32;
+        let hf_min = max_sy << self.nly as u32;
+        if (self.width as u32) < wf_min {
+            return Err(Error::invalid(format!(
+                "jpegxs encoder: Wf={} below the minimum max_i(sx)×2^NL,x = {}×2^{} = {} (Table 11)",
+                self.width, max_sx, self.nlx, wf_min
+            )));
+        }
+        if (self.height as u32) < hf_min {
+            return Err(Error::invalid(format!(
+                "jpegxs encoder: Hf={} below the minimum max_i(sy)×2^NL,y = {}×2^{} = {} (Table 11)",
+                self.height, max_sy, self.nly, hf_min
+            )));
+        }
         // Fq must be one of the ISO/IEC 21122-1:2022 Table A.8 values:
         // 0 (integer / lossless transform), 6 (NLT, Bw = 18), or 8
         // (high-precision regular, Bw = 20).
@@ -20382,5 +20410,39 @@ mod tests {
             hp_psnr >= lo_psnr - 0.01,
             "high-precision PSNR {hp_psnr:.2} dB should be >= integer-transform {lo_psnr:.2} dB"
         );
+    }
+
+    #[test]
+    fn rejects_pictures_below_the_table_11_minimum() {
+        // Fuzz-surfaced (round 438): a 3-wide picture with a sx=2
+        // component at NL,x=1 requires Wf >= 2×2^1 = 4 (Table 11). The
+        // decoder always rejected the geometry; the encoder must refuse
+        // to emit it rather than produce an undecodable stream.
+        let planes = |wc: usize, hc: usize, w1: usize, h1: usize| {
+            vec![vec![7u8; wc * hc], vec![9u8; w1 * h1]]
+        };
+        let err =
+            encode_planar_subsampled(3, 2, 2, 0, 1, 1, 1, &[1, 2], &[1, 1], &planes(3, 2, 2, 2))
+                .unwrap_err();
+        assert!(
+            format!("{err}").contains("Wf=3 below the minimum"),
+            "expected Table 11 Wf rejection, got {err}"
+        );
+        // Same on the vertical axis: Hf=2 with a sy=2 component at
+        // NL,y=2 requires Hf >= 2×2^2 = 8.
+        let err =
+            encode_planar_subsampled(8, 2, 2, 0, 2, 2, 0, &[1, 1], &[1, 2], &planes(8, 2, 8, 1))
+                .unwrap_err();
+        assert!(
+            format!("{err}").contains("Hf=2 below the minimum"),
+            "expected Table 11 Hf rejection, got {err}"
+        );
+        // The boundary case (Wf exactly at the minimum) encodes and
+        // round-trips through the decoder that enforces the same gate.
+        let ok =
+            encode_planar_subsampled(4, 2, 2, 0, 1, 1, 0, &[1, 2], &[1, 1], &planes(4, 2, 2, 2))
+                .expect("Wf at the Table 11 minimum must encode");
+        let img = decode_codestream(&ok, None).expect("minimum-width stream decodes");
+        assert_eq!(img.planes.len(), 2);
     }
 }
