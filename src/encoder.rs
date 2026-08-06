@@ -4297,6 +4297,91 @@ pub fn encode_planar_for_profile(
     cbr: bool,
     planes: &[Vec<u16>],
 ) -> Result<(Vec<u8>, crate::profile::Level, crate::profile::Sublevel)> {
+    let mut buf = encode_planar_for_profile_unsigned(
+        profile,
+        width,
+        height,
+        nc,
+        cpih,
+        nlx,
+        nly,
+        bd,
+        qpih,
+        q,
+        &[],
+        sx,
+        sy,
+        planes,
+    )?;
+    // Sign the stream: profile first (§A.4.2 makes the Full sublevel
+    // profile-dependent), then the tightest level / sublevel, then the
+    // CBR self-description. Each declaration re-verifies through the
+    // decoder's gates and fails loudly instead of emitting a false
+    // claim.
+    crate::signalling::declare_profile(&mut buf, profile)?;
+    let level = crate::signalling::pick_level(width as u32, height as u32);
+    let sublevel = crate::signalling::pick_sublevel(buf.len(), level, profile);
+    crate::signalling::declare_level_sublevel(&mut buf, level, sublevel)?;
+    if cbr {
+        crate::signalling::declare_cbr(&mut buf)?;
+    }
+    Ok((buf, level, sublevel))
+}
+
+/// Profile-mandated slice height in precinct rows: every
+/// non-unrestricted 21122-2:2019 profile mandates 16-image-row slices
+/// (Tables A.1–A.3), and one precinct row spans `2^NL,y` image rows.
+/// Errors when the mandate is not a whole number of precinct rows, and
+/// rejects [`crate::profile::Profile::Unrestricted`] (no mandated slice
+/// height — nothing to shape against).
+fn profile_hsl(profile: crate::profile::Profile, nly: u8) -> Result<u16> {
+    if matches!(profile, crate::profile::Profile::Unrestricted) {
+        return Err(Error::invalid(
+            "jpegxs encoder: encode_planar_for_profile requires a non-unrestricted profile \
+             (for an unrestricted stream use any entry point plus signalling::declare_auto)",
+        ));
+    }
+    let lim = profile.limits();
+    let rows_per_precinct = 1u32 << nly;
+    if lim.slice_height % rows_per_precinct != 0 {
+        return Err(Error::invalid(format!(
+            "jpegxs encoder: profile {} slice height of {} image rows is not a multiple of \
+             the 2^NL,y = {rows_per_precinct} rows per precinct",
+            profile.name(),
+            lim.slice_height
+        )));
+    }
+    Ok((lim.slice_height / rows_per_precinct) as u16)
+}
+
+/// Shared encode core of the profile-targeting entry points: validates
+/// the profile / component-layout inputs, derives the profile-mandated
+/// `Hsl`, packs the `u16` sample planes into the wire plane format for
+/// `bd`, and encodes. **No declarations are written** — the returned
+/// stream still carries `Ppih = 0` / `Plev = 0` / `Lcod = 0`; callers
+/// sign it via [`crate::signalling`].
+///
+/// Quantization comes from either the scalar `q` (when `q_slices` is
+/// empty — the [`encode_planar_for_profile`] regime, byte-identical to
+/// its historical output) or the per-slice `q_slices` vector (the
+/// rate-allocated CBR regime, one `Q[p]` per 16-image-row slice).
+#[allow(clippy::too_many_arguments)]
+fn encode_planar_for_profile_unsigned(
+    profile: crate::profile::Profile,
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    bd: u8,
+    qpih: u8,
+    q: u8,
+    q_slices: &[u8],
+    sx: &[u8],
+    sy: &[u8],
+    planes: &[Vec<u16>],
+) -> Result<Vec<u8>> {
     if matches!(profile, crate::profile::Profile::Unrestricted) {
         return Err(Error::invalid(
             "jpegxs encoder: encode_planar_for_profile requires a non-unrestricted profile \
@@ -4313,17 +4398,11 @@ pub fn encode_planar_for_profile(
     // Slice height in precinct rows from the profile's mandated
     // 16-image-row slices (Tables A.1–A.3): one precinct row spans
     // 2^NL,y image rows.
-    let lim = profile.limits();
-    let rows_per_precinct = 1u32 << nly;
-    if lim.slice_height % rows_per_precinct != 0 {
-        return Err(Error::invalid(format!(
-            "jpegxs encoder: profile {} slice height of {} image rows is not a multiple of \
-             the 2^NL,y = {rows_per_precinct} rows per precinct",
-            profile.name(),
-            lim.slice_height
-        )));
-    }
-    let hsl = (lim.slice_height / rows_per_precinct) as u16;
+    let hsl = profile_hsl(profile, nly)?;
+    // Picture-level fallback Q: the scalar `q` when no per-slice vector
+    // is supplied, else a representative value for the validate() range
+    // guard (the per-slice values win via `slice_cfg_for`).
+    let q_pic = q_slices.iter().copied().max().unwrap_or(q);
     // Pack the u16 sample planes into the wire plane format for `bd`.
     let byte_planes: Vec<Vec<u8>> = if bd == 8 {
         let mut out: Vec<Vec<u8>> = Vec::with_capacity(planes.len());
@@ -4363,7 +4442,7 @@ pub fn encode_planar_for_profile(
             "encode_planar_for_profile",
         )?
     };
-    let mut buf = encode_planar_inner_bd(
+    encode_planar_inner_bd(
         width,
         height,
         nc,
@@ -4372,7 +4451,7 @@ pub fn encode_planar_for_profile(
         nlx,
         nly,
         0, // fq = 0: integer-transform regular path (Table A.8), lossy via T[p,b]
-        q,
+        q_pic,
         sx,
         sy,
         0,
@@ -4387,26 +4466,294 @@ pub fn encode_planar_for_profile(
         0, // fs = 0
         hsl,
         qpih,
-        0,          // rp = 0
-        Vec::new(), // q_slices
+        0, // rp = 0
+        q_slices.to_vec(),
         Vec::new(), // q_precincts
         Vec::new(), // r_precincts
         &byte_planes,
         0, // rm = 0
+    )
+}
+
+/// Rate-budget `Q[p]` picker for the profile-targeting entry points:
+/// one `Q[p]` per profile-mandated 16-image-row slice such that the
+/// (unsigned) codestream emitted by the [`encode_planar_for_profile`]
+/// composition fits `target_bytes`.
+///
+/// Same three-pass ladder search as [`pick_q_slices_for_target_bytes`]
+/// (lossless probe → uniform-Q bisect → low-activity-first per-slice
+/// relaxation), generalised over the full profile composition:
+/// per-component `(sx, sy)` chroma sub-sampling, `bd ∈ 8..=16` `u16`
+/// sample planes, and `Qpih`. The spatial-activity ranking accounts for
+/// sub-sampling — each component's slice row range and row width are
+/// mapped through its own `(sx, sy)` — so a 4:2:2 / 4:2:0 layout ranks
+/// slices by the samples it actually codes.
+///
+/// Errors with `target_bytes unreachable` when even `Q = 15` on every
+/// slice overshoots the budget.
+#[allow(clippy::too_many_arguments)]
+pub fn pick_q_slices_for_profile_target_bytes(
+    profile: crate::profile::Profile,
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    bd: u8,
+    qpih: u8,
+    sx: &[u8],
+    sy: &[u8],
+    target_bytes: usize,
+    planes: &[Vec<u16>],
+) -> Result<Vec<u8>> {
+    if target_bytes == 0 {
+        return Err(Error::invalid(
+            "jpegxs picker: target_bytes must be > 0".to_string(),
+        ));
+    }
+    let hsl = profile_hsl(profile, nly)?;
+    let hp_pow = 1u32 << nly;
+    let np_y = (height as u32).div_ceil(hp_pow);
+    let hsl_rows = hsl as u32;
+    if hsl_rows == 0 {
+        return Err(Error::invalid(format!(
+            "jpegxs picker: profile {} Hsl resolves to zero precinct rows per slice \
+             (height={height}, NL,y={nly})",
+            profile.name()
+        )));
+    }
+    let n_slices = np_y.div_ceil(hsl_rows) as usize;
+    let encode = |q_slices: &[u8]| {
+        encode_planar_for_profile_unsigned(
+            profile, width, height, nc, cpih, nlx, nly, bd, qpih, 0, q_slices, sx, sy, planes,
+        )
+    };
+
+    // Pass 1 — lossless probe.
+    let q_zero = vec![0u8; n_slices];
+    if encode(&q_zero)?.len() <= target_bytes {
+        return Ok(q_zero);
+    }
+
+    // Pass 2 — uniform-Q bisect over `1..=15`.
+    let mut lo: u8 = 1;
+    let mut hi: u8 = 15;
+    let mut best_uniform_q: Option<u8> = None;
+    while lo <= hi {
+        let mid = (lo + hi) / 2;
+        let cs = encode(&vec![mid; n_slices])?;
+        if cs.len() <= target_bytes {
+            best_uniform_q = Some(mid);
+            if mid == 0 {
+                break;
+            }
+            hi = mid - 1;
+        } else {
+            if mid == 15 {
+                break;
+            }
+            lo = mid + 1;
+        }
+    }
+    let uniform_q = match best_uniform_q {
+        Some(q) => q,
+        None => {
+            let cs = encode(&vec![15u8; n_slices])?;
+            return Err(Error::invalid(format!(
+                "jpegxs picker: target_bytes={target_bytes} unreachable; Q=15 emits {} bytes",
+                cs.len()
+            )));
+        }
+    };
+    if n_slices == 1 {
+        return Ok(vec![uniform_q; 1]);
+    }
+
+    // Pass 3 — per-slice relaxation, low-activity slices first (see
+    // [`pick_q_slices_for_target_bytes`] for the rationale). Activity
+    // is computed per component in that component's own sub-sampled
+    // domain.
+    let slice_row_ranges = compute_slice_row_ranges(height, nly, hsl_rows);
+    debug_assert_eq!(slice_row_ranges.len(), n_slices);
+    let mut activity: Vec<(usize, u64)> = slice_row_ranges
+        .iter()
+        .enumerate()
+        .map(|(t, &(y0, y1))| {
+            (
+                t,
+                slice_activity_u16_subsampled(planes, width, sx, sy, y0, y1),
+            )
+        })
+        .collect();
+    activity.sort_by_key(|&(_, a)| a);
+
+    let mut best = vec![uniform_q; n_slices];
+    loop {
+        let mut changed = false;
+        for &(t, _) in &activity {
+            if best[t] == 0 {
+                continue;
+            }
+            let mut trial = best.clone();
+            trial[t] -= 1;
+            if encode(&trial)?.len() <= target_bytes {
+                best = trial;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    Ok(best)
+}
+
+/// Sub-sampling-aware slice-activity helper: L1 norm of the row-to-row
+/// first difference, summed across components, with each component's
+/// image-row range `y0..y1` and row width mapped through its own
+/// `(sx[i], sy[i])` into the component sampling grid (§B.1 ceiling
+/// sizing). Mirrors [`slice_activity_u16`] for the `sx = sy = 1` case.
+fn slice_activity_u16_subsampled(
+    planes: &[Vec<u16>],
+    width: u16,
+    sx: &[u8],
+    sy: &[u8],
+    y0: u32,
+    y1: u32,
+) -> u64 {
+    let mut acc: u64 = 0;
+    for (i, plane) in planes.iter().enumerate() {
+        let sxi = sx.get(i).copied().unwrap_or(1).max(1) as usize;
+        let syi = sy.get(i).copied().unwrap_or(1).max(1) as u32;
+        let wc = (width as usize).div_ceil(sxi);
+        if wc == 0 || plane.len() < wc {
+            continue;
+        }
+        let plane_rows = plane.len() / wc;
+        let r0 = ((y0 / syi) as usize).min(plane_rows);
+        let r1 = ((y1.div_ceil(syi)) as usize).min(plane_rows);
+        if r1 <= r0 + 1 {
+            continue;
+        }
+        for r in r0..r1 - 1 {
+            let cur = &plane[r * wc..(r + 1) * wc];
+            let nxt = &plane[(r + 1) * wc..(r + 2) * wc];
+            for c in 0..wc {
+                acc += (cur[c] as i32 - nxt[c] as i32).unsigned_abs() as u64;
+            }
+        }
+    }
+    acc
+}
+
+/// **CBR × profile one-call composition**: emit a codestream of
+/// *exactly* `target_bytes` bytes that claims — and provably satisfies
+/// — a named ISO/IEC 21122-2:2019 profile, the tightest level /
+/// sublevel fit, and a truthful CBR `Lcod` (21122-1 Table 11), in a
+/// single entry point.
+///
+/// Composition of the two round-415 conformance-grade entry points that
+/// previously had to be sequenced by hand (and could not be: the
+/// rate-allocation pickers only spoke the 4:4:4 8-bit / high-bd
+/// layouts, not the profile-mandated `(sx, sy) × bd × Hsl = 16-row`
+/// composition):
+///
+/// * the rate allocation is [`pick_q_slices_for_profile_target_bytes`]
+///   — one `Q[p]` per profile-mandated 16-image-row slice, landing at
+///   or under the budget;
+/// * the residual gap is closed with vendor-specific COM extension
+///   segments before the first SLH ([`crate::signalling::pad_to_size`],
+///   §A.4.10 — decode output is byte-identical with or without the
+///   padding), re-allocating against `target_bytes − 6` when the gap
+///   falls below the 6-byte minimum COM segment;
+/// * the stream is then signed like [`encode_planar_for_profile`]:
+///   `Ppih` to the target profile, `Plev` to the tightest verified
+///   level / sublevel fit **of the final `target_bytes` size** (the
+///   size a CBR channel actually carries), and `Lcod = target_bytes`,
+///   each claim verified through the decoder's own conformance gates
+///   before it is kept.
+///
+/// Same input shape as [`encode_planar_for_profile`] (`u16` sample
+/// planes at any `bd ∈ 8..=16`, per-component `(sx, sy)`). Returns
+/// `(codestream, level, sublevel, q_slices)` with
+/// `codestream.len() == target_bytes` guaranteed. Errors when even the
+/// coarsest allocation (`Q = 15` everywhere) cannot fit
+/// `target_bytes − 6`, or when the configuration violates the profile.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_planar_for_profile_cbr_target_bytes(
+    profile: crate::profile::Profile,
+    width: u16,
+    height: u16,
+    nc: u8,
+    cpih: u8,
+    nlx: u8,
+    nly: u8,
+    bd: u8,
+    qpih: u8,
+    sx: &[u8],
+    sy: &[u8],
+    target_bytes: usize,
+    planes: &[Vec<u16>],
+) -> Result<(
+    Vec<u8>,
+    crate::profile::Level,
+    crate::profile::Sublevel,
+    Vec<u8>,
+)> {
+    let mut q_slices = pick_q_slices_for_profile_target_bytes(
+        profile,
+        width,
+        height,
+        nc,
+        cpih,
+        nlx,
+        nly,
+        bd,
+        qpih,
+        sx,
+        sy,
+        target_bytes,
+        planes,
     )?;
-    // Sign the stream: profile first (§A.4.2 makes the Full sublevel
-    // profile-dependent), then the tightest level / sublevel, then the
-    // CBR self-description. Each declaration re-verifies through the
-    // decoder's gates and fails loudly instead of emitting a false
-    // claim.
+    let mut buf = encode_planar_for_profile_unsigned(
+        profile, width, height, nc, cpih, nlx, nly, bd, qpih, 0, &q_slices, sx, sy, planes,
+    )?;
+    let gap = target_bytes - buf.len();
+    if (1..=5).contains(&gap) {
+        // The gap is smaller than the smallest COM segment (6 bytes).
+        // Re-allocate against target − 6: the new stream is ≤ target − 6,
+        // so the new gap is ≥ 6 and paddable.
+        q_slices = pick_q_slices_for_profile_target_bytes(
+            profile,
+            width,
+            height,
+            nc,
+            cpih,
+            nlx,
+            nly,
+            bd,
+            qpih,
+            sx,
+            sy,
+            target_bytes - 6,
+            planes,
+        )?;
+        buf = encode_planar_for_profile_unsigned(
+            profile, width, height, nc, cpih, nlx, nly, bd, qpih, 0, &q_slices, sx, sy, planes,
+        )?;
+    }
+    // Pad to the exact CBR size first, then sign: the level / sublevel
+    // and Lcod claims must describe the stream a constant-bitrate
+    // channel actually carries (`target_bytes`), and each declaration
+    // verifies against the current buffer state.
+    crate::signalling::pad_to_size(&mut buf, target_bytes)?;
     crate::signalling::declare_profile(&mut buf, profile)?;
     let level = crate::signalling::pick_level(width as u32, height as u32);
-    let sublevel = crate::signalling::pick_sublevel(buf.len(), level, profile);
+    let sublevel = crate::signalling::pick_sublevel(target_bytes, level, profile);
     crate::signalling::declare_level_sublevel(&mut buf, level, sublevel)?;
-    if cbr {
-        crate::signalling::declare_cbr(&mut buf)?;
-    }
-    Ok((buf, level, sublevel))
+    crate::signalling::declare_cbr(&mut buf)?;
+    Ok((buf, level, sublevel, q_slices))
 }
 
 /// Round-108 uniform-inverse-quantizer entry point (`Qpih = 1`).

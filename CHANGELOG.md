@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased — round 438 (CBR × profile one-call composition)
+
+* **`encoder::encode_planar_for_profile_cbr_target_bytes`** — the CBR ×
+  profile composition in a single entry point: emit a codestream of
+  *exactly* `target_bytes` bytes that claims — and provably satisfies —
+  a named ISO/IEC 21122-2:2019 profile, the tightest level / sublevel
+  fit **of the final CBR size**, and a truthful `Lcod` (21122-1
+  Table 11). Previously the two round-415 conformance-grade entry
+  points could not be sequenced by hand: the rate-allocation pickers
+  only spoke the 4:4:4 8-bit / high-bd layouts, not the
+  profile-mandated `(sx, sy) × bd × Hsl = 16-image-row` composition.
+  Returns `(codestream, level, sublevel, q_slices)`.
+* **`encoder::pick_q_slices_for_profile_target_bytes`** — the
+  rate-budget `Q[p]` picker behind it: the same three-pass ladder
+  search as `pick_q_slices_for_target_bytes` (lossless probe →
+  uniform-Q bisect → low-activity-first per-slice relaxation),
+  generalised over per-component `(sx, sy)` chroma sub-sampling,
+  `bd ∈ 8..=16` `u16` sample planes, and `Qpih`, with the
+  spatial-activity ranking mapped through each component's own
+  sub-sampling grid.
+* The profile encode core is shared: `encode_planar_for_profile` now
+  funnels through the same unsigned core with an empty per-slice
+  vector, byte-identical to its historical output (the SHA-256-pinned
+  encoder conformance matrix is unchanged).
+* Tests: exact-size CBR across Main 422.10 / Light 444.12 /
+  Light-Subline 422.10 / High 4444.12 (gap-0, unpaddable-gap
+  re-allocation, small and large COM padding; bit-exact self-decode
+  whenever the allocation stays lossless), a half-size lossy squeeze
+  with verified declarations, unreachable-target and
+  unrestricted-profile rejections.
+
 ## Unreleased — round 415 (encoder conformance signalling: Ppih / Plev / Lcod)
 
 * **New `signalling` module** — encoder-side profile / level / sublevel

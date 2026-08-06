@@ -307,6 +307,16 @@ On top of that sit two conformance-grade entry points:
   or under the budget, COM padding closes the gap (re-allocating
   against `target − 6` when the residue is smaller than the 6-byte
   minimum segment), and `Lcod` truthfully declares the size.
+- **`encode_planar_for_profile_cbr_target_bytes`** composes the two in
+  one call: an exactly-`target_bytes` CBR stream that also claims — and
+  provably satisfies — a named profile. The rate allocation
+  (`pick_q_slices_for_profile_target_bytes`) runs the same three-pass
+  ladder search generalised over the profile composition (per-component
+  `(sx, sy)` sub-sampling, `bd ∈ 8..=16`, `Qpih`, the mandated
+  16-image-row slices, with the spatial-activity ranking mapped through
+  each component's own sub-sampling grid), and the level / sublevel are
+  picked against the final CBR size — the byte count a constant-bitrate
+  channel actually carries.
 
 The Part-3 wrapper keeps the declarations consistent: the
 `JxsFileBuilder` synthesises its `jxpl` Profile/Level box from the
@@ -500,7 +510,9 @@ interleaved RGB, and generalised planar input, with `_lossy`,
 `_hsl_qslice`,
 `_run_mode1`, `_run_mode1_highbd`, `_run_mode1_subsampled`,
 `_qpr_rpr`, `_for_profile` (profile-targeted + signed),
-`_cbr_target_bytes` (exact-size CBR), and `*_target_bytes` variants for
+`_cbr_target_bytes` (exact-size CBR),
+`_for_profile_cbr_target_bytes` (exact-size CBR × profile in one call),
+and `*_target_bytes` variants for
 the feature axes above. See the module docs for the exact signatures and
 scope per entry point.
 

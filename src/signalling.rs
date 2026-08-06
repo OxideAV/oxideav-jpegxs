@@ -1344,4 +1344,264 @@ mod tests {
         )
         .is_err());
     }
+
+    #[test]
+    fn encode_planar_for_profile_cbr_hits_exact_sizes_across_profiles() {
+        // The CBR × profile one-call composition, across the profile
+        // feature axes the plain CBR entry points cannot reach: chroma
+        // sub-sampling, high bit depth, four components, NL,y ∈ {0, 2},
+        // and the uniform quantizer — each under the profile-mandated
+        // 16-image-row slices.
+        let cases = [
+            // Main 422.10 — 4:2:2, 10-bit, uniform quantizer.
+            ProfileCase {
+                profile: Profile::Main422_10,
+                nc: 3,
+                cpih: 0,
+                nlx: 2,
+                nly: 1,
+                bd: 10,
+                qpih: 1,
+                sx: &[1, 2, 2],
+                sy: &[1, 1, 1],
+            },
+            // Light 444.12 — RCT, 12-bit, deadzone only.
+            ProfileCase {
+                profile: Profile::Light444_12,
+                nc: 3,
+                cpih: 1,
+                nlx: 2,
+                nly: 1,
+                bd: 12,
+                qpih: 0,
+                sx: &[1, 1, 1],
+                sy: &[1, 1, 1],
+            },
+            // Light-Subline 422.10 — NL,y = 0 (Hsl = 16 precinct rows).
+            ProfileCase {
+                profile: Profile::LightSubline422_10,
+                nc: 3,
+                cpih: 0,
+                nlx: 3,
+                nly: 0,
+                bd: 8,
+                qpih: 1,
+                sx: &[1, 2, 2],
+                sy: &[1, 1, 1],
+            },
+            // High 4444.12 — four components at NL,y = 2 (Hsl = 4).
+            ProfileCase {
+                profile: Profile::High4444_12,
+                nc: 4,
+                cpih: 0,
+                nlx: 2,
+                nly: 2,
+                bd: 12,
+                qpih: 1,
+                sx: &[1, 1, 1, 1],
+                sy: &[1, 1, 1, 1],
+            },
+        ];
+        let w = 64usize;
+        let h = 64usize;
+        for case in &cases {
+            let name = case.profile.name();
+            let planes: Vec<Vec<u16>> = (0..case.nc as usize)
+                .map(|i| {
+                    plane16(
+                        w.div_ceil(case.sx[i] as usize),
+                        h.div_ceil(case.sy[i] as usize),
+                        case.bd,
+                        i as u32 + 7,
+                    )
+                })
+                .collect();
+            // Lossless size probe: the signed-but-unpadded stream of the
+            // scalar entry point has the same byte count as the
+            // rate-allocated stream at Q = 0 everywhere.
+            let (lossless, _, _) = encoder::encode_planar_for_profile(
+                case.profile,
+                w as u16,
+                h as u16,
+                case.nc,
+                case.cpih,
+                case.nlx,
+                case.nly,
+                case.bd,
+                case.qpih,
+                0,
+                case.sx,
+                case.sy,
+                false,
+                &planes,
+            )
+            .unwrap_or_else(|e| panic!("{name}: lossless probe: {e}"));
+            let base = lossless.len();
+            // `base` pads nothing (gap 0, lossless); `base + 3` forces
+            // the target − 6 re-allocation fallback; `base + 6` pads the
+            // lossless stream; `base + 999` pads with a large COM.
+            for target in [base, base + 3, base + 6, base + 999] {
+                let (buf, level, sublevel, q_slices) =
+                    encoder::encode_planar_for_profile_cbr_target_bytes(
+                        case.profile,
+                        w as u16,
+                        h as u16,
+                        case.nc,
+                        case.cpih,
+                        case.nlx,
+                        case.nly,
+                        case.bd,
+                        case.qpih,
+                        case.sx,
+                        case.sy,
+                        target,
+                        &planes,
+                    )
+                    .unwrap_or_else(|e| panic!("{name} target {target}: {e}"));
+                assert_eq!(buf.len(), target, "{name} target {target}: exact CBR size");
+                let cs = codestream::parse(&buf).unwrap();
+                assert_eq!(cs.pih.lcod as usize, target, "{name} target {target}: Lcod");
+                assert_eq!(
+                    cs.pih.ppih,
+                    case.profile.ppih(),
+                    "{name} target {target}: Ppih"
+                );
+                assert_eq!(level, Level::L2k1, "{name} target {target}: level");
+                // The picked sublevel admits the CBR size (Full has no
+                // byte bound; §A.4.2 permits it under a real profile).
+                if let Some(max) =
+                    crate::profile::max_codestream_size(level, sublevel, case.profile)
+                {
+                    assert!(
+                        max >= target as u64,
+                        "{name} target {target}: sublevel bound {max}"
+                    );
+                }
+                // Profile-mandated slice height on the wire.
+                assert_eq!(
+                    (cs.pih.hsl as u32) << case.nly,
+                    16,
+                    "{name} target {target}: 16-image-row slices"
+                );
+                assert_eq!(
+                    q_slices.len(),
+                    (h as u32).div_ceil(16) as usize,
+                    "{name} target {target}: one Q per 16-row slice"
+                );
+                verify_declarations(&buf)
+                    .unwrap_or_else(|e| panic!("{name} target {target}: verify: {e}"));
+                let img = decode_ok(&buf);
+                assert_eq!(img.planes.len(), case.nc as usize, "{name} target {target}");
+                // Bit-exact whenever the allocation could stay lossless
+                // (gap 0, or a paddable ≥ 6-byte gap).
+                if target == base || target >= base + 6 {
+                    assert!(
+                        q_slices.iter().all(|&q| q == 0),
+                        "{name} target {target}: lossless allocation"
+                    );
+                    for (i, p) in img.planes.iter().enumerate() {
+                        assert_eq!(
+                            p.data,
+                            pack(&planes[i], case.bd),
+                            "{name} target {target}: plane {i} bit-exact"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn encode_planar_for_profile_cbr_lossy_squeeze_and_errors() {
+        let w = 64usize;
+        let h = 64usize;
+        let planes = vec![
+            plane16(w, h, 10, 1),
+            plane16(w / 2, h, 10, 2),
+            plane16(w / 2, h, 10, 3),
+        ];
+        let (lossless, _, _) = encoder::encode_planar_for_profile(
+            Profile::Main422_10,
+            w as u16,
+            h as u16,
+            3,
+            0,
+            2,
+            1,
+            10,
+            0,
+            0,
+            &[1, 2, 2],
+            &[1, 1, 1],
+            false,
+            &planes,
+        )
+        .expect("lossless probe");
+        // Squeeze to roughly half the lossless size: the allocation must
+        // quantize, land exactly on target, and still satisfy every
+        // declared claim.
+        let target = lossless.len() / 2;
+        let (buf, _, _, q_slices) = encoder::encode_planar_for_profile_cbr_target_bytes(
+            Profile::Main422_10,
+            w as u16,
+            h as u16,
+            3,
+            0,
+            2,
+            1,
+            10,
+            0,
+            &[1, 2, 2],
+            &[1, 1, 1],
+            target,
+            &planes,
+        )
+        .expect("lossy CBR encode");
+        assert_eq!(buf.len(), target);
+        assert!(
+            q_slices.iter().any(|&q| q > 0),
+            "half-size target must quantize"
+        );
+        verify_declarations(&buf).expect("lossy declarations verify");
+        let img = decode_ok(&buf);
+        assert_eq!(img.planes.len(), 3);
+
+        // An unreachable target errors instead of overshooting.
+        assert!(encoder::encode_planar_for_profile_cbr_target_bytes(
+            Profile::Main422_10,
+            w as u16,
+            h as u16,
+            3,
+            0,
+            2,
+            1,
+            10,
+            0,
+            &[1, 2, 2],
+            &[1, 1, 1],
+            64,
+            &planes,
+        )
+        .is_err());
+
+        // The unrestricted profile has no mandated slice height — the
+        // composition is profile-shaped by definition and rejects it.
+        let err = encoder::encode_planar_for_profile_cbr_target_bytes(
+            Profile::Unrestricted,
+            w as u16,
+            h as u16,
+            3,
+            0,
+            2,
+            1,
+            10,
+            0,
+            &[1, 2, 2],
+            &[1, 1, 1],
+            lossless.len() + 6,
+            &planes,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("non-unrestricted"));
+    }
 }
