@@ -1,8 +1,9 @@
 //! Structured encode → decode invariant target: fuzzer bytes pick an
 //! encoder configuration (dimensions, components, colour transform,
-//! cascade depths, sub-sampling, quantization) plus the plane samples.
-//! Whenever the encoder accepts the configuration, the emitted
-//! codestream must decode — and bit-exactly at `q = 0`.
+//! cascade depths, sub-sampling / quantizer / run-mode / multi-slice
+//! axis, quantization) plus the plane samples. Whenever the encoder
+//! accepts the configuration, the emitted codestream must decode — and
+//! bit-exactly at `q = 0`.
 
 #![no_main]
 
@@ -21,11 +22,16 @@ fuzz_target!(|data: &[u8]| {
     let nlx = hdr[4] % 6;
     let nly = (hdr[5] % 3).min(nlx);
     let q = hdr[6] % 16;
-    // Per-component sub-sampling from one bit pair each (Cpih = 0 only).
+    // Entry-point axis: 0 = generic sub-sampled, 1 = uniform quantizer
+    // (Qpih = 1, 4:4:4), 2 = run mode 1 (Rm = 1, 4:4:4), 3 = explicit
+    // multi-slice (Hsl > 0, 4:4:4).
+    let axis = (hdr[3] >> 1) & 3;
+    // Per-component sub-sampling from one bit pair each (generic axis,
+    // Cpih = 0 only).
     let mut sx = Vec::with_capacity(nc as usize);
     let mut sy = Vec::with_capacity(nc as usize);
     for i in 0..nc {
-        if cpih == 0 && i > 0 {
+        if axis == 0 && cpih == 0 && i > 0 {
             sx.push(1 + ((hdr[7] >> (2 * (i - 1))) & 1));
             sy.push(1 + ((hdr[7] >> (2 * (i - 1) + 1)) & 1));
         } else {
@@ -49,15 +55,32 @@ fuzz_target!(|data: &[u8]| {
                 .collect()
         })
         .collect();
-    let Ok(buf) = oxideav_jpegxs::encoder::encode_planar_subsampled(
-        width, height, nc, cpih, nlx, nly, q, &sx, &sy, &planes,
-    ) else {
+    let encoded = match axis {
+        1 => oxideav_jpegxs::encoder::encode_planar_qpih(width, height, nc, cpih, nlx, nly, q, &planes),
+        2 => oxideav_jpegxs::encoder::encode_planar_run_mode1(
+            width, height, nc, cpih, nlx, nly, q, &planes,
+        ),
+        3 => oxideav_jpegxs::encoder::encode_planar_hsl(
+            width,
+            height,
+            nc,
+            cpih,
+            nlx,
+            nly,
+            q,
+            (hdr[7] % 4) as u16 + 1,
+            &planes,
+        ),
+        _ => oxideav_jpegxs::encoder::encode_planar_subsampled(
+            width, height, nc, cpih, nlx, nly, q, &sx, &sy, &planes,
+        ),
+    };
+    let Ok(buf) = encoded else {
         // A rejected configuration is fine; an accepted one must
         // round-trip below.
         return;
     };
-    let img = oxideav_jpegxs::decode_jpeg_xs(&buf)
-        .expect("every emitted codestream must decode");
+    let img = oxideav_jpegxs::decode_jpeg_xs(&buf).expect("every emitted codestream must decode");
     assert_eq!(img.planes.len(), nc as usize);
     if q == 0 {
         for (i, p) in img.planes.iter().enumerate() {
