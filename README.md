@@ -411,6 +411,20 @@ unknown` / `Unrestricted` `jxpl`) for whichever the caller omits via
 `jptp` boxes (`mastering_display(...)` / `transport_parameters(...)`)
 follow `jxpl` in the Figure A.7 order.
 
+### Fuzzing
+
+`fuzz/` is a cargo-fuzz harness (its own workspace) with three targets:
+`decode` (arbitrary bytes through media-type / probe /
+`verify_declarations` / full decode, asserting decoded-geometry
+consistency on success), `jxs_file` (the Part-3 box parser plus the
+wrapped decode path), and `roundtrip` (a structured target — the fuzzer
+bytes pick an encoder configuration and the plane samples; every
+configuration the encoder accepts must decode, bit-exactly at `q = 0`).
+`cargo run --bin seed_gen` (from `fuzz/`) writes feature-spanning
+corpus seeds. Two hardening fixes came out of the initial campaigns
+(encoder-side Table 11 minimum dimensions; the 32-bit bitplane-count
+representability cap).
+
 ### Profile / level surface
 
 The `profile` module implements the ISO/IEC 21122-2:2019 Annex A

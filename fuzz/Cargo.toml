@@ -1,0 +1,51 @@
+[package]
+name = "oxideav-jpegxs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.oxideav-jpegxs]
+path = ".."
+
+# The fuzz harness is its own workspace root: the crate lives inside the
+# oxideav umbrella checkout during development, and the umbrella must
+# not claim this package.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "seed_gen"
+path = "seed_gen.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jxs_file"
+path = "fuzz_targets/jxs_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "roundtrip"
+path = "fuzz_targets/roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1
