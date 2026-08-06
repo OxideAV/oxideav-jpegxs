@@ -3426,6 +3426,93 @@ also passes 149 tests (was 140).
 
 ## Unreleased — encoder round 2 (multi-component RCT + multi-decomp + odd dims)
 
+## [0.0.8](https://github.com/OxideAV/oxideav-jpegxs/compare/v0.0.7...v0.0.8) - 2026-08-06
+
+### Other
+
+- round 438 rollup — README/CHANGELOG for the fuzz axes + 21122-4 re-validation
+- widen the roundtrip fuzz target — Qpih=1 / Rm=1 / multi-slice axes
+- cargo-fuzz harness — decode / jxs_file / roundtrip targets + seed generator
+- two fuzz-surfaced hardening fixes — Table 11 minimum dims on encode + 32-bit bitplane-count cap
+- 21122-3 Media Type registration surface (A.7.2 / C.5.2 / C.6.2 / D.2.2)
+- pin the CBR x profile composition in the encoder conformance matrix
+- encode_planar_for_profile_cbr_target_bytes — exact-size CBR x profile in one call
+- coverage tails — 4:2:2:4 profile matrix row + probe surfaces declared Ppih/Plev
+- encode_planar_cbr_target_bytes_highbd — exact-size CBR over the u16-LE high-bit-depth path
+- insert_com writer (A.4.10) + README — encoder conformance signalling round rollup
+- jxpl Profile/Level box consistency (21122-3 A.5.3.3) — mirror-defaults from the PIH + contradiction gate on build/decode
+- encoder conformance pinning — SHA-256 hash matrix + self-decode + declaration truth over 15 feature-axis streams
+- exact-size CBR emission — COM padding (A.4.10) + Lcod self-description over the per-slice rate allocation
+- encode_planar_for_profile — profile-targeting encoder pinned across all eight 21122-2:2019 profiles
+- encoder conformance signalling — verified Ppih / Plev / Lcod declarations (21122-2 Annex A + 21122-1 Table 11)
+- README/CHANGELOG — four-component end-to-end, ETS verdicts, Nc 1..=8
+- encoder accepts the full Annex A.4.3 component range Nc = 1..=8
+- retire the non-conformant per-precinct 2-D DWT branches
+- four-component end-to-end coverage — Nc=4 Cpih=1 roundtrips + Annex C ETS reporting
+- README/CHANGELOG — full ISO/IEC 21122-4 decoder conformance (65/65 bit-exact)
+- NL,y >= 1 always takes the picture-level cascade DWT (both directions)
+- Fs=1 sign bits for non-zero meaningless tail coefficients (Table C.9 NOTE 2)
+- README — document ISO/IEC 21122-4 conformance harness + joint-packet fix
+- conformance harness — derive plane byte width per-component, not from Bw
+- joint multi-component packet grouping (ISO/IEC 21122-1 Annex B.7 Table B.4)
+- ISO/IEC 21122-4 decoder conformance harness (env-gated vector runner + pgx reader)
+- recognise the Exif box in the JPEG XS Header box (21122-3 A.5.4)
+- bmdm Buffer Model Description box (21122-3 A.5.3.4)
+- dmon + jptp Video Support boxes (21122-3 A.5.3.5/.6)
+- JPEG XS Video Information box (jpvi, 21122-3 A.5.3.2)
+- add CI / crates.io / docs.rs / MIT-license badges
+- Rm=1 significance-dispatch + geometry coverage + README (ISO/IEC 21122-1 Table A.12)
+- Rm=1 high-bit-depth + chroma-subsampled compositions (ISO/IEC 21122-1 Table A.12)
+- run mode Rm=1 encoder emission + decode-path coverage (ISO/IEC 21122-1 Table A.12 / C.6.5)
+- README — document round-376 profile/level/sublevel/CAP conformance layer
+- reject Full sublevel with an unrestricted profile (ISO/IEC 21122-2 §A.4.2)
+- enforce Table A.8 additional (Bw,Fq) constraints at decode (ISO/IEC 21122-1)
+- reject CTS marker present with Cpih≠3 (ISO/IEC 21122-1 Table A.2)
+- CAP capabilities marker — encoder emission + decoder conformance (ISO/IEC 21122-1 §A.4.3)
+- enforce Cw rightmost-precinct conformance, both directions (ISO/IEC 21122-1 Table 11)
+- enforce Wf/Hf vs decomposition-depth conformance at decode (ISO/IEC 21122-1 Table 11)
+- enforce CBR Lcod self-length conformance at decode (ISO/IEC 21122-1 Table 11)
+- enforce sublevel coded-size bound Ssl,max at decode (ISO/IEC 21122-2 §A.4.1)
+- enforce profile/level conformance at decode (ISO/IEC 21122-2 Annex A)
+- README — document verified NLT path-intersection compositions
+- Sd>0 CWD x NLT quadratic path-intersection round-trip
+- Cw>0 x NLT quadratic path-intersection round-trip
+- Cw>0 x 4:2:0 multi-level round-trip + stale module-doc fix
+- sub-sampled NLT lossy + odd-dimension round-trip coverage
+- high-bit-depth NLT + chroma sub-sampling encode entry points
+- NLT + chroma sub-sampling encode entry points (Annex G.4/G.5 × 4:2:2/4:2:0)
+- probe accepts box-wrapped JXS files + writer varying-depth BPC
+- add a JXS file-format writer (ISO/IEC 21122-3 Annex A)
+- parse the JXS still-image file format (ISO/IEC 21122-3 Annex A)
+- document Ng=4/Ss=8 gate + multi-significance-group (Ns>1) decode coverage
+- round 362 — multi-significance-group (Ns>1) round-trip coverage
+- enforce Ng=4 / Ss=8 conformance gate (Table A.7)
+- round 359 — deepen decode-geometry coverage (4:2:0 + NLT + Bw=20 at deeper vertical cascades)
+- 4:2:2 horizontal-only (NL,y=0) round-trip + README geometry note
+- extend NL,y=0 coverage — lossy, 12-bit highbd, deeper cascade
+- NL,y=0 horizontal-only geometry — joint LL+HL first packet (Annex B.7 β1=2)
+- high-precision (Bw=20, Fq=8) regular lossy entry point
+- Annex E.3 Fq fractional-coefficient scaling + Table A.8 (Bw, Fq) conformance
+- lossy-correctness PSNR proof for the subsampled Annex H WGT-truncation fix
+- high-bit-depth subsampled Annex H weights + subsampled WGT-truncation alignment fix
+- high-bit-depth CFA Star-Tetrix Annex H weights (H.9–H.11, Sd=1)
+- drive uniform inverse quantizer (Qpih=1) through structural decode paths
+- Annex C.3 raw-mode-consistency gate + encoder Rl=1 conformance fix
+- uniform inverse quantizer (Qpih=1, Annex D.3) on chroma-subsampled inputs
+- document the decode-path conformance gates (Lprc + filler cross-check + reserved-field rejection)
+- enforce Cpih=3 Star-Tetrix full-resolution input constraint (Annex A.4.3 / F.2)
+- reject reserved code points of the enumerated PIH fields (Annex A.4.4 Tables A.9–A.13)
+- enforce Annex C.2 Table C.1 R[p] ∈ [0, NL-1] range on precinct-header parse
+- prove the sub-packet filler cross-check tolerates legal Annex C.3 filler
+- wire Annex C.2 Lprc[p] consistency + exact sub-packet filler cross-check into the decode path
+- round 334 — bitplane-count subpacket size Lcnt[p,s] inference + consistency predicate (Annex C.6 Tables C.12/C.13/C.14)
+- Annex H CFA Star-Tetrix weight tables H.9–H.11 (Cpih=3, Sd=1)
+- Annex H subsampled WGT weight tables H.4–H.8 (4:2:2 / 4:2:0)
+- content-adaptive WGT weights — Annex H PSNR-optimized tables H.1–H.3
+- round 319 — sign-subpacket size Lsgn[p,s] inference + consistency predicate (Annex C.5.5 Table C.9)
+- round 315 — bitplane-count range conformance across all decode modes (Annex C.6.4/C.6.5/C.6.6 Tables C.12/C.13/C.14)
+- refresh to current status, drop per-round changelog cruft
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-jpegxs/compare/v0.0.6...v0.0.7) - 2026-06-15
 
 ### Other
