@@ -142,7 +142,7 @@ fn pih_body_offset(buf: &[u8]) -> Result<usize> {
 ///   (21122-1 Table 11).
 ///
 /// A stream that passes this function decodes through
-/// [`crate::decode_jpeg_xs`] without tripping any declaration gate —
+/// [`crate::decode_components`] without tripping any declaration gate —
 /// they are the same checks.
 pub fn verify_declarations(buf: &[u8]) -> Result<()> {
     let cs = codestream::parse(buf)?;
@@ -526,9 +526,9 @@ pub fn declare_auto(buf: &mut [u8], cbr: bool) -> Result<(Profile, Level, Sublev
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
-    use crate::decoder;
     use crate::encoder;
 
     /// Deterministic 8-bit test plane.
@@ -555,8 +555,8 @@ mod tests {
             .expect("profile-shaped encode")
     }
 
-    fn decode_ok(buf: &[u8]) -> crate::image::JpegXsImage {
-        decoder::decode_codestream(buf, None).expect("decode")
+    fn decode_ok(buf: &[u8]) -> crate::image::Components {
+        crate::decode_components(buf).expect("decode")
     }
 
     #[test]

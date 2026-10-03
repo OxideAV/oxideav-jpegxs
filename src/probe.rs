@@ -1,4 +1,6 @@
-//! Probe utility for JPEG XS codestreams.
+//! Header inspection for JPEG XS codestreams and `.jxs` files
+//! ([`inspect`] — the depth companion of the contract's [`crate::probe()`]
+//! / [`crate::info`]).
 //!
 //! Given a raw byte buffer that begins with the SOC marker (`FF 10`),
 //! parses just enough of the marker chain to return the geometric
@@ -6,7 +8,7 @@
 
 use crate::codestream::{self, Codestream};
 
-/// Summary information returned by [`probe`].
+/// Summary information returned by [`inspect`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JpegXsFileInfo {
     /// Image width on the sample grid (`Wf` from the picture header).
@@ -34,8 +36,10 @@ pub struct JpegXsFileInfo {
 /// the JPEG XS Signature box); in the latter case the embedded codestream
 /// is located and probed. Returns `None` if the buffer matches neither
 /// shape or fails to parse cleanly. For richer error reporting use
-/// [`codestream::parse`] directly.
-pub fn probe(buf: &[u8]) -> Option<JpegXsFileInfo> {
+/// [`codestream::parse`] directly; for the contract header summary use
+/// [`crate::info`]. Unlike `info`, this works for every parseable
+/// stream, contract layout or not.
+pub fn inspect(buf: &[u8]) -> Option<JpegXsFileInfo> {
     // A box-wrapped .jxs file: locate the embedded codestream first.
     let cs_buf: &[u8] = if crate::fileformat::is_jxs_file(buf) {
         let file = crate::fileformat::parse_jxs_file(buf).ok()?;
@@ -61,6 +65,7 @@ pub fn probe(buf: &[u8]) -> Option<JpegXsFileInfo> {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 
@@ -75,9 +80,9 @@ mod tests {
             .collect();
         let cs =
             crate::encoder::encode_planar(w, h, 1, 0, 1, 1, std::slice::from_ref(&pixels)).unwrap();
-        let bare = probe(&cs).expect("probe bare codestream");
+        let bare = inspect(&cs).expect("probe bare codestream");
         let file = crate::fileformat::write_jxs_file(&cs).unwrap();
-        let wrapped = probe(&file).expect("probe wrapped file");
+        let wrapped = inspect(&file).expect("probe wrapped file");
         assert_eq!(bare, wrapped);
         assert_eq!(wrapped.width, w as u32);
         assert_eq!(wrapped.height, h as u32);
@@ -100,25 +105,25 @@ mod tests {
         let mut cs = crate::encoder::encode_planar_hsl(w, h, 3, 1, 2, 1, 0, 8, &planes).unwrap();
         let (profile, level, sublevel) =
             crate::signalling::declare_auto(&mut cs, true).expect("declare");
-        let bare = probe(&cs).expect("probe bare");
+        let bare = inspect(&cs).expect("probe bare");
         assert_eq!(bare.profile, profile.ppih());
         assert_eq!(
             bare.level,
             ((level.plev_high_byte() as u16) << 8) | sublevel.plev_low_byte() as u16
         );
         let file = crate::fileformat::write_jxs_file(&cs).unwrap();
-        let wrapped = probe(&file).expect("probe wrapped");
+        let wrapped = inspect(&file).expect("probe wrapped");
         assert_eq!(wrapped.profile, bare.profile);
         assert_eq!(wrapped.level, bare.level);
     }
 
     #[test]
     fn probe_rejects_garbage_and_truncated_box() {
-        assert!(probe(&[]).is_none());
-        assert!(probe(&[0x00, 0x01, 0x02]).is_none());
+        assert!(inspect(&[]).is_none());
+        assert!(inspect(&[0x00, 0x01, 0x02]).is_none());
         // Leading signature bytes but a truncated box chain.
         let mut sig = crate::fileformat::SIGNATURE_BOX.to_vec();
         sig.extend_from_slice(&[0x00, 0x00, 0x00, 0x10]); // dangling LBox
-        assert!(probe(&sig).is_none());
+        assert!(inspect(&sig).is_none());
     }
 }

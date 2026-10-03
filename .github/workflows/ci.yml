@@ -5,10 +5,11 @@ name: CI
 # * `ci` (default-features) — uses the OxideAV org-level reusable workflow,
 #   which exercises the registry-integrated path (oxideav-core dep +
 #   Decoder trait impl).
-# * `ci-standalone` (no-default-features) — inline job that builds and
-#   tests the lib with `--no-default-features`, exercising the
-#   `oxideav-core`-free standalone path. Catches regressions where
-#   pipeline modules accidentally regrow an oxideav-core import.
+# * `ci-standalone` (no-default-features) — inline job that builds,
+#   tests and clippy-checks every target with `--no-default-features`,
+#   exercising the `oxideav-core`-free standalone path. Catches
+#   regressions where pipeline modules accidentally regrow an
+#   oxideav-core import.
 
 on:
   push:
@@ -43,4 +44,7 @@ jobs:
         run: cargo build --no-default-features --lib --verbose
 
       - name: Test (no-default-features)
-        run: cargo test --no-default-features --lib --verbose
+        run: cargo test --no-default-features --all-targets --verbose
+
+      - name: Clippy (no-default-features)
+        run: cargo clippy --no-default-features --all-targets --no-deps -- -D warnings

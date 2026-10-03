@@ -25,6 +25,11 @@
 //! depth, NLT non-linearity, run mode 1, multi-slice + rate-allocated
 //! CBR, and all eight 21122-2:2019 profile targets.
 
+// The pinned matrix deliberately exercises the historical `encode_planar_*`
+// entry points (deprecated in favour of `encode` + `EncodeOptions`): their
+// byte output is the fixture.
+#![allow(deprecated)]
+
 use oxideav_jpegxs::encoder;
 use oxideav_jpegxs::profile::Profile;
 use oxideav_jpegxs::signalling;
@@ -162,7 +167,7 @@ fn pack16(p: &[u16], bd: u8) -> Vec<u8> {
 
 /// Decode `buf` and assert plane `i` equals `expect[i]` byte-for-byte.
 fn assert_decodes_to(name: &str, buf: &[u8], expect: &[Vec<u8>]) {
-    let img = oxideav_jpegxs::decode_jpeg_xs(buf)
+    let img = oxideav_jpegxs::decode_components(buf)
         .unwrap_or_else(|e| panic!("{name}: self-decode failed: {e}"));
     assert_eq!(img.planes.len(), expect.len(), "{name}: plane count");
     for (i, p) in img.planes.iter().enumerate() {
@@ -319,7 +324,7 @@ fn pinned_encoder_streams() {
     let buf =
         encoder::encode_planar_nlt_quadratic(W as u16, H as u16, 1, 0, 2, 1, 0, 0, &luma).unwrap();
     check_pin("nlt_quadratic_lossless_nl21", &buf);
-    let img = oxideav_jpegxs::decode_jpeg_xs(&buf).expect("nlt quadratic decodes");
+    let img = oxideav_jpegxs::decode_components(&buf).expect("nlt quadratic decodes");
     assert_eq!(img.planes.len(), 1);
     let max_err = img.planes[0]
         .data
@@ -353,7 +358,7 @@ fn pinned_encoder_streams() {
     assert_eq!(buf.len(), target);
     signalling::verify_declarations(&buf).unwrap();
     check_pin("cbr_exact_target", &buf);
-    oxideav_jpegxs::decode_jpeg_xs(&buf).unwrap();
+    oxideav_jpegxs::decode_components(&buf).unwrap();
 
     // --- The eight 21122-2:2019 profile targets (CBR-signed). ---
     struct P {
@@ -531,5 +536,5 @@ fn pinned_encoder_streams() {
     assert_eq!(q_slices.len(), 4); // 64 rows / 16-row slices
     signalling::verify_declarations(&buf).unwrap();
     check_pin("profile_cbr_exact_target_main422_10", &buf);
-    oxideav_jpegxs::decode_jpeg_xs(&buf).unwrap();
+    oxideav_jpegxs::decode_components(&buf).unwrap();
 }

@@ -8,15 +8,238 @@ Built clean-room from the ISO/IEC 21122 specification documents under
 `docs/image/jpegxs/` only. Zero C dependencies, zero FFI, zero `*-sys`.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
-framework but usable standalone.
+framework but usable standalone (`default-features = false`, no
+`oxideav-core`).
 
-## Status
+## Standalone use
+
+`oxideav-jpegxs` follows the OxideAV image-crate contract
+(`IMAGE_CRATE_API`): the same small root vocabulary every
+`oxideav-<format>` image crate exposes, usable with
+`default-features = false` and no `oxideav-core`, returning pixels as
+plain `Vec<u8>`. Every decode function accepts either a bare ISO/IEC
+21122-1 codestream (`SOC` marker first) or a `.jxs` still-image file
+(ISO/IEC 21122-3 Annex A, JPEG XS Signature box first).
+
+```toml
+[dependencies]
+oxideav-jpegxs = { version = "0.0", default-features = false }
+```
+
+```rust
+let bytes = std::fs::read("in.jxs")?;
+if oxideav_jpegxs::probe(&bytes) {
+    let info  = oxideav_jpegxs::info(&bytes)?;       // header only: width, height, format, bit depth, profile
+    let img   = oxideav_jpegxs::decode(&bytes)?;     // JpegXsImage, native layout (grey / GBR(A) / YCbCr(A) planes)
+    let rgba: Vec<u8> = img.to_rgba8();              // tightly packed RGBA, 4 * width bytes per row
+    let (w, h) = (img.width(), img.height());
+
+    let opts = oxideav_jpegxs::EncodeOptions::default().with_quantization(2);
+    let out: Vec<u8> = oxideav_jpegxs::encode_rgba8(w, h, &rgba, &opts)?;   // planar RGBA through the RCT
+    std::fs::write("out.jxs", out)?;
+}
+```
+
+| Item | Signature |
+|---|---|
+| `probe` | `fn(&[u8]) -> bool` — `FF 10 FF 50` (SOC + CAP) or the JPEG XS Signature box; allocation-free |
+| `info` | `fn(&[u8]) -> Result<ImageInfo, Error>` — `width`, `height`, `format`, `frames` (1), `has_alpha`, `color`, `has_icc` / `has_exif` / `has_xmp`, plus `bit_depth`, `components`, `cpih`, `profile` (`Ppih`), `level` (`Plev`), `lossless`, `boxed` |
+| `decode` / `decode_with` | `fn(&[u8][, &DecodeOptions]) -> Result<JpegXsImage, Error>` — native layout, colour + metadata filled |
+| `decode_rgb8` / `decode_rgba8` | `-> Result<RgbImage / RgbaImage, Error>` — `{ width, height, data }`, tightly packed, 3 / 4 bytes per pixel |
+| `decode_from` | `fn<R: Read>(R) -> Result<JpegXsImage, Error>` |
+| `encode` | `fn(&JpegXsImage, &EncodeOptions) -> Result<Vec<u8>, Error>` — the image's own layout; never a silent conversion |
+| `encode_rgb8` / `encode_rgba8` | `fn(w, h, &[u8], &EncodeOptions)` — `Gbrp8` / `Gbrap8` through the reversible colour transform (alpha is the pass-through fourth component) |
+| `encode_to` | `fn<W: Write>(&JpegXsImage, &EncodeOptions, W) -> Result<(), Error>` |
+| `decode_components` / `decode_components_with` | `-> Result<Components, Error>` — the planes exactly as the codestream carries them (codestream order, per-component `bit_depths` / `sampling`, `cpih`); works for every decodable stream |
+| `encode_components` | `fn(&Components, &EncodeOptions) -> Result<Vec<u8>, Error>` — the universal encoder funnel (any `Nc ∈ 1..=8`, any `Cpih`, Star-Tetrix) |
+| `inspect` | `fn(&[u8]) -> Option<JpegXsFileInfo>` — raw header summary for any parseable stream (the pre-contract `probe`) |
+| `JpegXsImage` | `{ width, height, format: PixelFormat, planes: Vec<Plane>, color: ColorInfo, metadata: Metadata, bit_depth }` with `new` / `from_rgb8` / `from_rgba8` (all `Result`), `with_color` / `with_metadata` / `with_bit_depth`, `width()` / `height()` / `format()`, `as_bytes()` (grey only) / `into_raw()`, `to_rgb8()` / `to_rgba8()`, `sample(plane, x, y)` |
+| `PixelFormat` | `= JpegXsPixelFormat`: `Gray8` / `Gray10Le` / `Gray12Le` / `Gray16Le`, `Gbrp8` / `Gbrp10Le` / `Gbrp12Le` / `Gbrp14Le` / `Gbrp16Le`, `Gbrap8` … `Gbrap16Le`, `Yuv444P` / `Yuv422P` / `Yuv420P` (+ `10Le` / `12Le` / `16Le`), `Yuva444P` / `Yuva422P` / `Yuva420P` (+ `10Le` / `12Le` / `16Le`) — names mirror `oxideav_core::PixelFormat` |
+| `Error` | `= JpegXsError`: `InvalidData`, `Unsupported`, `LimitExceeded`, `Io(std::io::Error)` |
+
+Every layout is planar (JPEG XS codes components as separate planes);
+`planes` are in the **layout's** order — G, B, R(, A) for the RGB
+layouts, Y, Cb, Cr(, A) for YCbCr — each at its tight stride, chroma
+planes at `⌈W / 2⌉ × ⌈H / 2⌉` for 4:2:0 and `⌈W / 2⌉ × H` for 4:2:2.
+Samples deeper than 8 bits are two little-endian bytes with the value
+in the low `bit_depth` bits; depths without a label of their own (9, 11,
+13, 14, 15 — and 14 for YCbCr) ride the 16-bit carrier with
+`JpegXsImage::bit_depth` / `ImageInfo::bit_depth` naming the significant
+bits.
+
+`to_rgb8` / `to_rgba8` are exact per layout: deep samples rescaled by
+rounding `v × 255 / (2^B − 1)`, grey replicated, GBR(A) reordered,
+YCbCr converted with the H.273 matrix the image's `color` names (`1`
+BT.709, `5` / `6` BT.601, `9` BT.2020; anything else — including
+"unspecified" — as BT.709) and its range (`Limited` or `Unspecified` →
+studio range, the broadcast default; `Full` → full swing), chroma
+replicated without interpolation; alpha from the fourth plane, `255`
+when there is none.
+
+The pre-contract names stay for one release as deprecated wrappers:
+`decode_jpeg_xs` (→ `decode_components`), `decode_jxs_file` (→
+`decode`), `encode_image` / `encode_raw_luma` (→ `encode`), the whole
+`encoder::encode_planar_*` / `encode_luma_8bit` / `encode_rgb_8bit` /
+`pick_*` family (→ `encode` / `encode_components` with `EncodeOptions`
+fields). The old `probe(&[u8]) -> Option<JpegXsFileInfo>` is now
+`inspect`; `probe` is the contract's boolean sniff. `JpegXsImage` changed
+shape (format-tagged contract image; the raw component view is
+`Components`), and `JpegXsPlane` is an alias of `Plane`.
+
+## Framework use
+
+With the default `registry` feature the crate depends on `oxideav-core`
+and adds:
+
+- `register(&mut RuntimeContext)` — the codec (decoder + encoder) and the
+  `.jxs` extension; `register_codecs` / `register_containers` /
+  `register_registries` for the split registries. Wired into
+  `oxideav_meta::register_all` through `oxideav_core::register!`.
+- `make_decoder(&CodecParameters)` — one packet (bare codestream or
+  `.jxs` file) → one `VideoFrame` in the **native layout**
+  (`Gray*` / `Gbrp*` / `Gbrap*` / `Yuv*` / `Yuva*`, the picture's own
+  depth). The colour-signal side-channel is stamped only when the packet
+  is a `.jxs` file carrying a CICP box — a bare codestream has no colour
+  signalling and none is invented.
+- `make_encoder(&CodecParameters)` — `width` / `height` / `pixel_format`
+  describe the frames; `options` map onto `EncodeOptions` (`quantization`,
+  `target_bytes`, `profile`, `levels_x` / `levels_y`, `rct`, `quantizer`,
+  `slice_height`, `run_mode`, `weights`, `high_precision`, `boxed`). Any
+  JPEG XS layout is accepted as is; packed `Rgb24` / `Rgba` frames are
+  deplaned to `Gbrp8` / `Gbrap8`. One frame in, one keyframe packet out.
+- The frame bridge: `From<JpegXsImage> for VideoFrame`,
+  `JpegXsImage::from_video_frame(&VideoFrame, &CodecParameters)` and
+  `TryFrom<(&VideoFrame, &CodecParameters)>`; `JpegXsPixelFormat` ↔
+  `PixelFormat` 1:1 by name (`From` / `TryFrom`); `ColorInfo` ↔
+  `ColorSignal`; `JpegXsError` → `oxideav_core::Error`
+  (`LimitExceeded` → `ResourceExhausted`).
+
+The framework `Decoder` / `Encoder` call the standalone functions above
+— one implementation. Pictures without a contract layout (Star-Tetrix
+CFA, two- or five-plus-component sets) are `Unsupported` on the
+framework path and on `decode`; `decode_components` still decodes them.
+
+## Supported layouts
+
+Decode — derived from the component table and `Cpih`:
+
+| Codestream | Layout | Notes |
+|---|---|---|
+| `Nc = 1`, `B ∈ 8..=16` | `Gray8` / `Gray10Le` / `Gray12Le` / `Gray16Le` | 9 / 11 / 13 / 14 / 15-bit in `Gray16Le` |
+| `Nc = 3`, `Cpih = 1` (RCT) | `Gbrp8` / `Gbrp10Le` / `Gbrp12Le` / `Gbrp14Le` / `Gbrp16Le` | components R, G, B → planes G, B, R |
+| `Nc = 4`, `Cpih = 1` | `Gbrap8` … `Gbrap16Le` | fourth component passed through as alpha |
+| `Nc = 3`, `Cpih = 0`, chroma 1:1 / 2:1 / 2:2 | `Yuv444P` / `Yuv422P` / `Yuv420P` (+ `10Le` / `12Le` / `16Le`) | a `.jxs` CICP box with matrix `0` at 4:4:4 → `Gbrp*` instead |
+| `Nc = 4`, `Cpih = 0` | `Yuva444P` / `Yuva422P` / `Yuva420P` (+ `10Le` / `12Le` / `16Le`) | fourth component as alpha (full rate) |
+| `Cpih = 3` (Star-Tetrix CFA), `Nc ∈ {2, 5..=8}`, mixed `B[i]`, other sampling | — (`Unsupported`) | `decode_components` / `inspect` cover them |
+
+Encode — `encode` writes the image's layout; every contract layout has a
+JPEG XS representation, so no input is converted:
+
+| Layout | Codestream |
+|---|---|
+| `Gray*` | `Nc = 1`, `Cpih = 0` |
+| `Gbrp*` / `Gbrap*` | `Nc = 3 / 4`, `Cpih = 1` (reversible colour transform; `Cpih = 0` with `EncodeOptions::rct = false`) |
+| `Yuv*` / `Yuva*` | `Nc = 3 / 4`, `Cpih = 0`, `sx` / `sy` from the layout |
+| any `Components` set | `encode_components`: `Nc ∈ 1..=8`, `Cpih ∈ {0, 1, 3}`, one `B[i]` per stream |
+
+`encode_rgb8` / `encode_rgba8` go through `Gbrp8` / `Gbrap8`. Note that
+RGB coded **without** the RCT in a bare codestream decodes as
+`Yuv444P` — the codestream cannot say otherwise; keep `rct` on or write
+a `.jxs` file (`boxed`), whose CICP matrix `0` brings it back as RGB.
+
+## Options
+
+`EncodeOptions` (`#[non_exhaustive]`, `Default`, `with_*` builders) —
+every encoder choice is a field:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `quantization` | `0` | `Q[p]` `0..=15`; `0` = lossless (bit-exact round trip) |
+| `target_bytes` | `None` | constant bitrate: exact codestream size (rate allocation + COM padding + `Lcod`) |
+| `profile` | `None` | shape to an ISO/IEC 21122-2 `Profile` and declare `Ppih` / `Plev` (verified) |
+| `levels_x` / `levels_y` | `None` | `NL,x` (`1..=8`) / `NL,y` (`0..=NL,x`); `None` = largest `NL,x ≤ 5` the width admits, `NL,y = 1` when the height admits it |
+| `rct` | `true` | reversible colour transform on RGB layouts |
+| `quantizer` | `Deadzone` | `Qpih`: `Deadzone` / `Uniform` |
+| `slice_height` | `None` | `Hsl` in precinct rows; `None` = one slice |
+| `column_width` | `0` | `Cw` precinct column width |
+| `sign_packet` | `false` | `Fs = 1`, signs in a separate sub-packet |
+| `run_mode` | `ZeroResiduals` | `Rm`: `ZeroResiduals` / `ZeroCoefficients` |
+| `refinement` | `0` | `R[p]` |
+| `high_precision` | `false` | `Bw = 20`, `Fq = 8` path |
+| `nlt` | `None` | `NltParams::Quadratic { dco }` / `Extended { t1, t2, e }` |
+| `weights` | `Default` | band weights: `Default` / `AnnexH` (Annex H PSNR-optimised tables when one exists) |
+| `suppressed_components` | `0` | `Sd` (CWD marker) |
+| `star_tetrix` | `None` | `StarTetrixParams { e1, e2, cf, ct }` for `Cpih = 3` component sets |
+| `q_slices` / `q_precincts` / `r_precincts` | empty | per-slice / per-precinct `Q[p]` / `R[p]` overrides |
+| `boxed` | `false` | emit a `.jxs` file (CICP from `color`, `cdef` for alpha layouts, Exif from `metadata`) |
+
+Compositions the encoder cannot honour are refused with
+`Error::Unsupported`, never silently dropped: `profile` composes with
+`quantization` / `quantizer` / `levels_*` / `target_bytes` only;
+`target_bytes` without a profile needs 4:4:4 sampling and the deadzone
+quantiser (set a profile for sub-sampled CBR); mixed component bit
+depths need one `B[i]` per stream.
+
+`DecodeOptions` — `max_width` / `max_height` (default `65535`, the
+`Wf` / `Hf` field maximum), `max_pixels` (default `1 << 28`),
+`max_bytes` (default unlimited), `strict` (default `false`: reject bytes
+after `EOC` and a missing `EOC`). `None` = unlimited. Limits are checked
+on the picture header before any sample buffer is allocated
+(`Error::LimitExceeded`).
+
+## Metadata and colour
+
+A bare ISO/IEC 21122-1 codestream carries no colour description and no
+metadata. A `.jxs` file (ISO/IEC 21122-3 Annex A) carries:
+
+- **Colour** — the CICP Colour Specification box (`METH = 5`):
+  `ColourPrimaries` / `TransferCharacteristics` / `MatrixCoefficients`
+  (H.273 code points) and the full-range flag, read verbatim into
+  `ColorInfo { range, primaries, transfer, matrix }`. Without a box the
+  layout's documented default applies: RGB layouts report matrix `0`
+  (identity — the inverse RCT output *is* RGB) with range, primaries and
+  transfer unspecified; grey and YCbCr layouts are entirely
+  unspecified. No primaries, transfer or range is invented.
+- **Metadata** — the Exif box payload (`Metadata::exif`). `icc` / `xmp`
+  are always `None` (the JXS file format defines neither) and `gamma` is
+  `None` (transfer is an H.273 code point).
+
+`encode(.., boxed = true)` writes the image's `ColorInfo` as the CICP box
+(`Unspecified` range becomes the limited-range flag — the CICP `V` byte
+has no "unspecified"), a Channel Definition box for the alpha layouts
+(channel 3 = whole-image opacity) and the Exif payload. Lossless
+round trip (`quantization = 0`) is pinned: planes exact for every
+layout through a bare codestream; planes, colour and metadata exact
+through a `.jxs` file for images whose range is signalled.
+
+## Limits
+
+- `Wf` / `Hf` are 16-bit fields: pictures up to 65535 × 65535; the
+  encoder needs `Wf ≥ max(sx) × 2^NL,x` and `Hf ≥ max(sy) × 2^NL,y`
+  (ISO/IEC 21122-1 Table 11) and at least 2 × 2.
+- `DecodeOptions` defaults: 65535 × 65535, 268 Mpixel, unlimited input
+  size; all enforced before allocation.
+- The decoder rejects CAP bits it does not implement, reserved `Ppih` /
+  `Plev` values, profile / level / sublevel claims the stream does not
+  satisfy, `Lcod` mismatches and `.jxs` headers that contradict their
+  codestream; every malformed input is an `Error`, never a panic (fuzzed:
+  `probe` / `info` / `decode` / `decode_components` / `.jxs` parsing /
+  encode → decode round trip).
+
+## JPEG XS specifics
+
+The sections below describe the codec's coverage of ISO/IEC 21122 per
+tool; the `encode_planar_*` names they cite are the historical per-axis
+entry points (now deprecated wrappers — every axis is an `EncodeOptions`
+field, see *Options*).
+
+### Status
 
 Both directions are **working for a substantial subset** of ISO/IEC
 21122-1:2022 and self-roundtrip losslessly across the supported feature
 matrix. JPEG XS has no inter-frame state, so each picture is independent.
 
-### Decoder
+#### Decoder
 
 End-to-end decode of the multi-component subset:
 
@@ -189,7 +412,7 @@ conformance** drawn from the codestream's own declarations (ISO/IEC
 - The CTS marker presence is fully Cpih-determined: mandatory for
   `Cpih = 3` and rejected for any other `Cpih` (Table A.2).
 
-### Encoder
+#### Encoder
 
 A planar encoder covering the same feature matrix, lossless (`q = 0`)
 and lossy (`q ∈ 1..=15`), with rate-budget pickers that drive per-slice
@@ -337,7 +560,7 @@ every lossless case), and declaration truth for every claimed `Ppih` /
 sub-sampling, `B[i] = 12`, NLT quadratic, `Rm = 1`, exact-size CBR, all
 eight profile targets, and the CBR × profile one-call composition.
 
-### Codestream parser
+#### Codestream parser
 
 The marker-chain parser per ISO/IEC 21122-1:2022 Annex A recognises:
 
@@ -348,7 +571,7 @@ The marker-chain parser per ISO/IEC 21122-1:2022 Annex A recognises:
 - Each header marker has a typed body accessor (`cts()`, `crg()`,
   `nlt()`, `wgt()`, `cwd()`, `com()`) surfacing field-level errors.
 
-### JXS still-image file format
+#### JXS still-image file format
 
 The `fileformat` module parses the box-based **JXS still-image file
 format** (ISO/IEC 21122-3:2019 Annex A) that optionally wraps a raw
@@ -411,7 +634,7 @@ unknown` / `Unrestricted` `jxpl`) for whichever the caller omits via
 `jptp` boxes (`mastering_display(...)` / `transport_parameters(...)`)
 follow `jxpl` in the Figure A.7 order.
 
-### Fuzzing
+#### Fuzzing
 
 `fuzz/` is a cargo-fuzz harness (its own workspace) with three targets:
 `decode` (arbitrary bytes through media-type / probe /
@@ -427,7 +650,7 @@ corpus seeds. Two hardening fixes came out of the initial campaigns
 (encoder-side Table 11 minimum dimensions; the 32-bit bitplane-count
 representability cap).
 
-### Profile / level surface
+#### Profile / level surface
 
 The `profile` module implements the ISO/IEC 21122-2:2019 Annex A
 profile / level / sublevel tables: `Profile::from_ppih`,
@@ -438,7 +661,7 @@ depths, `Qpih`, slice-height, column-mode caps). Buffer-model bounds
 (Annexes B/C/D) are out of scope — they require a transmission-channel
 rate not observable from the codestream.
 
-### ISO/IEC 21122-4 conformance
+#### ISO/IEC 21122-4 conformance
 
 The decoder is exercised against the official **ISO/IEC 21122-4:2020**
 decoder conformance codestreams (the 65-stream, 1.4 GB reference-vector
@@ -493,7 +716,7 @@ crate's self-roundtrips could never catch:
   path remains for `NL,y = 0` where one single-column precinct row is a
   complete horizontal transform unit.
 
-### Not yet covered
+#### Not yet covered
 
 - Bit depths above 16 (would need a `u32` plane format; B > 16 also has
   no published decode vector to validate against).
@@ -505,49 +728,26 @@ crate's self-roundtrips could never catch:
   (H.9–H.11, `encode_planar_star_tetrix_annex_h` /
   `_star_tetrix_highbd_annex_h`, `Cf = 0` / `Cf = 3` columns).
 
-## Public API
+### Depth API
 
-```rust
-// Probe: width / height / components / bit depth / profile / level /
-// Cpih / lossless flag. Accepts a bare codestream or a box-wrapped
-// .jxs file.
-let info = oxideav_jpegxs::probe(bytes);
+The contract surface above is the common floor; the depth modules stay
+public for callers who need the marker chain or the Annex-level kernels:
 
-// Decode a bare codestream.
-let picture = oxideav_jpegxs::decode_jpeg_xs(bytes)?;
-
-// Decode a box-wrapped .jxs file (ISO/IEC 21122-3 Annex A), or write
-// one around an encoded codestream.
-// let picture = oxideav_jpegxs::decode_jxs_file(jxs_bytes)?;
-// let jxs = oxideav_jpegxs::write_jxs_file(&codestream)?;
-# Ok::<(), oxideav_jpegxs::Error>(())
-```
-
-Encoder entry points (in `oxideav_jpegxs::encoder`) cover single-luma,
-interleaved RGB, and generalised planar input, with `_lossy`,
-`_highprec_lossy`,
-`_lossy_annex_h`, `_subsampled_annex_h`, `_star_tetrix_annex_h`,
-`_star_tetrix_highbd_annex_h`, `_sd_star_tetrix_highbd`,
-`_subsampled_highbd_annex_h`, `_highbd`,
-`_subsampled`, `_star_tetrix`, `_nlt_quadratic`, `_nlt_extended`,
-`_subsampled_nlt_quadratic`, `_subsampled_nlt_extended`,
-`_subsampled_nlt_quadratic_highbd`, `_subsampled_nlt_extended_highbd`,
-`_hsl_qslice`,
-`_run_mode1`, `_run_mode1_highbd`, `_run_mode1_subsampled`,
-`_qpr_rpr`, `_for_profile` (profile-targeted + signed),
-`_cbr_target_bytes` (exact-size CBR),
-`_for_profile_cbr_target_bytes` (exact-size CBR × profile in one call),
-and `*_target_bytes` variants for
-the feature axes above. See the module docs for the exact signatures and
-scope per entry point.
-
-The `signalling` module (`declare_profile` / `declare_level_sublevel` /
-`declare_cbr` / `declare_auto` / `pick_*` / `pad_to_size` /
-`insert_com` / `verify_declarations`) upgrades any encoded codestream
-to a verified self-describing one — see the Encoder section above.
-
-The crate also registers a software decoder through the standard
-`oxideav-core` registry path.
+- `codestream::parse` → `Codestream` (CAP / PIH / CDT / WGT / NLT / CWD /
+  CTS / CRG / COM / slices), `inspect` → `JpegXsFileInfo`.
+- `encoder::encode_planar_*` — the historical per-axis entry points,
+  deprecated in favour of `encode` / `encode_components` +
+  `EncodeOptions` (every axis is a field); their byte output is pinned
+  by `tests/encoder_conformance.rs`.
+- `signalling` (`declare_profile` / `declare_level_sublevel` /
+  `declare_cbr` / `declare_auto` / `pick_*` / `pad_to_size` /
+  `insert_com` / `verify_declarations`) upgrades any codestream to a
+  verified self-describing one.
+- `fileformat` (`parse_jxs_file` → `JxsFile`, `JxsFileBuilder`,
+  `write_jxs_file`, `media_type`) — the ISO/IEC 21122-3 Annex A box
+  layer, including the Video Support superbox records.
+- `profile` (`Profile` / `Level` / `Sublevel` / `check_profile` /
+  `check_level` / `check_codestream_size`) — ISO/IEC 21122-2.
 
 ## License
 

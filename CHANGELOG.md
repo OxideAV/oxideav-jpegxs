@@ -1,5 +1,82 @@
 # Changelog
 
+## Unreleased — round 469 (image-crate API contract)
+
+### Changed
+
+* **Contract surface** (`IMAGE_CRATE_API`, wave 5): the crate root now
+  exposes `probe -> bool`, `info -> ImageInfo`, `decode` / `decode_with`
+  / `decode_rgb8` / `decode_rgba8` / `decode_from`, `encode` /
+  `encode_rgb8` / `encode_rgba8` / `encode_to`, plus the component-plane
+  depth pair `decode_components` / `decode_components_with` /
+  `encode_components`. Every decode function accepts a bare codestream
+  or a `.jxs` file.
+* **`JpegXsImage` changed shape** to the contract image: `{ width,
+  height, format: PixelFormat, planes: Vec<Plane>, color: ColorInfo,
+  metadata: Metadata, bit_depth }` with fallible `new` / `from_rgb8` /
+  `from_rgba8`, `with_color` / `with_metadata` / `with_bit_depth`,
+  `as_bytes` / `into_raw`, `to_rgb8` / `to_rgba8`, `sample`. Planes are
+  in the layout's order (G, B, R(, A) for RGB). The previous raw shape
+  (`num_components`, `cpih`, `pts`, codestream-order planes) lives on as
+  **`Components`** `{ width, height, cpih, bit_depths, sampling, planes }`,
+  which `decode_components` returns and `encode_components` consumes.
+* **`JpegXsPixelFormat`** (`PixelFormat` alias) mirrors
+  `oxideav_core::PixelFormat` by name: `Gray8` / `Gray10Le` / `Gray12Le`
+  / `Gray16Le`, `Gbrp8` … `Gbrp16Le`, `Gbrap8` … `Gbrap16Le`, `Yuv444P`
+  / `Yuv422P` / `Yuv420P` and `Yuva*` at 8 / 10 / 12 / 16 bits. The
+  layout is derived from `Nc`, `Cpih`, the component table and (for
+  `.jxs`) the CICP matrix; Star-Tetrix CFA, `Nc ∈ {2, 5..=8}`, mixed
+  bit depths and other sampling have no contract layout (`info` /
+  `decode` return `Unsupported`; `decode_components` still decodes them).
+* **`ColorInfo { range: ColorRange, primaries, transfer, matrix }`**
+  from the `.jxs` CICP box (verbatim) or the layout's documented default
+  (RGB: matrix `0`, else unspecified); **`Metadata { icc, exif, xmp,
+  gamma }`** with `exif` from the Exif box.
+* **`EncodeOptions`** (`#[non_exhaustive]`, `Default`, `with_*`): every
+  encoder axis is a field — `quantization`, `target_bytes`, `profile`,
+  `levels_x` / `levels_y` (automatic when `None`), `rct`, `quantizer`,
+  `slice_height`, `column_width`, `sign_packet`, `run_mode`,
+  `refinement`, `high_precision`, `nlt`, `weights` (`Default` /
+  `AnnexH`), `suppressed_components`, `star_tetrix`, `q_slices` /
+  `q_precincts` / `r_precincts`, `boxed` (`.jxs` output with CICP,
+  `cdef` for alpha layouts and Exif). New enums `Quantizer`, `RunMode`,
+  `Weights`, record `StarTetrixParams`.
+* **`DecodeOptions`** — `max_width` / `max_height` / `max_pixels` /
+  `max_bytes` / `strict`, enforced on the picture header before any
+  sample buffer is allocated (`Error::LimitExceeded`).
+* **`JpegXsError`** gains `LimitExceeded` and `Io(std::io::Error)` (+
+  `From<std::io::Error>`), is `#[non_exhaustive]`, and no longer derives
+  `Clone` / `PartialEq`; `pub type Error = JpegXsError`.
+* **Registry adapter**: `make_encoder` (new — framework `Encoder` with a
+  `CodecOptionsStruct` schema over `EncodeOptions`),
+  `register_registries`, the frame bridge (`From<JpegXsImage> for
+  VideoFrame`, `JpegXsImage::from_video_frame`, `TryFrom<(&VideoFrame,
+  &CodecParameters)>`), `JpegXsPixelFormat` ↔ `PixelFormat` and
+  `ColorInfo` ↔ `ColorSignal` mappings. The framework decoder emits the
+  native layout and stamps the colour signal only for `.jxs` inputs with
+  a CICP box. The adapters call the standalone functions.
+* `probe(&[u8]) -> Option<JpegXsFileInfo>` is renamed **`inspect`**;
+  `probe` is the contract's allocation-free boolean sniff.
+* `Cargo.toml` excludes `/tests` and `/fuzz` from the published package;
+  the `ci-standalone` job now runs clippy and every test target.
+* Fuzz targets cover `probe` / `info` / `decode` / `decode_with` /
+  `decode_components` / `decode_rgba8`; the fuzz lockfile follows
+  `oxideav-core` 0.1.37.
+
+### Deprecated
+
+* `decode_jpeg_xs` (→ `decode` / `decode_components`; now returns
+  `Components`), `decode_jxs_file` (→ `decode`), `encode_image` /
+  `encode_raw_luma` (→ `encode`), and the whole `encoder::encode_planar_*`
+  / `encode_luma_8bit` / `encode_rgb_8bit` / `pick_*` family (→ `encode`
+  / `encode_components` with `EncodeOptions`). Their byte output is
+  unchanged and remains pinned by the encoder conformance matrix.
+
+### Removed
+
+* `JpegXsImage::{num_components, cpih, pts}` — see `Components` for the
+  raw view; `pts` travels on the framework `VideoFrame`.
+
 ## Unreleased — round 438 (CBR × profile one-call composition)
 
 * **`encoder::encode_planar_for_profile_cbr_target_bytes`** — the CBR ×

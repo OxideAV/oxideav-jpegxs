@@ -161,11 +161,11 @@ fn read_reference(dir: &Path, n: u32) -> Result<Vec<PgxComponent>, String> {
     Ok(comps)
 }
 
-/// Compare one decoded [`oxideav_jpegxs::JpegXsImage`] against the
+/// Compare one decoded [`oxideav_jpegxs::Components`] set against the
 /// reference component set (§B.8 — exact sample equality). Returns the
 /// index of the first mismatch on failure.
 fn compare_image(
-    img: &oxideav_jpegxs::JpegXsImage,
+    img: &oxideav_jpegxs::Components,
     reference: &[PgxComponent],
 ) -> Result<(), String> {
     if img.planes.len() != reference.len() {
@@ -178,9 +178,8 @@ fn compare_image(
     for (k, (plane, refc)) in img.planes.iter().zip(reference.iter()).enumerate() {
         // The decoder packs each plane at the *component* precision B[i]
         // (`decoder.rs`: one byte/sample when B[i] ≤ 8, else two
-        // little-endian bytes) — not at the picture-wide `Bw`
-        // (`img.bit_depth`), which can be 20 even for an 8-bit component.
-        // The reference `.h` precision equals B[i], so use it per plane.
+        // little-endian bytes). The reference `.h` precision equals B[i],
+        // so use it per plane.
         let bytes_per_sample = if refc.precision <= 8 { 1 } else { 2 };
         let stride_samples = plane.stride / bytes_per_sample;
         let plane_w = stride_samples;
@@ -275,12 +274,10 @@ fn run_stream(dir: &Path, n: u32) -> Outcome {
         Ok(b) => b,
         Err(e) => return Outcome::Fail(format!("read {n}.jxs: {e}")),
     };
-    let decoded = if oxideav_jpegxs::is_jxs_file(&jxs) {
-        oxideav_jpegxs::decode_jxs_file(&jxs)
-    } else {
-        oxideav_jpegxs::decode_jpeg_xs(&jxs)
-    };
-    let img = match decoded {
+    // §B.6 / §B.8 compare per-component planes in codestream order, so
+    // the component view is the one under test; the contract `decode` is
+    // checked alongside (same samples, layout order) when it has a view.
+    let img = match oxideav_jpegxs::decode_components(&jxs) {
         Ok(img) => img,
         Err(oxideav_jpegxs::JpegXsError::Unsupported(m)) => return Outcome::Unsupported(m),
         Err(e) => return Outcome::Fail(format!("decode error: {e}")),
@@ -289,10 +286,55 @@ fn run_stream(dir: &Path, n: u32) -> Outcome {
         Ok(r) => r,
         Err(e) => return Outcome::Fail(format!("reference: {e}")),
     };
-    match compare_image(&img, &reference) {
+    if let Err(e) = compare_image(&img, &reference) {
+        return Outcome::Fail(e);
+    }
+    match check_contract_view(&jxs, &img) {
         Ok(()) => Outcome::Pass,
         Err(e) => Outcome::Fail(e),
     }
+}
+
+/// The contract `decode` must agree with the component view sample for
+/// sample: RGB layouts reorder R, G, B(, A) to G, B, R(, A), every other
+/// layout keeps codestream order. Streams without a contract layout
+/// (`Unsupported`) are fine — the component view is their only view.
+fn check_contract_view(jxs: &[u8], comps: &oxideav_jpegxs::Components) -> Result<(), String> {
+    let img = match oxideav_jpegxs::decode(jxs) {
+        Ok(img) => img,
+        Err(oxideav_jpegxs::JpegXsError::Unsupported(_)) => return Ok(()),
+        Err(e) => return Err(format!("contract decode error: {e}")),
+    };
+    let info = oxideav_jpegxs::info(jxs).map_err(|e| format!("info: {e}"))?;
+    if info.format != img.format || info.width != img.width || info.height != img.height {
+        return Err("info() disagrees with decode()".into());
+    }
+    let order: Vec<usize> = if img.format.is_rgb() {
+        // G, B, R(, A) ← components 1, 2, 0(, 3).
+        let mut o = vec![1, 2, 0];
+        if comps.len() == 4 {
+            o.push(3);
+        }
+        o
+    } else {
+        (0..comps.len()).collect()
+    };
+    if img.planes.len() != order.len() {
+        return Err(format!(
+            "contract view: {} plane(s) for {} component(s)",
+            img.planes.len(),
+            comps.len()
+        ));
+    }
+    for (k, &c) in order.iter().enumerate() {
+        if img.planes[k] != comps.planes[c] {
+            return Err(format!(
+                "contract view plane {k} ({}) differs from component {c}",
+                img.format
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn conformance_dir() -> Option<PathBuf> {
@@ -417,8 +459,16 @@ fn synthetic_encode_decode_matches_pgx_roundtrip() {
     let pixels: Vec<u8> = (0..(w as usize * h as usize))
         .map(|i| ((i * 7 + 3) & 0xff) as u8)
         .collect();
-    let codestream = oxideav_jpegxs::encoder::encode_luma_8bit(w, h, &pixels).unwrap();
-    let img = oxideav_jpegxs::decode_jpeg_xs(&codestream).unwrap();
+    let image = oxideav_jpegxs::JpegXsImage::new(
+        w as u32,
+        h as u32,
+        oxideav_jpegxs::PixelFormat::Gray8,
+        vec![oxideav_jpegxs::Plane::new(w as usize, pixels)],
+    )
+    .unwrap();
+    let codestream =
+        oxideav_jpegxs::encode(&image, &oxideav_jpegxs::EncodeOptions::default()).unwrap();
+    let img = oxideav_jpegxs::decode_components(&codestream).unwrap();
     assert_eq!(img.planes.len(), 1);
 
     // Serialize the decoded plane to a pgx raw buffer (8-bit path) and

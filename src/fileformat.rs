@@ -4,7 +4,7 @@
 //! optionally be wrapped in the box-based **JXS file format** for still
 //! images (file extension `.jxs`). This module parses that box structure
 //! and extracts the embedded codestream so it can be handed to
-//! [`crate::decode_jpeg_xs`].
+//! [`crate::decode_components`].
 //!
 //! The box structure is the JPEG 2000 family box syntax (A.3, Table A.1):
 //! every box is `LBox(4) | TBox(4) | [XLBox(8)] | DBox`, big-endian. The
@@ -1302,19 +1302,26 @@ pub fn parse_jxs_file(buf: &[u8]) -> Result<JxsFile> {
     })
 }
 
-/// Decode a JXS file (ISO/IEC 21122-3 Annex A): parse the box wrapper,
-/// extract the embedded codestream, and decode it through
-/// [`crate::decode_jpeg_xs`].
+/// Decode a JXS file (ISO/IEC 21122-3 Annex A) to its contract image.
 ///
-/// The Image Header box `NC` field is cross-checked against the
-/// codestream's `Nc` (A.5.4.2 declares them redundant and contradictory
-/// files non-conforming); a mismatch is rejected.
+/// Historical entry point: [`crate::decode`] accepts both bare
+/// codestreams and `.jxs` files; [`crate::decode_components`] gives the
+/// codestream-order component planes.
+#[deprecated(note = "use oxideav_jpegxs::decode (IMAGE_CRATE_API)")]
 pub fn decode_jxs_file(buf: &[u8]) -> Result<crate::image::JpegXsImage> {
-    let file = parse_jxs_file(buf)?;
-    let codestream = file.codestream(buf);
-    // Cross-check the ihdr geometry against the codestream picture header
-    // (A.5.4.2: contradictory files are non-conforming).
-    let cs = crate::codestream::parse(codestream)?;
+    crate::decode(buf)
+}
+
+/// Cross-check a parsed `.jxs` file against the codestream it wraps:
+/// the Image Header box `NC` / `WIDTH` / `HEIGHT` against the picture
+/// header (A.5.4.2 declares them redundant and contradictory files
+/// non-conforming) and the `jxpl` Profile/Level box (when present)
+/// against the codestream declarations it duplicates.
+pub(crate) fn check_file_consistency(
+    file: &JxsFile,
+    cs: &crate::codestream::Codestream,
+    codestream_len: usize,
+) -> Result<()> {
     let ihdr = &file.header.image_header;
     if u16::from(cs.pih.nc) != ihdr.num_components {
         return Err(JpegXsError::invalid(format!(
@@ -1331,14 +1338,10 @@ pub fn decode_jxs_file(buf: &[u8]) -> Result<crate::image::JpegXsImage> {
             cs.pih.height()
         )));
     }
-    // Cross-check the jxpl Profile/Level box (when present) against the
-    // codestream declarations it duplicates (A.5.3.3 — "Profile of the
-    // codestream" / "Level of the codestream": the box is a redundant
-    // early-parse copy of the PIH fields).
     if let Some(pl) = &file.profile_level {
-        check_jxpl_consistency(&cs, codestream.len(), pl)?;
+        check_jxpl_consistency(cs, codestream_len, pl)?;
     }
-    crate::decode_jpeg_xs(codestream)
+    Ok(())
 }
 
 /// Enforce that a `jxpl` Profile/Level box (A.5.3.3) does not
@@ -1670,6 +1673,7 @@ pub fn write_jxs_file(codestream: &[u8]) -> Result<Vec<u8>> {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 
@@ -1776,10 +1780,10 @@ mod tests {
         let cs =
             crate::encoder::encode_planar(w, h, 1, 0, 1, 1, std::slice::from_ref(&pixels)).unwrap();
         let file = wrap_codestream(&cs, w as u32, h as u32, 1, 8, false);
-        let img = decode_jxs_file(&file).expect("decode jxs file");
+        let img = crate::decode_components(&file).expect("decode jxs file");
         assert_eq!(img.width, w as u32);
         assert_eq!(img.height, h as u32);
-        assert_eq!(img.num_components, 1);
+        assert_eq!(img.len(), 1);
         assert_eq!(img.planes[0].data, pixels);
     }
 
@@ -1809,7 +1813,7 @@ mod tests {
         let (cs, w, h) = luma_codestream();
         // Claim 3 components in the ihdr while the codestream has 1.
         let file = wrap_codestream(&cs, w, h, 3, 8, false);
-        let err = decode_jxs_file(&file).unwrap_err();
+        let err = crate::decode_components(&file).unwrap_err();
         assert!(matches!(err, JpegXsError::InvalidData(_)));
     }
 
@@ -1817,7 +1821,7 @@ mod tests {
     fn rejects_ihdr_dimension_mismatch() {
         let (cs, _w, h) = luma_codestream();
         let file = wrap_codestream(&cs, 99, h, 1, 8, false);
-        assert!(decode_jxs_file(&file).is_err());
+        assert!(crate::decode_components(&file).is_err());
     }
 
     #[test]
@@ -1840,7 +1844,7 @@ mod tests {
         spliced.extend_from_slice(&boxed(0x6465_6164, b"\xde\xad")); // unknown 'dead'
         spliced.extend_from_slice(&boxed(TBOX_XML, b"<x/>"));
         spliced.extend_from_slice(&file[cs_off..]);
-        let img = decode_jxs_file(&spliced).expect("decode with unknown boxes");
+        let img = crate::decode_components(&spliced).expect("decode with unknown boxes");
         assert_eq!(img.width, w);
     }
 
@@ -1944,6 +1948,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod writer_tests {
     use super::*;
 
@@ -1972,7 +1977,7 @@ mod writer_tests {
         assert_eq!(parsed.header.image_header.height, h as u32);
         assert_eq!(parsed.header.image_header.num_components, 1);
         assert_eq!(parsed.header.image_header.bit_depth(), Some(8));
-        let img = decode_jxs_file(&file).unwrap();
+        let img = crate::decode_components(&file).unwrap();
         assert_eq!(img.planes[0].data, pixels);
     }
 
@@ -2017,8 +2022,8 @@ mod writer_tests {
         let pl = parsed.profile_level.unwrap();
         assert_eq!(pl.ppih, 0x1234);
         assert_eq!(pl.plev, 0x5678);
-        let img = decode_jxs_file(&file).unwrap();
-        assert_eq!(img.num_components, 3);
+        let img = crate::decode_components(&file).unwrap();
+        assert_eq!(img.len(), 3);
         for (c, plane) in planes.iter().enumerate() {
             assert_eq!(&img.planes[c].data, plane, "component {c} round-trips");
         }
@@ -2057,7 +2062,7 @@ mod writer_tests {
         let pl = parsed.profile_level.unwrap();
         assert_eq!(pl.ppih, crate::profile::Profile::Main444_12.ppih());
         assert_eq!(pl.plev, 0x1004); // 2k-1 | Sublev3bpp
-        let img = decode_jxs_file(&file).unwrap();
+        let img = crate::decode_components(&file).unwrap();
         for (c, plane) in planes.iter().enumerate() {
             assert_eq!(&img.planes[c].data, plane, "component {c}");
         }
@@ -2096,7 +2101,7 @@ mod writer_tests {
         assert_eq!(&file[pos + 4..pos + 6], &want, "payload follows the tag");
         let other = crate::profile::Profile::High444_12.ppih().to_be_bytes();
         file[pos + 4..pos + 6].copy_from_slice(&other);
-        let err = decode_jxs_file(&file).unwrap_err();
+        let err = crate::decode_components(&file).unwrap_err();
         assert!(
             format!("{err}").contains("disagrees with codestream Ppih"),
             "expected jxpl/PIH contradiction, got {err}"
@@ -2134,12 +2139,12 @@ mod writer_tests {
             .profile_level(crate::profile::Profile::Main444_12.ppih(), 0)
             .build(&sliced)
             .unwrap();
-        decode_jxs_file(&file).unwrap();
+        crate::decode_components(&file).unwrap();
         let file = JxsFileBuilder::new(srgb())
             .profile_level(0x7777, 0x7700)
             .build(&single_slice)
             .unwrap();
-        decode_jxs_file(&file).unwrap();
+        crate::decode_components(&file).unwrap();
     }
 
     #[test]
@@ -2165,8 +2170,8 @@ mod writer_tests {
         assert_eq!(parsed.header.image_header.bit_depth(), Some(12));
         assert!(!parsed.header.image_header.is_signed());
         // Decodes back to the same 12-bit samples.
-        let img = decode_jxs_file(&file).unwrap();
-        assert_eq!(img.bit_depth, 12);
+        let img = crate::decode_components(&file).unwrap();
+        assert_eq!(img.max_bit_depth(), 12);
         assert_eq!(
             img.planes[0].data,
             samples
@@ -2379,7 +2384,7 @@ mod writer_tests {
         assert_eq!(parsed.video_info.unwrap(), VideoInformation::unknown());
         assert_eq!(parsed.profile_level.unwrap().ppih, 0x1234);
         // Round-trips through decode.
-        assert!(decode_jxs_file(&file).is_ok());
+        assert!(crate::decode_components(&file).is_ok());
     }
 
     #[test]
@@ -2583,7 +2588,7 @@ mod writer_tests {
         let parsed = parse_jxs_file(&file).unwrap();
         assert_eq!(parsed.header.exif.as_deref(), Some(exif.as_slice()));
         // The Exif box lives inside jp2h and does not disturb decode.
-        assert!(decode_jxs_file(&file).is_ok());
+        assert!(crate::decode_components(&file).is_ok());
     }
 
     #[test]
@@ -2629,6 +2634,6 @@ mod writer_tests {
         assert!(parsed.video_info.is_some());
         assert!(parsed.profile_level.is_some());
         assert_eq!(parsed.mastering_display.unwrap(), bt709_dmon());
-        assert!(decode_jxs_file(&file).is_ok());
+        assert!(crate::decode_components(&file).is_ok());
     }
 }

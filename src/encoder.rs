@@ -96,6 +96,8 @@
 //! SOC | CAP | PIH | CDT | WGT | [NLT] | [CTS] | [CRG] | SLH | <slice 0 entropy data> | EOC
 //! ```
 
+#![allow(deprecated)]
+
 use crate::colour_transform::{forward_rct, forward_star_tetrix};
 use crate::dwt::{forward_2d, forward_cascade_2d};
 use crate::error::{JpegXsError as Error, Result};
@@ -734,6 +736,9 @@ impl EncodeConfig {
 ///
 /// Lossless single-decomposition (`NL,x = NL,y = 1`) bootstrap path
 /// retained from round 1 for callers that pin the original geometry.
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_luma_8bit(width: u16, height: u16, pixels: &[u8]) -> Result<Vec<u8>> {
     let expected = (width as usize) * (height as usize);
     if pixels.len() != expected {
@@ -750,6 +755,9 @@ pub fn encode_luma_8bit(width: u16, height: u16, pixels: &[u8]) -> Result<Vec<u8
 /// Round-3 retains the round-2 lossless behaviour. For lossy encoding
 /// or chroma sub-sampling, use [`encode_planar_lossy`] /
 /// [`encode_planar_subsampled`].
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_rgb_8bit(
     width: u16,
     height: u16,
@@ -776,80 +784,33 @@ pub fn encode_rgb_8bit(
     encode_planar(width, height, 3, cpih, nl, nl, &[r, g, b])
 }
 
-/// Encode the JPEG XS codestream out of a [`JpegXsImage`].
+/// Encode a [`JpegXsImage`] losslessly with the default options.
 ///
-/// Round 3 still defaults to lossless (`Fq = 0`, `q = 0`) and 4:4:4
-/// (`sx = sy = 1` for every plane). For lossy or chroma-sub-sampled
-/// encoding, see [`encode_planar_lossy`] / [`encode_planar_subsampled`].
+/// Historical entry point; [`crate::encode`] with
+/// [`crate::EncodeOptions`] is the contract form.
+#[deprecated(note = "use oxideav_jpegxs::encode (IMAGE_CRATE_API)")]
 pub fn encode_image(img: &JpegXsImage) -> Result<Vec<u8>> {
-    if img.bit_depth != 8 {
-        return Err(Error::Unsupported(format!(
-            "jpegxs encoder round 3: requires Bw = 8, got {}",
-            img.bit_depth
-        )));
-    }
-    if !(1..=8).contains(&img.num_components) {
-        return Err(Error::invalid(format!(
-            "jpegxs encoder: Nc must be 1..=8 (Annex A.4.3), got {}",
-            img.num_components
-        )));
-    }
-    if img.planes.len() != img.num_components as usize {
-        return Err(Error::invalid(format!(
-            "jpegxs encoder: image planes ({}) != num_components ({})",
-            img.planes.len(),
-            img.num_components
-        )));
-    }
-    let w = img.width as usize;
-    let h = img.height as usize;
-    let mut planes: Vec<Vec<u8>> = Vec::with_capacity(img.planes.len());
-    for (i, plane) in img.planes.iter().enumerate() {
-        if plane.stride != w {
-            return Err(Error::Unsupported(format!(
-                "jpegxs encoder round 3: plane {i} stride {} != width {w} (no padding)",
-                plane.stride
-            )));
-        }
-        if plane.data.len() != w * h {
-            return Err(Error::invalid(format!(
-                "jpegxs encoder: plane {i} data length {} != width*height {}",
-                plane.data.len(),
-                w * h
-            )));
-        }
-        planes.push(plane.data.clone());
-    }
-    encode_planar(
-        img.width as u16,
-        img.height as u16,
-        img.num_components,
-        img.cpih,
-        1,
-        1,
-        &planes,
-    )
+    crate::encode(img, &crate::EncodeOptions::default())
 }
 
-/// Build a [`JpegXsImage`] from raw bytes and then encode. Useful for
-/// self-roundtrip tests that already have raw pixels.
+/// Build a grey [`JpegXsImage`] from raw bytes and then encode it
+/// losslessly. Useful for self-roundtrip tests that already have raw
+/// pixels.
+#[deprecated(note = "use oxideav_jpegxs::encode (IMAGE_CRATE_API)")]
 pub fn encode_raw_luma(width: u16, height: u16, pixels: Vec<u8>) -> Result<Vec<u8>> {
-    let img = JpegXsImage {
-        width: width as u32,
-        height: height as u32,
-        num_components: 1,
-        cpih: 0,
-        bit_depth: 8,
-        planes: vec![JpegXsPlane {
-            stride: width as usize,
-            data: pixels,
-        }],
-        pts: None,
-    };
-    encode_image(&img)
+    let img = JpegXsImage::new(
+        width as u32,
+        height as u32,
+        crate::JpegXsPixelFormat::Gray8,
+        vec![JpegXsPlane::new(width as usize, pixels)],
+    )?;
+    crate::encode(&img, &crate::EncodeOptions::default())
 }
 
 /// Lossless 4:4:4 entry point (round-2 signature). All `sx[i] = sy[i] = 1`.
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar(
     width: u16,
     height: u16,
@@ -878,6 +839,9 @@ pub fn encode_planar(
 /// marker emitted carries the canonical RGGB or GRBG arrangement
 /// depending on `ct`.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_star_tetrix(
     width: u16,
     height: u16,
@@ -924,7 +888,7 @@ pub fn encode_planar_star_tetrix(
 /// marker (`Cf`, `e1`, `e2`) and the CRG marker (Table F.9 RGGB layout
 /// for `Ct = 0`, GRBG layout for `Ct = 1`) identical to the 8-bit form;
 /// only the per-component CDT `B[i]` byte and the PIH `Bw` byte change.
-/// Self-roundtrips bit-exactly through [`crate::decode_jpeg_xs`] at
+/// Self-roundtrips bit-exactly through [`crate::decode_components`] at
 /// 10/12/16-bit.
 ///
 /// `e1`, `e2` are the CTS chroma-weighting exponents (0..=3); `cf` is
@@ -937,6 +901,9 @@ pub fn encode_planar_star_tetrix(
 /// `cpih = 3`, but this entry point pins `q = 0` for the round-195
 /// lossless scope.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_star_tetrix_highbd(
     width: u16,
     height: u16,
@@ -1054,6 +1021,9 @@ pub fn encode_planar_star_tetrix_highbd(
 /// `ct` share the same validation as the 8-bit / lossless high-bit-
 /// depth forms (in [`EncodeConfig::validate`]).
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_star_tetrix_highbd_lossy(
     width: u16,
     height: u16,
@@ -1159,6 +1129,9 @@ pub fn encode_planar_star_tetrix_highbd_lossy(
 /// path; use [`encode_planar_star_tetrix_highbd_annex_h`] to drive the Annex H
 /// PSNR-optimized weights on this same `Sd = 1` highbd layout.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_sd_star_tetrix_highbd(
     width: u16,
     height: u16,
@@ -1242,6 +1215,9 @@ pub fn encode_planar_sd_star_tetrix_highbd(
 /// using the H gains. This closes the previously-deferred "content-adaptive WGT
 /// weights for the CFA Star-Tetrix layouts at bit depths above 8" follow-up.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_star_tetrix_highbd_annex_h(
     width: u16,
     height: u16,
@@ -1363,6 +1339,9 @@ fn pack_cfa_u16_planes(
 /// [`encode_planar_highprec_lossy`], which selects the `(Bw = 20, Fq = 8)`
 /// combination.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_lossy(
     width: u16,
     height: u16,
@@ -1399,6 +1378,9 @@ pub fn encode_planar_lossy(
 ///
 /// `q` is the precinct quantization step (`0..=15`; `0` = lossless).
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_run_mode1(
     width: u16,
     height: u16,
@@ -1451,6 +1433,9 @@ pub fn encode_planar_run_mode1(
 /// wavelet coefficients unchanged (`Rm` gates only the insignificant-group
 /// `M` reconstruction, which is bit-depth-independent).
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_run_mode1_highbd(
     width: u16,
     height: u16,
@@ -1528,6 +1513,9 @@ pub fn encode_planar_run_mode1_highbd(
 /// vertical level shallower, so the `Rm = 1` insignificant-group logic runs
 /// across the mixed-depth band cascade.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_run_mode1_subsampled(
     width: u16,
     height: u16,
@@ -1595,6 +1583,9 @@ pub fn encode_planar_run_mode1_subsampled(
 /// note that because the `>> Fq` rounding discards the bottom `Fq` bits it
 /// is *not* bit-exact lossless — use [`encode_planar`] for lossless.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_highprec_lossy(
     width: u16,
     height: u16,
@@ -1628,7 +1619,7 @@ pub fn encode_planar_highprec_lossy(
 /// The supplied weights drive BOTH the WGT marker (Annex A.4.11) AND the
 /// forward truncation `T[p,b] = clamp(Q[p] − G[b] − r, 0, 15)` (Annex
 /// C.6.2 Table C.10, `r = (P[b] < R[p]) ? 1 : 0`), so the codestream
-/// round-trips through [`crate::decode_jpeg_xs`] — the decoder reads the
+/// round-trips through [`crate::decode_components`] — the decoder reads the
 /// identical `(G[b], P[b])` off the WGT segment and reconstructs the same
 /// per-band truncation positions. The richer gains (Annex H assigns up to
 /// `G = 4` to the deepest LL band, versus the default cap of 2) let the
@@ -1639,6 +1630,9 @@ pub fn encode_planar_highprec_lossy(
 /// already clamped to its `0` floor — so this entry point is only
 /// meaningful for `q ∈ 1..=15`.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_lossy_annex_h(
     width: u16,
     height: u16,
@@ -1706,11 +1700,14 @@ pub fn encode_planar_lossy_annex_h(
 /// the encoder's existing-band emission order. The decoder reads the identical
 /// `(G[b], P[b])` off the wire and reconstructs the same
 /// `T[p,b] = clamp(Q[p] − G[b] − r, 0, 15)` (Annex C.6.2 Table C.10), so the
-/// codestream round-trips through [`crate::decode_jpeg_xs`].
+/// codestream round-trips through [`crate::decode_components`].
 ///
 /// As with the 4:4:4 entry point, the weights are a no-op at `q = 0`
 /// (lossless), so this path is meaningful for `q ∈ 1..=15`.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_subsampled_annex_h(
     width: u16,
     height: u16,
@@ -1786,6 +1783,9 @@ pub fn encode_planar_subsampled_annex_h(
 /// (lossless) — every `T[p,b]` is already clamped to its `0` floor — so this
 /// path is meaningful for `q ∈ 1..=15`.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_star_tetrix_annex_h(
     width: u16,
     height: u16,
@@ -1857,8 +1857,11 @@ pub fn encode_planar_star_tetrix_annex_h(
 /// not exposed on this path. `nlx`/`nly` follow the Annex A.4.4 limits.
 /// `q` is fixed at 0 (lossless) here; lossy high-bit-depth quantization is
 /// a later round. Self-roundtrips bit-exactly through
-/// [`crate::decode_jpeg_xs`].
+/// [`crate::decode_components`].
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_highbd(
     width: u16,
     height: u16,
@@ -1954,6 +1957,9 @@ pub fn encode_planar_highbd(
 /// input specific. `q = 0` is rejected — use [`encode_planar_highbd`] for
 /// the lossless path.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_highbd_lossy(
     width: u16,
     height: u16,
@@ -2055,8 +2061,11 @@ pub fn encode_planar_highbd_lossy(
 /// 4:2:2 / 4:2:0 case) is the same path as the 8-bit sub-sampled
 /// encoder. The decoder packs `u16` LE per plane when `B[i] > 8`
 /// regardless of sub-sampling, so the output round-trips bit-exactly
-/// through [`crate::decode_jpeg_xs`].
+/// through [`crate::decode_components`].
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_subsampled_highbd(
     width: u16,
     height: u16,
@@ -2141,6 +2150,9 @@ pub fn encode_planar_subsampled_highbd(
 /// 4:4:4 paths. `cpih ∈ {0, 1}`. Rejects `q = 0` (use
 /// [`encode_planar_subsampled_highbd`]).
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_subsampled_highbd_lossy(
     width: u16,
     height: u16,
@@ -2283,6 +2295,9 @@ fn pack_subsampled_u16_planes(
 /// coefficients, so the only bit-depth-dependent pieces remain the Annex G.3 DC
 /// level shift and the `u16`-LE plane packing.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_subsampled_highbd_annex_h(
     width: u16,
     height: u16,
@@ -2373,7 +2388,7 @@ pub fn encode_planar_subsampled_highbd_annex_h(
 /// Slices decode independently: the decoder reconstructs the identical
 /// precinct-to-slice grouping from PIH `Hsl` + `Np,y`
 /// ([`crate::slice_walker`] Annex B.10), so any output round-trips
-/// through [`crate::decode_jpeg_xs`]. Vertical prediction is precinct-
+/// through [`crate::decode_components`]. Vertical prediction is precinct-
 /// scoped in this encoder, so slice boundaries carry no predictor state
 /// across them (Annex B.10 requires vertical prediction be disabled
 /// across slice boundaries — satisfied trivially here because no
@@ -2383,6 +2398,9 @@ pub fn encode_planar_subsampled_highbd_annex_h(
 /// running past the last precinct row). `q` is the precinct quantization
 /// step (`0..=15`); `q = 0` is lossless and `q > 0` forces `Fq = 8`.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_hsl(
     width: u16,
     height: u16,
@@ -2464,6 +2482,9 @@ pub fn encode_planar_hsl(
 /// to the caller (no rate-distortion search is performed); a
 /// follow-up round can wrap this with a PSNR-driven slice budgeter.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_hsl_qslice(
     width: u16,
     height: u16,
@@ -2569,6 +2590,9 @@ pub fn encode_planar_hsl_qslice(
 /// [`EncodeConfig::validate`] errors (`cpih` / `nlx` / `nly` / plane
 /// sizes).
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_qpr(
     width: u16,
     height: u16,
@@ -2665,6 +2689,9 @@ pub fn encode_planar_qpr(
 /// the standard [`EncodeConfig::validate`] errors (`cpih` / `nlx` /
 /// `nly` / plane sizes).
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_rpr(
     width: u16,
     height: u16,
@@ -2772,6 +2799,9 @@ pub fn encode_planar_rpr(
 /// standard [`EncodeConfig::validate`] errors (`cpih` / `nlx` / `nly`
 /// / plane sizes).
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_qpr_rpr(
     width: u16,
     height: u16,
@@ -2884,6 +2914,9 @@ pub fn encode_planar_qpr_rpr(
 ///   overshoots the budget. The error message reports the actual
 ///   encoded length so the caller knows how far over they are.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode with EncodeOptions::target_bytes (IMAGE_CRATE_API)"
+)]
 pub fn pick_q_slices_for_target_bytes(
     width: u16,
     height: u16,
@@ -3028,6 +3061,9 @@ pub fn pick_q_slices_for_target_bytes(
 /// callers can persist it for reproducible re-encode of identical
 /// parameters.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_hsl_target_bytes(
     width: u16,
     height: u16,
@@ -3078,6 +3114,9 @@ pub fn encode_planar_hsl_target_bytes(
 /// the allocation chose. Errors when even the coarsest allocation
 /// (`Q = 15` everywhere) cannot fit `target_bytes − 6`.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_cbr_target_bytes(
     width: u16,
     height: u16,
@@ -3133,6 +3172,9 @@ pub fn encode_planar_cbr_target_bytes(
 /// the minimum COM segment. Returns the exactly-`target_bytes` stream
 /// plus the chosen `(q_slices, rp)`.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_cbr_target_bytes_highbd(
     width: u16,
     height: u16,
@@ -3331,6 +3373,9 @@ fn slice_activity(planes: &[Vec<u8>], width: u16, y0: u32, y1: u32) -> u64 {
 ///   the budget. The error message reports the actual encoded length
 ///   so the caller knows how far over they are.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode with EncodeOptions::target_bytes (IMAGE_CRATE_API)"
+)]
 pub fn pick_rp_for_target_bytes(
     width: u16,
     height: u16,
@@ -3398,6 +3443,9 @@ pub fn pick_rp_for_target_bytes(
 /// value is the one returned by [`pick_rp_for_target_bytes`]; callers
 /// can persist it for reproducible re-encode of identical parameters.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_rp_target_bytes(
     width: u16,
     height: u16,
@@ -3434,7 +3482,7 @@ pub fn encode_planar_rp_target_bytes(
 /// The decoder reconstructs the identical `T[p,b]` from the
 /// `(P[b], R[p], Q[p])` triple it reads back from the wire, so any
 /// output of this entry point round-trips through
-/// [`crate::decode_jpeg_xs`].
+/// [`crate::decode_components`].
 ///
 /// `hsl`, `q_slices`, and `rp` follow the same semantics as in
 /// [`encode_planar_hsl_qslice`] and [`encode_planar_rp`]:
@@ -3475,6 +3523,9 @@ pub fn encode_planar_rp_target_bytes(
 /// Errors: validation errors from [`EncodeConfig::validate`] (wrong
 /// `q_slices` length, entries > 15, `R[p] >= NL`, etc.).
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_hsl_qslice_rp(
     width: u16,
     height: u16,
@@ -3591,6 +3642,9 @@ pub fn encode_planar_hsl_qslice_rp(
 /// The [`encode_planar_hsl_qslice_rp_target_bytes`] convenience wrapper
 /// does both in one call and returns `(codestream, q_slices, rp)`.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode with EncodeOptions::target_bytes (IMAGE_CRATE_API)"
+)]
 pub fn pick_q_slices_rp_for_target_bytes(
     width: u16,
     height: u16,
@@ -3808,6 +3862,9 @@ fn np_y_for(height: u16, nly: u8) -> u32 {
 /// are the ones returned by [`pick_q_slices_rp_for_target_bytes`];
 /// callers can persist them for reproducible re-encode.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_hsl_qslice_rp_target_bytes(
     width: u16,
     height: u16,
@@ -3878,6 +3935,9 @@ pub fn encode_planar_hsl_qslice_rp_target_bytes(
 /// not exposed here — they intersect with the joint primitive on a
 /// future round.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_hsl_qslice_rp_highbd(
     width: u16,
     height: u16,
@@ -3993,6 +4053,9 @@ pub fn encode_planar_hsl_qslice_rp_highbd(
 ///
 /// **Scope** mirrors [`encode_planar_hsl_qslice_rp_highbd`] exactly.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode with EncodeOptions::target_bytes (IMAGE_CRATE_API)"
+)]
 pub fn pick_q_slices_rp_for_target_bytes_highbd(
     width: u16,
     height: u16,
@@ -4244,6 +4307,9 @@ fn slice_activity_u16(planes: &[Vec<u16>], width: u16, y0: u32, y1: u32) -> u64 
 /// them for reproducible re-encode through
 /// [`encode_planar_hsl_qslice_rp_highbd`].
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_hsl_qslice_rp_target_bytes_highbd(
     width: u16,
     height: u16,
@@ -4309,6 +4375,9 @@ pub fn encode_planar_hsl_qslice_rp_target_bytes_highbd(
 /// no profile shaping; use any other entry point plus
 /// [`crate::signalling::declare_auto`].
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_for_profile(
     profile: crate::profile::Profile,
     width: u16,
@@ -4520,6 +4589,9 @@ fn encode_planar_for_profile_unsigned(
 /// Errors with `target_bytes unreachable` when even `Q = 15` on every
 /// slice overshoots the budget.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode with EncodeOptions::target_bytes (IMAGE_CRATE_API)"
+)]
 pub fn pick_q_slices_for_profile_target_bytes(
     profile: crate::profile::Profile,
     width: u16,
@@ -4709,6 +4781,9 @@ fn slice_activity_u16_subsampled(
 /// coarsest allocation (`Q = 15` everywhere) cannot fit
 /// `target_bytes − 6`, or when the configuration violates the profile.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_for_profile_cbr_target_bytes(
     profile: crate::profile::Profile,
     width: u16,
@@ -4807,8 +4882,11 @@ pub fn encode_planar_for_profile_cbr_target_bytes(
 /// `q` is the precinct quantization step (`0..=15`); `q = 0` is lossless
 /// and `q > 0` forces `Fq = 8` per Table A.8. The decoder has threaded
 /// `pih.qpih` into `dequantize_precinct` since the early rounds, so any
-/// output of this entry point round-trips through [`crate::decode_jpeg_xs`].
+/// output of this entry point round-trips through [`crate::decode_components`].
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_qpih(
     width: u16,
     height: u16,
@@ -4872,8 +4950,11 @@ pub fn encode_planar_qpih(
 /// to `v` and the stream round-trips bit-exactly. At `q > 0` (`Fq = 8`)
 /// the decoder applies the equal-bucket Neumann reconstruction per band.
 /// The decoder threads `pih.qpih` into `dequantize_precinct`, so any
-/// output round-trips through [`crate::decode_jpeg_xs`].
+/// output round-trips through [`crate::decode_components`].
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_qpih_subsampled(
     width: u16,
     height: u16,
@@ -4941,7 +5022,7 @@ pub fn encode_planar_qpih_subsampled(
 /// coded bits in those bands. This is a valid encoder choice the spec
 /// permits ("Other choices are possible", Annex H NOTE); the decoder
 /// reconstructs the identical `T[p,b]` from the `(P[b], R[p])` pair it
-/// reads back, so any output round-trips through [`crate::decode_jpeg_xs`].
+/// reads back, so any output round-trips through [`crate::decode_components`].
 ///
 /// `rp` is range-checked against `NL-1` (the total band count minus one,
 /// Annex B.6); a value past the highest band index is rejected. At
@@ -4954,6 +5035,9 @@ pub fn encode_planar_qpih_subsampled(
 /// `q` is the precinct quantization step (`0..=15`); `q = 0` is lossless
 /// and `q > 0` forces `Fq = 8` per Table A.8.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_rp(
     width: u16,
     height: u16,
@@ -5014,8 +5098,11 @@ pub fn encode_planar_rp(
 /// `q` is the precinct quantization step (`0..=15`); `q = 0` is lossless
 /// and `q > 0` forces `Fq = 8` per Table A.8. The decoder already threads
 /// `pih.fs` end-to-end (slice walker → packet body), so any output of this
-/// entry point round-trips through [`crate::decode_jpeg_xs`].
+/// entry point round-trips through [`crate::decode_components`].
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_fs1(
     width: u16,
     height: u16,
@@ -5073,11 +5160,14 @@ pub fn encode_planar_fs1(
 /// `Np,x × Np,y` precincts in raster order and gather them into the
 /// picture-level band buffers before running the inverse cascade DWT,
 /// so any encoder output with `cw > 0` round-trips through
-/// [`crate::decode_jpeg_xs`].
+/// [`crate::decode_components`].
 ///
 /// Validation: `Cs` must not exceed the picture width; `Cs == 0` is
 /// rejected.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_cw(
     width: u16,
     height: u16,
@@ -5134,6 +5224,9 @@ pub fn encode_planar_cw(
 /// Cpih=1 (RCT) + Sd see [`encode_planar_sd_rct`]; for Cpih=3
 /// (Star-Tetrix) + Sd see [`encode_planar_sd_star_tetrix`].
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_sd(
     width: u16,
     height: u16,
@@ -5192,6 +5285,9 @@ pub fn encode_planar_sd(
 /// for every component (the encoder forces 4:4:4 here to keep the
 /// post-RCT geometry well-defined).
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_sd_rct(
     width: u16,
     height: u16,
@@ -5251,6 +5347,9 @@ pub fn encode_planar_sd_rct(
 /// Constraints: `nc >= 4` (Star-Tetrix input window), `nc > 3` (CWD),
 /// `1 <= sd < nc`, `sx[i] = sy[i] = 1` for every component.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_sd_star_tetrix(
     width: u16,
     height: u16,
@@ -5305,6 +5404,9 @@ pub fn encode_planar_sd_star_tetrix(
 /// lossless, `q > 0`
 /// engages Fq=8 lossy mode.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_subsampled(
     width: u16,
     height: u16,
@@ -5334,6 +5436,9 @@ pub fn encode_planar_subsampled(
 /// `dco` is the DC offset applied to the forward map and embedded in
 /// the NLT marker (Annex G.4 `DCO`). For standard use pass `dco = 0`.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_nlt_quadratic(
     width: u16,
     height: u16,
@@ -5401,6 +5506,9 @@ pub fn encode_planar_nlt_quadratic(
 /// `extended_path` once across `v_wave ∈ [0, 2^Bw - 1]` and recording the
 /// first wavelet-domain code that reconstructs each 8-bit pixel value.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_nlt_extended(
     width: u16,
     height: u16,
@@ -5485,6 +5593,9 @@ pub fn encode_planar_nlt_extended(
 /// `q = 0` is lossless within the quadratic LUT resolution; `q > 0`
 /// engages the `Fq = 8` lossy mode.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_subsampled_nlt_quadratic(
     width: u16,
     height: u16,
@@ -5548,6 +5659,9 @@ pub fn encode_planar_subsampled_nlt_quadratic(
 /// both thresholds in `1..=2^Bw − 1`. `cpih` must be `0` for genuinely
 /// sub-sampled input (see [`encode_planar_subsampled_nlt_quadratic`]).
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_subsampled_nlt_extended(
     width: u16,
     height: u16,
@@ -5643,6 +5757,9 @@ pub fn encode_planar_subsampled_nlt_extended(
 /// and the full `2^B[i]` reverse-LUT). Star-Tetrix (`Cpih = 3`)
 /// high-bit-depth is still 8-bit-input specific.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_nlt_quadratic_highbd(
     width: u16,
     height: u16,
@@ -5738,6 +5855,9 @@ pub fn encode_planar_nlt_quadratic_highbd(
 /// component (the inner RCT guard rejects `cpih = 1` per Annex F.2);
 /// Star-Tetrix high bit depth remains out of scope.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_subsampled_nlt_quadratic_highbd(
     width: u16,
     height: u16,
@@ -5847,6 +5967,9 @@ pub fn encode_planar_subsampled_nlt_quadratic_highbd(
 ///
 /// Star-Tetrix (`Cpih = 3`) high-bit-depth remains out of scope.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_nlt_extended_highbd(
     width: u16,
     height: u16,
@@ -5951,6 +6074,9 @@ pub fn encode_planar_nlt_extended_highbd(
 /// constraints apply: `0 < t1 < t2`, `1 ≤ e ≤ 4`, both thresholds in
 /// `1..=2^Bw − 1`.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_subsampled_nlt_extended_highbd(
     width: u16,
     height: u16,
@@ -6171,7 +6297,7 @@ fn encode_planar_inner_nlt(
 /// still 8-bit-input specific because its forward LUT inverter is
 /// keyed on the reconstructed level table.
 #[allow(clippy::too_many_arguments)]
-fn encode_planar_inner_bd(
+pub(crate) fn encode_planar_inner_bd(
     width: u16,
     height: u16,
     nc: u8,
@@ -9559,6 +9685,9 @@ fn compute_precinct_row_ranges(height: u16, nly: u8) -> Vec<(u32, u32)> {
 /// * [`crate::JpegXsError::Invalid`] when even `q_precincts = [15;
 ///   n]` + `r_precincts = [0; n]` overshoots the budget.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode with EncodeOptions::target_bytes (IMAGE_CRATE_API)"
+)]
 pub fn pick_qpr_rpr_for_target_bytes(
     width: u16,
     height: u16,
@@ -9775,6 +9904,9 @@ fn pick_q_precincts_at_rp(
 /// callers can persist them for reproducible re-encode of identical
 /// parameters.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "use oxideav_jpegxs::encode / encode_components with EncodeOptions (IMAGE_CRATE_API)"
+)]
 pub fn encode_planar_qpr_rpr_target_bytes(
     width: u16,
     height: u16,
@@ -9804,7 +9936,6 @@ pub fn encode_planar_qpr_rpr_target_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decoder::decode_codestream;
 
     fn psnr(a: &[u8], b: &[u8]) -> f64 {
         assert_eq!(a.len(), b.len());
@@ -9897,7 +10028,7 @@ mod tests {
     fn encode_then_decode_flat_image_is_exact() {
         let pixels = vec![123u8; 32 * 32];
         let codestream = encode_luma_8bit(32, 32, &pixels).expect("encode flat 32x32");
-        let img = decode_codestream(&codestream, None).expect("decode flat 32x32");
+        let img = crate::decode_components(&codestream).expect("decode flat 32x32");
         assert_eq!(img.planes[0].data, pixels);
     }
 
@@ -9905,7 +10036,7 @@ mod tests {
     fn self_roundtrip_synthetic_32x32_is_lossless() {
         let pixels = make_synthetic_32x32();
         let codestream = encode_luma_8bit(32, 32, &pixels).expect("encode 32x32");
-        let img = decode_codestream(&codestream, None).expect("decode 32x32");
+        let img = crate::decode_components(&codestream).expect("decode 32x32");
         assert_eq!(img.planes[0].data, pixels);
         let p = psnr(&pixels, &img.planes[0].data);
         assert!(p >= 40.0, "self-roundtrip PSNR {p:.2} dB falls short");
@@ -9915,7 +10046,7 @@ mod tests {
     fn self_roundtrip_2x2_minimum_size() {
         let pixels = vec![10u8, 200, 50, 150];
         let codestream = encode_luma_8bit(2, 2, &pixels).expect("encode 2x2");
-        let img = decode_codestream(&codestream, None).expect("decode 2x2");
+        let img = crate::decode_components(&codestream).expect("decode 2x2");
         assert_eq!(img.planes[0].data, pixels);
     }
 
@@ -9923,7 +10054,7 @@ mod tests {
     fn encode_image_then_decode_round_trips() {
         let pixels = make_synthetic_32x32();
         let codestream = encode_raw_luma(32, 32, pixels.clone()).expect("encode_raw_luma");
-        let img = decode_codestream(&codestream, None).expect("decode after encode_raw_luma");
+        let img = crate::decode_components(&codestream).expect("decode after encode_raw_luma");
         assert_eq!(img.planes[0].data, pixels);
     }
 
@@ -9933,7 +10064,7 @@ mod tests {
     fn self_roundtrip_rgb_32x32_no_transform() {
         let pixels = make_synthetic_rgb_32x32();
         let codestream = encode_rgb_8bit(32, 32, &pixels, 0, 1).expect("encode RGB 32x32");
-        let img = decode_codestream(&codestream, None).expect("decode RGB Cpih=0");
+        let img = crate::decode_components(&codestream).expect("decode RGB Cpih=0");
         let n = 32 * 32;
         let (mut r, mut g, mut b) = (
             Vec::with_capacity(n),
@@ -9954,7 +10085,7 @@ mod tests {
     fn self_roundtrip_rgb_32x32_rct() {
         let pixels = make_synthetic_rgb_32x32();
         let codestream = encode_rgb_8bit(32, 32, &pixels, 1, 1).expect("encode RGB Cpih=1");
-        let img = decode_codestream(&codestream, None).expect("decode RGB Cpih=1");
+        let img = crate::decode_components(&codestream).expect("decode RGB Cpih=1");
         let n = 32 * 32;
         let (mut r, mut g, mut b) = (
             Vec::with_capacity(n),
@@ -9976,7 +10107,7 @@ mod tests {
         let pixels = make_synthetic_32x32();
         let codestream = encode_planar(32, 32, 1, 0, 2, 2, std::slice::from_ref(&pixels))
             .expect("encode luma NL=2/2");
-        let img = decode_codestream(&codestream, None).expect("decode luma NL=2/2");
+        let img = crate::decode_components(&codestream).expect("decode luma NL=2/2");
         assert_eq!(img.planes[0].data, pixels);
     }
 
@@ -9984,7 +10115,7 @@ mod tests {
     fn self_roundtrip_rgb_nl_2_2_rct() {
         let pixels = make_synthetic_rgb_32x32();
         let codestream = encode_rgb_8bit(32, 32, &pixels, 1, 2).expect("encode RGB NL=2/2 Cpih=1");
-        let img = decode_codestream(&codestream, None).expect("decode RGB NL=2/2 Cpih=1");
+        let img = crate::decode_components(&codestream).expect("decode RGB NL=2/2 Cpih=1");
         let n = 32 * 32;
         let (mut r, mut g, mut b) = (
             Vec::with_capacity(n),
@@ -10010,7 +10141,7 @@ mod tests {
             }
         }
         let codestream = encode_luma_8bit(31, 31, &pixels).expect("encode 31x31");
-        let img = decode_codestream(&codestream, None).expect("decode 31x31");
+        let img = crate::decode_components(&codestream).expect("decode 31x31");
         assert_eq!(img.planes[0].data, pixels);
     }
 
@@ -10026,7 +10157,7 @@ mod tests {
         }
         let codestream = encode_planar(w as u16, h as u16, 1, 0, 2, 2, &[pixels.clone()])
             .expect("encode 33x17 NL=2/2");
-        let img = decode_codestream(&codestream, None).expect("decode 33x17 NL=2/2");
+        let img = crate::decode_components(&codestream).expect("decode 33x17 NL=2/2");
         assert_eq!(img.planes[0].data, pixels);
     }
 
@@ -10044,30 +10175,20 @@ mod tests {
             g.push(chunk[1]);
             b.push(chunk[2]);
         }
-        let img = JpegXsImage {
-            width: 32,
-            height: 32,
-            num_components: 3,
-            cpih: 1,
-            bit_depth: 8,
-            planes: vec![
-                JpegXsPlane {
-                    stride: 32,
-                    data: r.clone(),
-                },
-                JpegXsPlane {
-                    stride: 32,
-                    data: g.clone(),
-                },
-                JpegXsPlane {
-                    stride: 32,
-                    data: b.clone(),
-                },
+        // Contract layout: G, B, R plane order (`Gbrp8`), RCT on encode.
+        let img = JpegXsImage::new(
+            32,
+            32,
+            crate::JpegXsPixelFormat::Gbrp8,
+            vec![
+                JpegXsPlane::new(32, g.clone()),
+                JpegXsPlane::new(32, b.clone()),
+                JpegXsPlane::new(32, r.clone()),
             ],
-            pts: None,
-        };
+        )
+        .unwrap();
         let codestream = encode_image(&img).expect("encode_image RGB Cpih=1");
-        let decoded = decode_codestream(&codestream, None).expect("decode RGB image");
+        let decoded = crate::decode_components(&codestream).expect("decode RGB image");
         assert_eq!(decoded.planes[0].data, r);
         assert_eq!(decoded.planes[1].data, g);
         assert_eq!(decoded.planes[2].data, b);
@@ -10112,7 +10233,7 @@ mod tests {
         );
         // And round-trip remains lossless.
         let img =
-            decode_codestream(&encode_rgb_8bit(32, 32, &pixels, 1, 2).unwrap(), None).unwrap();
+            crate::decode_components(&encode_rgb_8bit(32, 32, &pixels, 1, 2).unwrap()).unwrap();
         let n = 32 * 32;
         let (mut r, mut g, mut b) = (
             Vec::with_capacity(n),
@@ -10143,7 +10264,7 @@ mod tests {
             "round-3 flat luma codestream {} not smaller than raw 1024",
             codestream.len()
         );
-        let img = decode_codestream(&codestream, None).expect("decode flat 32x32");
+        let img = crate::decode_components(&codestream).expect("decode flat 32x32");
         assert_eq!(img.planes[0].data, pixels);
     }
 
@@ -10170,7 +10291,7 @@ mod tests {
         }
         let cs = encode_planar_lossy(32, 32, 3, 1, 2, 2, 1, &[r.clone(), g.clone(), b.clone()])
             .expect("encode lossy q=1");
-        let img = decode_codestream(&cs, None).expect("decode lossy");
+        let img = crate::decode_components(&cs).expect("decode lossy");
         let mut decoded_rgb = vec![0u8; pixels.len()];
         for (i, ((rd, gd), bd)) in img.planes[0]
             .data
@@ -10214,7 +10335,7 @@ mod tests {
             b.push(chunk[2]);
         }
         let cs = encode_planar_lossy(32, 32, 3, 1, 2, 2, 4, &[r, g, b]).expect("encode lossy q=4");
-        let img = decode_codestream(&cs, None).expect("decode lossy q=4");
+        let img = crate::decode_components(&cs).expect("decode lossy q=4");
         let mut decoded_rgb = vec![0u8; pixels.len()];
         for (i, ((rd, gd), bd)) in img.planes[0]
             .data
@@ -10276,8 +10397,8 @@ mod tests {
             &[y_plane.clone(), cb_plane.clone(), cr_plane.clone()],
         )
         .expect("encode 4:2:2 lossless");
-        let img = decode_codestream(&cs, None).expect("decode 4:2:2");
-        assert_eq!(img.num_components, 3);
+        let img = crate::decode_components(&cs).expect("decode 4:2:2");
+        assert_eq!(img.num_components(), 3);
         assert_eq!(img.planes[0].data, y_plane);
         assert_eq!(img.planes[1].data, cb_plane);
         assert_eq!(img.planes[2].data, cr_plane);
@@ -10313,8 +10434,8 @@ mod tests {
             &[y_plane.clone(), cb_plane.clone(), cr_plane.clone()],
         )
         .expect("encode 4:2:0 lossless");
-        let img = decode_codestream(&cs, None).expect("decode 4:2:0");
-        assert_eq!(img.num_components, 3);
+        let img = crate::decode_components(&cs).expect("decode 4:2:0");
+        assert_eq!(img.num_components(), 3);
         assert_eq!(img.planes[0].data, y_plane);
         assert_eq!(img.planes[1].data, cb_plane);
         assert_eq!(img.planes[2].data, cr_plane);
@@ -10392,8 +10513,8 @@ mod tests {
             &[planes[0].clone(), planes[1].clone(), planes[2].clone()],
         )
         .expect("encode 4:4:4 NL=3/3");
-        let img = crate::decoder::decode_codestream(&cs, None).expect("decode 4:4:4 NL=3/3");
-        assert_eq!(img.num_components, 3);
+        let img = crate::decode_components(&cs).expect("decode 4:4:4 NL=3/3");
+        assert_eq!(img.num_components(), 3);
         assert_eq!(img.planes[0].data, planes[0]);
         assert_eq!(img.planes[1].data, planes[1]);
         assert_eq!(img.planes[2].data, planes[2]);
@@ -10429,8 +10550,8 @@ mod tests {
             &[y_plane.clone(), cb_plane.clone(), cr_plane.clone()],
         )
         .expect("encode 4:2:2 NL=3/3");
-        let img = crate::decoder::decode_codestream(&cs, None).expect("decode 4:2:2 NL=3/3");
-        assert_eq!(img.num_components, 3);
+        let img = crate::decode_components(&cs).expect("decode 4:2:2 NL=3/3");
+        assert_eq!(img.num_components(), 3);
         assert_eq!(img.planes[0].data, y_plane);
         assert_eq!(img.planes[1].data, cb_plane);
         assert_eq!(img.planes[2].data, cr_plane);
@@ -10466,8 +10587,8 @@ mod tests {
             &[y_plane.clone(), cb_plane.clone(), cr_plane.clone()],
         )
         .expect("encode 4:2:0 NL=2/2 q=2 lossy");
-        let img = crate::decoder::decode_codestream(&cs, None).expect("decode 4:2:0 NL=2/2 q=2");
-        assert_eq!(img.num_components, 3);
+        let img = crate::decode_components(&cs).expect("decode 4:2:0 NL=2/2 q=2");
+        assert_eq!(img.num_components(), 3);
         // Lossy path — check that bytes-out matches plane sample count and
         // values are within a reasonable error range of the originals (sanity).
         assert_eq!(img.planes[0].data.len(), y_plane.len());
@@ -10528,8 +10649,8 @@ mod tests {
             &[y_plane.clone(), cb_plane.clone(), cr_plane.clone()],
         )
         .expect("encode 4:2:0 NL=3/2 lossless");
-        let img = crate::decoder::decode_codestream(&cs, None).expect("decode 4:2:0 NL=3/2");
-        assert_eq!(img.num_components, 3);
+        let img = crate::decode_components(&cs).expect("decode 4:2:0 NL=3/2");
+        assert_eq!(img.num_components(), 3);
         assert_eq!(img.planes[0].data, y_plane);
         assert_eq!(img.planes[1].data, cb_plane);
         assert_eq!(img.planes[2].data, cr_plane);
@@ -10565,8 +10686,8 @@ mod tests {
             &[y_plane.clone(), cb_plane.clone(), cr_plane.clone()],
         )
         .expect("encode 4:2:0 NL=2/2 lossless");
-        let img = crate::decoder::decode_codestream(&cs, None).expect("decode 4:2:0 NL=2/2");
-        assert_eq!(img.num_components, 3);
+        let img = crate::decode_components(&cs).expect("decode 4:2:0 NL=2/2");
+        assert_eq!(img.num_components(), 3);
         assert_eq!(img.planes[0].data, y_plane);
         assert_eq!(img.planes[1].data, cb_plane);
         assert_eq!(img.planes[2].data, cr_plane);
@@ -10604,8 +10725,8 @@ mod tests {
             &[y_plane.clone(), cb_plane.clone(), cr_plane.clone()],
         )
         .expect("encode 4:2:0 NL=3/3 q=2");
-        let img = crate::decoder::decode_codestream(&cs, None).expect("decode 4:2:0 NL=3/3 q=2");
-        assert_eq!(img.num_components, 3);
+        let img = crate::decode_components(&cs).expect("decode 4:2:0 NL=3/3 q=2");
+        assert_eq!(img.num_components(), 3);
         assert_eq!(img.planes[0].data.len(), y_plane.len());
         assert_eq!(img.planes[1].data.len(), cb_plane.len());
         assert_eq!(img.planes[2].data.len(), cr_plane.len());
@@ -10647,9 +10768,8 @@ mod tests {
             &[y_plane.clone(), cb_plane.clone(), cr_plane.clone()],
         )
         .expect("encode 4:2:0 NL=3/3 lossless");
-        let img =
-            crate::decoder::decode_codestream(&cs, None).expect("decode 4:2:0 NL=3/3 lossless");
-        assert_eq!(img.num_components, 3);
+        let img = crate::decode_components(&cs).expect("decode 4:2:0 NL=3/3 lossless");
+        assert_eq!(img.num_components(), 3);
         assert_eq!(img.planes[0].data, y_plane);
         assert_eq!(img.planes[1].data, cb_plane);
         assert_eq!(img.planes[2].data, cr_plane);
@@ -10685,8 +10805,8 @@ mod tests {
             &[y_plane.clone(), cb_plane.clone(), cr_plane.clone()],
         )
         .expect("encode 4:2:2 NL=2/2 lossless");
-        let img = crate::decoder::decode_codestream(&cs, None).expect("decode 4:2:2 NL=2/2");
-        assert_eq!(img.num_components, 3);
+        let img = crate::decode_components(&cs).expect("decode 4:2:2 NL=2/2");
+        assert_eq!(img.num_components(), 3);
         assert_eq!(img.planes[0].data, y_plane);
         assert_eq!(img.planes[1].data, cb_plane);
         assert_eq!(img.planes[2].data, cr_plane);
@@ -10733,8 +10853,8 @@ mod tests {
             &[r.clone(), g1.clone(), g2.clone(), b.clone()],
         )
         .expect("encode Cpih=3 lossless");
-        let img = decode_codestream(&cs, None).expect("decode Cpih=3");
-        assert_eq!(img.num_components, 4);
+        let img = crate::decode_components(&cs).expect("decode Cpih=3");
+        assert_eq!(img.num_components(), 4);
         assert_eq!(img.planes[0].data, r, "red plane must round-trip");
         assert_eq!(img.planes[1].data, g1, "G1 plane must round-trip");
         assert_eq!(img.planes[2].data, g2, "G2 plane must round-trip");
@@ -10759,7 +10879,7 @@ mod tests {
             &[r.clone(), g1.clone(), g2.clone(), b.clone()],
         )
         .expect("encode Cpih=3 Ct=1 e1=2 e2=3");
-        let img = decode_codestream(&cs, None).expect("decode Cpih=3 Ct=1");
+        let img = crate::decode_components(&cs).expect("decode Cpih=3 Ct=1");
         assert_eq!(img.planes[0].data, r);
         assert_eq!(img.planes[1].data, g1);
         assert_eq!(img.planes[2].data, g2);
@@ -10783,7 +10903,7 @@ mod tests {
             &[r.clone(), g1.clone(), g2.clone(), b.clone()],
         )
         .expect("encode Cpih=3 NL=2/2 Cf=3");
-        let img = decode_codestream(&cs, None).expect("decode Cpih=3 NL=2/2 Cf=3");
+        let img = crate::decode_components(&cs).expect("decode Cpih=3 NL=2/2 Cf=3");
         assert_eq!(img.planes[0].data, r);
         assert_eq!(img.planes[1].data, g1);
         assert_eq!(img.planes[2].data, g2);
@@ -10799,7 +10919,7 @@ mod tests {
     fn round4_vertical_prediction_lossless_round_trip() {
         let pixels = make_synthetic_rgb_32x32();
         let codestream = encode_rgb_8bit(32, 32, &pixels, 1, 2).expect("encode RGB NL=2/2 Cpih=1");
-        let img = decode_codestream(&codestream, None).expect("decode round 4 vertpred");
+        let img = crate::decode_components(&codestream).expect("decode round 4 vertpred");
         let n = 32 * 32;
         let (mut r, mut g, mut b) = (
             Vec::with_capacity(n),
@@ -10832,7 +10952,7 @@ mod tests {
         }
         let cs = encode_planar(w, h, 1, 0, 2, 2, &[pixels.clone()])
             .expect("encode 64x64 vertical gradient");
-        let img = decode_codestream(&cs, None).expect("decode 64x64 vertical gradient");
+        let img = crate::decode_components(&cs).expect("decode 64x64 vertical gradient");
         assert_eq!(img.planes[0].data, pixels, "round-trip lossless");
         assert!(
             cs.len() < 4096,
@@ -10883,7 +11003,7 @@ mod tests {
         }
         let cs = encode_planar(w, h, 1, 0, 2, 1, std::slice::from_ref(&pixels))
             .expect("encode luma NL_x=2 NL_y=1");
-        let img = decode_codestream(&cs, None).expect("decode NL_x=2 NL_y=1");
+        let img = crate::decode_components(&cs).expect("decode NL_x=2 NL_y=1");
         assert_eq!(
             img.planes[0].data, pixels,
             "luma must round-trip with NL_x=2 NL_y=1"
@@ -10907,7 +11027,7 @@ mod tests {
         }
         let cs = encode_planar(32, 32, 3, 1, 2, 1, &[r.clone(), g.clone(), b.clone()])
             .expect("encode RGB NL_x=2 NL_y=1 Cpih=1");
-        let img = decode_codestream(&cs, None).expect("decode RGB NL_x=2 NL_y=1");
+        let img = crate::decode_components(&cs).expect("decode RGB NL_x=2 NL_y=1");
         assert_eq!(img.planes[0].data, r, "red plane NL_x=2 NL_y=1");
         assert_eq!(img.planes[1].data, g, "green plane NL_x=2 NL_y=1");
         assert_eq!(img.planes[2].data, b, "blue plane NL_x=2 NL_y=1");
@@ -10936,7 +11056,7 @@ mod tests {
         let cs =
             encode_planar_nlt_quadratic(32, 32, 1, 0, 2, 2, 0, 0, std::slice::from_ref(&pixels))
                 .expect("encode NLT quadratic lossless");
-        let img = decode_codestream(&cs, None).expect("decode NLT quadratic");
+        let img = crate::decode_components(&cs).expect("decode NLT quadratic");
         let p = psnr(&pixels, &img.planes[0].data);
         assert!(
             p >= 40.0,
@@ -10980,7 +11100,7 @@ mod tests {
             &[y.clone(), u.clone(), v.clone()],
         )
         .expect("encode 4:2:2 NLT quadratic");
-        let img = decode_codestream(&cs, None).expect("decode 4:2:2 NLT quadratic");
+        let img = crate::decode_components(&cs).expect("decode 4:2:2 NLT quadratic");
         for (plane, orig, name) in [
             (&img.planes[0].data, &y, "Y"),
             (&img.planes[1].data, &u, "U"),
@@ -11032,7 +11152,7 @@ mod tests {
             &[y.clone(), u.clone(), v.clone()],
         )
         .expect("encode 4:2:0 NLT quadratic");
-        let img = decode_codestream(&cs, None).expect("decode 4:2:0 NLT quadratic");
+        let img = crate::decode_components(&cs).expect("decode 4:2:0 NLT quadratic");
         for (plane, orig, name) in [
             (&img.planes[0].data, &y, "Y"),
             (&img.planes[1].data, &u, "U"),
@@ -11088,7 +11208,7 @@ mod tests {
             &[y.clone(), u.clone(), v.clone()],
         )
         .expect("encode 4:2:2 NLT extended");
-        let img = decode_codestream(&cs, None).expect("decode 4:2:2 NLT extended");
+        let img = crate::decode_components(&cs).expect("decode 4:2:2 NLT extended");
         for (plane, orig, name) in [
             (&img.planes[0].data, &y, "Y"),
             (&img.planes[1].data, &u, "U"),
@@ -11189,7 +11309,7 @@ mod tests {
             lossy.len(),
             lossless
         );
-        let img = decode_codestream(&lossy, None).expect("decode 4:2:0 NLT lossy q=2");
+        let img = crate::decode_components(&lossy).expect("decode 4:2:0 NLT lossy q=2");
         for (plane, orig, name) in [
             (&img.planes[0].data, &y, "Y"),
             (&img.planes[1].data, &u, "U"),
@@ -11243,7 +11363,7 @@ mod tests {
             &[y.clone(), u.clone(), v.clone()],
         )
         .expect("encode odd-dim 4:2:0 NLT quadratic");
-        let img = decode_codestream(&cs, None).expect("decode odd-dim 4:2:0 NLT quadratic");
+        let img = crate::decode_components(&cs).expect("decode odd-dim 4:2:0 NLT quadratic");
         assert_eq!(img.planes[1].data.len(), cw * ch, "chroma is ceil-sized");
         for (plane, orig, name) in [
             (&img.planes[0].data, &y, "Y"),
@@ -11270,7 +11390,7 @@ mod tests {
         let lossy_cs =
             encode_planar_nlt_quadratic(32, 32, 1, 0, 2, 2, 2, 0, std::slice::from_ref(&pixels))
                 .expect("encode NLT lossy q=2");
-        let img = decode_codestream(&lossy_cs, None).expect("decode NLT lossy q=2");
+        let img = crate::decode_components(&lossy_cs).expect("decode NLT lossy q=2");
         let p = psnr(&pixels, &img.planes[0].data);
         assert!(
             p >= 30.0,
@@ -11346,8 +11466,8 @@ mod tests {
             std::slice::from_ref(&plane),
         )
         .expect("encode NLT quadratic high-bd 10-bit lossless");
-        let img = crate::decoder::decode_codestream(&cs, None).expect("decode 10-bit NLT");
-        assert_eq!(img.num_components, 1);
+        let img = crate::decode_components(&cs).expect("decode 10-bit NLT");
+        assert_eq!(img.num_components(), 1);
         let p = psnr_u16_bytes(&plane, &img.planes[0].data, bd);
         assert!(
             p >= 40.0,
@@ -11376,7 +11496,7 @@ mod tests {
             std::slice::from_ref(&plane),
         )
         .expect("encode NLT quadratic high-bd 12-bit lossless");
-        let img = crate::decoder::decode_codestream(&cs, None).expect("decode 12-bit NLT");
+        let img = crate::decode_components(&cs).expect("decode 12-bit NLT");
         let p = psnr_u16_bytes(&plane, &img.planes[0].data, bd);
         assert!(
             p >= 40.0,
@@ -11413,8 +11533,8 @@ mod tests {
             &[y.clone(), u.clone(), v.clone()],
         )
         .expect("encode 4:2:2 high-bd NLT quadratic");
-        let img = crate::decoder::decode_codestream(&cs, None).expect("decode 4:2:2 high-bd NLT");
-        assert_eq!(img.num_components, 3);
+        let img = crate::decode_components(&cs).expect("decode 4:2:2 high-bd NLT");
+        assert_eq!(img.num_components(), 3);
         for (orig, plane, name) in [
             (&y, &img.planes[0].data, "Y"),
             (&u, &img.planes[1].data, "U"),
@@ -11456,7 +11576,7 @@ mod tests {
             &[y.clone(), u.clone(), v.clone()],
         )
         .expect("encode 4:2:0 high-bd NLT quadratic");
-        let img = crate::decoder::decode_codestream(&cs, None).expect("decode 4:2:0 high-bd NLT");
+        let img = crate::decode_components(&cs).expect("decode 4:2:0 high-bd NLT");
         for (orig, plane, name) in [
             (&y, &img.planes[0].data, "Y"),
             (&u, &img.planes[1].data, "U"),
@@ -11503,8 +11623,7 @@ mod tests {
             &[y.clone(), u.clone(), v.clone()],
         )
         .expect("encode 4:2:2 high-bd NLT extended");
-        let img = crate::decoder::decode_codestream(&cs, None)
-            .expect("decode 4:2:2 high-bd NLT extended");
+        let img = crate::decode_components(&cs).expect("decode 4:2:2 high-bd NLT extended");
         for (orig, plane, name) in [
             (&y, &img.planes[0].data, "Y"),
             (&u, &img.planes[1].data, "U"),
@@ -11539,7 +11658,7 @@ mod tests {
             std::slice::from_ref(&plane),
         )
         .expect("encode NLT quadratic high-bd 16-bit lossless");
-        let img = crate::decoder::decode_codestream(&cs, None).expect("decode 16-bit NLT");
+        let img = crate::decode_components(&cs).expect("decode 16-bit NLT");
         let p = psnr_u16_bytes(&plane, &img.planes[0].data, bd);
         assert!(
             p >= 40.0,
@@ -11584,7 +11703,7 @@ mod tests {
             std::slice::from_ref(&plane),
         )
         .expect("encode 10-bit NLT lossy q=2");
-        let img = crate::decoder::decode_codestream(&lossy_cs, None).expect("decode q=2 10-bit");
+        let img = crate::decode_components(&lossy_cs).expect("decode q=2 10-bit");
         let p = psnr_u16_bytes(&plane, &img.planes[0].data, bd);
         assert!(
             p >= 30.0,
@@ -11628,8 +11747,8 @@ mod tests {
             std::slice::from_ref(&plane),
         )
         .expect("encode 10-bit NLT dco=1024");
-        let img = crate::decoder::decode_codestream(&cs, None).expect("decode 10-bit NLT dco=1024");
-        assert_eq!(img.num_components, 1);
+        let img = crate::decode_components(&cs).expect("decode 10-bit NLT dco=1024");
+        assert_eq!(img.num_components(), 1);
         assert_eq!(img.planes[0].data.len(), w * h * 2);
     }
 
@@ -11702,8 +11821,8 @@ mod tests {
         )
         .expect("encode 10-bit NLT extended lossless");
         // Decoder produces a 10-bit plane (2 bytes per sample).
-        let img = crate::decoder::decode_codestream(&cs, None).expect("decode 10-bit NLT extended");
-        assert_eq!(img.num_components, 1);
+        let img = crate::decode_components(&cs).expect("decode 10-bit NLT extended");
+        assert_eq!(img.num_components(), 1);
         assert_eq!(img.planes[0].data.len(), w * h * 2);
     }
 
@@ -11731,8 +11850,8 @@ mod tests {
             &[r.clone(), g.clone(), b.clone()],
         )
         .expect("encode 10-bit RGB+RCT NLT quadratic");
-        let img = crate::decoder::decode_codestream(&cs, None).expect("decode 10-bit RGB+RCT NLT");
-        assert_eq!(img.num_components, 3);
+        let img = crate::decode_components(&cs).expect("decode 10-bit RGB+RCT NLT");
+        assert_eq!(img.num_components(), 3);
         let pr = psnr_u16_bytes(&r, &img.planes[0].data, bd);
         let pg = psnr_u16_bytes(&g, &img.planes[1].data, bd);
         let pb = psnr_u16_bytes(&b, &img.planes[2].data, bd);
@@ -11768,7 +11887,7 @@ mod tests {
             std::slice::from_ref(&plane),
         )
         .expect("encode 10-bit NLT extended lossless");
-        let img = crate::decoder::decode_codestream(&cs, None).expect("decode 10-bit NLT extended");
+        let img = crate::decode_components(&cs).expect("decode 10-bit NLT extended");
         let p = psnr_u16_bytes(&plane, &img.planes[0].data, bd);
         assert!(
             p >= 30.0,
@@ -11799,7 +11918,7 @@ mod tests {
             std::slice::from_ref(&plane),
         )
         .expect("encode 12-bit NLT extended lossless");
-        let img = crate::decoder::decode_codestream(&cs, None).expect("decode 12-bit NLT extended");
+        let img = crate::decode_components(&cs).expect("decode 12-bit NLT extended");
         let p = psnr_u16_bytes(&plane, &img.planes[0].data, bd);
         assert!(
             p >= 30.0,
@@ -11831,7 +11950,7 @@ mod tests {
             std::slice::from_ref(&plane),
         )
         .expect("encode 16-bit NLT extended lossless");
-        let img = crate::decoder::decode_codestream(&cs, None).expect("decode 16-bit NLT extended");
+        let img = crate::decode_components(&cs).expect("decode 16-bit NLT extended");
         let p = psnr_u16_bytes(&plane, &img.planes[0].data, bd);
         assert!(
             p >= 30.0,
@@ -11878,8 +11997,7 @@ mod tests {
             std::slice::from_ref(&plane),
         )
         .expect("encode 10-bit NLT extended lossy q=2");
-        let img = crate::decoder::decode_codestream(&lossy_cs, None)
-            .expect("decode 10-bit NLT extended q=2");
+        let img = crate::decode_components(&lossy_cs).expect("decode 10-bit NLT extended q=2");
         let p = psnr_u16_bytes(&plane, &img.planes[0].data, bd);
         assert!(
             p >= 25.0,
@@ -11920,9 +12038,8 @@ mod tests {
             &[r.clone(), g.clone(), b.clone()],
         )
         .expect("encode 10-bit RGB+RCT NLT extended");
-        let img = crate::decoder::decode_codestream(&cs, None)
-            .expect("decode 10-bit RGB+RCT NLT extended");
-        assert_eq!(img.num_components, 3);
+        let img = crate::decode_components(&cs).expect("decode 10-bit RGB+RCT NLT extended");
+        assert_eq!(img.num_components(), 3);
         let pr = psnr_u16_bytes(&r, &img.planes[0].data, bd);
         let pg = psnr_u16_bytes(&g, &img.planes[1].data, bd);
         let pb = psnr_u16_bytes(&b, &img.planes[2].data, bd);
@@ -12139,7 +12256,7 @@ mod tests {
         }
         let cs = encode_planar_lossy(32, 32, 3, 1, 2, 2, 2, &[r.clone(), g.clone(), b.clone()])
             .expect("encode lossy q=2 with per-band gains");
-        let img = decode_codestream(&cs, None).expect("decode q=2");
+        let img = crate::decode_components(&cs).expect("decode q=2");
         let mut dec_rgb = vec![0u8; pixels.len()];
         for (i, ((rd, gd), bd)) in img.planes[0]
             .data
@@ -12179,12 +12296,12 @@ mod tests {
             cs_nl2.len()
         );
         // Round-trip losslessly.
-        let img2 = decode_codestream(&cs_nl2, None).expect("decode NL=2 flat");
+        let img2 = crate::decode_components(&cs_nl2).expect("decode NL=2 flat");
         assert_eq!(img2.planes[0].data, pixels, "NL=2 round-trip");
         // NL=1 (single-level, no significance) also round-trips.
         let cs_nl1 =
             encode_planar(64, 64, 1, 0, 1, 1, std::slice::from_ref(&pixels)).expect("encode NL=1");
-        let img1 = decode_codestream(&cs_nl1, None).expect("decode NL=1 flat");
+        let img1 = crate::decode_components(&cs_nl1).expect("decode NL=1 flat");
         assert_eq!(img1.planes[0].data, pixels, "NL=1 round-trip");
     }
 
@@ -12237,7 +12354,7 @@ mod tests {
         );
         let cs = encode_planar(w, h, 1, 0, 1, 1, std::slice::from_ref(&pixels))
             .expect("encode wide NL=1");
-        let img = decode_codestream(&cs, None).expect("decode wide NL=1");
+        let img = crate::decode_components(&cs).expect("decode wide NL=1");
         assert_eq!(img.planes[0].data, pixels, "wide NL=1 streaming round-trip");
     }
 
@@ -12271,7 +12388,7 @@ mod tests {
             cs.len(),
             wu * hu
         );
-        let img = decode_codestream(&cs, None).expect("decode Ns=2 NL=2 flat");
+        let img = crate::decode_components(&cs).expect("decode Ns=2 NL=2 flat");
         assert_eq!(img.planes[0].data, pixels, "Ns=2 NL=2 round-trip");
     }
 
@@ -12300,7 +12417,7 @@ mod tests {
             .expect("encode Rm=1 luma");
         let parsed = crate::codestream::parse(&cs).expect("parse Rm=1 codestream");
         assert_eq!(parsed.pih.rm, 1, "PIH should report Rm=1");
-        let img = decode_codestream(&cs, None).expect("decode Rm=1 luma");
+        let img = crate::decode_components(&cs).expect("decode Rm=1 luma");
         assert_eq!(img.planes[0].data, px, "Rm=1 luma lossless round-trip");
     }
 
@@ -12323,11 +12440,11 @@ mod tests {
         );
         // Both are bit-exact lossless.
         assert_eq!(
-            decode_codestream(&rm1, None).expect("dec Rm=1").planes[0].data,
+            crate::decode_components(&rm1).expect("dec Rm=1").planes[0].data,
             px
         );
         assert_eq!(
-            decode_codestream(&rm0, None).expect("dec Rm=0").planes[0].data,
+            crate::decode_components(&rm0).expect("dec Rm=0").planes[0].data,
             px
         );
     }
@@ -12344,7 +12461,7 @@ mod tests {
         let planes = [r.clone(), g.clone(), b.clone()];
         let cs = encode_planar_run_mode1(w, h, 3, 1, 2, 2, 0, &planes).expect("encode Rm=1 RGB");
         assert_eq!(crate::codestream::parse(&cs).unwrap().pih.rm, 1);
-        let img = decode_codestream(&cs, None).expect("decode Rm=1 RGB");
+        let img = crate::decode_components(&cs).expect("decode Rm=1 RGB");
         assert_eq!(img.planes[0].data, r, "R plane");
         assert_eq!(img.planes[1].data, g, "G plane");
         assert_eq!(img.planes[2].data, b, "B plane");
@@ -12385,7 +12502,7 @@ mod tests {
         let parsed = crate::codestream::parse(&cs).expect("parse");
         assert_eq!(parsed.pih.nc, 4, "PIH Nc=4");
         assert_eq!(parsed.pih.cpih, 1, "PIH Cpih=1");
-        let img = decode_codestream(&cs, None).expect("decode Nc=4 Cpih=1");
+        let img = crate::decode_components(&cs).expect("decode Nc=4 Cpih=1");
         assert_eq!(img.planes.len(), 4);
         assert_eq!(img.planes[0].data, r, "R plane");
         assert_eq!(img.planes[1].data, g, "G plane");
@@ -12405,7 +12522,7 @@ mod tests {
         let [r, g, b, a] = make_rgba_planes(w as usize, h as usize);
         let planes = [r.clone(), g.clone(), b.clone(), a.clone()];
         let cs = encode_planar(w, h, 4, 1, 1, 1, &planes).expect("encode Nc=4 NL=1/1");
-        let img = decode_codestream(&cs, None).expect("decode Nc=4 NL=1/1");
+        let img = crate::decode_components(&cs).expect("decode Nc=4 NL=1/1");
         assert_eq!(img.planes.len(), 4);
         assert_eq!(img.planes[0].data, r, "R plane");
         assert_eq!(img.planes[1].data, g, "G plane");
@@ -12423,7 +12540,7 @@ mod tests {
         let planes = [l.clone(), a.clone()];
         let cs = encode_planar(w, h, 2, 0, 2, 2, &planes).expect("encode Nc=2");
         assert_eq!(crate::codestream::parse(&cs).unwrap().pih.nc, 2);
-        let img = decode_codestream(&cs, None).expect("decode Nc=2");
+        let img = crate::decode_components(&cs).expect("decode Nc=2");
         assert_eq!(img.planes.len(), 2);
         assert_eq!(img.planes[0].data, l, "luma plane");
         assert_eq!(img.planes[1].data, a, "alpha plane");
@@ -12439,7 +12556,7 @@ mod tests {
         let k: Vec<u8> = a.iter().map(|&v| 255 - v).collect();
         let planes = [r.clone(), g.clone(), b.clone(), a.clone(), k.clone()];
         let cs = encode_planar(w, h, 5, 1, 2, 2, &planes).expect("encode Nc=5 Cpih=1");
-        let img = decode_codestream(&cs, None).expect("decode Nc=5 Cpih=1");
+        let img = crate::decode_components(&cs).expect("decode Nc=5 Cpih=1");
         assert_eq!(img.planes.len(), 5);
         assert_eq!(img.planes[0].data, r, "R plane");
         assert_eq!(img.planes[1].data, g, "G plane");
@@ -12463,7 +12580,7 @@ mod tests {
             .collect();
         let cs = encode_planar(w, h, 8, 0, 2, 2, &planes).expect("encode Nc=8");
         assert_eq!(crate::codestream::parse(&cs).unwrap().pih.nc, 8);
-        let img = decode_codestream(&cs, None).expect("decode Nc=8");
+        let img = crate::decode_components(&cs).expect("decode Nc=8");
         assert_eq!(img.planes.len(), 8);
         for (k, plane) in planes.iter().enumerate() {
             assert_eq!(&img.planes[k].data, plane, "component {k}");
@@ -12488,7 +12605,7 @@ mod tests {
         let planes = [r.clone(), g.clone(), b.clone(), a.clone()];
         let cs =
             encode_planar_lossy(w, h, 4, 1, 2, 2, 2, &planes).expect("encode Nc=4 Cpih=1 lossy");
-        let img = decode_codestream(&cs, None).expect("decode Nc=4 Cpih=1 lossy");
+        let img = crate::decode_components(&cs).expect("decode Nc=4 Cpih=1 lossy");
         assert_eq!(img.planes.len(), 4);
         for (k, orig) in [&r, &g, &b, &a].into_iter().enumerate() {
             let mut sse = 0.0f64;
@@ -12515,7 +12632,7 @@ mod tests {
         let cs = encode_planar_run_mode1(w, h, 1, 0, 2, 2, 2, std::slice::from_ref(&px))
             .expect("encode Rm=1 lossy");
         assert_eq!(crate::codestream::parse(&cs).unwrap().pih.rm, 1);
-        let img = decode_codestream(&cs, None).expect("decode Rm=1 lossy");
+        let img = crate::decode_components(&cs).expect("decode Rm=1 lossy");
         let mut sse = 0.0f64;
         for (a, b) in px.iter().zip(img.planes[0].data.iter()) {
             let d = *a as f64 - *b as f64;
@@ -12542,7 +12659,7 @@ mod tests {
         let parsed = crate::codestream::parse(&cs).expect("parse");
         assert_eq!(parsed.pih.rm, 1, "PIH Rm=1");
         assert_eq!(parsed.pih.bw, 12, "Bw = B[i] = 12");
-        let img = decode_codestream(&cs, None).expect("decode Rm=1 12-bit");
+        let img = crate::decode_components(&cs).expect("decode Rm=1 12-bit");
         let out: Vec<u16> = img.planes[0]
             .data
             .chunks_exact(2)
@@ -12575,7 +12692,7 @@ mod tests {
         let cs = encode_planar_run_mode1_subsampled(w, h, 3, 0, 2, 2, 0, &sx, &sy, &planes)
             .expect("encode Rm=1 4:2:0");
         assert_eq!(crate::codestream::parse(&cs).unwrap().pih.rm, 1);
-        let img = decode_codestream(&cs, None).expect("decode Rm=1 4:2:0");
+        let img = crate::decode_components(&cs).expect("decode Rm=1 4:2:0");
         assert_eq!(img.planes[0].data, luma, "luma");
         assert_eq!(img.planes[1].data, cb, "Cb");
         assert_eq!(img.planes[2].data, cr, "Cr");
@@ -12596,7 +12713,7 @@ mod tests {
         let cs = encode_planar_run_mode1(w, h, 1, 0, 2, 2, 0, std::slice::from_ref(&px))
             .expect("encode Rm=1 Ns=2");
         assert_eq!(crate::codestream::parse(&cs).unwrap().pih.rm, 1);
-        let img = decode_codestream(&cs, None).expect("decode Rm=1 Ns=2");
+        let img = crate::decode_components(&cs).expect("decode Rm=1 Ns=2");
         assert_eq!(img.planes[0].data, px, "Rm=1 Ns=2 round-trip");
     }
 
@@ -12610,7 +12727,7 @@ mod tests {
         let cs = encode_planar_run_mode1(w, h, 1, 0, 3, 3, 0, std::slice::from_ref(&px))
             .expect("encode Rm=1 NL=3 odd");
         assert_eq!(crate::codestream::parse(&cs).unwrap().pih.rm, 1);
-        let img = decode_codestream(&cs, None).expect("decode Rm=1 NL=3 odd");
+        let img = crate::decode_components(&cs).expect("decode Rm=1 NL=3 odd");
         assert_eq!(img.planes[0].data, px, "Rm=1 NL=3 odd-dim round-trip");
     }
 
@@ -12627,7 +12744,7 @@ mod tests {
             let cs = encode_planar_run_mode1(w, h, 1, 0, 2, 2, q, std::slice::from_ref(&px))
                 .unwrap_or_else(|e| panic!("encode Rm=1 q={q}: {e}"));
             let img =
-                decode_codestream(&cs, None).unwrap_or_else(|e| panic!("decode Rm=1 q={q}: {e}"));
+                crate::decode_components(&cs).unwrap_or_else(|e| panic!("decode Rm=1 q={q}: {e}"));
             if q == 0 {
                 assert_eq!(img.planes[0].data, px, "Rm=1 q=0 bit-exact");
             }
@@ -12711,7 +12828,7 @@ mod tests {
         );
         let planes = [r.clone(), g.clone(), b.clone()];
         let cs = encode_planar(w, h, 3, 1, 2, 2, &planes).expect("encode Ns>1 RGB RCT");
-        let img = decode_codestream(&cs, None).expect("decode Ns>1 RGB RCT");
+        let img = crate::decode_components(&cs).expect("decode Ns>1 RGB RCT");
         assert_eq!(img.planes[0].data, r, "R plane round-trip");
         assert_eq!(img.planes[1].data, g, "G plane round-trip");
         assert_eq!(img.planes[2].data, b, "B plane round-trip");
@@ -12802,9 +12919,9 @@ mod tests {
                 &[y.clone(), cb.clone(), cr.clone()],
             )
             .unwrap_or_else(|e| panic!("encode 4:2:0 NL={nl}/{nl}: {e:?}"));
-            let img = decode_codestream(&cs, None)
+            let img = crate::decode_components(&cs)
                 .unwrap_or_else(|e| panic!("decode 4:2:0 NL={nl}/{nl}: {e:?}"));
-            assert_eq!(img.num_components, 3);
+            assert_eq!(img.num_components(), 3);
             assert_eq!(img.planes[0].data, y, "Y plane 4:2:0 NL={nl}/{nl}");
             assert_eq!(img.planes[1].data, cb, "Cb plane 4:2:0 NL={nl}/{nl}");
             assert_eq!(img.planes[2].data, cr, "Cr plane 4:2:0 NL={nl}/{nl}");
@@ -12834,7 +12951,7 @@ mod tests {
                 &[y.clone(), cb.clone(), cr.clone()],
             )
             .unwrap_or_else(|e| panic!("encode 4:2:0 NL={nlx}/{nly}: {e:?}"));
-            let img = decode_codestream(&cs, None)
+            let img = crate::decode_components(&cs)
                 .unwrap_or_else(|e| panic!("decode 4:2:0 NL={nlx}/{nly}: {e:?}"));
             assert_eq!(img.planes[0].data, y, "Y plane 4:2:0 NL={nlx}/{nly}");
             assert_eq!(img.planes[1].data, cb, "Cb plane 4:2:0 NL={nlx}/{nly}");
@@ -12865,7 +12982,7 @@ mod tests {
                 &[yp.clone(), cbp.clone(), crp.clone()],
             )
             .unwrap_or_else(|e| panic!("encode {bd}-bit 4:2:0 NL=3/3: {e:?}"));
-            let img = decode_codestream(&cs, None)
+            let img = crate::decode_components(&cs)
                 .unwrap_or_else(|e| panic!("decode {bd}-bit 4:2:0 NL=3/3: {e:?}"));
             let unpack = |d: &[u8]| -> Vec<u16> {
                 d.chunks_exact(2)
@@ -12900,7 +13017,7 @@ mod tests {
                 &[y.clone(), cb.clone(), cr.clone()],
             )
             .unwrap_or_else(|e| panic!("encode 4:2:0 lossy NL={nl}/{nl}: {e:?}"));
-            let img = decode_codestream(&cs, None)
+            let img = crate::decode_components(&cs)
                 .unwrap_or_else(|e| panic!("decode 4:2:0 lossy NL={nl}/{nl}: {e:?}"));
             assert_eq!(img.planes[0].data.len(), y.len());
             assert_eq!(img.planes[1].data.len(), cb.len());
@@ -12938,7 +13055,7 @@ mod tests {
             .unwrap_or_else(|e| panic!("encode NLT-quad NL={nly}/{nly}: {e:?}"));
             let parsed = crate::codestream::parse(&cs).expect("parse NLT-quad");
             assert_eq!(parsed.pih.bw, 18, "NLT quadratic forces Bw=18");
-            let img = decode_codestream(&cs, None)
+            let img = crate::decode_components(&cs)
                 .unwrap_or_else(|e| panic!("decode NLT-quad NL={nly}/{nly}: {e:?}"));
             let p = psnr(&lp, &img.planes[0].data);
             assert!(
@@ -12971,7 +13088,7 @@ mod tests {
             .unwrap_or_else(|e| panic!("encode NLT-ext NL={nly}/{nly}: {e:?}"));
             let parsed = crate::codestream::parse(&cs).expect("parse NLT-ext");
             assert_eq!(parsed.pih.bw, 18, "NLT extended forces Bw=18");
-            let img = decode_codestream(&cs, None)
+            let img = crate::decode_components(&cs)
                 .unwrap_or_else(|e| panic!("decode NLT-ext NL={nly}/{nly}: {e:?}"));
             let p = psnr(&lp, &img.planes[0].data);
             assert!(
@@ -12995,7 +13112,7 @@ mod tests {
                     .unwrap_or_else(|e| panic!("encode highprec NL={nly}/{nly}: {e:?}"));
             let parsed = crate::codestream::parse(&cs).expect("parse highprec");
             assert_eq!(parsed.pih.bw, 20, "high-precision path forces Bw=20");
-            let img = decode_codestream(&cs, None)
+            let img = crate::decode_components(&cs)
                 .unwrap_or_else(|e| panic!("decode highprec NL={nly}/{nly}: {e:?}"));
             assert_eq!(
                 img.planes[0].data, lp,
@@ -13020,9 +13137,9 @@ mod tests {
                 .unwrap_or_else(|e| panic!("encode Star-Tetrix NL={nl}/{nl}: {e:?}"));
             let parsed = crate::codestream::parse(&cs).expect("parse Star-Tetrix");
             assert_eq!(parsed.pih.cpih, 3, "Star-Tetrix must signal Cpih=3");
-            let img = decode_codestream(&cs, None)
+            let img = crate::decode_components(&cs)
                 .unwrap_or_else(|e| panic!("decode Star-Tetrix NL={nl}/{nl}: {e:?}"));
-            assert_eq!(img.num_components, 4);
+            assert_eq!(img.num_components(), 4);
             for (c, plane) in planes.iter().enumerate() {
                 assert_eq!(
                     &img.planes[c].data, plane,
@@ -13065,7 +13182,7 @@ mod tests {
                 parsed.pih.bw, 20,
                 "high-bit-depth NLT runs the wavelet domain at Bw=20"
             );
-            let img = decode_codestream(&cs, None)
+            let img = crate::decode_components(&cs)
                 .unwrap_or_else(|e| panic!("decode NLT-quad-highbd NL={nly}/{nly}: {e:?}"));
             let got: Vec<u16> = img.planes[0]
                 .data
@@ -13094,7 +13211,7 @@ mod tests {
         let pixels = make_nl_test_64x64();
         let cs = encode_planar(64, 64, 1, 0, 3, 3, std::slice::from_ref(&pixels))
             .expect("encode luma NL=3/3");
-        let img = decode_codestream(&cs, None).expect("decode NL=3/3");
+        let img = crate::decode_components(&cs).expect("decode NL=3/3");
         assert_eq!(
             img.planes[0].data, pixels,
             "luma must round-trip losslessly at NL=3/3"
@@ -13106,7 +13223,7 @@ mod tests {
         let pixels = make_nl_test_64x64();
         let cs = encode_planar(64, 64, 1, 0, 4, 4, std::slice::from_ref(&pixels))
             .expect("encode luma NL=4/4");
-        let img = decode_codestream(&cs, None).expect("decode NL=4/4");
+        let img = crate::decode_components(&cs).expect("decode NL=4/4");
         assert_eq!(
             img.planes[0].data, pixels,
             "luma must round-trip losslessly at NL=4/4"
@@ -13118,7 +13235,7 @@ mod tests {
         let pixels = make_nl_test_64x64();
         let cs = encode_planar(64, 64, 1, 0, 5, 5, std::slice::from_ref(&pixels))
             .expect("encode luma NL=5/5");
-        let img = decode_codestream(&cs, None).expect("decode NL=5/5");
+        let img = crate::decode_components(&cs).expect("decode NL=5/5");
         assert_eq!(
             img.planes[0].data, pixels,
             "luma must round-trip losslessly at NL=5/5"
@@ -13141,7 +13258,7 @@ mod tests {
         }
         let cs = encode_planar(32, 32, 3, 1, 3, 3, &[r.clone(), g.clone(), b.clone()])
             .expect("encode RGB NL=3/3 Cpih=1");
-        let img = decode_codestream(&cs, None).expect("decode RGB NL=3/3");
+        let img = crate::decode_components(&cs).expect("decode RGB NL=3/3");
         assert_eq!(img.planes[0].data, r, "red plane NL=3/3");
         assert_eq!(img.planes[1].data, g, "green plane NL=3/3");
         assert_eq!(img.planes[2].data, b, "blue plane NL=3/3");
@@ -13152,7 +13269,7 @@ mod tests {
         let pixels = make_nl_test_64x64();
         let cs = encode_planar(64, 64, 1, 0, 3, 2, std::slice::from_ref(&pixels))
             .expect("encode luma NL=3/2");
-        let img = decode_codestream(&cs, None).expect("decode NL=3/2");
+        let img = crate::decode_components(&cs).expect("decode NL=3/2");
         assert_eq!(
             img.planes[0].data, pixels,
             "luma must round-trip losslessly at NL=3/2"
@@ -13173,7 +13290,7 @@ mod tests {
         let pixels = make_nl_test_64x64();
         let cs = encode_planar(64, 64, 1, 0, 1, 0, std::slice::from_ref(&pixels))
             .expect("encode luma NL,x=1 NL,y=0");
-        let img = decode_codestream(&cs, None).expect("decode NL,y=0");
+        let img = crate::decode_components(&cs).expect("decode NL,y=0");
         assert_eq!(
             img.planes[0].data, pixels,
             "luma must round-trip losslessly at NL,x=1 NL,y=0"
@@ -13197,7 +13314,7 @@ mod tests {
             std::slice::from_ref(&pixels),
         )
         .expect("encode 31x17 NL,y=0");
-        let img = decode_codestream(&cs, None).expect("decode 31x17 NL,y=0");
+        let img = crate::decode_components(&cs).expect("decode 31x17 NL,y=0");
         assert_eq!(
             img.planes[0].data, pixels,
             "odd-dimension luma must round-trip at NL,x=1 NL,y=0"
@@ -13224,14 +13341,14 @@ mod tests {
         // Cpih=0 (no colour transform) first to isolate the packet path.
         let cs0 = encode_planar(32, 32, 3, 0, 1, 0, &[r.clone(), g.clone(), b.clone()])
             .expect("encode RGB NL,y=0 Cpih=0");
-        let img0 = decode_codestream(&cs0, None).expect("decode RGB NL,y=0 Cpih=0");
+        let img0 = crate::decode_components(&cs0).expect("decode RGB NL,y=0 Cpih=0");
         assert_eq!(img0.planes[0].data, r, "red plane NL,y=0 Cpih=0");
         assert_eq!(img0.planes[1].data, g, "green plane NL,y=0 Cpih=0");
         assert_eq!(img0.planes[2].data, b, "blue plane NL,y=0 Cpih=0");
 
         let cs = encode_planar(32, 32, 3, 1, 1, 0, &[r.clone(), g.clone(), b.clone()])
             .expect("encode RGB NL,y=0 Cpih=1");
-        let img = decode_codestream(&cs, None).expect("decode RGB NL,y=0");
+        let img = crate::decode_components(&cs).expect("decode RGB NL,y=0");
         assert_eq!(img.planes[0].data, r, "red plane NL,y=0");
         assert_eq!(img.planes[1].data, g, "green plane NL,y=0");
         assert_eq!(img.planes[2].data, b, "blue plane NL,y=0");
@@ -13245,7 +13362,7 @@ mod tests {
         let pixels = make_nl_test_64x64();
         let cs = encode_planar_lossy(64, 64, 1, 0, 1, 0, 2, std::slice::from_ref(&pixels))
             .expect("encode luma NL,y=0 q=2");
-        let img = decode_codestream(&cs, None).expect("decode NL,y=0 q=2");
+        let img = crate::decode_components(&cs).expect("decode NL,y=0 q=2");
         let p = psnr(&pixels, &img.planes[0].data);
         assert!(p >= 25.0, "NL,y=0 q=2 PSNR {p:.2} dB below 25 dB floor");
     }
@@ -13268,7 +13385,7 @@ mod tests {
             std::slice::from_ref(&pixels),
         )
         .expect("encode 12-bit NL,y=0");
-        let img = decode_codestream(&cs, None).expect("decode 12-bit NL,y=0");
+        let img = crate::decode_components(&cs).expect("decode 12-bit NL,y=0");
         // Plane is u16-LE packed.
         let got: Vec<u16> = img.planes[0]
             .data
@@ -13289,7 +13406,7 @@ mod tests {
         for nlx in [2u8, 3, 5] {
             let cs = encode_planar(64, 64, 1, 0, nlx, 0, std::slice::from_ref(&pixels))
                 .unwrap_or_else(|e| panic!("encode NL,x={nlx} NL,y=0: {e:?}"));
-            let img = decode_codestream(&cs, None)
+            let img = crate::decode_components(&cs)
                 .unwrap_or_else(|e| panic!("decode NL,x={nlx} NL,y=0: {e:?}"));
             assert_eq!(
                 img.planes[0].data, pixels,
@@ -13332,7 +13449,7 @@ mod tests {
             &[y_plane.clone(), cb_plane.clone(), cr_plane.clone()],
         )
         .expect("encode 4:2:2 NL,y=0 lossless");
-        let img = decode_codestream(&cs, None).expect("decode 4:2:2 NL,y=0");
+        let img = crate::decode_components(&cs).expect("decode 4:2:2 NL,y=0");
         assert_eq!(img.planes[0].data, y_plane, "Y plane 4:2:2 NL,y=0");
         assert_eq!(img.planes[1].data, cb_plane, "Cb plane 4:2:2 NL,y=0");
         assert_eq!(img.planes[2].data, cr_plane, "Cr plane 4:2:2 NL,y=0");
@@ -13356,7 +13473,7 @@ mod tests {
         let pixels = make_nl_test_64x64();
         let cs = encode_planar_lossy(64, 64, 1, 0, 4, 4, 4, std::slice::from_ref(&pixels))
             .expect("encode luma NL=4/4 q=4");
-        let img = decode_codestream(&cs, None).expect("decode NL=4/4 q=4");
+        let img = crate::decode_components(&cs).expect("decode NL=4/4 q=4");
         let p = psnr(&pixels, &img.planes[0].data);
         assert!(p >= 25.0, "NL=4/4 q=4 PSNR {p:.2} dB below 25 dB floor");
     }
@@ -13385,7 +13502,7 @@ mod tests {
             std::slice::from_ref(&pixels),
         )
         .expect("encode NLT extended lossless");
-        let img = decode_codestream(&cs, None).expect("decode NLT extended");
+        let img = crate::decode_components(&cs).expect("decode NLT extended");
         let p = psnr(&pixels, &img.planes[0].data);
         assert!(
             p >= 30.0,
@@ -13427,7 +13544,7 @@ mod tests {
             std::slice::from_ref(&pixels),
         )
         .expect("encode NLT extended lossy q=2");
-        let img = decode_codestream(&lossy_cs, None).expect("decode NLT extended lossy q=2");
+        let img = crate::decode_components(&lossy_cs).expect("decode NLT extended lossy q=2");
         let p = psnr(&pixels, &img.planes[0].data);
         assert!(
             p >= 25.0,
@@ -13532,7 +13649,7 @@ mod tests {
         let pixels = make_nl_test_64x64();
         let cs = encode_planar(64, 64, 1, 0, 6, 6, std::slice::from_ref(&pixels))
             .expect("encode luma NL=6/6");
-        let img = decode_codestream(&cs, None).expect("decode NL=6/6");
+        let img = crate::decode_components(&cs).expect("decode NL=6/6");
         assert_eq!(
             img.planes[0].data, pixels,
             "luma must round-trip losslessly at NL=6/6"
@@ -13555,7 +13672,7 @@ mod tests {
         }
         let cs = encode_planar_cw(w as u16, h as u16, 1, 0, 1, 1, 0, 1, &[pixels.clone()])
             .expect("encode 64x16 Cw=1 NL=1/1");
-        let img = decode_codestream(&cs, None).expect("decode 64x16 Cw=1");
+        let img = crate::decode_components(&cs).expect("decode 64x16 Cw=1");
         assert_eq!(
             img.planes[0].data, pixels,
             "luma must round-trip losslessly with Cw=1 NL=1/1"
@@ -13577,7 +13694,7 @@ mod tests {
         }
         let cs = encode_planar_cw(w as u16, h as u16, 1, 0, 2, 2, 0, 1, &[pixels.clone()])
             .expect("encode 64x16 Cw=1 NL=2/2");
-        let img = decode_codestream(&cs, None).expect("decode 64x16 Cw=1 NL=2/2");
+        let img = crate::decode_components(&cs).expect("decode 64x16 Cw=1 NL=2/2");
         assert_eq!(
             img.planes[0].data, pixels,
             "luma must round-trip losslessly with Cw=1 NL=2/2"
@@ -13612,7 +13729,7 @@ mod tests {
             &[r.clone(), g.clone(), b.clone()],
         )
         .expect("encode 128x32 Cw=2 RCT NL=2/2");
-        let img = decode_codestream(&cs, None).expect("decode 128x32 Cw=2 RCT NL=2/2");
+        let img = crate::decode_components(&cs).expect("decode 128x32 Cw=2 RCT NL=2/2");
         assert_eq!(img.planes[0].data, r);
         assert_eq!(img.planes[1].data, g);
         assert_eq!(img.planes[2].data, b);
@@ -13632,7 +13749,7 @@ mod tests {
         }
         let cs = encode_planar_cw(w as u16, h as u16, 1, 0, 2, 2, 2, 1, &[pixels.clone()])
             .expect("encode 64x16 Cw=1 q=2");
-        let img = decode_codestream(&cs, None).expect("decode 64x16 Cw=1 q=2");
+        let img = crate::decode_components(&cs).expect("decode 64x16 Cw=1 q=2");
         let p = psnr(&pixels, &img.planes[0].data);
         assert!(p >= 25.0, "Cw=1 lossy q=2 PSNR {p:.2} dB below 25 dB floor");
     }
@@ -13699,7 +13816,7 @@ mod tests {
             &[y_plane.clone(), u_plane.clone(), v_plane.clone()],
         )
         .expect("encode 64x8 4:2:2 Cw=1 NL=1/1");
-        let img = decode_codestream(&cs, None).expect("decode 64x8 4:2:2 Cw=1");
+        let img = crate::decode_components(&cs).expect("decode 64x8 4:2:2 Cw=1");
         assert_eq!(img.planes[0].data, y_plane);
         assert_eq!(img.planes[1].data, u_plane);
         assert_eq!(img.planes[2].data, v_plane);
@@ -13762,7 +13879,7 @@ mod tests {
             &[y.clone(), u.clone(), v.clone()],
         )
         .expect("encode 128x32 4:2:0 Cw=1 NL=2/2");
-        let img = decode_codestream(&cs, None).expect("decode 128x32 4:2:0 Cw=1 NL=2/2");
+        let img = crate::decode_components(&cs).expect("decode 128x32 4:2:0 Cw=1 NL=2/2");
         assert_eq!(img.planes[0].data, y, "luma Cw=1 4:2:0 NL=2/2 lossless");
         assert_eq!(img.planes[1].data, u, "U Cw=1 4:2:0 NL=2/2 lossless");
         assert_eq!(img.planes[2].data, v, "V Cw=1 4:2:0 NL=2/2 lossless");
@@ -13817,7 +13934,7 @@ mod tests {
             &[y.clone()],
         )
         .expect("encode 96x32 luma Cw=1 NLT quadratic");
-        let img = decode_codestream(&cs, None).expect("decode 96x32 luma Cw=1 NLT quadratic");
+        let img = crate::decode_components(&cs).expect("decode 96x32 luma Cw=1 NLT quadratic");
         let p = psnr(&y, &img.planes[0].data);
         assert!(
             p >= 40.0,
@@ -13883,8 +14000,8 @@ mod tests {
             &[p0.clone(), p1.clone(), p2.clone(), p3.clone()],
         )
         .expect("encode Sd=1 NLT quadratic 4-comp");
-        let img = decode_codestream(&cs, None).expect("decode Sd=1 NLT quadratic 4-comp");
-        assert_eq!(img.num_components, 4);
+        let img = crate::decode_components(&cs).expect("decode Sd=1 NLT quadratic 4-comp");
+        assert_eq!(img.num_components(), 4);
         for (idx, orig) in [&p0, &p1, &p2, &p3].iter().enumerate() {
             let p = psnr(orig, &img.planes[idx].data);
             assert!(
@@ -13909,7 +14026,7 @@ mod tests {
         }
         let cs = encode_planar_cw(w as u16, h as u16, 1, 0, 1, 1, 0, 1, &[pixels.clone()])
             .expect("encode 96x16 Cw=1 NL=1/1");
-        let img = decode_codestream(&cs, None).expect("decode 96x16 Cw=1");
+        let img = crate::decode_components(&cs).expect("decode 96x16 Cw=1");
         assert_eq!(img.planes[0].data, pixels);
     }
 
@@ -13949,7 +14066,7 @@ mod tests {
         let planes = r282_planes(w, h, &sx, &sy);
         let cs = encode_planar_subsampled(w as u16, h as u16, 3, 0, 2, 2, 0, &sx, &sy, &planes)
             .expect("encode 65x16 4:2:2 NL=2/2");
-        let img = decode_codestream(&cs, None).expect("decode 65x16 4:2:2");
+        let img = crate::decode_components(&cs).expect("decode 65x16 4:2:2");
         for (i, p) in planes.iter().enumerate() {
             assert_eq!(&img.planes[i].data, p, "plane {i} lossless roundtrip");
         }
@@ -13966,7 +14083,7 @@ mod tests {
         let planes = r282_planes(w, h, &sx, &sy);
         let cs = encode_planar_subsampled(w as u16, h as u16, 3, 0, 2, 2, 0, &sx, &sy, &planes)
             .expect("encode 65x17 4:2:0 NL=2/2");
-        let img = decode_codestream(&cs, None).expect("decode 65x17 4:2:0");
+        let img = crate::decode_components(&cs).expect("decode 65x17 4:2:0");
         for (i, p) in planes.iter().enumerate() {
             assert_eq!(&img.planes[i].data, p, "plane {i} lossless roundtrip");
         }
@@ -13988,7 +14105,7 @@ mod tests {
         let planes = r282_planes(w, h, &sx, &sy);
         let cs = encode_planar_subsampled(w as u16, h as u16, 3, 0, 3, 3, 0, &sx, &sy, &planes)
             .expect("encode 33x33 4:2:0 NL=3/3");
-        let img = decode_codestream(&cs, None).expect("decode 33x33 4:2:0 NL=3/3");
+        let img = crate::decode_components(&cs).expect("decode 33x33 4:2:0 NL=3/3");
         for (i, p) in planes.iter().enumerate() {
             assert_eq!(&img.planes[i].data, p, "plane {i} lossless roundtrip");
         }
@@ -14011,7 +14128,7 @@ mod tests {
             let planes = r282_planes(w, h, &sx, &sy);
             let cs = encode_planar_subsampled(w as u16, h as u16, 3, 0, 1, 1, 0, &sx, &sy, &planes)
                 .unwrap_or_else(|e| panic!("encode 65x{h} {label} NL=1/1: {e}"));
-            let img = decode_codestream(&cs, None)
+            let img = crate::decode_components(&cs)
                 .unwrap_or_else(|e| panic!("decode 65x{h} {label} NL=1/1: {e}"));
             for (i, p) in planes.iter().enumerate() {
                 assert_eq!(
@@ -14044,7 +14161,7 @@ mod tests {
             .collect();
         let cs = encode_planar_subsampled(w as u16, h as u16, 3, 0, 2, 2, 2, &sx, &sy, &planes)
             .expect("encode 65x17 4:2:0 q=2");
-        let img = decode_codestream(&cs, None).expect("decode 65x17 4:2:0 q=2");
+        let img = crate::decode_components(&cs).expect("decode 65x17 4:2:0 q=2");
         for (i, p) in planes.iter().enumerate() {
             assert_eq!(img.planes[i].data.len(), p.len(), "plane {i} ceil-sized");
             let db = psnr(p, &img.planes[i].data);
@@ -14080,7 +14197,7 @@ mod tests {
             std::slice::from_ref(&plane),
         )
         .expect("encode 17x8 10-bit NL=2/2");
-        let img = decode_codestream(&cs, None).expect("decode 17x8 10-bit");
+        let img = crate::decode_components(&cs).expect("decode 17x8 10-bit");
         let want: Vec<u8> = plane.iter().flat_map(|s| s.to_le_bytes()).collect();
         assert_eq!(img.planes[0].data, want, "lossless roundtrip");
     }
@@ -14179,7 +14296,7 @@ mod tests {
         let cs =
             encode_planar_subsampled_highbd(w as u16, h as u16, 3, 0, 2, 2, bd, &sx, &sy, &planes)
                 .expect("encode 65x16 4:2:2 10-bit");
-        let img = decode_codestream(&cs, None).expect("decode 65x16 4:2:2 10-bit");
+        let img = crate::decode_components(&cs).expect("decode 65x16 4:2:2 10-bit");
         for (i, p) in planes.iter().enumerate() {
             let want: Vec<u8> = p.iter().flat_map(|s| s.to_le_bytes()).collect();
             assert_eq!(
@@ -14231,7 +14348,7 @@ mod tests {
             &planes,
         )
         .expect("encode 69x16 4:2:2 Cw=1 NL=1/1");
-        let img = decode_codestream(&cs, None).expect("decode 69x16 4:2:2 Cw=1");
+        let img = crate::decode_components(&cs).expect("decode 69x16 4:2:2 Cw=1");
         for (i, p) in planes.iter().enumerate() {
             assert_eq!(&img.planes[i].data, p, "plane {i} Cw=1 odd-width roundtrip");
         }
@@ -14336,7 +14453,7 @@ mod tests {
         let body = cdt_pos + 4;
         assert_eq!(cs[body], 8, "component 0 is 8-bit");
         cs[body + 2] = 10; // component 1 → 10-bit (now != B[0])
-        let err = decode_codestream(&cs, None).unwrap_err();
+        let err = crate::decode_components(&cs).unwrap_err();
         assert!(
             format!("{err}").contains("requires B[i]=B[0]"),
             "expected uniform-depth rejection, got {err}"
@@ -14425,7 +14542,7 @@ mod tests {
             &[p0.clone(), p1.clone(), p2.clone(), p3.clone()],
         )
         .expect("encode 32x16 Nc=4 Sd=1 NL=2/2");
-        let img = decode_codestream(&cs, None).expect("decode Sd=1");
+        let img = crate::decode_components(&cs).expect("decode Sd=1");
         assert_eq!(img.planes[0].data, p0, "wavelet comp 0 lossless");
         assert_eq!(img.planes[1].data, p1, "wavelet comp 1 lossless");
         assert_eq!(img.planes[2].data, p2, "wavelet comp 2 lossless");
@@ -14451,7 +14568,7 @@ mod tests {
         let p: Vec<Vec<u8>> = (0..5u32).map(make).collect();
         let cs = encode_planar_sd(w as u16, h as u16, 5, 1, 1, 0, 2, &p)
             .expect("encode 16x8 Nc=5 Sd=2 NL=1/1");
-        let img = decode_codestream(&cs, None).expect("decode Sd=2");
+        let img = crate::decode_components(&cs).expect("decode Sd=2");
         for (i, expected) in p.iter().enumerate().take(5) {
             assert_eq!(&img.planes[i].data, expected, "comp {i} roundtrip");
         }
@@ -14476,7 +14593,7 @@ mod tests {
         }
         let cs =
             encode_planar_sd(w as u16, h as u16, 4, 2, 2, 2, 1, &p).expect("encode lossy Sd=1 q=2");
-        let img = decode_codestream(&cs, None).expect("decode lossy Sd=1");
+        let img = crate::decode_components(&cs).expect("decode lossy Sd=1");
         for (i, expected) in p.iter().enumerate().take(4) {
             let q = psnr(expected, &img.planes[i].data);
             assert!(
@@ -14537,8 +14654,8 @@ mod tests {
             &[r.clone(), g.clone(), b.clone(), alpha.clone()],
         )
         .expect("encode 32x16 Nc=4 Sd=1 Cpih=1 NL=2/2");
-        let img = decode_codestream(&cs, None).expect("decode Sd=1 Cpih=1");
-        assert_eq!(img.num_components, 4);
+        let img = crate::decode_components(&cs).expect("decode Sd=1 Cpih=1");
+        assert_eq!(img.num_components(), 4);
         assert_eq!(img.cpih, 1, "PIH should report Cpih=1");
         assert_eq!(img.planes[0].data, r, "R lossless via RCT");
         assert_eq!(img.planes[1].data, g, "G lossless via RCT");
@@ -14563,7 +14680,7 @@ mod tests {
         }
         let cs = encode_planar_sd_rct(w as u16, h as u16, 4, 2, 2, 2, 1, &p)
             .expect("encode lossy Sd=1 Cpih=1 q=2");
-        let img = decode_codestream(&cs, None).expect("decode lossy Sd=1 Cpih=1");
+        let img = crate::decode_components(&cs).expect("decode lossy Sd=1 Cpih=1");
         assert_eq!(img.cpih, 1);
         for (i, expected) in p.iter().enumerate().take(4) {
             let q = psnr(expected, &img.planes[i].data);
@@ -14594,7 +14711,7 @@ mod tests {
         let p: Vec<Vec<u8>> = (0..5u32).map(make).collect();
         let cs = encode_planar_sd_rct(w as u16, h as u16, 5, 1, 1, 0, 2, &p)
             .expect("encode 16x8 Nc=5 Sd=2 Cpih=1 NL=1/1");
-        let img = decode_codestream(&cs, None).expect("decode Sd=2 Cpih=1");
+        let img = crate::decode_components(&cs).expect("decode Sd=2 Cpih=1");
         assert_eq!(img.cpih, 1);
         for (i, expected) in p.iter().enumerate().take(5) {
             assert_eq!(&img.planes[i].data, expected, "comp {i} roundtrip");
@@ -14641,8 +14758,8 @@ mod tests {
             &[r.clone(), g1.clone(), g2.clone(), b.clone(), ir.clone()],
         )
         .expect("encode 16x8 Nc=5 Sd=1 Cpih=3");
-        let img = decode_codestream(&cs, None).expect("decode Sd=1 Cpih=3");
-        assert_eq!(img.num_components, 5);
+        let img = crate::decode_components(&cs).expect("decode Sd=1 Cpih=3");
+        assert_eq!(img.num_components(), 5);
         assert_eq!(img.cpih, 3, "PIH should report Cpih=3");
         assert_eq!(img.planes[0].data, r, "R lossless via Star-Tetrix");
         assert_eq!(img.planes[1].data, g1, "G1 lossless via Star-Tetrix");
@@ -14697,8 +14814,8 @@ mod tests {
         let cs =
             encode_planar_sd_star_tetrix(w as u16, h as u16, 5, 1, 1, 0, 2, 0, 0, 0, 0, &planes)
                 .expect("encode Nc=5 Sd=2 Cpih=3 (suppressed Star-Tetrix output)");
-        let img = decode_codestream(&cs, None).expect("decode Nc=5 Sd=2 Cpih=3");
-        assert_eq!(img.num_components, 5);
+        let img = crate::decode_components(&cs).expect("decode Nc=5 Sd=2 Cpih=3");
+        assert_eq!(img.num_components(), 5);
         assert_eq!(img.cpih, 3);
         for (i, want) in planes.iter().enumerate() {
             assert_eq!(&img.planes[i].data, want, "component {i} lossless");
@@ -14716,7 +14833,7 @@ mod tests {
             .expect("encode 32x32 luma Fs=1 NL=2/2");
         let parsed = crate::codestream::parse(&cs).expect("parse codestream");
         assert_eq!(parsed.pih.fs, 1, "PIH should report Fs=1");
-        let img = decode_codestream(&cs, None).expect("decode Fs=1 luma");
+        let img = crate::decode_components(&cs).expect("decode Fs=1 luma");
         assert_eq!(img.planes[0].data, pixels, "Fs=1 luma lossless");
     }
 
@@ -14735,7 +14852,7 @@ mod tests {
         }
         let cs = encode_planar_fs1(32, 32, 3, 1, 2, 2, 0, &[r.clone(), g.clone(), b.clone()])
             .expect("encode RGB Fs=1 Cpih=1 NL=2/2");
-        let img = decode_codestream(&cs, None).expect("decode Fs=1 RGB");
+        let img = crate::decode_components(&cs).expect("decode Fs=1 RGB");
         assert_eq!(img.planes[0].data, r, "R lossless Fs=1");
         assert_eq!(img.planes[1].data, g, "G lossless Fs=1");
         assert_eq!(img.planes[2].data, b, "B lossless Fs=1");
@@ -14749,7 +14866,7 @@ mod tests {
         let pixels = make_synthetic_32x32();
         let cs = encode_planar_fs1(32, 32, 1, 0, 2, 2, 2, std::slice::from_ref(&pixels))
             .expect("encode 32x32 luma Fs=1 q=2");
-        let img = decode_codestream(&cs, None).expect("decode Fs=1 lossy");
+        let img = crate::decode_components(&cs).expect("decode Fs=1 lossy");
         let q = psnr(&pixels, &img.planes[0].data);
         assert!(q >= 30.0, "Fs=1 q=2 luma PSNR {q:.2} dB below 30 dB floor");
     }
@@ -14796,8 +14913,8 @@ mod tests {
             std::slice::from_ref(&pixels),
         )
         .expect("encode Fs=1");
-        let img0 = decode_codestream(&cs0, None).expect("decode Fs=0");
-        let img1 = decode_codestream(&cs1, None).expect("decode Fs=1");
+        let img0 = crate::decode_components(&cs0).expect("decode Fs=0");
+        let img1 = crate::decode_components(&cs1).expect("decode Fs=1");
         assert_eq!(
             img0.planes[0].data, img1.planes[0].data,
             "Fs=0 and Fs=1 must decode to identical pixels"
@@ -14887,7 +15004,7 @@ mod tests {
         let parsed = crate::codestream::parse(&cs).expect("parse codestream");
         assert_eq!(parsed.pih.hsl, 2, "PIH Hsl must be 2");
         assert_eq!(parsed.slices.len(), 4, "Np,y=8 / Hsl=2 → 4 slices");
-        let img = decode_codestream(&cs, None).expect("decode 32x32 luma Hsl=2");
+        let img = crate::decode_components(&cs).expect("decode 32x32 luma Hsl=2");
         assert_eq!(
             img.planes[0].data, pixels,
             "multi-slice luma must be lossless"
@@ -14909,7 +15026,7 @@ mod tests {
         let parsed = crate::codestream::parse(&cs).expect("parse codestream");
         assert_eq!(parsed.pih.hsl, 3, "PIH Hsl must be 3");
         assert_eq!(parsed.slices.len(), 2, "Np,y=6 / Hsl=3 → 2 slices");
-        let img = decode_codestream(&cs, None).expect("decode RGB+RCT Hsl=3");
+        let img = crate::decode_components(&cs).expect("decode RGB+RCT Hsl=3");
         assert_eq!(img.planes[0].data, r, "R plane lossless");
         assert_eq!(img.planes[1].data, g, "G plane lossless");
         assert_eq!(img.planes[2].data, b, "B plane lossless");
@@ -14933,7 +15050,7 @@ mod tests {
             std::slice::from_ref(&pixels),
         )
         .expect("encode 32x32 luma Hsl=2 q=2");
-        let img = decode_codestream(&cs, None).expect("decode Hsl=2 q=2");
+        let img = crate::decode_components(&cs).expect("decode Hsl=2 q=2");
         let p = psnr(&pixels, &img.planes[0].data);
         assert!(
             p >= 30.0,
@@ -14996,7 +15113,7 @@ mod tests {
             hsl_full, baseline,
             "hsl=Np,y must be byte-identical (one slice)"
         );
-        let img = decode_codestream(&hsl0, None).expect("decode hsl=0");
+        let img = crate::decode_components(&hsl0).expect("decode hsl=0");
         assert_eq!(img.planes[0].data, pixels, "hsl=0 lossless");
     }
 
@@ -15021,7 +15138,7 @@ mod tests {
         .expect("encode 16x20 luma Hsl=2");
         let parsed = crate::codestream::parse(&cs).expect("parse codestream");
         assert_eq!(parsed.slices.len(), 3, "Np,y=5 / Hsl=2 → 3 slices (2,2,1)");
-        let img = decode_codestream(&cs, None).expect("decode 16x20 luma Hsl=2");
+        let img = crate::decode_components(&cs).expect("decode 16x20 luma Hsl=2");
         assert_eq!(
             img.planes[0].data, pixels,
             "non-divisible multi-slice lossless"
@@ -15182,7 +15299,7 @@ mod tests {
         );
         // Decoder reconstructs the picture (lossy in the q>0 slices,
         // lossless in the q=0 slice).
-        let img = decode_codestream(&mixed, None).expect("decode mixed q_slices");
+        let img = crate::decode_components(&mixed).expect("decode mixed q_slices");
         let p = psnr(&pixels, &img.planes[0].data);
         assert!(
             p >= 30.0,
@@ -15548,7 +15665,7 @@ mod tests {
             "wrapper bytes must equal a follow-up qslice encode with the same q vector"
         );
         // And the picture round-trips at acceptable quality.
-        let img = decode_codestream(&cs, None).expect("decode picker stream");
+        let img = crate::decode_components(&cs).expect("decode picker stream");
         let p = psnr(&pixels, &img.planes[0].data);
         assert!(p >= 25.0, "picker round-trip PSNR {p:.2} dB < 25 dB");
     }
@@ -15622,7 +15739,7 @@ mod tests {
             .expect("encode 32x32 luma Qpih=1 NL=2/2");
         let parsed = crate::codestream::parse(&cs).expect("parse codestream");
         assert_eq!(parsed.pih.qpih, 1, "PIH should report Qpih=1");
-        let img = decode_codestream(&cs, None).expect("decode Qpih=1 luma");
+        let img = crate::decode_components(&cs).expect("decode Qpih=1 luma");
         assert_eq!(img.planes[0].data, pixels, "Qpih=1 luma lossless");
     }
 
@@ -15643,7 +15760,7 @@ mod tests {
             .expect("encode RGB Qpih=1 Cpih=1 NL=2/2");
         let parsed = crate::codestream::parse(&cs).expect("parse codestream");
         assert_eq!(parsed.pih.qpih, 1, "PIH should report Qpih=1");
-        let img = decode_codestream(&cs, None).expect("decode Qpih=1 RGB");
+        let img = crate::decode_components(&cs).expect("decode Qpih=1 RGB");
         assert_eq!(img.planes[0].data, r, "R lossless Qpih=1");
         assert_eq!(img.planes[1].data, g, "G lossless Qpih=1");
         assert_eq!(img.planes[2].data, b, "B lossless Qpih=1");
@@ -15660,7 +15777,7 @@ mod tests {
             .expect("encode 32x32 luma Qpih=1 q=2");
         let parsed = crate::codestream::parse(&cs).expect("parse codestream");
         assert_eq!(parsed.pih.qpih, 1, "PIH should report Qpih=1");
-        let img = decode_codestream(&cs, None).expect("decode Qpih=1 lossy");
+        let img = crate::decode_components(&cs).expect("decode Qpih=1 lossy");
         let q = psnr(&pixels, &img.planes[0].data);
         assert!(
             q >= 30.0,
@@ -15705,8 +15822,8 @@ mod tests {
             0x10,
             "the differing byte must toggle exactly the Qpih bit (bit 4)"
         );
-        let img0 = decode_codestream(&cs0, None).expect("decode Qpih=0");
-        let img1 = decode_codestream(&cs1, None).expect("decode Qpih=1");
+        let img0 = crate::decode_components(&cs0).expect("decode Qpih=0");
+        let img1 = crate::decode_components(&cs1).expect("decode Qpih=1");
         assert_eq!(
             img0.planes[0].data, img1.planes[0].data,
             "Qpih=0 and Qpih=1 lossless must decode to identical pixels"
@@ -15849,7 +15966,7 @@ mod tests {
         let pixels = make_synthetic_32x32();
         let cs = encode_planar_qpih(32, 32, 1, 0, 2, 2, 3, std::slice::from_ref(&pixels))
             .expect("encode Qpih=1 q=3 luma");
-        let img = decode_codestream(&cs, None).expect("decode Qpih=1 q=3");
+        let img = crate::decode_components(&cs).expect("decode Qpih=1 q=3");
         let q = psnr(&pixels, &img.planes[0].data);
         assert!(
             q >= 25.0,
@@ -15897,7 +16014,7 @@ mod tests {
         let parsed = crate::codestream::parse(&cs).expect("parse");
         assert_eq!(parsed.pih.qpih, 1, "PIH Qpih=1");
         assert_eq!(parsed.pih.fs, 1, "PIH Fs=1");
-        let img = decode_codestream(&cs, None).expect("decode Qpih=1 Fs=1");
+        let img = crate::decode_components(&cs).expect("decode Qpih=1 Fs=1");
         assert_eq!(img.planes[0].data, pixels, "Qpih=1 Fs=1 lossless");
     }
 
@@ -15960,7 +16077,7 @@ mod tests {
         for rp in 1..=(nl as u8 - 1) {
             let cs = encode_planar_rp(32, 32, 1, 0, 2, 2, 0, rp, std::slice::from_ref(&pixels))
                 .unwrap_or_else(|e| panic!("encode rp={rp} q=0: {e:?}"));
-            let img = decode_codestream(&cs, None)
+            let img = crate::decode_components(&cs)
                 .unwrap_or_else(|e| panic!("decode rp={rp} q=0: {e:?}"));
             assert_eq!(img.planes[0].data, pixels, "rp={rp} q=0 must be lossless");
         }
@@ -15985,7 +16102,7 @@ mod tests {
         let weights =
             crate::slice_walker::parse_wgt(&parsed.wgt, nbeta as usize).expect("parse_wgt");
         assert_eq!(weights[0].priority, 0, "band 0 (LL) priority is 0");
-        let img = decode_codestream(&cs, None).expect("decode rp=1 q=2");
+        let img = crate::decode_components(&cs).expect("decode rp=1 q=2");
         let p = psnr(&pixels, &img.planes[0].data);
         assert!(p >= 30.0, "rp=1 q=2 PSNR {p:.2} dB below 30 dB floor");
     }
@@ -16011,7 +16128,7 @@ mod tests {
             "rp>0 must change the lossy data sub-packet vs rp=0"
         );
         // Both still round-trip.
-        let img = decode_codestream(&rp_hi, None).expect("decode rp=NL-1 q=2");
+        let img = crate::decode_components(&rp_hi).expect("decode rp=NL-1 q=2");
         let p = psnr(&pixels, &img.planes[0].data);
         // Refining low-frequency bands should not collapse quality; hold a
         // sane floor (the refined LL band carries more precision).
@@ -16037,14 +16154,14 @@ mod tests {
         // q=0 lossless with rp=2 (refines bands 0 and 1).
         let cs0 =
             encode_planar_rp(32, 32, 3, 1, 2, 2, 0, 2, &planes).expect("encode RGB+RCT rp=2 q=0");
-        let img0 = decode_codestream(&cs0, None).expect("decode RGB+RCT rp=2 q=0");
+        let img0 = crate::decode_components(&cs0).expect("decode RGB+RCT rp=2 q=0");
         assert_eq!(img0.planes[0].data, r, "R lossless rp=2");
         assert_eq!(img0.planes[1].data, g, "G lossless rp=2");
         assert_eq!(img0.planes[2].data, b, "B lossless rp=2");
         // q=2 lossy with rp=3.
         let cs2 =
             encode_planar_rp(32, 32, 3, 1, 2, 2, 2, 3, &planes).expect("encode RGB+RCT rp=3 q=2");
-        let img2 = decode_codestream(&cs2, None).expect("decode RGB+RCT rp=3 q=2");
+        let img2 = crate::decode_components(&cs2).expect("decode RGB+RCT rp=3 q=2");
         for (plane, name) in [(&r, "R"), (&g, "G"), (&b, "B")]
             .iter()
             .map(|(p, n)| (*p, *n))
@@ -16110,8 +16227,8 @@ mod tests {
         let src = make_synthetic_highbd(32, 32, 10);
         let cs = encode_planar_highbd(32, 32, 1, 0, 1, 1, 10, std::slice::from_ref(&src))
             .expect("encode 10-bit luma");
-        let img = decode_codestream(&cs, None).expect("decode 10-bit luma");
-        assert_eq!(img.bit_depth, 10, "PIH Bw must be 10");
+        let img = crate::decode_components(&cs).expect("decode 10-bit luma");
+        assert_eq!(img.max_bit_depth(), 10, "PIH Bw must be 10");
         assert_eq!(plane_u16(&img.planes[0].data), src);
     }
 
@@ -16120,7 +16237,7 @@ mod tests {
         let src = make_synthetic_highbd(32, 32, 12);
         let cs = encode_planar_highbd(32, 32, 1, 0, 3, 3, 12, std::slice::from_ref(&src))
             .expect("encode 12-bit luma NL=3/3");
-        let img = decode_codestream(&cs, None).expect("decode 12-bit luma NL=3/3");
+        let img = crate::decode_components(&cs).expect("decode 12-bit luma NL=3/3");
         assert_eq!(plane_u16(&img.planes[0].data), src);
     }
 
@@ -16133,7 +16250,7 @@ mod tests {
         src[2] = 32768;
         let cs = encode_planar_highbd(16, 16, 1, 0, 2, 2, 16, std::slice::from_ref(&src))
             .expect("encode 16-bit luma");
-        let img = decode_codestream(&cs, None).expect("decode 16-bit luma");
+        let img = crate::decode_components(&cs).expect("decode 16-bit luma");
         assert_eq!(plane_u16(&img.planes[0].data), src);
     }
 
@@ -16142,7 +16259,7 @@ mod tests {
         let src = vec![40000u16; 32 * 32];
         let cs = encode_planar_highbd(32, 32, 1, 0, 2, 2, 16, std::slice::from_ref(&src))
             .expect("encode flat 16-bit");
-        let img = decode_codestream(&cs, None).expect("decode flat 16-bit");
+        let img = crate::decode_components(&cs).expect("decode flat 16-bit");
         assert_eq!(plane_u16(&img.planes[0].data), src);
     }
 
@@ -16162,7 +16279,7 @@ mod tests {
         let planes = vec![r.clone(), g.clone(), b.clone()];
         let cs =
             encode_planar_highbd(32, 32, 3, 1, 2, 2, 16, &planes).expect("encode 16-bit RGB + RCT");
-        let img = decode_codestream(&cs, None).expect("decode 16-bit RGB + RCT");
+        let img = crate::decode_components(&cs).expect("decode 16-bit RGB + RCT");
         assert_eq!(plane_u16(&img.planes[0].data), r);
         assert_eq!(plane_u16(&img.planes[1].data), g);
         assert_eq!(plane_u16(&img.planes[2].data), b);
@@ -16176,7 +16293,7 @@ mod tests {
         let planes = vec![r.clone(), g.clone(), b.clone()];
         let cs = encode_planar_highbd(16, 24, 3, 0, 2, 1, 12, &planes)
             .expect("encode 12-bit RGB no transform");
-        let img = decode_codestream(&cs, None).expect("decode 12-bit RGB no transform");
+        let img = crate::decode_components(&cs).expect("decode 12-bit RGB no transform");
         assert_eq!(plane_u16(&img.planes[0].data), r);
         assert_eq!(plane_u16(&img.planes[1].data), g);
         assert_eq!(plane_u16(&img.planes[2].data), b);
@@ -16235,8 +16352,8 @@ mod tests {
         let src = make_synthetic_highbd(32, 32, 10);
         let cs = encode_planar_highbd_lossy(32, 32, 1, 0, 2, 2, 10, 1, std::slice::from_ref(&src))
             .expect("encode 10-bit luma q=1");
-        let img = decode_codestream(&cs, None).expect("decode 10-bit luma q=1");
-        assert_eq!(img.bit_depth, 10, "PIH Bw must be 10");
+        let img = crate::decode_components(&cs).expect("decode 10-bit luma q=1");
+        assert_eq!(img.max_bit_depth(), 10, "PIH Bw must be 10");
         let rec = plane_u16(&img.planes[0].data);
         assert_eq!(rec.len(), src.len());
         let p = psnr_u16(&src, &rec, 10);
@@ -16249,7 +16366,7 @@ mod tests {
         let src = make_synthetic_highbd(32, 32, 12);
         let cs = encode_planar_highbd_lossy(32, 32, 1, 0, 3, 3, 12, 2, std::slice::from_ref(&src))
             .expect("encode 12-bit luma q=2 NL=3/3");
-        let img = decode_codestream(&cs, None).expect("decode 12-bit luma q=2 NL=3/3");
+        let img = crate::decode_components(&cs).expect("decode 12-bit luma q=2 NL=3/3");
         let rec = plane_u16(&img.planes[0].data);
         let p = psnr_u16(&src, &rec, 12);
         assert!(p >= 30.0, "12-bit q=2 PSNR {p:.2} dB must be >= 30 dB");
@@ -16270,7 +16387,7 @@ mod tests {
         let planes = vec![r.clone(), g.clone(), b.clone()];
         let cs = encode_planar_highbd_lossy(32, 32, 3, 1, 2, 2, 16, 1, &planes)
             .expect("encode 16-bit RGB + RCT q=1");
-        let img = decode_codestream(&cs, None).expect("decode 16-bit RGB + RCT q=1");
+        let img = crate::decode_components(&cs).expect("decode 16-bit RGB + RCT q=1");
         for (i, orig) in [&r, &g, &b].iter().enumerate() {
             let rec = plane_u16(&img.planes[i].data);
             let p = psnr_u16(orig, &rec, 16);
@@ -16367,9 +16484,9 @@ mod tests {
             &[r.clone(), g1.clone(), g2.clone(), b.clone()],
         )
         .expect("encode 10-bit Cpih=3 NL=2/2");
-        let img = decode_codestream(&cs, None).expect("decode 10-bit Cpih=3 NL=2/2");
-        assert_eq!(img.num_components, 4);
-        assert_eq!(img.bit_depth, 10, "PIH Bw must be 10");
+        let img = crate::decode_components(&cs).expect("decode 10-bit Cpih=3 NL=2/2");
+        assert_eq!(img.num_components(), 4);
+        assert_eq!(img.max_bit_depth(), 10, "PIH Bw must be 10");
         assert_eq!(img.cpih, 3, "PIH Cpih must be 3 (Star-Tetrix)");
         for (i, orig) in [&r, &g1, &g2, &b].iter().enumerate() {
             let rec = plane_u16(&img.planes[i].data);
@@ -16404,8 +16521,8 @@ mod tests {
             &[r.clone(), g1.clone(), g2.clone(), b.clone()],
         )
         .expect("encode 12-bit Cpih=3 Ct=1 NL=2/2");
-        let img = decode_codestream(&cs, None).expect("decode 12-bit Cpih=3 Ct=1");
-        assert_eq!(img.bit_depth, 12);
+        let img = crate::decode_components(&cs).expect("decode 12-bit Cpih=3 Ct=1");
+        assert_eq!(img.max_bit_depth(), 12);
         assert_eq!(img.cpih, 3);
         for (i, orig) in [&r, &g1, &g2, &b].iter().enumerate() {
             let rec = plane_u16(&img.planes[i].data);
@@ -16440,8 +16557,8 @@ mod tests {
             &[r.clone(), g1.clone(), g2.clone(), b.clone()],
         )
         .expect("encode 16-bit Cpih=3");
-        let img = decode_codestream(&cs, None).expect("decode 16-bit Cpih=3");
-        assert_eq!(img.bit_depth, 16);
+        let img = crate::decode_components(&cs).expect("decode 16-bit Cpih=3");
+        assert_eq!(img.max_bit_depth(), 16);
         for (i, orig) in [&r, &g1, &g2, &b].iter().enumerate() {
             let rec = plane_u16(&img.planes[i].data);
             let p = psnr_u16(orig, &rec, 16);
@@ -16514,9 +16631,9 @@ mod tests {
             &[r.clone(), g1.clone(), g2.clone(), b.clone()],
         )
         .expect("encode 10-bit Cpih=3 q=1");
-        let img = decode_codestream(&cs, None).expect("decode 10-bit Cpih=3 q=1");
-        assert_eq!(img.num_components, 4);
-        assert_eq!(img.bit_depth, 10, "PIH Bw must be 10");
+        let img = crate::decode_components(&cs).expect("decode 10-bit Cpih=3 q=1");
+        assert_eq!(img.num_components(), 4);
+        assert_eq!(img.max_bit_depth(), 10, "PIH Bw must be 10");
         assert_eq!(img.cpih, 3, "PIH Cpih must be 3 (Star-Tetrix)");
         for (i, orig) in [&r, &g1, &g2, &b].iter().enumerate() {
             let rec = plane_u16(&img.planes[i].data);
@@ -16548,8 +16665,8 @@ mod tests {
             &[r.clone(), g1.clone(), g2.clone(), b.clone()],
         )
         .expect("encode 12-bit Cpih=3 q=2");
-        let img = decode_codestream(&cs, None).expect("decode 12-bit Cpih=3 q=2");
-        assert_eq!(img.bit_depth, 12);
+        let img = crate::decode_components(&cs).expect("decode 12-bit Cpih=3 q=2");
+        assert_eq!(img.max_bit_depth(), 12);
         assert_eq!(img.cpih, 3);
         for (i, orig) in [&r, &g1, &g2, &b].iter().enumerate() {
             let rec = plane_u16(&img.planes[i].data);
@@ -16583,8 +16700,8 @@ mod tests {
             &[r.clone(), g1.clone(), g2.clone(), b.clone()],
         )
         .expect("encode 16-bit Cpih=3 Ct=1 q=1");
-        let img = decode_codestream(&cs, None).expect("decode 16-bit Cpih=3 Ct=1 q=1");
-        assert_eq!(img.bit_depth, 16);
+        let img = crate::decode_components(&cs).expect("decode 16-bit Cpih=3 Ct=1 q=1");
+        assert_eq!(img.max_bit_depth(), 16);
         assert_eq!(img.cpih, 3);
         for (i, orig) in [&r, &g1, &g2, &b].iter().enumerate() {
             let rec = plane_u16(&img.planes[i].data);
@@ -16680,8 +16797,8 @@ mod tests {
         let cs =
             encode_planar_subsampled_highbd(w, h, 3, 0, 2, 2, 10, &[1, 2, 2], &[1, 1, 1], &planes)
                 .expect("encode 10-bit 4:2:2 lossless");
-        let img = decode_codestream(&cs, None).expect("decode 10-bit 4:2:2 lossless");
-        assert_eq!(img.bit_depth, 10, "PIH Bw must be 10");
+        let img = crate::decode_components(&cs).expect("decode 10-bit 4:2:2 lossless");
+        assert_eq!(img.max_bit_depth(), 10, "PIH Bw must be 10");
         assert_eq!(plane_u16(&img.planes[0].data), y);
         assert_eq!(plane_u16(&img.planes[1].data), cb);
         assert_eq!(plane_u16(&img.planes[2].data), cr);
@@ -16700,8 +16817,8 @@ mod tests {
         let cs =
             encode_planar_subsampled_highbd(w, h, 3, 0, 1, 1, 12, &[1, 2, 2], &[1, 2, 2], &planes)
                 .expect("encode 12-bit 4:2:0 lossless");
-        let img = decode_codestream(&cs, None).expect("decode 12-bit 4:2:0 lossless");
-        assert_eq!(img.bit_depth, 12, "PIH Bw must be 12");
+        let img = crate::decode_components(&cs).expect("decode 12-bit 4:2:0 lossless");
+        assert_eq!(img.max_bit_depth(), 12, "PIH Bw must be 12");
         assert_eq!(plane_u16(&img.planes[0].data), y);
         assert_eq!(plane_u16(&img.planes[1].data), cb);
         assert_eq!(plane_u16(&img.planes[2].data), cr);
@@ -16722,7 +16839,7 @@ mod tests {
         let cs =
             encode_planar_subsampled_highbd(w, h, 3, 0, 2, 2, 16, &[1, 2, 2], &[1, 1, 1], &planes)
                 .expect("encode 16-bit 4:2:2 lossless");
-        let img = decode_codestream(&cs, None).expect("decode 16-bit 4:2:2 lossless");
+        let img = crate::decode_components(&cs).expect("decode 16-bit 4:2:2 lossless");
         assert_eq!(plane_u16(&img.planes[0].data), y);
         assert_eq!(plane_u16(&img.planes[1].data), cb);
         assert_eq!(plane_u16(&img.planes[2].data), cr);
@@ -16751,8 +16868,8 @@ mod tests {
             &planes,
         )
         .expect("encode 10-bit 4:2:2 q=1");
-        let img = decode_codestream(&cs, None).expect("decode 10-bit 4:2:2 q=1");
-        assert_eq!(img.bit_depth, 10);
+        let img = crate::decode_components(&cs).expect("decode 10-bit 4:2:2 q=1");
+        assert_eq!(img.max_bit_depth(), 10);
         for (i, orig) in [&y, &cb, &cr].iter().enumerate() {
             let rec = plane_u16(&img.planes[i].data);
             let p = psnr_u16(orig, &rec, 10);
@@ -16786,7 +16903,7 @@ mod tests {
             &planes,
         )
         .expect("encode 12-bit 4:2:0 q=2");
-        let img = decode_codestream(&cs, None).expect("decode 12-bit 4:2:0 q=2");
+        let img = crate::decode_components(&cs).expect("decode 12-bit 4:2:0 q=2");
         for (i, orig) in [&y, &cb, &cr].iter().enumerate() {
             let rec = plane_u16(&img.planes[i].data);
             let p = psnr_u16(orig, &rec, 12);
@@ -17185,7 +17302,7 @@ mod tests {
             nl - 1,
             "q=0 every R[p] fits; picker returns the maximum NL-1"
         );
-        let img = decode_codestream(&cs, None).expect("decode q=0 picker output");
+        let img = crate::decode_components(&cs).expect("decode q=0 picker output");
         assert_eq!(
             img.planes[0].data, pixels,
             "q=0 picker output must be lossless"
@@ -17250,7 +17367,7 @@ mod tests {
             .expect("RGB+RCT wrapper at max budget");
         assert!(cs.len() <= cs_max.len(), "wrapper output must fit budget");
         assert!(
-            decode_codestream(&cs, None).is_ok(),
+            crate::decode_components(&cs).is_ok(),
             "picked RGB+RCT R[p]={rp} q=2 must decode"
         );
     }
@@ -17346,7 +17463,7 @@ mod tests {
             std::slice::from_ref(&pixels),
         )
         .expect("joint q=0 rp=NL-1");
-        let img = decode_codestream(&cs, None).expect("decode joint q=0 rp=NL-1");
+        let img = crate::decode_components(&cs).expect("decode joint q=0 rp=NL-1");
         assert_eq!(
             img.planes[0].data, pixels,
             "lossless joint must roundtrip bit-exactly"
@@ -17591,7 +17708,7 @@ mod tests {
             encode_planar_hsl_qslice_rp_target_bytes(32, 32, 3, 1, 2, 2, 4, budget, &planes)
                 .expect("RGB+RCT joint picker");
         assert!(cs.len() <= budget, "RGB+RCT picker output must fit budget");
-        let img = decode_codestream(&cs, None).expect("decode RGB+RCT joint picker output");
+        let img = crate::decode_components(&cs).expect("decode RGB+RCT joint picker output");
         assert_eq!(
             img.planes.len(),
             3,
@@ -17669,8 +17786,8 @@ mod tests {
             std::slice::from_ref(&src),
         )
         .expect("joint highbd q=0 rp=NL-1");
-        let img = decode_codestream(&cs, None).expect("decode highbd joint q=0 rp=NL-1");
-        assert_eq!(img.bit_depth, 10, "PIH Bw must be 10");
+        let img = crate::decode_components(&cs).expect("decode highbd joint q=0 rp=NL-1");
+        assert_eq!(img.max_bit_depth(), 10, "PIH Bw must be 10");
         assert_eq!(
             plane_u16(&img.planes[0].data),
             src,
@@ -17775,7 +17892,7 @@ mod tests {
             std::slice::from_ref(&src),
         )
         .expect("joint highbd 10-bit q=1");
-        let img = decode_codestream(&cs, None).expect("decode joint highbd 10-bit q=1");
+        let img = crate::decode_components(&cs).expect("decode joint highbd 10-bit q=1");
         let rec = plane_u16(&img.planes[0].data);
         let p = psnr_u16(&src, &rec, 10);
         assert!(
@@ -17806,7 +17923,7 @@ mod tests {
             std::slice::from_ref(&src),
         )
         .expect("joint highbd 12-bit mixed q");
-        let img = decode_codestream(&cs, None).expect("decode joint highbd 12-bit mixed q");
+        let img = crate::decode_components(&cs).expect("decode joint highbd 12-bit mixed q");
         let rec = plane_u16(&img.planes[0].data);
         let p = psnr_u16(&src, &rec, 12);
         // [0, 3] mix at NL=2/2 is well within the 30 dB floor we hold on
@@ -18053,7 +18170,7 @@ mod tests {
             &planes,
         )
         .expect("joint highbd 10-bit RGB+RCT lossless rp=NL-1");
-        let img = decode_codestream(&cs, None).expect("decode joint highbd 10-bit RGB+RCT");
+        let img = crate::decode_components(&cs).expect("decode joint highbd 10-bit RGB+RCT");
         for (i, orig) in [&r, &g, &b].iter().enumerate() {
             let rec = plane_u16(&img.planes[i].data);
             assert_eq!(rec, **orig, "component {i} must roundtrip bit-exactly");
@@ -18213,7 +18330,7 @@ mod tests {
         );
         // Decoder reconstructs the picture (lossy in the q>0 precincts,
         // lossless in the q=0 precincts).
-        let img = decode_codestream(&mixed, None).expect("decode mixed q_precincts");
+        let img = crate::decode_components(&mixed).expect("decode mixed q_precincts");
         let p = psnr(&pixels, &img.planes[0].data);
         assert!(
             p >= 30.0,
@@ -18276,7 +18393,7 @@ mod tests {
         );
         // Decoder round-trip — every precinct's reconstructed Q surfaces
         // in correct band truncation, so the bit-accuracy floor holds.
-        let img = decode_codestream(&cs, None).expect("decode mixed q_precincts");
+        let img = crate::decode_components(&cs).expect("decode mixed q_precincts");
         let p = psnr(&pixels, &img.planes[0].data);
         assert!(
             p >= 25.0,
@@ -18346,7 +18463,7 @@ mod tests {
         let qpr = vec![0u8; 8];
         let cs = encode_planar_qpr(w as u16, h as u16, 3, 1, 2, 2, &qpr, &planes)
             .expect("qpr lossless RGB+RCT encode");
-        let img = decode_codestream(&cs, None).expect("decode qpr lossless RGB+RCT");
+        let img = crate::decode_components(&cs).expect("decode qpr lossless RGB+RCT");
         assert_eq!(img.planes[0].data, r, "R component lossless");
         assert_eq!(img.planes[1].data, g, "G component lossless");
         assert_eq!(img.planes[2].data, b, "B component lossless");
@@ -18374,7 +18491,7 @@ mod tests {
         let qpr = vec![0u8; 4];
         let cs = encode_planar_qpr(w as u16, h as u16, 4, 3, 2, 2, &qpr, &planes)
             .expect("qpr lossless Star-Tetrix encode");
-        let img = decode_codestream(&cs, None).expect("decode qpr lossless Star-Tetrix");
+        let img = crate::decode_components(&cs).expect("decode qpr lossless Star-Tetrix");
         for (i, want) in planes.iter().enumerate() {
             assert_eq!(img.planes[i].data, *want, "component {i} lossless");
         }
@@ -18508,7 +18625,7 @@ mod tests {
             "first precinct R[p] must equal r_precincts[0]"
         );
         // Round-trip: q=0 floors every T[p,b] so this is lossless.
-        let img = decode_codestream(&cs, None).expect("decode rpr stream");
+        let img = crate::decode_components(&cs).expect("decode rpr stream");
         assert_eq!(
             img.planes[0].data, pixels,
             "q=0 + per-precinct R[p] must round-trip losslessly"
@@ -18655,8 +18772,8 @@ mod tests {
             std::slice::from_ref(&pixels),
         )
         .expect("Q+R encode");
-        let img_q = decode_codestream(&cs_q_only, None).expect("decode Q-only");
-        let img_qr = decode_codestream(&cs_q_and_r, None).expect("decode Q+R");
+        let img_q = crate::decode_components(&cs_q_only).expect("decode Q-only");
+        let img_qr = crate::decode_components(&cs_q_and_r).expect("decode Q+R");
         let psnr_q = psnr(&pixels, &img_q.planes[0].data);
         let psnr_qr = psnr(&pixels, &img_qr.planes[0].data);
         assert!(
@@ -18711,7 +18828,7 @@ mod tests {
             r_byte_first, r_pattern[0],
             "first precinct R[p] must equal r_precincts[0]"
         );
-        let img = decode_codestream(&cs, None).expect("decode qpr+rpr");
+        let img = crate::decode_components(&cs).expect("decode qpr+rpr");
         let p = psnr(&pixels, &img.planes[0].data);
         assert!(p >= 20.0, "qpr+rpr PSNR {p:.2} dB < 20 dB floor");
     }
@@ -18954,7 +19071,7 @@ mod tests {
         assert_eq!(q_picked.len(), 8, "Np,y = 8 → 8 Q[p] entries");
         assert_eq!(r_picked.len(), 8, "Np,y = 8 → 8 R[p] entries");
         // Lossy stream still decodes through the round-242 primitive.
-        let img = decode_codestream(&cs, None).expect("decode picker output");
+        let img = crate::decode_components(&cs).expect("decode picker output");
         assert_eq!(img.width as usize, w);
         assert_eq!(img.height as usize, h);
     }
@@ -19009,7 +19126,7 @@ mod tests {
             q_picked.iter().any(|&q| q > 0),
             "tight budget must drive Q > 0 on some precinct: {q_picked:?}"
         );
-        let img = decode_codestream(&cs, None).expect("decode");
+        let img = crate::decode_components(&cs).expect("decode");
         let plane = &img.planes[0].data;
         assert_eq!(plane.len(), w * h, "reconstructed plane size");
         let p = psnr(&pixels, plane);
@@ -19070,7 +19187,7 @@ mod tests {
         .expect("replay primitive");
         assert_eq!(cs, cs_replay, "wrapper output == primitive replay");
         assert_eq!(cs, lossless, "matches lossless reference");
-        let img = decode_codestream(&cs, None).expect("decode lossless");
+        let img = crate::decode_components(&cs).expect("decode lossless");
         assert_eq!(img.planes[0].data, pixels, "lossless self-roundtrip");
     }
 
@@ -19121,7 +19238,7 @@ mod tests {
 
             // (b) Round-trips with a sane PSNR floor (encoder/decoder agree
             // on T[p,b] derived from the shared weights table).
-            let img = decode_codestream(&cs, None).expect("decode Annex H codestream");
+            let img = crate::decode_components(&cs).expect("decode Annex H codestream");
             let mut src = Vec::with_capacity(64 * 64 * 3);
             let mut rec = Vec::with_capacity(64 * 64 * 3);
             for i in 0..64 * 64 {
@@ -19156,7 +19273,7 @@ mod tests {
         let planes = make_synthetic_rgb_64x64();
         let cs = encode_planar_lossy_annex_h(64, 64, 3, 1, 5, 1, 0, &planes)
             .expect("Annex H lossless encode");
-        let img = decode_codestream(&cs, None).expect("decode Annex H lossless");
+        let img = crate::decode_components(&cs).expect("decode Annex H lossless");
         for (c, (rec_plane, src_plane)) in img.planes.iter().zip(planes.iter()).enumerate() {
             assert_eq!(
                 rec_plane.data, *src_plane,
@@ -19279,7 +19396,7 @@ mod tests {
             // The strict encoder/decoder T[p,b] alignment proof is the q=0
             // bit-exact test below; PSNR is content-dependent (the steep luma
             // ramp + high 4:2:0 LL gains make it a poor invariant here).
-            let img = decode_codestream(&cs, None).expect("decode subsampled Annex H stream");
+            let img = crate::decode_components(&cs).expect("decode subsampled Annex H stream");
             assert_eq!(img.width as usize, 64, "decoded width");
             assert_eq!(img.height as usize, 64, "decoded height");
             assert_eq!(img.planes.len(), 3, "decoded component count");
@@ -19319,7 +19436,7 @@ mod tests {
             let sy = [1u8, syc, syc];
             let cs = encode_planar_subsampled_annex_h(64, 64, 3, 0, 5, nly, 0, &sx, &sy, &planes)
                 .expect("subsampled Annex H lossless encode");
-            let img = decode_codestream(&cs, None).expect("decode subsampled Annex H lossless");
+            let img = crate::decode_components(&cs).expect("decode subsampled Annex H lossless");
             for (c, (rec_plane, src_plane)) in img.planes.iter().zip(planes.iter()).enumerate() {
                 assert_eq!(
                     rec_plane.data, *src_plane,
@@ -19434,9 +19551,9 @@ mod tests {
                 );
 
                 // (b) Round-trips through the decoder, highbd plane layout.
-                let img = decode_codestream(&cs, None).expect("decode highbd subsampled Annex H");
-                assert_eq!(img.num_components, 3);
-                assert_eq!(img.bit_depth, bd, "bd={bd}: Bw byte");
+                let img = crate::decode_components(&cs).expect("decode highbd subsampled Annex H");
+                assert_eq!(img.num_components(), 3);
+                assert_eq!(img.max_bit_depth(), bd, "bd={bd}: Bw byte");
 
                 // (c) Differs from the default-weights highbd subsampled path.
                 let default_cs = encode_planar_subsampled_highbd_lossy(
@@ -19466,7 +19583,7 @@ mod tests {
                     64, 64, 3, 0, 5, nly, bd, 0, &sx, &sy, &planes,
                 )
                 .expect("highbd subsampled Annex H lossless encode");
-                let img = decode_codestream(&cs, None).expect("decode highbd subsampled lossless");
+                let img = crate::decode_components(&cs).expect("decode highbd subsampled lossless");
                 for (c, (rec, src)) in img.planes.iter().zip(planes.iter()).enumerate() {
                     let got: Vec<u16> = rec
                         .data
@@ -19554,7 +19671,7 @@ mod tests {
                 )
                 .expect("highbd subsampled Annex H lossy encode");
                 let img =
-                    decode_codestream(&cs, None).expect("decode highbd subsampled Annex H lossy");
+                    crate::decode_components(&cs).expect("decode highbd subsampled Annex H lossy");
                 for (i, orig) in planes.iter().enumerate() {
                     let rec = plane_u16(&img.planes[i].data);
                     let p = psnr_u16(orig, &rec, bd);
@@ -19632,8 +19749,8 @@ mod tests {
                 assert_eq!(got_g.len(), n_bands, "NLy={nly} cf={cf}: WGT entry count");
 
                 // (b) Round-trips through the decoder.
-                let img = decode_codestream(&cs, None).expect("decode CFA Annex H stream");
-                assert_eq!(img.num_components, 4, "NLy={nly} cf={cf}: 4 CFA comps");
+                let img = crate::decode_components(&cs).expect("decode CFA Annex H stream");
+                assert_eq!(img.num_components(), 4, "NLy={nly} cf={cf}: 4 CFA comps");
                 assert_eq!(img.cpih, 3, "NLy={nly} cf={cf}: Cpih=3");
                 assert_eq!(img.width as usize, w);
                 assert_eq!(img.height as usize, h);
@@ -19668,7 +19785,7 @@ mod tests {
                     w as u16, h as u16, 5, nly, 0, 0, 0, cf, 0, &planes,
                 )
                 .expect("CFA Annex H lossless encode");
-                let img = decode_codestream(&cs, None).expect("decode CFA Annex H lossless");
+                let img = crate::decode_components(&cs).expect("decode CFA Annex H lossless");
                 for (c, (rec, src)) in img.planes.iter().zip(planes.iter()).enumerate() {
                     assert_eq!(
                         rec.data, *src,
@@ -19772,10 +19889,10 @@ mod tests {
 
                     // (b) Round-trips through the decoder with the highbd plane
                     // layout (2 bytes/sample, Bw=B[i]=bd).
-                    let img = decode_codestream(&cs, None).expect("decode highbd CFA Annex H");
-                    assert_eq!(img.num_components, 4, "bd={bd} NLy={nly}: 4 CFA comps");
+                    let img = crate::decode_components(&cs).expect("decode highbd CFA Annex H");
+                    assert_eq!(img.num_components(), 4, "bd={bd} NLy={nly}: 4 CFA comps");
                     assert_eq!(img.cpih, 3, "bd={bd} NLy={nly}: Cpih=3");
-                    assert_eq!(img.bit_depth, bd, "bd={bd}: Bw byte");
+                    assert_eq!(img.max_bit_depth(), bd, "bd={bd}: Bw byte");
                     assert_eq!(img.width as usize, w);
                     assert_eq!(img.height as usize, h);
                     for p in &img.planes {
@@ -19813,7 +19930,7 @@ mod tests {
                     )
                     .expect("highbd CFA Annex H lossless encode");
                     let img =
-                        decode_codestream(&cs, None).expect("decode highbd CFA Annex H lossless");
+                        crate::decode_components(&cs).expect("decode highbd CFA Annex H lossless");
                     // Reconstruct each component as u16 from the LE plane bytes
                     // and compare against the source samples.
                     for (c, (rec, src)) in img.planes.iter().zip(planes.iter()).enumerate() {
@@ -19976,8 +20093,8 @@ mod tests {
         .expect("encode 4:2:0 Qpih=1 lossless");
         let parsed = crate::codestream::parse(&cs).expect("parse");
         assert_eq!(parsed.pih.qpih, 1, "4:2:0 stream must signal Qpih=1");
-        let img = decode_codestream(&cs, None).expect("decode 4:2:0 Qpih=1 lossless");
-        assert_eq!(img.num_components, 3);
+        let img = crate::decode_components(&cs).expect("decode 4:2:0 Qpih=1 lossless");
+        assert_eq!(img.num_components(), 3);
         assert_eq!(img.planes[0].data, y, "Y plane lossless");
         assert_eq!(img.planes[1].data, cb, "Cb plane lossless");
         assert_eq!(img.planes[2].data, cr, "Cr plane lossless");
@@ -20004,7 +20121,7 @@ mod tests {
         .expect("encode 4:2:2 Qpih=1 lossless");
         let parsed = crate::codestream::parse(&cs).expect("parse");
         assert_eq!(parsed.pih.qpih, 1, "4:2:2 stream must signal Qpih=1");
-        let img = decode_codestream(&cs, None).expect("decode 4:2:2 Qpih=1 lossless");
+        let img = crate::decode_components(&cs).expect("decode 4:2:2 Qpih=1 lossless");
         assert_eq!(img.planes[0].data, y, "Y plane lossless");
         assert_eq!(img.planes[1].data, cb, "Cb plane lossless");
         assert_eq!(img.planes[2].data, cr, "Cr plane lossless");
@@ -20034,7 +20151,7 @@ mod tests {
         .expect("encode 4:2:0 Qpih=1 q=2");
         let parsed = crate::codestream::parse(&cs).expect("parse");
         assert_eq!(parsed.pih.qpih, 1, "4:2:0 lossy stream must signal Qpih=1");
-        let img = decode_codestream(&cs, None).expect("decode 4:2:0 Qpih=1 q=2");
+        let img = crate::decode_components(&cs).expect("decode 4:2:0 Qpih=1 q=2");
         assert_eq!(img.planes[0].data.len(), y.len());
         assert_eq!(img.planes[1].data.len(), cb.len());
         assert_eq!(img.planes[2].data.len(), cr.len());
@@ -20077,8 +20194,8 @@ mod tests {
         .expect("encode 4:4:4 RCT Qpih=1 q=2");
         let parsed = crate::codestream::parse(&cs).expect("parse");
         assert_eq!(parsed.pih.qpih, 1, "RCT stream must signal Qpih=1");
-        let img = decode_codestream(&cs, None).expect("decode 4:4:4 RCT Qpih=1 q=2");
-        assert_eq!(img.num_components, 3);
+        let img = crate::decode_components(&cs).expect("decode 4:4:4 RCT Qpih=1 q=2");
+        assert_eq!(img.num_components(), 3);
         let psnr_r = psnr(&r, &img.planes[0].data);
         let psnr_g = psnr(&g, &img.planes[1].data);
         let psnr_b = psnr(&b, &img.planes[2].data);
@@ -20167,7 +20284,7 @@ mod tests {
         .expect("encode 4:2:0 Qpih=1 multi-slice lossless");
         let parsed = crate::codestream::parse(&cs).expect("parse");
         assert_eq!(parsed.pih.qpih, 1, "multi-slice stream must signal Qpih=1");
-        let img = decode_codestream(&cs, None).expect("decode 4:2:0 Qpih=1 multi-slice");
+        let img = crate::decode_components(&cs).expect("decode 4:2:0 Qpih=1 multi-slice");
         assert_eq!(img.planes[0].data, y, "Y lossless across slices");
         assert_eq!(img.planes[1].data, cb, "Cb lossless across slices");
         assert_eq!(img.planes[2].data, cr, "Cr lossless across slices");
@@ -20204,7 +20321,7 @@ mod tests {
             parsed.pih.qpih, 1,
             "multi-precinct stream must signal Qpih=1"
         );
-        let img = decode_codestream(&cs, None).expect("decode 4:2:2 Qpih=1 multi-precinct");
+        let img = crate::decode_components(&cs).expect("decode 4:2:2 Qpih=1 multi-precinct");
         assert_eq!(img.planes[0].data, y, "Y lossless across precinct columns");
         assert_eq!(
             img.planes[1].data, cb,
@@ -20244,7 +20361,7 @@ mod tests {
         let parsed = crate::codestream::parse(&cs).expect("parse");
         assert_eq!(parsed.pih.qpih, 1);
         assert_eq!(parsed.pih.fs, 1, "Fs=1 separate sign sub-packet");
-        let img = decode_codestream(&cs, None).expect("decode 4:2:0 Qpih=1 Fs=1");
+        let img = crate::decode_components(&cs).expect("decode 4:2:0 Qpih=1 Fs=1");
         assert_eq!(img.planes[0].data, y);
         assert_eq!(img.planes[1].data, cb);
         assert_eq!(img.planes[2].data, cr);
@@ -20277,8 +20394,8 @@ mod tests {
         let parsed = crate::codestream::parse(&cs).expect("parse");
         assert_eq!(parsed.pih.qpih, 1, "Star-Tetrix stream must signal Qpih=1");
         assert_eq!(parsed.pih.cpih, 3, "Cpih=3 Star-Tetrix");
-        let img = decode_codestream(&cs, None).expect("decode CFA Qpih=1 Star-Tetrix");
-        assert_eq!(img.num_components, 4);
+        let img = crate::decode_components(&cs).expect("decode CFA Qpih=1 Star-Tetrix");
+        assert_eq!(img.num_components(), 4);
         for (c, plane) in planes.iter().enumerate() {
             assert_eq!(
                 &img.planes[c].data, plane,
@@ -20316,7 +20433,7 @@ mod tests {
             "Fq=0 requires Bw=B[0]=8 (Table A.8 lossless combination)"
         );
         // Still genuinely lossy + decodes within the floor.
-        let img = decode_codestream(&cs, None).expect("decode 32x32 luma q=2");
+        let img = crate::decode_components(&cs).expect("decode 32x32 luma q=2");
         let p = psnr(&pixels, &img.planes[0].data);
         assert!(
             p >= 25.0,
@@ -20354,7 +20471,7 @@ mod tests {
         // Set Fq nibble to 8 (keep Br low nibble), producing the
         // non-tabulated (Bw=8, Fq=8) pair.
         cs[fq_br_idx] = (8 << 4) | (cs[fq_br_idx] & 0x0f);
-        let err = decode_codestream(&cs, None)
+        let err = crate::decode_components(&cs)
             .expect_err("decoder must reject the non-Table-A.8 (Bw=8, Fq=8) pair");
         let msg = format!("{err}");
         assert!(
@@ -20391,7 +20508,7 @@ mod tests {
             (20, 8),
             "high-precision path must signal the (Bw=20, Fq=8) Table A.8 pair"
         );
-        let hp_img = decode_codestream(&hp, None).expect("decode high-precision q=2");
+        let hp_img = crate::decode_components(&hp).expect("decode high-precision q=2");
         let hp_psnr = psnr(&pixels, &hp_img.planes[0].data);
         assert!(
             hp_psnr >= 30.0,
@@ -20401,7 +20518,7 @@ mod tests {
         // The integer-transform path at the same q on the same content.
         let lo = encode_planar_lossy(w as u16, h as u16, 1, 0, 5, 5, q, &[pixels.clone()])
             .expect("encode 64x64 integer-transform q=2");
-        let lo_img = decode_codestream(&lo, None).expect("decode integer-transform q=2");
+        let lo_img = crate::decode_components(&lo).expect("decode integer-transform q=2");
         let lo_psnr = psnr(&pixels, &lo_img.planes[0].data);
         // The extra fractional precision must not make reconstruction worse;
         // allow a tiny epsilon for cases where both paths are already near
@@ -20442,7 +20559,7 @@ mod tests {
         let ok =
             encode_planar_subsampled(4, 2, 2, 0, 1, 1, 0, &[1, 2], &[1, 1], &planes(4, 2, 2, 2))
                 .expect("Wf at the Table 11 minimum must encode");
-        let img = decode_codestream(&ok, None).expect("minimum-width stream decodes");
+        let img = crate::decode_components(&ok).expect("minimum-width stream decodes");
         assert_eq!(img.planes.len(), 2);
     }
 }

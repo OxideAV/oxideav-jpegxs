@@ -24,5 +24,7 @@ fuzz_target!(|data: &[u8]| {
         let _ = &file.mastering_display;
         let _ = &file.transport_params;
     }
-    let _ = oxideav_jpegxs::decode_jxs_file(data);
+    let _ = oxideav_jpegxs::info(data);
+    let _ = oxideav_jpegxs::decode(data);
+    let _ = oxideav_jpegxs::decode_components(data);
 });

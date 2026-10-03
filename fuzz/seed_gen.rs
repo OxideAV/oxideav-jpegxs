@@ -5,6 +5,7 @@
 //! the marker chain from scratch.
 //!
 //! Run from the `fuzz/` directory: `cargo run --bin seed_gen`.
+#![allow(deprecated)]
 
 use std::fs;
 use std::path::Path;

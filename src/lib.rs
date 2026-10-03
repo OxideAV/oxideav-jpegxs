@@ -1,57 +1,68 @@
 //! JPEG XS — ISO/IEC 21122 low-latency image codec for production / IP
-//! video (SMPTE ST 2110-22).
+//! video (SMPTE ST 2110-22): a complete Part-1 decoder (65/65 ISO/IEC
+//! 21122-4 conformance vectors sample-exact), a Part-1 encoder across
+//! the whole tool set, the Part-2 profile / level surface and the
+//! Part-3 `.jxs` still-image file format.
 //!
-//! Round 6 ships a working end-to-end decoder for the multi-component,
-//! single-precinct-row subset of the standard with multi-level
-//! wavelet cascade and Star-Tetrix CFA support:
+//! # Standalone use
 //!
-//! * Round 1 — Part-1 codestream marker-chain parser
-//!   ([`codestream::parse`]); see [`codestream::Codestream`] for the
-//!   captured geometry. [`probe`] returns [`probe::JpegXsFileInfo`]
-//!   without instantiating a decoder.
-//! * Round 2 — reversible 5/3 inverse DWT (Annex E), in [`dwt`].
-//! * Round 3 — entropy decoder (Annex C) over hand-built precinct /
-//!   packet geometry, in [`entropy`].
-//! * Round 4 — slice / precinct / packet geometry walker (Annex
-//!   B.5–B.10) in [`slice_walker`], inverse quantization (Annex D) in
-//!   [`dequant`], and a wired-up [`Decoder`] in [`decoder`].
-//! * Round 5 — multi-component dispatch in [`slice_walker`] /
-//!   [`decoder`], inverse RCT colour transform (Annex F.3) in
-//!   [`colour_transform`], NLT marker parser + linear / quadratic /
-//!   extended output scaling (Annex G.3 / G.4 / G.5) in [`output`].
-//! * Round 6 — multi-level inverse-DWT cascade
-//!   ([`dwt::inverse_cascade_2d`], Annex E.2 Table E.1) wired into the
-//!   decoder; inverse Star-Tetrix transform
-//!   ([`colour_transform::inverse_star_tetrix`], Annex F.5) with the
-//!   `access()` reflection from Table F.12; CTS marker parser
-//!   ([`cts`]), CRG marker parser ([`crg`]) including the Table F.9 /
-//!   F.10 / F.11 super-pixel look-up tables; CAP `cap[]` byte-array
-//!   decoder ([`capabilities`]).
+//! The crate follows the OxideAV image-crate API contract. With
+//! `default-features = false` nothing but `std` is pulled in:
 //!
-//! Round-6 supported subset (`make_decoder` accepts):
+//! ```no_run
+//! let bytes = std::fs::read("in.jxs")?;
+//! if oxideav_jpegxs::probe(&bytes) {
+//!     let info = oxideav_jpegxs::info(&bytes)?;          // header only
+//!     let img = oxideav_jpegxs::decode(&bytes)?;         // JpegXsImage, native layout
+//!     let rgba: Vec<u8> = img.to_rgba8();
+//!     let (w, h) = (img.width(), img.height());
+//!     let opts = oxideav_jpegxs::EncodeOptions::default().with_quantization(2);
+//!     let out = oxideav_jpegxs::encode_rgba8(w, h, &rgba, &opts)?;
+//!     std::fs::write("out.jxs", out)?;
+//!     let _ = info;
+//! }
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
 //!
-//! * `Nc ∈ {1, 2, 3, 4}`, `sx, sy ∈ {1, 2}` per component
-//!   (4:4:4, 4:2:2, 4:2:0).
-//! * `Cw == 0` (one precinct per row of the picture).
-//! * `NL,x` ≥ `NL,y`, both bounded by typical spec values; tested at
-//!   `NL = 3/3` end-to-end and `NL = 5/5` at the cascade level.
-//! * `Cpih ∈ {0, 1, 3}` — no transform, RGB↔YCbCr reversible
-//!   (Annex F.3), or Star-Tetrix (Annex F.5).
-//! * `Qpih ∈ {0, 1}` (deadzone or uniform inverse quantizer).
-//! * `Fq ∈ {0, 8}` (lossless / regular per Table A.8). 8-bit output
-//!   samples (`B[i] == 8`); higher bit depths return `Unsupported`.
-//! * NLT marker present → quadratic / extended output scaling
-//!   dispatched per Annex G.4 / G.5.
+//! * [`probe()`] / [`info`] / [`decode`] / [`decode_with`] /
+//!   [`decode_rgb8`] / [`decode_rgba8`] / [`decode_from`] accept a bare
+//!   ISO/IEC 21122-1 codestream or a `.jxs` file.
+//! * [`encode`] / [`encode_rgb8`] / [`encode_rgba8`] / [`encode_to`]
+//!   write a bare codestream, or a `.jxs` file with
+//!   [`EncodeOptions::boxed`].
+//! * [`JpegXsImage`] carries `width`, `height`, [`PixelFormat`],
+//!   `planes`, [`ColorInfo`], [`Metadata`] and the significant
+//!   `bit_depth`; [`JpegXsPixelFormat`] mirrors `oxideav_core::PixelFormat`
+//!   by name (grey, planar GBR(A), planar YCbCr(A) at 8 / 10 / 12 / 14 /
+//!   16 bits).
+//! * [`decode_components`] / [`encode_components`] are the depth pair
+//!   over [`Components`] — the planes exactly as the codestream carries
+//!   them, for pictures without a contract layout (Star-Tetrix CFA,
+//!   two- or five-plus-component sets) and for conformance comparison.
+//! * [`inspect`] returns the raw header summary ([`JpegXsFileInfo`]) for
+//!   any parseable stream.
 //!
-//! Out of round-6 scope (returns `Error::Unsupported`): `Cw > 0`
-//! (custom precinct widths), CWD-driven `Sd > 0`, output bit depths
-//! > 8, encoder side.
+//! # Framework use
+//!
+//! With the default `registry` feature: [`register`] installs the codec
+//! (decoder + encoder) and the `.jxs` extension into an
+//! `oxideav_core::RuntimeContext`; [`make_decoder`] / [`make_encoder`]
+//! are the factories; `From<JpegXsImage> for VideoFrame` and
+//! [`JpegXsImage::from_video_frame`] bridge frames. The framework path
+//! calls the standalone functions above — one implementation.
+//!
+//! The depth modules ([`codestream`], [`decoder`], [`encoder`], [`dwt`],
+//! [`entropy`], [`profile`], [`signalling`], [`fileformat`], …) remain
+//! public for callers who need the marker chain, the Annex-level
+//! kernels, profile / level verification or the box builder.
 
+pub mod api;
 pub mod capabilities;
 pub mod codestream;
 pub mod colour_transform;
 pub mod com;
 pub mod component_table;
+pub mod convert;
 pub mod crg;
 pub mod cts;
 pub mod cwd;
@@ -64,6 +75,7 @@ pub mod error;
 pub mod fileformat;
 pub mod image;
 pub mod markers;
+pub mod options;
 pub mod output;
 pub mod picture_header;
 pub mod probe;
@@ -76,7 +88,26 @@ pub mod slice_walker;
 pub mod registry;
 
 #[cfg(feature = "registry")]
-pub use registry::{__oxideav_entry, make_decoder, register, register_codecs, register_containers};
+pub use registry::{
+    __oxideav_entry, make_decoder, make_encoder, register, register_codecs, register_containers,
+    register_registries,
+};
+
+// --- the contract surface -------------------------------------------------
+
+pub use api::{
+    decode, decode_components, decode_components_with, decode_from, decode_rgb8, decode_rgba8,
+    decode_with, encode, encode_components, encode_rgb8, encode_rgba8, encode_to, info, probe,
+};
+pub use error::{Error, JpegXsError, Result};
+pub use image::{
+    ColorInfo, ColorModel, ColorRange, Components, DecodeOptions, ImageInfo, JpegXsImage,
+    JpegXsPixelFormat, JpegXsPlane, Metadata, PixelFormat, Plane, RgbImage, RgbaImage,
+};
+pub use options::{EncodeOptions, Quantizer, RunMode, StarTetrixParams, Weights};
+pub use probe::{inspect, JpegXsFileInfo};
+
+// --- depth surface --------------------------------------------------------
 
 pub use capabilities::{
     parse_capabilities, parse_capabilities_lossy, unsupported_cap_bits, Capabilities,
@@ -89,6 +120,7 @@ pub use component_table::{Component, ComponentTable};
 pub use crg::{cfa_pattern_type, parse_crg, CrgEntry, CrgMarker};
 pub use cts::{parse_cts, CtsExtent, CtsMarker};
 pub use cwd::{parse_cwd, CwdMarker};
+#[allow(deprecated)]
 pub use encoder::{
     encode_image, encode_luma_8bit, encode_planar_cbr_target_bytes,
     encode_planar_cbr_target_bytes_highbd, encode_planar_cw, encode_planar_for_profile,
@@ -104,20 +136,19 @@ pub use encoder::{
     pick_q_slices_rp_for_target_bytes_highbd, pick_qpr_rpr_for_target_bytes,
     pick_rp_for_target_bytes,
 };
-pub use error::{JpegXsError, Result};
+#[allow(deprecated)]
+pub use fileformat::decode_jxs_file;
 pub use fileformat::{
-    decode_jxs_file, is_jxs_file, media_type, parse_jxs_file, write_jxs_file,
-    BufferModelDescription, ChannelDef, ChannelDefinition, Cicp, ColourSpec, FileType, FrameRate,
-    FrameRateDenominator, HeaderBox, ImageHeader, InterlaceMode, JxsFile, JxsFileBuilder,
-    MasteringDisplayMetadata, ProfileLevel, SampleCharacteristics, SamplingStructure, TimeCode,
-    VideoInformation, VideoTransportParameters, CODESTREAM_MAGIC, MEDIA_TYPE_CODESTREAM,
-    MEDIA_TYPE_HEIF_IMAGE, MEDIA_TYPE_HEIF_SEQUENCE, MEDIA_TYPE_JXS,
+    is_jxs_file, media_type, parse_jxs_file, write_jxs_file, BufferModelDescription, ChannelDef,
+    ChannelDefinition, Cicp, ColourSpec, FileType, FrameRate, FrameRateDenominator, HeaderBox,
+    ImageHeader, InterlaceMode, JxsFile, JxsFileBuilder, MasteringDisplayMetadata, ProfileLevel,
+    SampleCharacteristics, SamplingStructure, TimeCode, VideoInformation, VideoTransportParameters,
+    CODESTREAM_MAGIC, MEDIA_TYPE_CODESTREAM, MEDIA_TYPE_HEIF_IMAGE, MEDIA_TYPE_HEIF_SEQUENCE,
+    MEDIA_TYPE_JXS,
 };
-pub use image::{JpegXsImage, JpegXsPlane};
 pub use markers::Marker;
 pub use output::{parse_nlt, NltParams};
 pub use picture_header::PictureHeader;
-pub use probe::{probe, JpegXsFileInfo};
 pub use profile::{
     check_codestream as check_profile, check_codestream_size, check_level, classify_chroma,
     column_width, max_codestream_size, ChromaFormat, ColumnMode, Level, Profile, ProfileLimits,
@@ -134,17 +165,15 @@ pub use slice_walker::{parse_wgt, BandWeight};
 /// Public codec id string. Matches the aggregator feature name `jpegxs`.
 pub const CODEC_ID_STR: &str = "jpegxs";
 
-/// Standalone decode entry point.
+/// Historical standalone decode entry point: the codestream-order
+/// component planes of one bare codestream.
 ///
-/// Decodes one JPEG XS codestream into a [`JpegXsImage`]. The crate's
-/// default `registry` Cargo feature additionally exposes
-/// [`registry::register`] / [`registry::make_decoder`] for the
-/// `oxideav-core` `Decoder` trait surface; with the feature off this
-/// function plus the underlying parser / decoder modules and the
-/// crate-local [`JpegXsImage`] / [`JpegXsError`] types are still
-/// available, with no `oxideav-core` dep in the dep tree.
-pub fn decode_jpeg_xs(buf: &[u8]) -> Result<JpegXsImage> {
-    decoder::decode_codestream(buf, None)
+/// [`decode`] is the contract form (native layout, colour, metadata,
+/// `.jxs` files accepted); [`decode_components`] keeps the raw
+/// component view this function returned.
+#[deprecated(note = "use oxideav_jpegxs::decode or decode_components (IMAGE_CRATE_API)")]
+pub fn decode_jpeg_xs(buf: &[u8]) -> Result<Components> {
+    decode_components(buf)
 }
 
 #[cfg(test)]
@@ -194,9 +223,10 @@ mod tests {
     }
 
     #[test]
-    fn probe_returns_geometry() {
+    fn inspect_returns_geometry() {
         let buf = build_tiny_codestream();
-        let info = probe(&buf).expect("probe tiny codestream");
+        assert!(probe(&buf));
+        let info = inspect(&buf).expect("inspect tiny codestream");
         assert_eq!(info.width, 4);
         assert_eq!(info.height, 3);
         assert_eq!(info.num_components, 1);
@@ -208,11 +238,13 @@ mod tests {
     }
 
     #[test]
-    fn probe_rejects_non_jpegxs() {
+    fn probe_and_inspect_reject_non_jpegxs() {
         let buf = vec![0xff, 0xd8, 0x00, 0x00];
-        assert!(probe(&buf).is_none());
+        assert!(!probe(&buf));
+        assert!(inspect(&buf).is_none());
         let buf = vec![];
-        assert!(probe(&buf).is_none());
+        assert!(!probe(&buf));
+        assert!(inspect(&buf).is_none());
     }
 
     #[cfg(feature = "registry")]

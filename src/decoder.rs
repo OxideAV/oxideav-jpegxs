@@ -34,14 +34,15 @@ use crate::entropy::{
     precinct_filler_bytes, precinct_truncation, BandCoefficients, PacketWireSize, PrecinctHeader,
 };
 use crate::error::{JpegXsError as Error, Result};
-use crate::image::{JpegXsImage, JpegXsPlane as VideoPlane};
+use crate::image::{Components, Plane as VideoPlane};
 use crate::output::apply_output_scaling;
 use crate::slice_walker::{PicturePlan, PrecinctPlan};
 
-/// Decode a single JPEG XS codestream into a [`JpegXsImage`].
-pub(crate) fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<JpegXsImage> {
-    let cs = codestream::parse(buf)?;
-
+/// Decode an already-parsed codestream (`cs` = [`codestream::parse`] of
+/// `buf`). Splitting the parse from the pixel decode lets callers check
+/// [`crate::DecodeOptions`] limits against the header before any sample
+/// buffer is allocated here.
+pub(crate) fn decode_parsed(buf: &[u8], cs: &codestream::Codestream) -> Result<Components> {
     let pih = cs.pih;
     let cdt = cs.cdt.clone();
     let wgt = cs.wgt.clone();
@@ -80,7 +81,7 @@ pub(crate) fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<JpegXsIm
     // `Wf` / `Hf` / `Wf×Hf` against the declared level's `Wmax` / `Hmax`
     // / `Lmax` (Table A.6); a reserved `Plev` high byte is rejected.
     match crate::profile::Profile::from_ppih(pih.ppih) {
-        Some(profile) => crate::profile::check_codestream(&cs, profile)?,
+        Some(profile) => crate::profile::check_codestream(cs, profile)?,
         None => {
             return Err(Error::invalid(format!(
                 "jpegxs decoder: Ppih=0x{:04X} is reserved for ISO/IEC use (Table A.5)",
@@ -88,11 +89,11 @@ pub(crate) fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<JpegXsIm
             )));
         }
     }
-    crate::profile::check_level(&cs)?;
+    crate::profile::check_level(cs)?;
     // Sublevel coded-domain bound: the SOC-to-EOC codestream byte count
     // must not exceed Ssl,max = floor(Lmax × Nbpp / 8) for the declared
     // level + sublevel (§A.4.1, Tables A.8–A.11).
-    crate::profile::check_codestream_size(&cs, buf.len())?;
+    crate::profile::check_codestream_size(cs, buf.len())?;
 
     // Lcod conformance (ISO/IEC 21122-1:2022 Table 11). The picture
     // header's Lcod field is "the size of the entire codestream in bytes
@@ -335,7 +336,7 @@ pub(crate) fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<JpegXsIm
                 4 => 2,
                 _ => 0,
             });
-            let nb = beta_count(nlx_i, nly_i) as usize;
+            let nb = beta_count(nlx_i, nly_i);
             let mut bands_i: Vec<Vec<i32>> = Vec::with_capacity(nb);
             for beta in 0..nb as u32 {
                 let (bw, bh) = band_dims(wc, hc, nlx_i, nly_i, beta);
@@ -471,14 +472,13 @@ pub(crate) fn decode_codestream(buf: &[u8], pts: Option<i64>) -> Result<JpegXsIm
         });
     }
 
-    Ok(JpegXsImage {
+    Ok(Components {
         width: pih.wf as u32,
         height: pih.hf as u32,
-        num_components: pih.nc,
         cpih: pih.cpih,
-        bit_depth: pih.bw,
+        bit_depths: cdt.components.iter().map(|c| c.bit_depth).collect(),
+        sampling: cdt.components.iter().map(|c| (c.sx, c.sy)).collect(),
         planes,
-        pts,
     })
 }
 
@@ -663,7 +663,7 @@ fn decode_slice(
 
 /// Multi-level path — copy this precinct's dequantized band data into
 /// the picture-level gather buffers `gathered[i][β]`. The cascade runs
-/// later in [`decode_codestream`] once every precinct has contributed.
+/// later in [`decode_parsed`] once every precinct has contributed.
 ///
 /// Sd suppressed components (i ≥ Nc - Sd) bypass `gathered`: their
 /// band data is the raw component samples and gets copied straight into
@@ -1015,7 +1015,7 @@ fn synthesise_precinct(
 
         // NL,x == 1 && NL,y == 1 is unreachable here: any NL,y >= 1
         // layout routes through the picture-level gather/cascade path
-        // (see `multi_level` in `decode_codestream`) because the Annex E
+        // (see `multi_level` in `decode_parsed`) because the Annex E
         // vertical 5/3 synthesis crosses precinct boundaries. This
         // streaming function only ever sees NL,y == 0.
         debug_assert_eq!(nly, 0, "streaming synthesis requires NL,y == 0");
@@ -1280,8 +1280,8 @@ mod tests {
     }
 
     /// Decode `buf` through the registry decoder, returning the result.
-    fn decode_buf(buf: Vec<u8>) -> Result<JpegXsImage> {
-        decode_codestream(&buf, None)
+    fn decode_buf(buf: Vec<u8>) -> Result<Components> {
+        crate::decode_components(&buf)
     }
 
     #[test]
@@ -2305,20 +2305,28 @@ mod tests {
     #[test]
     fn end_to_end_decode_star_tetrix_4comp_4x2() {
         let buf = build_zero_star_tetrix_4comp_4x2();
+        // A CFA picture has no contract layout: the framework decoder and
+        // `decode` report `Unsupported`, the component view decodes it.
         let params = CodecParameters::video(CodecId::new(crate::CODEC_ID_STR));
         let mut dec = make_decoder(&params).unwrap();
-        let pkt = Packet::new(0, TimeBase::new(1, 25), buf);
+        let pkt = Packet::new(0, TimeBase::new(1, 25), buf.clone());
         dec.send_packet(&pkt).expect("star-tetrix send_packet");
-        let frame = dec.receive_frame().expect("star-tetrix receive_frame");
-        let Frame::Video(vf) = frame else {
-            panic!("expected video frame");
-        };
+        assert!(matches!(
+            dec.receive_frame(),
+            Err(oxideav_core::Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            crate::decode(&buf),
+            Err(crate::JpegXsError::Unsupported(_))
+        ));
+        let comps = crate::decode_components(&buf).expect("star-tetrix component view");
+        assert_eq!(comps.cpih, 3);
         assert_eq!(
-            vf.planes.len(),
+            comps.planes.len(),
             4,
             "Star-Tetrix produces 4 component planes"
         );
-        for (i, plane) in vf.planes.iter().enumerate() {
+        for (i, plane) in comps.planes.iter().enumerate() {
             assert_eq!(plane.stride, 4, "comp {i} stride");
             assert_eq!(plane.data.len(), 8, "comp {i} 4×2 plane");
             for (x, &px) in plane.data.iter().enumerate() {

@@ -6,6 +6,10 @@
 //! bit-exactly at `q = 0`.
 
 #![no_main]
+// The axes are the historical `encode_planar_*` entry points (deprecated
+// in favour of `encode` + `EncodeOptions`); they stay the fuzz surface so
+// the pinned wire format keeps being exercised.
+#![allow(deprecated)]
 
 use libfuzzer_sys::fuzz_target;
 
@@ -80,7 +84,13 @@ fuzz_target!(|data: &[u8]| {
         // round-trip below.
         return;
     };
-    let img = oxideav_jpegxs::decode_jpeg_xs(&buf).expect("every emitted codestream must decode");
+    let img =
+        oxideav_jpegxs::decode_components(&buf).expect("every emitted codestream must decode");
+    // The contract view, when the layout has one, agrees with the
+    // component view sample for sample.
+    if let Ok(contract) = oxideav_jpegxs::decode(&buf) {
+        assert_eq!(contract.planes.len(), img.planes.len());
+    }
     assert_eq!(img.planes.len(), nc as usize);
     if q == 0 {
         for (i, p) in img.planes.iter().enumerate() {
