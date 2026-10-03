@@ -325,6 +325,20 @@ fn cicp_of(parsed: &Parsed<'_>) -> Option<Cicp> {
         .find_map(|c| c.cicp)
 }
 
+/// `true` when `bytes` is a `.jxs` file whose header carries a CICP
+/// colour specification box — the one case where the FILE (not a
+/// crate convention) defines the colour semantics. The registry
+/// decoder stamps the frame's colour signal only then; a bare
+/// codestream or a `.jxs` file with no CICP box leaves the frame
+/// unstamped and the layout default on [`JpegXsImage::color`].
+#[cfg(feature = "registry")]
+pub(crate) fn carries_cicp(bytes: &[u8]) -> bool {
+    fileformat::is_jxs_file(bytes)
+        && fileformat::parse_jxs_file(bytes)
+            .map(|f| f.header.colour_specs.iter().any(|c| c.cicp.is_some()))
+            .unwrap_or(false)
+}
+
 /// Which contract layout the codestream decodes to, with its bit depth.
 ///
 /// * `Nc = 1` → grey.

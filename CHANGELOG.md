@@ -63,6 +63,17 @@
   `decode_components` / `decode_rgba8`; the fuzz lockfile follows
   `oxideav-core` 0.1.37.
 
+### Fixed
+
+* **Colour-signal stamping follows the CICP box, not the wrapper**
+  (round 470 fleet sweep): the framework decoder stamped the frame's
+  colour signal for every `.jxs` file, including one whose `colr` box
+  uses a non-CICP `METH` (where `JpegXsImage::color` is only the
+  layout's documented default). It now stamps only when a CICP colour
+  specification box is present, as the README already stated; bare
+  codestreams and CICP-less files leave the frame unstamped. Pinned by
+  `decoder_jxs_file_without_cicp_has_no_colour_signal`.
+
 ### Deprecated
 
 * `decode_jpeg_xs` (→ `decode` / `decode_components`; now returns

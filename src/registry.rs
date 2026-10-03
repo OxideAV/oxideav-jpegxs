@@ -156,7 +156,7 @@ pub fn from_color_signal(s: &ColorSignal) -> ColorInfo {
 
 /// [`JpegXsImage`] → `VideoFrame`, moving the planes out of the image.
 /// The colour signal is stamped only when `stamp_color` is set (the
-/// decoder passes `true` for a `.jxs` file with a CICP box).
+/// decoder passes `true` only for a `.jxs` file with a CICP box).
 pub(crate) fn image_into_video_frame(
     image: JpegXsImage,
     pts: Option<i64>,
@@ -576,9 +576,11 @@ impl Decoder for JpegXsDecoder {
                 Err(Error::NeedMore)
             };
         };
-        // Only a `.jxs` file carries colour signalling (its CICP box);
-        // a bare codestream gets no colour signal stamped.
-        let stamp = crate::fileformat::is_jxs_file(&pkt.data);
+        // Only a `.jxs` file with a CICP box carries colour signalling;
+        // a bare codestream, or a file whose `colr` box uses another
+        // method, gets no colour signal stamped (the layout default
+        // stays on the standalone `ColorInfo` only).
+        let stamp = crate::api::carries_cicp(&pkt.data);
         let img = crate::decode_with(&pkt.data, &crate::DecodeOptions::default())?;
         Ok(Frame::Video(image_into_video_frame(img, pkt.pts, stamp)))
     }
@@ -760,6 +762,37 @@ mod tests {
         }
         dec.flush().unwrap();
         assert!(matches!(dec.receive_frame(), Err(Error::Eof)));
+    }
+
+    #[test]
+    fn decoder_jxs_file_without_cicp_has_no_colour_signal() {
+        // A `.jxs` wrapper whose `colr` box uses a non-CICP METH: the
+        // file carries no colour semantics the frame could be stamped
+        // with, so the registry frame stays unstamped (the layout
+        // default lives on the standalone `ColorInfo` only).
+        let (w, h) = (8u32, 4u32);
+        let img = gray(w, h, 7);
+        let cs = crate::encode(&img, &EncodeOptions::default()).unwrap();
+        let mut file = wrap(&cs, w, h, 1);
+        let colr = TBOX_COLOUR.to_be_bytes();
+        let at = file
+            .windows(4)
+            .position(|wnd| wnd == colr)
+            .expect("colr box in the hand-built wrapper");
+        assert_eq!(file[at + 4], COLR_METH_CICP);
+        file[at + 4] = 1; // another METH: METHDAT is method-specific, ignored
+
+        let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        let mut dec = make_decoder(&params).unwrap();
+        dec.send_packet(&Packet::new(0, TimeBase::new(1, 25), file))
+            .unwrap();
+        match dec.receive_frame().unwrap() {
+            Frame::Video(v) => {
+                assert_eq!(v.planes[0].data, img.planes[0].data);
+                assert!(v.color_signal().is_none());
+            }
+            _ => panic!("expected a video frame"),
+        }
     }
 
     #[test]
