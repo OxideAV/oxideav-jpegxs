@@ -38,6 +38,7 @@ if oxideav_jpegxs::probe(&bytes) {
     let out: Vec<u8> = oxideav_jpegxs::encode_rgba8(w, h, &rgba, &opts)?;   // planar RGBA through the RCT
     std::fs::write("out.jxs", out)?;
 }
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 | Item | Signature |
