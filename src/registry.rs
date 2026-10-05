@@ -507,19 +507,11 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
     );
 }
 
-/// Register JPEG XS file extensions into the supplied [`ContainerRegistry`].
-///
-/// A `.jxs` file may be either a bare ISO/IEC 21122-1 codestream (SOC
-/// marker first) or the box-based JXS still-image file format of ISO/IEC
-/// 21122-3 Annex A (JPEG XS Signature box first); the decoder accepts
-/// both, routing on the leading signature. No standalone demuxer is
-/// registered — the codec's `Decoder` unwraps the box layer itself. We
-/// register the canonical `.jxs` extension against the codec id
-/// `"jpegxs"` so a caller resolving a path hint via
-/// [`ContainerRegistry::container_for_extension`] still gets a useful
-/// answer (lookups are case-insensitive).
+/// Register the two containers of [`crate::container`]: `jpegxs` (bare
+/// codestream) and `jxs` (the ISO/IEC 21122-3 box file, `.jxs`) —
+/// demuxer, muxer, probe and extension table.
 pub fn register_containers(reg: &mut ContainerRegistry) {
-    reg.register_extension("jxs", CODEC_ID_STR);
+    crate::container::register(reg);
 }
 
 /// Register codecs and containers into two separate registries.
@@ -975,7 +967,7 @@ mod tests {
         assert!(ctx.codecs.decoder_ids().next().is_some());
         assert_eq!(
             ctx.containers.container_for_extension("JXS"),
-            Some(CODEC_ID_STR)
+            Some(crate::container::CONTAINER_JXS)
         );
         let mut ctx2 = RuntimeContext::new();
         __oxideav_entry(&mut ctx2);

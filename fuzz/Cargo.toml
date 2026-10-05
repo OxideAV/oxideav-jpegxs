@@ -13,6 +13,10 @@ libfuzzer-sys = "0.4"
 [dependencies.oxideav-jpegxs]
 path = ".."
 
+# The `demux` target drives the framework containers.
+[dependencies.oxideav-core]
+version = "0.1"
+
 # The fuzz harness is its own workspace root: the crate lives inside the
 # oxideav umbrella checkout during development, and the umbrella must
 # not claim this package.
@@ -43,6 +47,13 @@ bench = false
 [[bin]]
 name = "roundtrip"
 path = "fuzz_targets/roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "demux"
+path = "fuzz_targets/demux.rs"
 test = false
 doc = false
 bench = false

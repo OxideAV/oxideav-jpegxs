@@ -110,6 +110,7 @@ name = "oxideav-jpegxs-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
+ "oxideav-core",
  "oxideav-jpegxs",
 ]
 

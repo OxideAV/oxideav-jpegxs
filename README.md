@@ -92,10 +92,27 @@ shape (format-tagged contract image; the raw component view is
 With the default `registry` feature the crate depends on `oxideav-core`
 and adds:
 
-- `register(&mut RuntimeContext)` — the codec (decoder + encoder) and the
-  `.jxs` extension; `register_codecs` / `register_containers` /
-  `register_registries` for the split registries. Wired into
-  `oxideav_meta::register_all` through `oxideav_core::register!`.
+- `register(&mut RuntimeContext)` — the codec (decoder + encoder) and two
+  containers, `jpegxs` (the bare codestream) and `jxs` (the ISO/IEC
+  21122-3 box file, extension `.jxs`), each with a probe, a demuxer and
+  a muxer (`oxideav_jpegxs::container`); `register_codecs` /
+  `register_containers` / `register_registries` for the split
+  registries. Wired into `oxideav_meta::register_all` through
+  `oxideav_core::register!`, so `oxideav_image::open(&ctx, "shot.jxs")`
+  resolves through the registry.
+- The containers are single-image: the demuxer declares one video
+  stream — `width` / `height`, the native layout as `pixel_format`, and
+  `color_signal` only when the `.jxs` header carries a CICP box (a bare
+  codestream or a non-CICP `colr` signals nothing) — and emits the whole
+  file as one keyframe packet (time base 1/1, `pts` 0). A picture with
+  no contract layout still opens with `pixel_format = None`; the
+  decoder then reports `Unsupported`. `metadata()` carries
+  `("exif", "present")` when the header has an Exif box. The muxers
+  take the registry encoder's packets and write what their name says:
+  `jpegxs` strips a `.jxs` wrapper to the codestream, `jxs` wraps a bare
+  codestream the way `encode(.., boxed)` does (CICP from the stream's
+  colour signal — unspecified code points when it has none — and the
+  alpha channel definition). One picture per file.
 - `make_decoder(&CodecParameters)` — one packet (bare codestream or
   `.jxs` file) → one `VideoFrame` in the **native layout**
   (`Gray*` / `Gbrp*` / `Gbrap*` / `Yuv*` / `Yuva*`, the picture's own

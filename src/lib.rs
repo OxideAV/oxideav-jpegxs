@@ -85,6 +85,8 @@ pub mod slice_header;
 pub mod slice_walker;
 
 #[cfg(feature = "registry")]
+pub mod container;
+#[cfg(feature = "registry")]
 pub mod registry;
 
 #[cfg(feature = "registry")]
@@ -264,11 +266,12 @@ mod tests {
         use oxideav_core::ContainerRegistry;
         let mut reg = ContainerRegistry::new();
         register_containers(&mut reg);
-        // Canonical lower-case lookup.
-        assert_eq!(reg.container_for_extension("jxs"), Some(CODEC_ID_STR));
+        // Canonical lower-case lookup: `.jxs` is the box file format.
+        let jxs = container::CONTAINER_JXS;
+        assert_eq!(reg.container_for_extension("jxs"), Some(jxs));
         // Case-insensitive (the registry lower-cases both sides).
-        assert_eq!(reg.container_for_extension("JXS"), Some(CODEC_ID_STR));
-        assert_eq!(reg.container_for_extension("Jxs"), Some(CODEC_ID_STR));
+        assert_eq!(reg.container_for_extension("JXS"), Some(jxs));
+        assert_eq!(reg.container_for_extension("Jxs"), Some(jxs));
         // Unrelated extensions do not collide.
         assert_eq!(reg.container_for_extension("jpg"), None);
     }
@@ -285,8 +288,10 @@ mod tests {
         );
         assert_eq!(
             ctx.containers.container_for_extension("jxs"),
-            Some(CODEC_ID_STR),
-            "register(ctx) should install .jxs extension hint"
+            Some(container::CONTAINER_JXS),
+            "register(ctx) should install the .jxs container"
         );
+        assert!(ctx.containers.demuxer_names().any(|n| n == "jxs"));
+        assert!(ctx.containers.muxer_names().any(|n| n == "jpegxs"));
     }
 }

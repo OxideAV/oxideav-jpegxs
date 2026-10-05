@@ -144,14 +144,34 @@ pub fn encode(image: &JpegXsImage, opts: &EncodeOptions) -> Result<Vec<u8>> {
     if !opts.boxed {
         return Ok(cs);
     }
+    wrap_in_jxs(
+        &cs,
+        &image.color,
+        image.format.has_alpha(),
+        image.metadata.exif.as_deref(),
+    )
+}
+
+/// Wrap a bare codestream in a `.jxs` file (ISO/IEC 21122-3 Annex A):
+/// `color` becomes the CICP Colour Specification box (an `Unspecified`
+/// range becomes the limited-range flag — the CICP `V` byte has no
+/// "unspecified"), `has_alpha` adds the Channel Definition box naming
+/// channel 3 as whole-image opacity, `exif` the Exif box. Shared by
+/// [`encode`] (`boxed = true`) and the framework `jxs` muxer.
+pub(crate) fn wrap_in_jxs(
+    cs: &[u8],
+    color: &ColorInfo,
+    has_alpha: bool,
+    exif: Option<&[u8]>,
+) -> Result<Vec<u8>> {
     let cicp = Cicp {
-        colour_primaries: u16::from(image.color.primaries),
-        transfer_characteristics: u16::from(image.color.transfer),
-        matrix_coefficients: u16::from(image.color.matrix),
-        full_range: matches!(image.color.range, ColorRange::Full),
+        colour_primaries: u16::from(color.primaries),
+        transfer_characteristics: u16::from(color.transfer),
+        matrix_coefficients: u16::from(color.matrix),
+        full_range: matches!(color.range, ColorRange::Full),
     };
     let mut builder = JxsFileBuilder::new(cicp);
-    if image.format.has_alpha() {
+    if has_alpha {
         // A.5.4.4: colour channels associated with colour 1..=3, the
         // fourth channel is whole-image opacity.
         builder = builder.channels(vec![
@@ -177,10 +197,10 @@ pub fn encode(image: &JpegXsImage, opts: &EncodeOptions) -> Result<Vec<u8>> {
             },
         ]);
     }
-    if let Some(exif) = &image.metadata.exif {
-        builder = builder.exif(exif.clone());
+    if let Some(exif) = exif {
+        builder = builder.exif(exif.to_vec());
     }
-    builder.build(&cs)
+    builder.build(cs)
 }
 
 /// Encode a component set exactly as given: `Nc = planes.len()`
@@ -414,20 +434,84 @@ fn layout_of(parsed: &Parsed<'_>) -> Result<(JpegXsPixelFormat, u8)> {
 /// documented default.
 fn color_of(parsed: &Parsed<'_>, format: JpegXsPixelFormat) -> ColorInfo {
     match cicp_of(parsed) {
-        Some(c) => {
-            let cp = |v: u16| u8::try_from(v).unwrap_or(ColorInfo::UNSPECIFIED);
-            ColorInfo::new(
-                if c.full_range {
-                    ColorRange::Full
-                } else {
-                    ColorRange::Limited
-                },
-                cp(c.colour_primaries),
-                cp(c.transfer_characteristics),
-                cp(c.matrix_coefficients),
-            )
-        }
+        Some(c) => cicp_color(&c),
         None => ColorInfo::default_for(format),
+    }
+}
+
+/// A CICP box read verbatim into [`ColorInfo`].
+fn cicp_color(c: &Cicp) -> ColorInfo {
+    let cp = |v: u16| u8::try_from(v).unwrap_or(ColorInfo::UNSPECIFIED);
+    ColorInfo::new(
+        if c.full_range {
+            ColorRange::Full
+        } else {
+            ColorRange::Limited
+        },
+        cp(c.colour_primaries),
+        cp(c.transfer_characteristics),
+        cp(c.matrix_coefficients),
+    )
+}
+
+/// What the framework demuxer publishes before any sample is decoded —
+/// [`info`] with the layout made optional and the colour reduced to
+/// what the FILE signals.
+#[cfg(feature = "registry")]
+pub(crate) struct Described {
+    pub width: u32,
+    pub height: u32,
+    /// The contract layout, `None` when the picture has none
+    /// (Star-Tetrix CFA, `Nc ∉ {1, 3, 4}`, mixed depths, odd sampling):
+    /// the stream still opens, the decoder reports `Unsupported`.
+    pub format: Option<JpegXsPixelFormat>,
+    /// The `.jxs` CICP box, when the file has one — the only colour
+    /// signal a frame may be stamped with (round-470 ruling).
+    pub cicp: Option<ColorInfo>,
+    /// The `.jxs` header carries an Exif box.
+    pub has_exif: bool,
+    /// Box-wrapped `.jxs` file (vs a bare codestream).
+    pub boxed: bool,
+}
+
+/// Header-only walk for the framework demuxer. Only an `Unsupported`
+/// layout verdict is absorbed — malformed input is an error here as in
+/// [`info`].
+#[cfg(feature = "registry")]
+pub(crate) fn describe(bytes: &[u8]) -> Result<Described> {
+    let parsed = parse_input(bytes, &DecodeOptions::default().with_max_pixels(None))?;
+    let format = match layout_of(&parsed) {
+        Ok((f, _)) => Some(f),
+        Err(Error::Unsupported(_)) => None,
+        Err(e) => return Err(e),
+    };
+    Ok(Described {
+        width: parsed.cs.pih.width(),
+        height: parsed.cs.pih.height(),
+        format,
+        cicp: cicp_of(&parsed).map(|c| cicp_color(&c)),
+        has_exif: parsed
+            .file
+            .as_ref()
+            .is_some_and(|f| f.header.exif.is_some()),
+        boxed: parsed.file.is_some(),
+    })
+}
+
+/// The bare codestream inside `bytes`: the `.jxs` Contiguous Codestream
+/// box payload, or `bytes` itself.
+#[cfg(feature = "registry")]
+pub(crate) fn bare_codestream(bytes: &[u8]) -> Result<&[u8]> {
+    if fileformat::is_jxs_file(bytes) {
+        let file = fileformat::parse_jxs_file(bytes)?;
+        Ok(file.codestream(bytes))
+    } else if bytes.starts_with(&[0xff, 0x10]) {
+        Ok(bytes)
+    } else {
+        Err(Error::invalid(
+            "jpegxs: input is neither a JPEG XS codestream (SOC marker) nor a .jxs file \
+             (JPEG XS Signature box)",
+        ))
     }
 }
 

@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased — round 472 (framework containers)
+
+### Added
+
+* **Framework containers** (`oxideav_jpegxs::container`, `registry`
+  feature): `jpegxs` (bare codestream) and `jxs` (ISO/IEC 21122-3 box
+  file, `.jxs`), each with a probe, a demuxer and a muxer, so
+  `ctx.containers.probe_input` → `open_demuxer` → `first_decoder` opens
+  JPEG XS files through the registry (`oxideav-image`). The demuxer
+  declares the Layer 1 stream (native `pixel_format`, `color_signal`
+  only from a CICP box, `("exif", "present")` metadata) and opens
+  pictures with no contract layout as `pixel_format = None`; the muxers
+  write the encoder's packet bare or `.jxs`-wrapped by container name.
+  New `demux` fuzz target.
+
+### Changed
+
+* `register_containers` installs the containers above; the `jxs`
+  extension now resolves to the `jxs` container (previously to the codec
+  id, which no demuxer answered).
+
 ## Unreleased — round 469 (image-crate API contract)
 
 ### Changed
