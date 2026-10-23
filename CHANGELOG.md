@@ -3570,6 +3570,13 @@ also passes 149 tests (was 140).
 
 ## Unreleased — encoder round 2 (multi-component RCT + multi-decomp + odd dims)
 
+## [0.0.9](https://github.com/OxideAV/oxideav-jpegxs/compare/v0.0.8...v0.0.9) - 2026-10-23
+
+### Other
+
+- Interlace_Mode is a frame-level field-order code, reserved Interlace_Mode / Sampling_Structure codes round-trip as Reserved, all-zero tcod accepted as TimeCode::UNUSED (issue #10)
+- edition 2024, MSRV 1.95
+
 ## [0.0.8](https://github.com/OxideAV/oxideav-jpegxs/compare/v0.0.7...v0.0.8) - 2026-10-05
 
 ### Other
