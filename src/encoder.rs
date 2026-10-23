@@ -776,7 +776,7 @@ pub fn encode_rgb_8bit(
     let mut r = Vec::with_capacity(n);
     let mut g = Vec::with_capacity(n);
     let mut b = Vec::with_capacity(n);
-    for chunk in pixels.chunks_exact(3) {
+    for chunk in pixels.as_chunks::<3>().0 {
         r.push(chunk[0]);
         g.push(chunk[1]);
         b.push(chunk[2]);
@@ -1801,9 +1801,9 @@ pub fn encode_planar_star_tetrix_annex_h(
     let sx = vec![1u8; 4];
     let sy = vec![1u8; 4];
     let fq = 0; // integer-transform path; quantisation via T[p,b], Fq=0 (Table A.8)
-                // Outside the tabulated H.9–H.11 set `annex_h_weights` returns `None`;
-                // empty gains/priorities then fall back to the default-weights Sd=1
-                // Star-Tetrix path so the CFA codestream is still well-formed.
+    // Outside the tabulated H.9–H.11 set `annex_h_weights` returns `None`;
+    // empty gains/priorities then fall back to the default-weights Sd=1
+    // Star-Tetrix path so the CFA codestream is still well-formed.
     let (gains, priorities) = annex_h_weights(4, 3, 1, nlx, nly, cf, &sx, &sy).unwrap_or_default();
     encode_planar_inner_nlt(
         width,
@@ -3840,11 +3840,7 @@ fn pick_q_slices_at_rp(
 /// Round-224 helper — resolve the effective Hsl-in-precinct-rows the
 /// encoder uses internally (`Np,y` when caller passes `hsl == 0`).
 fn hsl_rows_for(hsl: u16, np_y: u32) -> u32 {
-    if hsl == 0 {
-        np_y
-    } else {
-        hsl as u32
-    }
+    if hsl == 0 { np_y } else { hsl as u32 }
 }
 
 /// Round-224 helper — Np,y = ⌈Hf / 2^NL,y⌉.
@@ -4440,7 +4436,7 @@ fn profile_hsl(profile: crate::profile::Profile, nly: u8) -> Result<u16> {
     }
     let lim = profile.limits();
     let rows_per_precinct = 1u32 << nly;
-    if lim.slice_height % rows_per_precinct != 0 {
+    if !lim.slice_height.is_multiple_of(rows_per_precinct) {
         return Err(Error::invalid(format!(
             "jpegxs encoder: profile {} slice height of {} image rows is not a multiple of \
              the 2^NL,y = {rows_per_precinct} rows per precinct",
@@ -6347,11 +6343,7 @@ pub(crate) fn encode_planar_inner_bd(
     // headroom and the inverse-LUT key uses `bc = bd`.
     // For 8-bit the legacy choice stands: Bw = 18 with NLT, else Bw = 8.
     let bw = if bd > 8 {
-        if nlt.is_some() {
-            20
-        } else {
-            bd
-        }
+        if nlt.is_some() { 20 } else { bd }
     } else if nlt.is_some() {
         18
     } else {
@@ -6650,10 +6642,10 @@ fn write_pih_body(out: &mut Vec<u8>, cfg: &EncodeConfig) {
     out.extend_from_slice(&cfg.width.to_be_bytes());
     out.extend_from_slice(&cfg.height.to_be_bytes());
     out.extend_from_slice(&cfg.cw.to_be_bytes()); // Cw (0 = full-width precincts)
-                                                  // Hsl — slice height in precinct rows (Annex B.10). cfg.hsl == 0 is
-                                                  // the single-slice default (Hsl = Np,y, the whole picture in one
-                                                  // slice); a non-zero cfg.hsl groups the precinct rows into
-                                                  // ⌈Np,y / Hsl⌉ slices and is emitted verbatim.
+    // Hsl — slice height in precinct rows (Annex B.10). cfg.hsl == 0 is
+    // the single-slice default (Hsl = Np,y, the whole picture in one
+    // slice); a non-zero cfg.hsl groups the precinct rows into
+    // ⌈Np,y / Hsl⌉ slices and is emitted verbatim.
     let hsl_field = effective_hsl(cfg);
     out.extend_from_slice(&hsl_field.to_be_bytes()); // Hsl
     out.push(cfg.nc);
@@ -6758,11 +6750,7 @@ fn precinct_cfg_for(cfg: &EncodeConfig, py: usize, px: usize, np_x: usize) -> Op
 fn effective_hsl(cfg: &EncodeConfig) -> u16 {
     let hp_pow = 1u32 << cfg.nly;
     let np_y = (cfg.height as u32).div_ceil(hp_pow) as u16;
-    if cfg.hsl == 0 {
-        np_y
-    } else {
-        cfg.hsl
-    }
+    if cfg.hsl == 0 { np_y } else { cfg.hsl }
 }
 
 /// Number of wavelet filter types `Nβ` per Annex B.3.
@@ -7638,7 +7626,9 @@ fn write_slice(out: &mut Vec<u8>, cfg: &EncodeConfig, planes_u8: &[Vec<u8>]) -> 
                 planes_u8
                     .iter()
                     .map(|p| {
-                        p.chunks_exact(2)
+                        p.as_chunks::<2>()
+                            .0
+                            .iter()
                             .map(|c| {
                                 let v = u16::from_le_bytes([c[0], c[1]]) as i64;
                                 let x = v.clamp(0, b_max);
@@ -7684,7 +7674,9 @@ fn write_slice(out: &mut Vec<u8>, cfg: &EncodeConfig, planes_u8: &[Vec<u8>]) -> 
                 planes_u8
                     .iter()
                     .map(|p| {
-                        p.chunks_exact(2)
+                        p.as_chunks::<2>()
+                            .0
+                            .iter()
                             .map(|c| {
                                 let v = u16::from_le_bytes([c[0], c[1]]) as usize;
                                 let y = fwd[v] as i64;
@@ -7722,7 +7714,9 @@ fn write_slice(out: &mut Vec<u8>, cfg: &EncodeConfig, planes_u8: &[Vec<u8>]) -> 
                 planes_u8
                     .iter()
                     .map(|p| {
-                        p.chunks_exact(2)
+                        p.as_chunks::<2>()
+                            .0
+                            .iter()
                             .map(|c| ((u16::from_le_bytes([c[0], c[1]]) as i32) << zeta) - dc_bias)
                             .collect::<Vec<i32>>()
                     })
@@ -8229,7 +8223,7 @@ fn encode_precinct_single_level(
     precinct_bytes[2] = (lprc & 0xff) as u8;
     precinct_bytes[3] = cfg.q.min(31);
     precinct_bytes[4] = cfg.rp; // R[p] — precinct refinement (Annex C.2 Table C.1)
-                                // D[p,b] bits at offset 5+ stay 0.
+    // D[p,b] bits at offset 5+ stay 0.
     precinct_bytes.extend_from_slice(&entropy);
     let _ = hp_real; // hp_real is the original-pixel-grid count; unused now
     Ok(precinct_bytes)
@@ -8940,8 +8934,8 @@ fn encode_precinct_cascade(
     precinct_bytes[2] = (lprc & 0xff) as u8;
     precinct_bytes[3] = cfg.q.min(31);
     precinct_bytes[4] = cfg.rp; // R[p] — precinct refinement (Annex C.2 Table C.1)
-                                // D[p,b] bits at offset 5+: pack 2 bits per existing band (Sig|Pred).
-                                // D[p,b] = (sig_bit << 1) | pred_bit per Table C.1.
+    // D[p,b] bits at offset 5+: pack 2 bits per existing band (Sig|Pred).
+    // D[p,b] = (sig_bit << 1) | pred_bit per Table C.1.
     let mut bit_cursor: usize = (24 + 8 + 8) as usize; // skip Lprc/Q/R bits
     for s in &slices {
         if !s.exists {
@@ -9287,12 +9281,12 @@ fn build_packet_body_with_m(
                         // non-zero one is flagged insignificant and its VLC
                         // residual is elided, which the Rm = 0 guard would
                         // have spent bits on.
-                        if cfg.rm != 1 {
-                            if let Some(pred) = vert_predecessor {
-                                let pred_m = &pred[entry_idx];
-                                if pred_m[g0..g1.min(pred_m.len())].iter().any(|&m| m > t) {
-                                    return true;
-                                }
+                        if cfg.rm != 1
+                            && let Some(pred) = vert_predecessor
+                        {
+                            let pred_m = &pred[entry_idx];
+                            if pred_m[g0..g1.min(pred_m.len())].iter().any(|&m| m > t) {
+                                return true;
                             }
                         }
                         false
@@ -9327,11 +9321,7 @@ fn build_packet_body_with_m(
         let m_per_group = &m_per_entry[entry_idx];
         let coef = |g: usize, k: usize| -> i32 {
             let xpos = g * ng_u + k;
-            if xpos < wpb {
-                band_line[xpos]
-            } else {
-                0
-            }
+            if xpos < wpb { band_line[xpos] } else { 0 }
         };
 
         // Helper to check if a code group is in a significant sig group.
@@ -10071,7 +10061,7 @@ mod tests {
             Vec::with_capacity(n),
             Vec::with_capacity(n),
         );
-        for chunk in pixels.chunks_exact(3) {
+        for chunk in pixels.as_chunks::<3>().0 {
             r.push(chunk[0]);
             g.push(chunk[1]);
             b.push(chunk[2]);
@@ -10092,7 +10082,7 @@ mod tests {
             Vec::with_capacity(n),
             Vec::with_capacity(n),
         );
-        for chunk in pixels.chunks_exact(3) {
+        for chunk in pixels.as_chunks::<3>().0 {
             r.push(chunk[0]);
             g.push(chunk[1]);
             b.push(chunk[2]);
@@ -10122,7 +10112,7 @@ mod tests {
             Vec::with_capacity(n),
             Vec::with_capacity(n),
         );
-        for chunk in pixels.chunks_exact(3) {
+        for chunk in pixels.as_chunks::<3>().0 {
             r.push(chunk[0]);
             g.push(chunk[1]);
             b.push(chunk[2]);
@@ -10170,7 +10160,7 @@ mod tests {
             Vec::with_capacity(n),
             Vec::with_capacity(n),
         );
-        for chunk in pixels.chunks_exact(3) {
+        for chunk in pixels.as_chunks::<3>().0 {
             r.push(chunk[0]);
             g.push(chunk[1]);
             b.push(chunk[2]);
@@ -10240,7 +10230,7 @@ mod tests {
             Vec::with_capacity(n),
             Vec::with_capacity(n),
         );
-        for chunk in pixels.chunks_exact(3) {
+        for chunk in pixels.as_chunks::<3>().0 {
             r.push(chunk[0]);
             g.push(chunk[1]);
             b.push(chunk[2]);
@@ -10284,7 +10274,7 @@ mod tests {
             Vec::with_capacity(n),
             Vec::with_capacity(n),
         );
-        for chunk in pixels.chunks_exact(3) {
+        for chunk in pixels.as_chunks::<3>().0 {
             r.push(chunk[0]);
             g.push(chunk[1]);
             b.push(chunk[2]);
@@ -10329,7 +10319,7 @@ mod tests {
             Vec::with_capacity(n),
             Vec::with_capacity(n),
         );
-        for chunk in pixels.chunks_exact(3) {
+        for chunk in pixels.as_chunks::<3>().0 {
             r.push(chunk[0]);
             g.push(chunk[1]);
             b.push(chunk[2]);
@@ -10926,7 +10916,7 @@ mod tests {
             Vec::with_capacity(n),
             Vec::with_capacity(n),
         );
-        for chunk in pixels.chunks_exact(3) {
+        for chunk in pixels.as_chunks::<3>().0 {
             r.push(chunk[0]);
             g.push(chunk[1]);
             b.push(chunk[2]);
@@ -11020,7 +11010,7 @@ mod tests {
             Vec::with_capacity(n),
             Vec::with_capacity(n),
         );
-        for chunk in pixels.chunks_exact(3) {
+        for chunk in pixels.as_chunks::<3>().0 {
             r.push(chunk[0]);
             g.push(chunk[1]);
             b.push(chunk[2]);
@@ -12125,85 +12115,95 @@ mod tests {
     fn r193_nlt_extended_highbd_rejects_bad_params() {
         let plane = vec![0u16; 32 * 32];
         // T2 ≤ T1.
-        assert!(encode_planar_nlt_extended_highbd(
-            32,
-            32,
-            1,
-            0,
-            2,
-            2,
-            10,
-            0,
-            1 << 18,
-            1 << 16,
-            3,
-            std::slice::from_ref(&plane)
-        )
-        .is_err());
+        assert!(
+            encode_planar_nlt_extended_highbd(
+                32,
+                32,
+                1,
+                0,
+                2,
+                2,
+                10,
+                0,
+                1 << 18,
+                1 << 16,
+                3,
+                std::slice::from_ref(&plane)
+            )
+            .is_err()
+        );
         // T1 = 0.
-        assert!(encode_planar_nlt_extended_highbd(
-            32,
-            32,
-            1,
-            0,
-            2,
-            2,
-            10,
-            0,
-            0,
-            1 << 16,
-            3,
-            std::slice::from_ref(&plane)
-        )
-        .is_err());
+        assert!(
+            encode_planar_nlt_extended_highbd(
+                32,
+                32,
+                1,
+                0,
+                2,
+                2,
+                10,
+                0,
+                0,
+                1 << 16,
+                3,
+                std::slice::from_ref(&plane)
+            )
+            .is_err()
+        );
         // E = 0.
-        assert!(encode_planar_nlt_extended_highbd(
-            32,
-            32,
-            1,
-            0,
-            2,
-            2,
-            10,
-            0,
-            1 << 16,
-            1 << 18,
-            0,
-            std::slice::from_ref(&plane)
-        )
-        .is_err());
+        assert!(
+            encode_planar_nlt_extended_highbd(
+                32,
+                32,
+                1,
+                0,
+                2,
+                2,
+                10,
+                0,
+                1 << 16,
+                1 << 18,
+                0,
+                std::slice::from_ref(&plane)
+            )
+            .is_err()
+        );
         // E = 5.
-        assert!(encode_planar_nlt_extended_highbd(
-            32,
-            32,
-            1,
-            0,
-            2,
-            2,
-            10,
-            0,
-            1 << 16,
-            1 << 18,
-            5,
-            std::slice::from_ref(&plane)
-        )
-        .is_err());
+        assert!(
+            encode_planar_nlt_extended_highbd(
+                32,
+                32,
+                1,
+                0,
+                2,
+                2,
+                10,
+                0,
+                1 << 16,
+                1 << 18,
+                5,
+                std::slice::from_ref(&plane)
+            )
+            .is_err()
+        );
         // T2 above 2^Bw - 1 (Bw=20 highbd).
-        assert!(encode_planar_nlt_extended_highbd(
-            32,
-            32,
-            1,
-            0,
-            2,
-            2,
-            10,
-            0,
-            1 << 16,
-            1 << 21,
-            3,
-            &[plane]
-        )
-        .is_err());
+        assert!(
+            encode_planar_nlt_extended_highbd(
+                32,
+                32,
+                1,
+                0,
+                2,
+                2,
+                10,
+                0,
+                1 << 16,
+                1 << 21,
+                3,
+                &[plane]
+            )
+            .is_err()
+        );
     }
 
     /// Round 193: a sample value above `2^bd − 1` is rejected.
@@ -12249,7 +12249,7 @@ mod tests {
             Vec::with_capacity(n),
             Vec::with_capacity(n),
         );
-        for chunk in pixels.chunks_exact(3) {
+        for chunk in pixels.as_chunks::<3>().0 {
             r.push(chunk[0]);
             g.push(chunk[1]);
             b.push(chunk[2]);
@@ -12662,7 +12662,9 @@ mod tests {
         let img = crate::decode_components(&cs).expect("decode Rm=1 12-bit");
         let out: Vec<u16> = img.planes[0]
             .data
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         assert_eq!(out, plane, "Rm=1 12-bit lossless round-trip");
@@ -12985,7 +12987,9 @@ mod tests {
             let img = crate::decode_components(&cs)
                 .unwrap_or_else(|e| panic!("decode {bd}-bit 4:2:0 NL=3/3: {e:?}"));
             let unpack = |d: &[u8]| -> Vec<u16> {
-                d.chunks_exact(2)
+                d.as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| u16::from_le_bytes([c[0], c[1]]))
                     .collect()
             };
@@ -13186,7 +13190,9 @@ mod tests {
                 .unwrap_or_else(|e| panic!("decode NLT-quad-highbd NL={nly}/{nly}: {e:?}"));
             let got: Vec<u16> = img.planes[0]
                 .data
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect();
             assert_eq!(got.len(), lp.len());
@@ -13251,7 +13257,7 @@ mod tests {
             Vec::with_capacity(n),
             Vec::with_capacity(n),
         );
-        for chunk in pixels.chunks_exact(3) {
+        for chunk in pixels.as_chunks::<3>().0 {
             r.push(chunk[0]);
             g.push(chunk[1]);
             b.push(chunk[2]);
@@ -13333,7 +13339,7 @@ mod tests {
             Vec::with_capacity(n),
             Vec::with_capacity(n),
         );
-        for chunk in pixels.chunks_exact(3) {
+        for chunk in pixels.as_chunks::<3>().0 {
             r.push(chunk[0]);
             g.push(chunk[1]);
             b.push(chunk[2]);
@@ -13389,7 +13395,9 @@ mod tests {
         // Plane is u16-LE packed.
         let got: Vec<u16> = img.planes[0]
             .data
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         assert_eq!(got, pixels, "12-bit luma must round-trip at NL,y=0");
@@ -13564,80 +13572,90 @@ mod tests {
     fn round7_nlt_extended_rejects_bad_params() {
         let pixels = vec![0u8; 32 * 32];
         // T2 ≤ T1.
-        assert!(encode_planar_nlt_extended(
-            32,
-            32,
-            1,
-            0,
-            2,
-            2,
-            0,
-            200,
-            100,
-            3,
-            std::slice::from_ref(&pixels)
-        )
-        .is_err());
+        assert!(
+            encode_planar_nlt_extended(
+                32,
+                32,
+                1,
+                0,
+                2,
+                2,
+                0,
+                200,
+                100,
+                3,
+                std::slice::from_ref(&pixels)
+            )
+            .is_err()
+        );
         // T1 = 0.
-        assert!(encode_planar_nlt_extended(
-            32,
-            32,
-            1,
-            0,
-            2,
-            2,
-            0,
-            0,
-            100,
-            3,
-            std::slice::from_ref(&pixels)
-        )
-        .is_err());
+        assert!(
+            encode_planar_nlt_extended(
+                32,
+                32,
+                1,
+                0,
+                2,
+                2,
+                0,
+                0,
+                100,
+                3,
+                std::slice::from_ref(&pixels)
+            )
+            .is_err()
+        );
         // E = 0.
-        assert!(encode_planar_nlt_extended(
-            32,
-            32,
-            1,
-            0,
-            2,
-            2,
-            0,
-            100,
-            200,
-            0,
-            std::slice::from_ref(&pixels)
-        )
-        .is_err());
+        assert!(
+            encode_planar_nlt_extended(
+                32,
+                32,
+                1,
+                0,
+                2,
+                2,
+                0,
+                100,
+                200,
+                0,
+                std::slice::from_ref(&pixels)
+            )
+            .is_err()
+        );
         // E = 5.
-        assert!(encode_planar_nlt_extended(
-            32,
-            32,
-            1,
-            0,
-            2,
-            2,
-            0,
-            100,
-            200,
-            5,
-            std::slice::from_ref(&pixels)
-        )
-        .is_err());
+        assert!(
+            encode_planar_nlt_extended(
+                32,
+                32,
+                1,
+                0,
+                2,
+                2,
+                0,
+                100,
+                200,
+                5,
+                std::slice::from_ref(&pixels)
+            )
+            .is_err()
+        );
         // T exceeds 2^Bw-1.
-        assert!(encode_planar_nlt_extended(
-            32,
-            32,
-            1,
-            0,
-            2,
-            2,
-            0,
-            (1 << 18) + 1,
-            (1 << 18) + 2,
-            3,
-            std::slice::from_ref(&pixels)
-        )
-        .is_err());
+        assert!(
+            encode_planar_nlt_extended(
+                32,
+                32,
+                1,
+                0,
+                2,
+                2,
+                0,
+                (1 << 18) + 1,
+                (1 << 18) + 2,
+                3,
+                std::slice::from_ref(&pixels)
+            )
+            .is_err()
+        );
     }
 
     // === Round 7: deeper wavelet cascade NL ∈ {6, 7, 8} ====================
@@ -15889,7 +15907,7 @@ mod tests {
         assert_eq!(forward_quant_index(0, 7, 4, 2), 1); // 7 >> 2 = 1
         assert_eq!(forward_quant_index(0, -12, 4, 2), 3); // 12 >> 2 = 3
         assert_eq!(forward_quant_index(0, 15, 4, 2), 3); // 15 >> 2 = 3
-                                                         // M <= T → no stored bitplanes → v = 0.
+        // M <= T → no stored bitplanes → v = 0.
         assert_eq!(forward_quant_index(0, 15, 2, 2), 0);
         assert_eq!(forward_quant_index(0, 15, 1, 2), 0);
     }
@@ -16186,7 +16204,7 @@ mod tests {
     fn round115_rejects_rp_out_of_range() {
         let pixels = make_synthetic_32x32();
         let nl = n_beta(2, 2) as u8; // NL = Nβ for Nc=1, NL=2/2
-                                     // rp = NL is one past the legal maximum (NL-1).
+        // rp = NL is one past the legal maximum (NL-1).
         let result = encode_planar_rp(32, 32, 1, 0, 2, 2, 2, nl, std::slice::from_ref(&pixels));
         assert!(
             result.is_err(),
@@ -16217,7 +16235,9 @@ mod tests {
     /// Reinterpret a two-byte-per-sample (little-endian) plane back into
     /// `u16` samples for comparison.
     fn plane_u16(data: &[u8]) -> Vec<u16> {
-        data.chunks_exact(2)
+        data.as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect()
     }
@@ -19587,7 +19607,9 @@ mod tests {
                 for (c, (rec, src)) in img.planes.iter().zip(planes.iter()).enumerate() {
                     let got: Vec<u16> = rec
                         .data
-                        .chunks_exact(2)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
                         .map(|b| u16::from_le_bytes([b[0], b[1]]))
                         .collect();
                     assert_eq!(
@@ -19936,7 +19958,9 @@ mod tests {
                     for (c, (rec, src)) in img.planes.iter().zip(planes.iter()).enumerate() {
                         let got: Vec<u16> = rec
                             .data
-                            .chunks_exact(2)
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
                             .map(|b| u16::from_le_bytes([b[0], b[1]]))
                             .collect();
                         assert_eq!(
@@ -20004,30 +20028,36 @@ mod tests {
             Err(Error::Unsupported(_))
         ));
         // bd = 17 rejected.
-        assert!(encode_planar_sd_star_tetrix_highbd(
-            w as u16, h as u16, 5, 1, 17, 2, 0, 0, 0, 0, &planes
-        )
-        .is_err());
+        assert!(
+            encode_planar_sd_star_tetrix_highbd(
+                w as u16, h as u16, 5, 1, 17, 2, 0, 0, 0, 0, &planes
+            )
+            .is_err()
+        );
         // Wrong plane count (3, not 4) rejected.
         let three: Vec<Vec<u16>> = planes[..3].to_vec();
-        assert!(encode_planar_star_tetrix_highbd_annex_h(
-            w as u16, h as u16, 5, 1, bd, 2, 0, 0, 0, 0, &three
-        )
-        .is_err());
+        assert!(
+            encode_planar_star_tetrix_highbd_annex_h(
+                w as u16, h as u16, 5, 1, bd, 2, 0, 0, 0, 0, &three
+            )
+            .is_err()
+        );
         // Mismatched plane sample count rejected.
         let mut bad = planes.to_vec();
         bad[2].pop();
-        assert!(encode_planar_sd_star_tetrix_highbd(
-            w as u16, h as u16, 5, 1, bd, 2, 0, 0, 0, 0, &bad
-        )
-        .is_err());
+        assert!(
+            encode_planar_sd_star_tetrix_highbd(w as u16, h as u16, 5, 1, bd, 2, 0, 0, 0, 0, &bad)
+                .is_err()
+        );
         // Out-of-range sample (> 2^bd − 1) rejected.
         let mut over = planes.to_vec();
         over[0][0] = ((1u32 << bd) as u16).wrapping_add(5);
-        assert!(encode_planar_star_tetrix_highbd_annex_h(
-            w as u16, h as u16, 5, 1, bd, 2, 0, 0, 0, 0, &over
-        )
-        .is_err());
+        assert!(
+            encode_planar_star_tetrix_highbd_annex_h(
+                w as u16, h as u16, 5, 1, bd, 2, 0, 0, 0, 0, &over
+            )
+            .is_err()
+        );
     }
 
     // === Round 343: uniform inverse quantizer (Qpih=1, Annex D.3) on

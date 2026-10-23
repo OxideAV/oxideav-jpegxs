@@ -846,19 +846,19 @@ pub fn check_codestream(cs: &Codestream, profile: Profile) -> Result<()> {
         ColumnMode::ColumnCapped => {
             // Light-Subline 422.10 caps Cs at the profile's
             // max_column_width regardless of how Cw + NL,x combine.
-            if let Some(cap) = lim.max_column_width {
-                if cs_val > cap {
-                    return Err(Error::invalid(format!(
-                        "jpegxs profile {}: Cs={} (Cw={}, max_sx={}, 2^NL,x={}, Wf={}) exceeds profile cap {}",
-                        profile.name(),
-                        cs_val,
-                        pih.cw,
-                        max_sx,
-                        1u32 << pih.nlx as u32,
-                        pih.wf,
-                        cap,
-                    )));
-                }
+            if let Some(cap) = lim.max_column_width
+                && cs_val > cap
+            {
+                return Err(Error::invalid(format!(
+                    "jpegxs profile {}: Cs={} (Cw={}, max_sx={}, 2^NL,x={}, Wf={}) exceeds profile cap {}",
+                    profile.name(),
+                    cs_val,
+                    pih.cw,
+                    max_sx,
+                    1u32 << pih.nlx as u32,
+                    pih.wf,
+                    cap,
+                )));
             }
         }
     }
@@ -887,21 +887,21 @@ pub fn check_level(cs: &Codestream) -> Result<Option<Level>> {
     }
     let w = cs.pih.width();
     let h = cs.pih.height();
-    if let Some(wmax) = level.max_width() {
-        if w > wmax {
-            return Err(Error::invalid(format!(
-                "jpegxs level {:?}: Wf={} exceeds Wmax={}",
-                level, w, wmax
-            )));
-        }
+    if let Some(wmax) = level.max_width()
+        && w > wmax
+    {
+        return Err(Error::invalid(format!(
+            "jpegxs level {:?}: Wf={} exceeds Wmax={}",
+            level, w, wmax
+        )));
     }
-    if let Some(hmax) = level.max_height() {
-        if h > hmax {
-            return Err(Error::invalid(format!(
-                "jpegxs level {:?}: Hf={} exceeds Hmax={}",
-                level, h, hmax
-            )));
-        }
+    if let Some(hmax) = level.max_height()
+        && h > hmax
+    {
+        return Err(Error::invalid(format!(
+            "jpegxs level {:?}: Hf={} exceeds Hmax={}",
+            level, h, hmax
+        )));
     }
     if let Some(lmax) = level.max_samples() {
         let samples = w as u64 * h as u64;
@@ -951,13 +951,13 @@ pub fn check_codestream_size(cs: &Codestream, codestream_len: usize) -> Result<(
                 .to_string(),
         ));
     }
-    if let Some(max) = max_codestream_size(level, sublevel, profile) {
-        if codestream_len as u64 > max {
-            return Err(Error::invalid(format!(
-                "jpegxs sublevel {sublevel:?} @ level {level:?}: codestream is {codestream_len} \
+    if let Some(max) = max_codestream_size(level, sublevel, profile)
+        && codestream_len as u64 > max
+    {
+        return Err(Error::invalid(format!(
+            "jpegxs sublevel {sublevel:?} @ level {level:?}: codestream is {codestream_len} \
                  bytes, exceeds Ssl,max = {max} bytes (floor(Lmax × Nbpp / 8), §A.4.1)"
-            )));
-        }
+        )));
     }
     Ok(())
 }

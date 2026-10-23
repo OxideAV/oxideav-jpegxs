@@ -15,17 +15,17 @@
 
 use crate::error::{JpegXsError as Error, Result};
 
-use crate::capabilities::{parse_capabilities_lossy, Capabilities};
-use crate::com::{parse_com, ComMarker};
+use crate::capabilities::{Capabilities, parse_capabilities_lossy};
+use crate::com::{ComMarker, parse_com};
 use crate::component_table::{self, ComponentTable};
-use crate::crg::{parse_crg, CrgMarker};
-use crate::cts::{parse_cts, CtsMarker};
-use crate::cwd::{parse_cwd, CwdMarker};
+use crate::crg::{CrgMarker, parse_crg};
+use crate::cts::{CtsMarker, parse_cts};
+use crate::cwd::{CwdMarker, parse_cwd};
 use crate::markers::Marker;
-use crate::output::{parse_nlt, NltParams};
+use crate::output::{NltParams, parse_nlt};
 use crate::picture_header::{self, PictureHeader};
 use crate::slice_header::{self, SliceHeader};
-use crate::slice_walker::{parse_wgt, BandWeight};
+use crate::slice_walker::{BandWeight, parse_wgt};
 
 /// Records one (SLH, entropy-coded body) slice in the codestream.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,7 +172,7 @@ impl Codestream {
     /// `existing-band-count` and the carried pair count under a
     /// specific geometry) are caught at slice-walker construction.
     pub fn wgt(&self) -> Result<Vec<BandWeight>> {
-        if self.wgt.len() % 2 != 0 {
+        if !self.wgt.len().is_multiple_of(2) {
             return Err(Error::invalid(format!(
                 "jpegxs WGT body length {} is not a multiple of 2 \
                  (Annex A.4.11 Table A.24: (G[b], P[b]) byte pairs)",
@@ -619,7 +619,7 @@ mod tests {
         v.extend_from_slice(&[0xff, 0x13]);
         v.extend_from_slice(&4u16.to_be_bytes());
         v.extend_from_slice(&[8, 0x11]); // B[0]=8, sx=1, sy=1
-                                         // WGT — Lwgt=2, no bands
+        // WGT — Lwgt=2, no bands
         v.extend_from_slice(&[0xff, 0x14]);
         v.extend_from_slice(&2u16.to_be_bytes());
         // SLH — Lslh=4, Yslh=0

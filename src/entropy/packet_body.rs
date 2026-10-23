@@ -56,10 +56,10 @@ use crate::error::{JpegXsError as Error, Result};
 
 use std::collections::HashMap;
 
-use crate::entropy::bits::{vlc, BitReader};
+use crate::entropy::bits::{BitReader, vlc};
 use crate::entropy::packet_header::PacketHeader;
 use crate::entropy::precinct_header::PrecinctHeader;
-use crate::entropy::{precinct_truncation, PacketLayout, PrecinctGeometry};
+use crate::entropy::{PacketLayout, PrecinctGeometry, precinct_truncation};
 
 /// Decoded coefficients for one band of one precinct. Magnitudes and
 /// signs are kept separately in the form Annex D.2 / D.3 expects.

@@ -107,21 +107,21 @@ pub use image::{
     JpegXsPixelFormat, JpegXsPlane, Metadata, PixelFormat, Plane, RgbImage, RgbaImage,
 };
 pub use options::{EncodeOptions, Quantizer, RunMode, StarTetrixParams, Weights};
-pub use probe::{inspect, JpegXsFileInfo};
+pub use probe::{JpegXsFileInfo, inspect};
 
 // --- depth surface --------------------------------------------------------
 
 pub use capabilities::{
-    parse_capabilities, parse_capabilities_lossy, unsupported_cap_bits, Capabilities,
+    Capabilities, parse_capabilities, parse_capabilities_lossy, unsupported_cap_bits,
 };
 pub use codestream::{Codestream, Slice};
 pub use com::{
-    parse_com, ComMarker, TCOM_COPYRIGHT, TCOM_ENCODER_VENDOR, TCOM_VENDOR_SPECIFIC_MIN,
+    ComMarker, TCOM_COPYRIGHT, TCOM_ENCODER_VENDOR, TCOM_VENDOR_SPECIFIC_MIN, parse_com,
 };
 pub use component_table::{Component, ComponentTable};
-pub use crg::{cfa_pattern_type, parse_crg, CrgEntry, CrgMarker};
-pub use cts::{parse_cts, CtsExtent, CtsMarker};
-pub use cwd::{parse_cwd, CwdMarker};
+pub use crg::{CrgEntry, CrgMarker, cfa_pattern_type, parse_crg};
+pub use cts::{CtsExtent, CtsMarker, parse_cts};
+pub use cwd::{CwdMarker, parse_cwd};
 #[allow(deprecated)]
 pub use encoder::{
     encode_image, encode_luma_8bit, encode_planar_cbr_target_bytes,
@@ -141,20 +141,20 @@ pub use encoder::{
 #[allow(deprecated)]
 pub use fileformat::decode_jxs_file;
 pub use fileformat::{
-    is_jxs_file, media_type, parse_jxs_file, write_jxs_file, BufferModelDescription, ChannelDef,
-    ChannelDefinition, Cicp, ColourSpec, FileType, FrameRate, FrameRateDenominator, HeaderBox,
-    ImageHeader, InterlaceMode, JxsFile, JxsFileBuilder, MasteringDisplayMetadata, ProfileLevel,
-    SampleCharacteristics, SamplingStructure, TimeCode, VideoInformation, VideoTransportParameters,
-    CODESTREAM_MAGIC, MEDIA_TYPE_CODESTREAM, MEDIA_TYPE_HEIF_IMAGE, MEDIA_TYPE_HEIF_SEQUENCE,
-    MEDIA_TYPE_JXS,
+    BufferModelDescription, CODESTREAM_MAGIC, ChannelDef, ChannelDefinition, Cicp, ColourSpec,
+    FileType, FrameRate, FrameRateDenominator, HeaderBox, ImageHeader, InterlaceMode, JxsFile,
+    JxsFileBuilder, MEDIA_TYPE_CODESTREAM, MEDIA_TYPE_HEIF_IMAGE, MEDIA_TYPE_HEIF_SEQUENCE,
+    MEDIA_TYPE_JXS, MasteringDisplayMetadata, ProfileLevel, SampleCharacteristics,
+    SamplingStructure, TimeCode, VideoInformation, VideoTransportParameters, is_jxs_file,
+    media_type, parse_jxs_file, write_jxs_file,
 };
 pub use markers::Marker;
-pub use output::{parse_nlt, NltParams};
+pub use output::{NltParams, parse_nlt};
 pub use picture_header::PictureHeader;
 pub use profile::{
+    ChromaFormat, ColumnMode, Level, Profile, ProfileLimits, QpihAllowed, Sublevel,
     check_codestream as check_profile, check_codestream_size, check_level, classify_chroma,
-    column_width, max_codestream_size, ChromaFormat, ColumnMode, Level, Profile, ProfileLimits,
-    QpihAllowed, Sublevel,
+    column_width, max_codestream_size,
 };
 pub use signalling::{
     declare_auto, declare_cbr, declare_cbr_padded, declare_level_sublevel, declare_profile,
@@ -162,7 +162,7 @@ pub use signalling::{
     verify_declarations,
 };
 pub use slice_header::SliceHeader;
-pub use slice_walker::{parse_wgt, BandWeight};
+pub use slice_walker::{BandWeight, parse_wgt};
 
 /// Public codec id string. Matches the aggregator feature name `jpegxs`.
 pub const CODEC_ID_STR: &str = "jpegxs";

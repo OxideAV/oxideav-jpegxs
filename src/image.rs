@@ -282,11 +282,7 @@ impl JpegXsPixelFormat {
     /// Bytes per sample in storage: 1 for the 8-bit layouts, 2 for the
     /// little-endian 16-bit carriers.
     pub fn bytes_per_sample(self) -> usize {
-        if self.nominal_bits() > 8 {
-            2
-        } else {
-            1
-        }
+        if self.nominal_bits() > 8 { 2 } else { 1 }
     }
 
     /// Sample precision the layout nominally carries (8 / 10 / 12 / 14 /
@@ -826,7 +822,7 @@ impl JpegXsImage {
         let mut g = Vec::with_capacity(n);
         let mut b = Vec::with_capacity(n);
         let mut r = Vec::with_capacity(n);
-        for px in data.chunks_exact(3) {
+        for px in data.as_chunks::<3>().0 {
             r.push(px[0]);
             g.push(px[1]);
             b.push(px[2]);
@@ -865,7 +861,7 @@ impl JpegXsImage {
         let mut b = Vec::with_capacity(n);
         let mut r = Vec::with_capacity(n);
         let mut a = Vec::with_capacity(n);
-        for px in data.chunks_exact(4) {
+        for px in data.as_chunks::<4>().0 {
             r.push(px[0]);
             g.push(px[1]);
             b.push(px[2]);
@@ -1422,20 +1418,24 @@ mod tests {
         assert!(JpegXsImage::from_rgba8(1, 1, vec![0; 3]).is_err());
         // new(): plane count, stride, size.
         assert!(JpegXsImage::new(2, 2, JpegXsPixelFormat::Gray8, vec![]).is_err());
-        assert!(JpegXsImage::new(
-            2,
-            2,
-            JpegXsPixelFormat::Gray8,
-            vec![Plane::new(1, vec![0; 2])]
-        )
-        .is_err());
-        assert!(JpegXsImage::new(
-            2,
-            2,
-            JpegXsPixelFormat::Gray8,
-            vec![Plane::new(2, vec![0; 3])]
-        )
-        .is_err());
+        assert!(
+            JpegXsImage::new(
+                2,
+                2,
+                JpegXsPixelFormat::Gray8,
+                vec![Plane::new(1, vec![0; 2])]
+            )
+            .is_err()
+        );
+        assert!(
+            JpegXsImage::new(
+                2,
+                2,
+                JpegXsPixelFormat::Gray8,
+                vec![Plane::new(2, vec![0; 3])]
+            )
+            .is_err()
+        );
         assert!(JpegXsImage::new(0, 2, JpegXsPixelFormat::Gray8, vec![]).is_err());
         assert!(JpegXsImage::new(70000, 2, JpegXsPixelFormat::Gray8, vec![]).is_err());
         let gray = JpegXsImage::new(
@@ -1496,33 +1496,39 @@ mod tests {
         assert_eq!(c.max_bit_depth(), 10);
         assert!(!c.uniform_bit_depth());
         assert!(Components::new(3, 2, 0, vec![], vec![], vec![]).is_err());
-        assert!(Components::new(
-            3,
-            2,
-            0,
-            vec![8],
-            vec![(1, 1)],
-            vec![Plane::new(4, vec![0; 8])]
-        )
-        .is_err());
-        assert!(Components::new(
-            3,
-            2,
-            0,
-            vec![7],
-            vec![(1, 1)],
-            vec![Plane::new(3, vec![0; 6])]
-        )
-        .is_err());
-        assert!(Components::new(
-            3,
-            2,
-            0,
-            vec![8, 8],
-            vec![(1, 1)],
-            vec![Plane::new(3, vec![0; 6])]
-        )
-        .is_err());
+        assert!(
+            Components::new(
+                3,
+                2,
+                0,
+                vec![8],
+                vec![(1, 1)],
+                vec![Plane::new(4, vec![0; 8])]
+            )
+            .is_err()
+        );
+        assert!(
+            Components::new(
+                3,
+                2,
+                0,
+                vec![7],
+                vec![(1, 1)],
+                vec![Plane::new(3, vec![0; 6])]
+            )
+            .is_err()
+        );
+        assert!(
+            Components::new(
+                3,
+                2,
+                0,
+                vec![8, 8],
+                vec![(1, 1)],
+                vec![Plane::new(3, vec![0; 6])]
+            )
+            .is_err()
+        );
     }
 
     #[test]

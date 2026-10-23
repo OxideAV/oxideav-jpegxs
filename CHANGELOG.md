@@ -17,6 +17,7 @@
 
 ### Changed
 
+- edition 2024, MSRV 1.95
 * `register_containers` installs the containers above; the `jxs`
   extension now resolves to the `jxs` container (previously to the codec
   id, which no demuxer answered).

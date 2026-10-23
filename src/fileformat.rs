@@ -268,7 +268,7 @@ impl FileType {
                 "jxs ftyp: body must hold BR, MinV and at least one CLi",
             ));
         }
-        if body.len() % 4 != 0 {
+        if !body.len().is_multiple_of(4) {
             return Err(JpegXsError::invalid(
                 "jxs ftyp: body length not a multiple of 4",
             ));
@@ -1715,7 +1715,7 @@ mod tests {
         ihdr.push(COMPRESSION_JPEG_XS);
         ihdr.push(0); // UnkC
         ihdr.push(0); // IPR
-                      // colr CICP sRGB (A.5.4.3, primaries=1 tc=13 mc=0).
+        // colr CICP sRGB (A.5.4.3, primaries=1 tc=13 mc=0).
         let mut colr = vec![COLR_METH_CICP, 0, 0];
         colr.extend_from_slice(&1u16.to_be_bytes());
         colr.extend_from_slice(&13u16.to_be_bytes());
@@ -2514,13 +2514,15 @@ mod writer_tests {
         // Wrong length.
         assert!(BufferModelDescription::parse(&base[..5]).is_err());
         // Constructor-side Tbmd validation.
-        assert!(BufferModelDescription {
-            model_type: 4,
-            ncg_horizontal: 0,
-            ncg_vertical: 0,
-        }
-        .to_bytes()
-        .is_err());
+        assert!(
+            BufferModelDescription {
+                model_type: 4,
+                ncg_horizontal: 0,
+                ncg_vertical: 0,
+            }
+            .to_bytes()
+            .is_err()
+        );
     }
 
     #[test]

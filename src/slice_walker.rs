@@ -932,7 +932,7 @@ fn compute_packet_layouts(
                 //   (0 + L0_image) umod sy[i] == 0
                 let l0_band = bands[b].l0 as u32;
                 let l0_image = l0_band * sy_i_safe;
-                if sy_i != 0 && (l0_image % sy_i) != 0 {
+                if sy_i != 0 && !l0_image.is_multiple_of(sy_i) {
                     continue;
                 }
                 first_pkt.push(PacketEntry {
@@ -1013,7 +1013,7 @@ fn compute_packet_layouts(
                     }
                     // Spec B.7 Table B.4 sub-sampling guard, image-grid:
                     //   (λ + L0[p,b]) umod sy[i] == 0
-                    if sy_i != 0 && (line_image % sy_i) != 0 {
+                    if sy_i != 0 && !line_image.is_multiple_of(sy_i) {
                         continue;
                     }
                     // Convert back to band-grid for the entry.line field

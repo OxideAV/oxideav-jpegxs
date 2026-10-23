@@ -30,8 +30,9 @@ use crate::dequant::dequantize_precinct;
 use crate::dwt::inverse_cascade_2d;
 use crate::entropy::packet_body::{PrecinctState, PrecinctTop};
 use crate::entropy::{
-    check_raw_mode_consistency, decode_packet_body, parse_packet_header, parse_precinct_header,
-    precinct_filler_bytes, precinct_truncation, BandCoefficients, PacketWireSize, PrecinctHeader,
+    BandCoefficients, PacketWireSize, PrecinctHeader, check_raw_mode_consistency,
+    decode_packet_body, parse_packet_header, parse_precinct_header, precinct_filler_bytes,
+    precinct_truncation,
 };
 use crate::error::{JpegXsError as Error, Result};
 use crate::image::{Components, Plane as VideoPlane};
@@ -104,16 +105,16 @@ pub(crate) fn decode_parsed(buf: &[u8], cs: &codestream::Codestream) -> Result<C
     // marker is two bytes). A mismatch means the stream's own length
     // field disagrees with its byte layout, so a conforming decoder
     // rejects it rather than decode a stream that mis-describes itself.
-    if pih.lcod != 0 {
-        if let Some(eoc) = cs.eoc_offset {
-            let actual = (eoc + 2) as u64;
-            if pih.lcod as u64 != actual {
-                return Err(Error::invalid(format!(
-                    "jpegxs decoder: Lcod={} (declared CBR codestream length) does not match the \
+    if pih.lcod != 0
+        && let Some(eoc) = cs.eoc_offset
+    {
+        let actual = (eoc + 2) as u64;
+        if pih.lcod as u64 != actual {
+            return Err(Error::invalid(format!(
+                "jpegxs decoder: Lcod={} (declared CBR codestream length) does not match the \
                      actual SOC-to-EOC length of {actual} bytes (Table 11)",
-                    pih.lcod
-                )));
-            }
+                pih.lcod
+            )));
         }
     }
 
@@ -1197,7 +1198,7 @@ mod tests {
         v.push(0x00); // Fslc/Ppoc/Cpih=0
         v.push(0x10); // NL,x=1, NL,y=0
         v.push(0x00); // Lh/Rl/Qpih/Fs/Rm
-                      // CDT
+        // CDT
         v.extend_from_slice(&[0xff, 0x13]);
         v.extend_from_slice(&4u16.to_be_bytes());
         v.extend_from_slice(&[8, 0x11]);
@@ -1205,7 +1206,7 @@ mod tests {
         v.extend_from_slice(&[0xff, 0x14]);
         v.extend_from_slice(&6u16.to_be_bytes());
         v.extend_from_slice(&[0u8, 0, 0, 0]); // 2 bands
-                                              // SLH
+        // SLH
         v.extend_from_slice(&[0xff, 0x20]);
         v.extend_from_slice(&4u16.to_be_bytes());
         v.extend_from_slice(&0u16.to_be_bytes());
@@ -2003,7 +2004,7 @@ mod tests {
         v.extend_from_slice(&[0xff, 0x50]);
         v.extend_from_slice(&3u16.to_be_bytes()); // Lcap=3 → 1 byte cap[]
         v.push(0x20); // bit 2 set (counting MSB-first)
-                      // PIH — Bw=18, Fq=6 per Table A.8.
+        // PIH — Bw=18, Fq=6 per Table A.8.
         v.extend_from_slice(&[0xff, 0x12]);
         v.extend_from_slice(&26u16.to_be_bytes());
         v.extend_from_slice(&0u32.to_be_bytes());
@@ -2234,7 +2235,7 @@ mod tests {
         v.extend_from_slice(&[0xff, 0x50]);
         v.extend_from_slice(&3u16.to_be_bytes());
         v.push(0x40); // bit 1 = 0x40
-                      // PIH
+        // PIH
         v.extend_from_slice(&[0xff, 0x12]);
         v.extend_from_slice(&26u16.to_be_bytes());
         v.extend_from_slice(&0u32.to_be_bytes());

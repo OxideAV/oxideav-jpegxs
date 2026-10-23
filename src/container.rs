@@ -28,16 +28,16 @@
 use std::io::{Read, SeekFrom, Write};
 
 use oxideav_core::{
-    CodecId, CodecParameters, CodecResolver, ContainerRegistry, Demuxer, Error, MediaType, Muxer,
-    Packet, PixelFormat, ProbeData, ProbeScore, ReadSeek, Result, StreamInfo, TimeBase, WriteSeek,
-    MAX_PROBE_SCORE, PROBE_SCORE_EXTENSION,
+    CodecId, CodecParameters, CodecResolver, ContainerRegistry, Demuxer, Error, MAX_PROBE_SCORE,
+    MediaType, Muxer, PROBE_SCORE_EXTENSION, Packet, PixelFormat, ProbeData, ProbeScore, ReadSeek,
+    Result, StreamInfo, TimeBase, WriteSeek,
 };
 
+use crate::CODEC_ID_STR;
 use crate::api::{bare_codestream, describe, wrap_in_jxs};
-use crate::fileformat::{is_jxs_file, CODESTREAM_MAGIC};
+use crate::fileformat::{CODESTREAM_MAGIC, is_jxs_file};
 use crate::image::{ColorInfo, JpegXsPixelFormat};
 use crate::registry::{from_color_signal, to_color_signal};
-use crate::CODEC_ID_STR;
 
 /// Container name of the bare codestream.
 pub const CONTAINER_JPEGXS: &str = "jpegxs";

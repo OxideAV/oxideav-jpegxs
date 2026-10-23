@@ -358,7 +358,9 @@ mod tests {
         let omega: Vec<i32> = samples.iter().map(|&s| s - 512).collect();
         let out = apply_output_scaling(&omega, 10, 10, None).unwrap();
         let decoded: Vec<u16> = out
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         let expect: Vec<u16> = samples.iter().map(|&s| s as u16).collect();

@@ -28,11 +28,11 @@ use oxideav_core::{
     RuntimeContext, TimeBase, TransferCharacteristics, VideoFrame, VideoPlane,
 };
 
+use crate::CODEC_ID_STR;
 use crate::error::JpegXsError;
 use crate::image::{ColorInfo, ColorRange, JpegXsImage, JpegXsPixelFormat, Plane};
 use crate::options::{EncodeOptions, Quantizer, RunMode, Weights};
 use crate::profile::Profile;
-use crate::CODEC_ID_STR;
 
 // ---- error mapping --------------------------------------------------------
 
@@ -439,7 +439,7 @@ impl CodecOptionsStruct for EncodeOptions {
                     other => {
                         return Err(Error::invalid(format!(
                             "jpegxs encoder: invalid quantizer {other:?}"
-                        )))
+                        )));
                     }
                 }
             }
@@ -454,7 +454,7 @@ impl CodecOptionsStruct for EncodeOptions {
                     other => {
                         return Err(Error::invalid(format!(
                             "jpegxs encoder: invalid run_mode {other:?}"
-                        )))
+                        )));
                     }
                 }
             }
@@ -465,7 +465,7 @@ impl CodecOptionsStruct for EncodeOptions {
                     other => {
                         return Err(Error::invalid(format!(
                             "jpegxs encoder: invalid weights {other:?}"
-                        )))
+                        )));
                     }
                 }
             }
@@ -474,7 +474,7 @@ impl CodecOptionsStruct for EncodeOptions {
             other => {
                 return Err(Error::invalid(format!(
                     "jpegxs encoder: unknown option {other:?}"
-                )))
+                )));
             }
         }
         Ok(())
@@ -948,12 +948,14 @@ mod tests {
         assert_eq!(o.slice_height, Some(2));
         assert_eq!(o.run_mode, RunMode::ZeroCoefficients);
         assert_eq!(o.weights, Weights::AnnexH);
-        assert!(o
-            .apply("quantizer", &OptionValue::String("x".into()))
-            .is_err());
-        assert!(o
-            .apply("profile", &OptionValue::String("x".into()))
-            .is_err());
+        assert!(
+            o.apply("quantizer", &OptionValue::String("x".into()))
+                .is_err()
+        );
+        assert!(
+            o.apply("profile", &OptionValue::String("x".into()))
+                .is_err()
+        );
         assert!(o.apply("nope", &OptionValue::Bool(true)).is_err());
         for name in PROFILE_NAMES {
             assert!(profile_from_name(name).is_some());

@@ -263,13 +263,13 @@ struct Parsed<'a> {
 }
 
 fn parse_input<'a>(bytes: &'a [u8], opts: &DecodeOptions) -> Result<Parsed<'a>> {
-    if let Some(max) = opts.max_bytes {
-        if bytes.len() as u64 > max {
-            return Err(Error::limit(format!(
-                "jpegxs: input of {} bytes exceeds max_bytes {max}",
-                bytes.len()
-            )));
-        }
+    if let Some(max) = opts.max_bytes
+        && bytes.len() as u64 > max
+    {
+        return Err(Error::limit(format!(
+            "jpegxs: input of {} bytes exceeds max_bytes {max}",
+            bytes.len()
+        )));
     }
     let (file, codestream): (Option<JxsFile>, &[u8]) = if fileformat::is_jxs_file(bytes) {
         let file = fileformat::parse_jxs_file(bytes)?;
@@ -285,19 +285,19 @@ fn parse_input<'a>(bytes: &'a [u8], opts: &DecodeOptions) -> Result<Parsed<'a>> 
     };
     let cs = codestream::parse(codestream)?;
     let (w, h) = (cs.pih.width(), cs.pih.height());
-    if let Some(max) = opts.max_width {
-        if w > max {
-            return Err(Error::limit(format!(
-                "jpegxs: width {w} exceeds max_width {max}"
-            )));
-        }
+    if let Some(max) = opts.max_width
+        && w > max
+    {
+        return Err(Error::limit(format!(
+            "jpegxs: width {w} exceeds max_width {max}"
+        )));
     }
-    if let Some(max) = opts.max_height {
-        if h > max {
-            return Err(Error::limit(format!(
-                "jpegxs: height {h} exceeds max_height {max}"
-            )));
-        }
+    if let Some(max) = opts.max_height
+        && h > max
+    {
+        return Err(Error::limit(format!(
+            "jpegxs: height {h} exceeds max_height {max}"
+        )));
     }
     if let Some(max) = opts.max_pixels {
         let px = u64::from(w) * u64::from(h);
@@ -657,7 +657,9 @@ fn planes_u16(components: &Components) -> Vec<Vec<u16>> {
         .map(|(p, &bd)| {
             if bd > 8 {
                 p.data
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| u16::from_le_bytes([c[0], c[1]]))
                     .collect()
             } else {
@@ -904,7 +906,7 @@ mod tests {
         assert_eq!(decode_rgb8(&bare).unwrap().data, rgb);
         let rgba = decode_rgba8(&bare).unwrap();
         assert_eq!(rgba.data.len(), (w * h * 4) as usize);
-        assert!(rgba.data.chunks_exact(4).all(|p| p[3] == 255));
+        assert!(rgba.data.as_chunks::<4>().0.iter().all(|p| p[3] == 255));
         // Boxed: colour + metadata survive; the image round-trips whole.
         let src = JpegXsImage::from_rgb8(w, h, rgb.clone())
             .unwrap()
@@ -1191,11 +1193,13 @@ mod tests {
             lim(DecodeOptions::default().with_max_bytes(Some(10))),
             Err(Error::LimitExceeded(_))
         ));
-        assert!(lim(DecodeOptions::default()
-            .with_max_width(None)
-            .with_max_height(None)
-            .with_max_pixels(None))
-        .is_ok());
+        assert!(
+            lim(DecodeOptions::default()
+                .with_max_width(None)
+                .with_max_height(None)
+                .with_max_pixels(None))
+            .is_ok()
+        );
         // Trailing garbage: tolerated by default, rejected under strict.
         let mut trailing = bytes.clone();
         trailing.extend_from_slice(&[0, 1, 2, 3]);

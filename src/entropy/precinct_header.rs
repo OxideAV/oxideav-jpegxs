@@ -28,7 +28,7 @@
 use crate::error::{JpegXsError as Error, Result};
 
 use crate::entropy::bits::BitReader;
-use crate::entropy::{validate_packet_layout, PacketLayout, PrecinctGeometry};
+use crate::entropy::{PacketLayout, PrecinctGeometry, validate_packet_layout};
 
 /// Decoded precinct header. `d` is one entry per band; bands whose
 /// `BandGeometry::exists` is false store `D[p,b] = 0`.

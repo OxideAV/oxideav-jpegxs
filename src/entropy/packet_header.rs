@@ -21,8 +21,8 @@
 
 use crate::error::{JpegXsError as Error, Result};
 
-use crate::entropy::bits::BitReader;
 use crate::entropy::PrecinctGeometry;
+use crate::entropy::bits::BitReader;
 
 /// Decoded packet header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

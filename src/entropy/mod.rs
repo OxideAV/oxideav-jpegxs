@@ -35,10 +35,10 @@ pub mod packet_body;
 pub mod packet_header;
 pub mod precinct_header;
 
-pub use bits::{vlc, vlc_codeword_bits, BitReader};
-pub use packet_body::{decode_packet_body, BandCoefficients, PacketDecode, PrecinctTop};
-pub use packet_header::{parse_packet_header, PacketHeader};
-pub use precinct_header::{parse_precinct_header, PrecinctHeader};
+pub use bits::{BitReader, vlc, vlc_codeword_bits};
+pub use packet_body::{BandCoefficients, PacketDecode, PrecinctTop, decode_packet_body};
+pub use packet_header::{PacketHeader, parse_packet_header};
+pub use precinct_header::{PrecinctHeader, parse_precinct_header};
 
 use crate::error::{JpegXsError as Error, Result};
 
@@ -1326,7 +1326,7 @@ mod tests {
     #[test]
     fn lcnt_inference_skips_uncoded_groups() {
         let g = geom(vec![band(8, 0, 0)]); // Ncg = 2
-                                           // Group 0 coded (Δm=0 → 1 bit); group 1 is Z=1 → None → 0 bits.
+        // Group 0 coded (Δm=0 → 1 bit); group 1 is Z=1 → None → 0 bits.
         let deltas: &[Option<i32>] = &[Some(0), None];
         let theta: &[i32] = &[0, 0];
         let pkt = PacketCountInfo {
@@ -1354,7 +1354,7 @@ mod tests {
     #[test]
     fn lcnt_inference_uses_theta_predictor() {
         let g = geom(vec![band(4, 0, 0)]); // Wpb=4, Ng=4 → Ncg=1
-                                           // Δm=3, θ=0 → unary: x = 3 → 4 bits.
+        // Δm=3, θ=0 → unary: x = 3 → 4 bits.
         let d_unary: &[Option<i32>] = &[Some(3)];
         let t0: &[i32] = &[0];
         let pkt_unary = PacketCountInfo {

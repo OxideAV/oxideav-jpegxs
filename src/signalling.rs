@@ -39,8 +39,8 @@
 use crate::codestream;
 use crate::error::{JpegXsError as Error, Result};
 use crate::profile::{
-    check_codestream, check_codestream_size, check_level, max_codestream_size, Level, Profile,
-    Sublevel,
+    Level, Profile, Sublevel, check_codestream, check_codestream_size, check_level,
+    max_codestream_size,
 };
 
 /// Byte offset of the `Lcod` field relative to the start of the PIH
@@ -498,10 +498,10 @@ pub fn pick_sublevel(codestream_len: usize, level: Level, profile: Profile) -> S
         candidates.push(Sublevel::Full);
     }
     for sub in candidates {
-        if let Some(max) = max_codestream_size(level, sub, profile) {
-            if codestream_len as u64 <= max {
-                return sub;
-            }
+        if let Some(max) = max_codestream_size(level, sub, profile)
+            && codestream_len as u64 <= max
+        {
+            return sub;
         }
     }
     Sublevel::Unrestricted
@@ -1567,22 +1567,24 @@ mod tests {
         assert_eq!(img.planes.len(), 3);
 
         // An unreachable target errors instead of overshooting.
-        assert!(encoder::encode_planar_for_profile_cbr_target_bytes(
-            Profile::Main422_10,
-            w as u16,
-            h as u16,
-            3,
-            0,
-            2,
-            1,
-            10,
-            0,
-            &[1, 2, 2],
-            &[1, 1, 1],
-            64,
-            &planes,
-        )
-        .is_err());
+        assert!(
+            encoder::encode_planar_for_profile_cbr_target_bytes(
+                Profile::Main422_10,
+                w as u16,
+                h as u16,
+                3,
+                0,
+                2,
+                1,
+                10,
+                0,
+                &[1, 2, 2],
+                &[1, 1, 1],
+                64,
+                &planes,
+            )
+            .is_err()
+        );
 
         // The unrestricted profile has no mandated slice height — the
         // composition is profile-shaped by definition and rejects it.

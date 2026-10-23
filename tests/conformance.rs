@@ -115,7 +115,9 @@ fn decode_pgx_raw(
             ));
         }
         Ok(raw
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| {
                 if big_endian {
                     ((c[0] as u32) << 8) | c[1] as u32
@@ -226,12 +228,11 @@ fn discover_streams(dir: &Path) -> Vec<u32> {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if let Some(stem) = name.strip_suffix(".jxs") {
-            if let Ok(n) = stem.parse::<u32>() {
-                if dir.join(format!("{n}.pgx")).exists() {
-                    streams.push(n);
-                }
-            }
+        if let Some(stem) = name.strip_suffix(".jxs")
+            && let Ok(n) = stem.parse::<u32>()
+            && dir.join(format!("{n}.pgx")).exists()
+        {
+            streams.push(n);
         }
     }
     streams.sort_unstable();

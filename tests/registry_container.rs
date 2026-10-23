@@ -14,14 +14,14 @@ use oxideav_core::{
     ProbeData, ReadSeek, RuntimeContext, StreamInfo, TimeBase, VideoFrame, WriteSeek,
 };
 use oxideav_jpegxs::container::{
-    open_demuxer, open_muxer_jpegxs, open_muxer_jxs, probe_jpegxs, probe_jxs, CONTAINER_JPEGXS,
-    CONTAINER_JXS,
+    CONTAINER_JPEGXS, CONTAINER_JXS, open_demuxer, open_muxer_jpegxs, open_muxer_jxs, probe_jpegxs,
+    probe_jxs,
 };
 use oxideav_jpegxs::registry::to_color_signal;
 use oxideav_jpegxs::{
-    decode, encode, encode_components, info, make_encoder, register, ColorInfo, ColorRange,
-    Components, EncodeOptions, JpegXsError, JpegXsImage, Metadata, PixelFormat as Jxs, Plane,
-    CODEC_ID_STR,
+    CODEC_ID_STR, ColorInfo, ColorRange, Components, EncodeOptions, JpegXsError, JpegXsImage,
+    Metadata, PixelFormat as Jxs, Plane, decode, encode, encode_components, info, make_encoder,
+    register,
 };
 
 /// A `WriteSeek` sink whose bytes stay reachable after the muxer took
@@ -211,10 +211,11 @@ fn probe_names_the_container_from_magic_and_extension() {
         probe(&ctx, b"not a picture at all", Some("jxs")).unwrap(),
         CONTAINER_JXS
     );
-    assert!(ctx
-        .containers
-        .open_demuxer(CONTAINER_JXS, reader(b"not a picture at all"), &ctx.codecs)
-        .is_err());
+    assert!(
+        ctx.containers
+            .open_demuxer(CONTAINER_JXS, reader(b"not a picture at all"), &ctx.codecs)
+            .is_err()
+    );
     for foreign in [
         &b"farbfeld\0\0\0\x01\0\0\0\x01\0\0\0\0\0\0\0\0"[..],
         &b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR"[..],
@@ -499,22 +500,25 @@ fn muxers_refuse_a_second_picture_and_foreign_packets() {
             .containers
             .open_muxer(name, out, std::slice::from_ref(&stream))
             .unwrap();
-        assert!(m
-            .write_packet(&Packet::new(0, TimeBase::new(1, 1), Vec::new()))
-            .is_err());
-        assert!(m
-            .write_packet(&Packet::new(0, TimeBase::new(1, 1), b"farbfeld".to_vec()))
-            .is_err());
+        assert!(
+            m.write_packet(&Packet::new(0, TimeBase::new(1, 1), Vec::new()))
+                .is_err()
+        );
+        assert!(
+            m.write_packet(&Packet::new(0, TimeBase::new(1, 1), b"farbfeld".to_vec()))
+                .is_err()
+        );
     }
     let out: Box<dyn WriteSeek> = Box::new(Cursor::new(Vec::new()));
     assert!(ctx.containers.open_muxer(CONTAINER_JXS, out, &[]).is_err());
     let mut other = stream.clone();
     other.params.codec_id = CodecId::new("png");
     let out: Box<dyn WriteSeek> = Box::new(Cursor::new(Vec::new()));
-    assert!(ctx
-        .containers
-        .open_muxer(CONTAINER_JPEGXS, out, std::slice::from_ref(&other))
-        .is_err());
+    assert!(
+        ctx.containers
+            .open_muxer(CONTAINER_JPEGXS, out, std::slice::from_ref(&other))
+            .is_err()
+    );
 }
 
 // ---- registration ---------------------------------------------------------------
@@ -588,8 +592,9 @@ fn hostile_input_never_panics() {
     for open in [open_muxer_jxs, open_muxer_jpegxs] {
         let out: Box<dyn WriteSeek> = Box::new(Cursor::new(Vec::new()));
         let mut m = open(out, std::slice::from_ref(&stream)).unwrap();
-        assert!(m
-            .write_packet(&Packet::new(0, TimeBase::new(1, 1), Vec::new()))
-            .is_err());
+        assert!(
+            m.write_packet(&Packet::new(0, TimeBase::new(1, 1), Vec::new()))
+                .is_err()
+        );
     }
 }
