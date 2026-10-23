@@ -608,9 +608,15 @@ Table A.5: `brat` max bit rate, the `frat` frame-rate rational with its
 `InterlaceMode` (Table A.7) / `FrameRateDenominator` (1.000 / 1.001,
 Table A.8) / numerator sub-fields and the `frat = 0` unknown sentinel,
 the `schar` sample characteristics (`Valid_Flag`, 4-bit `Sample_Bitdepth`,
-`SamplingStructure` Table A.10), and the `tcod` `HH:MM:SS:FF` time code —
-each with the spec's reserved-value and range rejections. The two
-remaining optional Video Support boxes this document defines are also
+`SamplingStructure` Table A.10), and the `tcod` `HH:MM:SS:FF` time code.
+`Interlace_Mode` is a *frame* property (field order; the same value in
+both pictures of an interlaced frame), not a picture counter. Structural
+violations (wrong length, `brat = 0`, a reserved `Framerate_Denominator`,
+`schar` sub-fields set under `Valid_Flag = 0`, an out-of-range time code)
+are rejected; the reserved `Interlace_Mode` / `Sampling_Structure` codes
+are carried as `Reserved` and written back verbatim, and the all-zero
+`tcod` word is accepted as `TimeCode::UNUSED` (time code not carried). The
+two remaining optional Video Support boxes this document defines are also
 typed: the **Mastering Display Metadata box** (`dmon`, A.5.3.5 — SMPTE
 ST 2086 primaries + white point, `Lmin`/`Lmax` luminance and the
 CTA-861-G `MCLL`/`MFALL` content light levels, with the 0…50000

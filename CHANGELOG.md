@@ -1,5 +1,39 @@
 # Changelog
 
+## Unreleased — round 480 (issue #10: `jpvi` field semantics)
+
+### Changed
+
+* **`jpvi` `Interlace_Mode` is documented as a frame property** (issue
+  #10, point 1): ISO/IEC 21122-3:2019 A.5.3.2 has the code give "field
+  order", so values 1 / 2 state which video field the first coded picture
+  of the frame is and are signalled identically in both pictures of an
+  interlaced frame. The `InterlaceMode` variant names are unchanged (the
+  mapping to the wire codes never moved); the doc comments that read them
+  as "this picture is the first / second field" are corrected, and
+  `InterlaceMode::{from_code, code, is_interlaced}` are added.
+* **Reserved `Interlace_Mode` / `Sampling_Structure` codes no longer fail
+  the box** (issue #10, point 3): `InterlaceMode::Reserved` (code 3) and
+  `SamplingStructure::Reserved(u8)` (codes 3 and 7–15 of the 2019 Table
+  A.10) are parsed and serialised verbatim, so a stream written against a
+  later edition of the table still opens. `SamplingStructure::{from_code,
+  code, component_count}` are added. A named variant for code 3 (4:2:0)
+  waits for that edition's table.
+* **An all-zero `tcod` is accepted** (issue #10, point 2) on parse and
+  write as `TimeCode::UNUSED` — "time code not carried"; it collides with
+  no legal time code since Table A.5 ranges `FF` 1–60. Every other
+  out-of-range word is still rejected. `TimeCode::{new, is_unused,
+  is_valid}` are added. `VideoInformation::unknown()` still writes
+  `00:00:00:01`.
+* `InterlaceMode`, `SamplingStructure` and `FrameRateDenominator` are
+  `#[non_exhaustive]` (code tables grow by edition).
+
+### Fixed
+
+* The `TBOX_HEADER` doc comment named the JPEG XS Header superbox
+  `'jp2h'`; the constant (0x6A78_7368, the value the 2019 text gives) is
+  `'jxsh'` and the comment now says so (issue #10, minor).
+
 ## Unreleased — round 472 (framework containers)
 
 ### Added

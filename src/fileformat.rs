@@ -25,7 +25,10 @@ use crate::error::{JpegXsError, Result};
 pub const TBOX_SIGNATURE: u32 = 0x4A58_5320;
 /// File Type box type `'ftyp'` (A.5.2, 0x6674_7970).
 pub const TBOX_FILETYPE: u32 = 0x6674_7970;
-/// JPEG XS Header (super)box type `'jp2h'` (A.5.4, 0x6A78_7368).
+/// JPEG XS Header (super)box type `'jxsh'` (A.5.4, 0x6A78_7368). The
+/// 2019 text's prose and Table A.2 spell the name `'jp2h'` (the JP2
+/// heritage name) but give this hex value, which reads `'jxsh'`; the hex
+/// is what goes on the wire.
 pub const TBOX_HEADER: u32 = 0x6A78_7368;
 /// Image Header box type `'ihdr'` (A.5.4.2, 0x6968_6472).
 pub const TBOX_IMAGE_HEADER: u32 = 0x6968_6472;
@@ -559,20 +562,77 @@ impl ProfileLevel {
 }
 
 /// Interlace mode of the coded frame (A.5.3.2 Table A.7 — the top two bits
-/// of the `frat` field). Field value 3 is reserved and rejected on parse.
+/// of the `frat` field).
+///
+/// This is a property of the **frame**, not of the individual picture.
+/// A.5.3.2 has the code specify "whether the original picture is
+/// progressive or interlaced (as well as field order in the latter case)",
+/// and the Annex B note has a two-picture (interlaced) sample indicated by
+/// the one Video Support box of that sample. So values 1 and 2 give the
+/// frame's field order — which video field the first coded picture of the
+/// frame is — and a conforming interlaced stream carries the *same*
+/// Interlace_Mode (and the same `jpvi` bytes) in both pictures of a frame.
+/// Writers must not emit 1 for the first field and 2 for the second; the
+/// Table A.7 row text ("picture is first video field") read on its own
+/// invites that per-picture reading, and earlier releases of this module
+/// documented the variants that way.
+///
+/// Value 3 is reserved (Table A.7); it parses as [`Self::Reserved`] and
+/// round-trips verbatim instead of failing the box.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum InterlaceMode {
     /// 0 — progressive frame (frame contains one full-height picture).
     Progressive,
-    /// 1 — interlaced frame, picture is the first video field.
+    /// 1 — interlaced frame whose first coded picture is the first video
+    /// field (field order "first field first"); signalled identically in
+    /// both pictures of the frame.
     InterlacedFirstField,
-    /// 2 — interlaced frame, picture is the second video field.
+    /// 2 — interlaced frame whose first coded picture is the second video
+    /// field; signalled identically in both pictures of the frame.
     InterlacedSecondField,
+    /// 3 — reserved by Table A.7; carried verbatim.
+    Reserved,
+}
+
+impl InterlaceMode {
+    /// Decode the 2-bit `Interlace_Mode` code (Table A.7). Only the low
+    /// two bits of `code` are considered.
+    pub fn from_code(code: u8) -> Self {
+        match code & 0x03 {
+            0 => InterlaceMode::Progressive,
+            1 => InterlaceMode::InterlacedFirstField,
+            2 => InterlaceMode::InterlacedSecondField,
+            _ => InterlaceMode::Reserved,
+        }
+    }
+
+    /// The 2-bit `Interlace_Mode` code (Table A.7).
+    pub fn code(self) -> u8 {
+        match self {
+            InterlaceMode::Progressive => 0,
+            InterlaceMode::InterlacedFirstField => 1,
+            InterlaceMode::InterlacedSecondField => 2,
+            InterlaceMode::Reserved => 3,
+        }
+    }
+
+    /// `true` for the two interlaced codes (1 and 2): the frame is two
+    /// coded pictures, one per video field, and the field rate is twice
+    /// the `frat` frame rate (A.5.3.2).
+    pub fn is_interlaced(self) -> bool {
+        matches!(
+            self,
+            InterlaceMode::InterlacedFirstField | InterlaceMode::InterlacedSecondField
+        )
+    }
 }
 
 /// Frame-rate denominator selector (A.5.3.2 Table A.8): only the two
-/// standardised values are legal; 0 and 3–63 are reserved.
+/// standardised values are legal; 0 and 3–63 are reserved and rejected on
+/// parse (no frame rate can be computed from them).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FrameRateDenominator {
     /// 1 — denominator value 1.000 (integer / PAL rates).
     Integer,
@@ -599,8 +659,18 @@ pub enum FrameRate {
 }
 
 /// Sampling structure of the image (A.5.3.2 Table A.10 — the low nibble of
-/// the `schar` field). Field values 3 and 7–15 are reserved.
+/// the `schar` field).
+///
+/// Table A.10 of ISO/IEC 21122-3:2019 assigns codes 0–2 and 4–6 and
+/// reserves 3 and 7–15. Reserved codes parse as [`Self::Reserved`] and
+/// round-trip verbatim instead of failing the box, so a stream from a
+/// writer following a later edition of the table (4:2:0 sampling exists in
+/// the codestream since ISO/IEC 21122-1:2022, and a code for it is expected
+/// to be assigned where this edition says "Reserved") still opens; the
+/// named variant for such a code is added once that edition's table is
+/// available to this crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SamplingStructure {
     /// 0 — 4:2:2 (YCbCr), `Nc = 3`.
     Yuv422,
@@ -614,6 +684,52 @@ pub enum SamplingStructure {
     YuvAux444,
     /// 6 — 4:4:4:4 (RGB + auxiliary), `Nc = 4`.
     RgbAux444,
+    /// 3 or 7–15 — reserved by Table A.10 (2019 edition); the payload is
+    /// the 4-bit code, carried verbatim.
+    Reserved(u8),
+}
+
+impl SamplingStructure {
+    /// Decode the 4-bit `Sampling_Structure` code (Table A.10). Only the
+    /// low nibble of `code` is considered.
+    pub fn from_code(code: u8) -> Self {
+        match code & 0x0f {
+            0 => SamplingStructure::Yuv422,
+            1 => SamplingStructure::Yuv444,
+            2 => SamplingStructure::Rgb444,
+            4 => SamplingStructure::YuvAux422,
+            5 => SamplingStructure::YuvAux444,
+            6 => SamplingStructure::RgbAux444,
+            other => SamplingStructure::Reserved(other),
+        }
+    }
+
+    /// The 4-bit `Sampling_Structure` code (Table A.10).
+    pub fn code(self) -> u8 {
+        match self {
+            SamplingStructure::Yuv422 => 0,
+            SamplingStructure::Yuv444 => 1,
+            SamplingStructure::Rgb444 => 2,
+            SamplingStructure::YuvAux422 => 4,
+            SamplingStructure::YuvAux444 => 5,
+            SamplingStructure::RgbAux444 => 6,
+            SamplingStructure::Reserved(code) => code & 0x0f,
+        }
+    }
+
+    /// The Table A.10 `N_c` column: the number of components the sampling
+    /// structure implies, or `None` for a reserved code.
+    pub fn component_count(self) -> Option<u8> {
+        match self {
+            SamplingStructure::Yuv422 | SamplingStructure::Yuv444 | SamplingStructure::Rgb444 => {
+                Some(3)
+            }
+            SamplingStructure::YuvAux422
+            | SamplingStructure::YuvAux444
+            | SamplingStructure::RgbAux444 => Some(4),
+            SamplingStructure::Reserved(_) => None,
+        }
+    }
 }
 
 /// Sample characteristics carried by the `schar` field (A.5.3.2 Table A.9).
@@ -633,6 +749,13 @@ pub enum SampleCharacteristics {
 }
 
 /// Time code of the coded frame (A.5.3.2 `tcod`, `HHMMSSFF`).
+///
+/// A.5.3.2 ranges the fields `HH` 0–23, `MM` 0–59, `SS` 0–59 and `FF`
+/// 1–60, so no in-range value spells "no time code". The all-zero word is
+/// accepted on both parse and write as [`Self::UNUSED`] — the time code
+/// is not carried — because it cannot collide with any legal time code
+/// (`FF >= 1`); it is what a sender that does not count frames in `tcod`
+/// writes. Any other `FF == 0` (or out-of-range field) is still rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimeCode {
     /// Hours (0–23).
@@ -641,8 +764,44 @@ pub struct TimeCode {
     pub minutes: u8,
     /// Seconds (0–59).
     pub seconds: u8,
-    /// Frame count within the second (1–60).
+    /// Frame count within the second (1–60; 0 only in [`Self::UNUSED`]).
     pub frames: u8,
+}
+
+impl TimeCode {
+    /// The all-zero `tcod` word: time code not carried.
+    pub const UNUSED: TimeCode = TimeCode {
+        hours: 0,
+        minutes: 0,
+        seconds: 0,
+        frames: 0,
+    };
+
+    /// A time code from its four fields (not range-checked here; the
+    /// `jpvi` writer rejects out-of-range values).
+    pub fn new(hours: u8, minutes: u8, seconds: u8, frames: u8) -> Self {
+        TimeCode {
+            hours,
+            minutes,
+            seconds,
+            frames,
+        }
+    }
+
+    /// `true` for the all-zero word ([`Self::UNUSED`]).
+    pub fn is_unused(self) -> bool {
+        self == Self::UNUSED
+    }
+
+    /// `true` when the word is one a conforming `jpvi` may carry: every
+    /// field within its A.5.3.2 range, or the all-zero "unused" word.
+    pub fn is_valid(self) -> bool {
+        self.is_unused()
+            || (self.hours <= 23
+                && self.minutes <= 59
+                && self.seconds <= 59
+                && (1..=60).contains(&self.frames))
+    }
 }
 
 /// JPEG XS Video Information box contents (`'jpvi'`, A.5.3.2 Table A.5). It
@@ -665,8 +824,10 @@ impl VideoInformation {
     /// A minimal conforming Video Information box carrying no useful
     /// signalling: the smallest legal bit rate (1 Mbit/s), an unknown frame
     /// rate, invalid sample characteristics, and time code `00:00:00:01`
-    /// (`FF` has no 0 value, Table A.5). Used when a JPEG XS Video Support
-    /// superbox must be emitted but the caller supplied no video metadata.
+    /// (the smallest word inside the Table A.5 ranges — `FF` is 1–60; a
+    /// caller that wants the all-zero "not carried" word sets
+    /// [`TimeCode::UNUSED`]). Used when a JPEG XS Video Support superbox
+    /// must be emitted but the caller supplied no video metadata.
     pub fn unknown() -> Self {
         VideoInformation {
             max_bit_rate: 1,
@@ -701,16 +862,10 @@ impl VideoInformation {
         let frame_rate = if frat == 0 {
             FrameRate::Unknown
         } else {
-            let interlace = match frat >> 30 {
-                0 => InterlaceMode::Progressive,
-                1 => InterlaceMode::InterlacedFirstField,
-                2 => InterlaceMode::InterlacedSecondField,
-                _ => {
-                    return Err(JpegXsError::invalid(
-                        "jxs jpvi: frat Interlace_Mode value 3 is reserved (Table A.7)",
-                    ));
-                }
-            };
+            // Interlace_Mode (Table A.7): a frame-level field-order code,
+            // identical in both pictures of an interlaced frame. The
+            // reserved value 3 is carried, not rejected.
+            let interlace = InterlaceMode::from_code((frat >> 30) as u8);
             let denominator = match (frat >> 24) & 0x3f {
                 1 => FrameRateDenominator::Integer,
                 2 => FrameRateDenominator::Ntsc,
@@ -738,19 +893,9 @@ impl VideoInformation {
             SampleCharacteristics::Invalid
         } else {
             let bitdepth_minus1 = ((schar >> 4) & 0x0f) as u8;
-            let sampling = match schar & 0x0f {
-                0 => SamplingStructure::Yuv422,
-                1 => SamplingStructure::Yuv444,
-                2 => SamplingStructure::Rgb444,
-                4 => SamplingStructure::YuvAux422,
-                5 => SamplingStructure::YuvAux444,
-                6 => SamplingStructure::RgbAux444,
-                _ => {
-                    return Err(JpegXsError::invalid(
-                        "jxs jpvi: schar Sampling_Structure is reserved (Table A.10)",
-                    ));
-                }
-            };
+            // Sampling_Structure (Table A.10): reserved codes (3, 7–15 in
+            // the 2019 table) are carried as `Reserved`, not rejected.
+            let sampling = SamplingStructure::from_code((schar & 0x0f) as u8);
             SampleCharacteristics::Valid {
                 bitdepth_minus1,
                 sampling,
@@ -763,15 +908,11 @@ impl VideoInformation {
             seconds: body[8 + 4],
             frames: body[8 + 5],
         };
-        // tcod ranges (A.5.3.2): HH 0-23, MM 0-59, SS 0-59, FF 1-60.
-        if timecode.hours > 23
-            || timecode.minutes > 59
-            || timecode.seconds > 59
-            || timecode.frames < 1
-            || timecode.frames > 60
-        {
+        // tcod ranges (A.5.3.2): HH 0-23, MM 0-59, SS 0-59, FF 1-60 — or
+        // the all-zero "time code not carried" word.
+        if !timecode.is_valid() {
             return Err(JpegXsError::invalid(
-                "jxs jpvi: tcod field out of range (HH 0-23, MM 0-59, SS 0-59, FF 1-60)",
+                "jxs jpvi: tcod field out of range (HH 0-23, MM 0-59, SS 0-59, FF 1-60, or all zero)",
             ));
         }
 
@@ -798,11 +939,7 @@ impl VideoInformation {
                 denominator,
                 numerator,
             } => {
-                let im = match interlace {
-                    InterlaceMode::Progressive => 0u32,
-                    InterlaceMode::InterlacedFirstField => 1,
-                    InterlaceMode::InterlacedSecondField => 2,
-                };
+                let im = u32::from(interlace.code());
                 let den = match denominator {
                     FrameRateDenominator::Integer => 1u32,
                     FrameRateDenominator::Ntsc => 2,
@@ -821,21 +958,14 @@ impl VideoInformation {
                         "jxs jpvi: schar Sample_Bitdepth exceeds the 4-bit field (Table A.9)",
                     ));
                 }
-                let ss = match sampling {
-                    SamplingStructure::Yuv422 => 0u16,
-                    SamplingStructure::Yuv444 => 1,
-                    SamplingStructure::Rgb444 => 2,
-                    SamplingStructure::YuvAux422 => 4,
-                    SamplingStructure::YuvAux444 => 5,
-                    SamplingStructure::RgbAux444 => 6,
-                };
+                let ss = u16::from(sampling.code());
                 0x8000 | (u16::from(bitdepth_minus1) << 4) | ss
             }
         };
         let tc = self.timecode;
-        if tc.hours > 23 || tc.minutes > 59 || tc.seconds > 59 || tc.frames < 1 || tc.frames > 60 {
+        if !tc.is_valid() {
             return Err(JpegXsError::invalid(
-                "jxs jpvi: tcod field out of range (HH 0-23, MM 0-59, SS 0-59, FF 1-60)",
+                "jxs jpvi: tcod field out of range (HH 0-23, MM 0-59, SS 0-59, FF 1-60, or all zero)",
             ));
         }
 
@@ -2294,10 +2424,6 @@ mod writer_tests {
         let mut b = base;
         b[0..4].copy_from_slice(&0u32.to_be_bytes());
         assert!(VideoInformation::parse(&b).is_err());
-        // Interlace_Mode == 3 reserved.
-        let mut b = base;
-        b[4] = 0xC1; // interlace=3, denom bits partly set
-        assert!(VideoInformation::parse(&b).is_err());
         // Framerate_Denominator == 0 reserved (with non-zero frat).
         let mut b = base;
         b[4..8].copy_from_slice(&0x0000_0018u32.to_be_bytes()); // denom=0, num=24
@@ -2306,13 +2432,15 @@ mod writer_tests {
         let mut b = base;
         b[8..10].copy_from_slice(&0x0070u16.to_be_bytes());
         assert!(VideoInformation::parse(&b).is_err());
-        // Sampling_Structure == 3 reserved (Valid_Flag set).
+        // tcod FF == 0 with a non-zero HH is out of range (only the
+        // all-zero word is the "unused" time code).
         let mut b = base;
-        b[8..10].copy_from_slice(&0x8003u16.to_be_bytes());
-        assert!(VideoInformation::parse(&b).is_err());
-        // tcod FF == 0 out of range.
-        let mut b = base;
+        b[10] = 1;
         b[13] = 0;
+        assert!(VideoInformation::parse(&b).is_err());
+        // tcod FF == 61 out of range.
+        let mut b = base;
+        b[13] = 61;
         assert!(VideoInformation::parse(&b).is_err());
         // tcod HH == 24 out of range.
         let mut b = base;
@@ -2320,6 +2448,141 @@ mod writer_tests {
         assert!(VideoInformation::parse(&b).is_err());
         // Wrong length.
         assert!(VideoInformation::parse(&base[..13]).is_err());
+        // The writer applies the same tcod rule.
+        let mut info = VideoInformation::unknown();
+        info.timecode = TimeCode::new(0, 0, 1, 0);
+        assert!(info.to_bytes().is_err());
+        info.timecode = TimeCode::new(0, 0, 0, 61);
+        assert!(info.to_bytes().is_err());
+    }
+
+    #[test]
+    fn jpvi_all_zero_tcod_is_time_code_unused() {
+        // Issue #10 (2): a sender that does not carry a time code writes
+        // tcod = 0x0000_0000. That word is outside the Table A.5 ranges
+        // (FF is 1–60) but collides with no legal time code, so it parses
+        // as `TimeCode::UNUSED` rather than failing the box.
+        let mut b = VideoInformation::unknown().to_bytes().unwrap();
+        b[10..14].copy_from_slice(&[0, 0, 0, 0]);
+        let info = VideoInformation::parse(&b).unwrap();
+        assert!(info.timecode.is_unused());
+        assert_eq!(info.timecode, TimeCode::UNUSED);
+        assert_eq!(info.to_bytes().unwrap(), b);
+        // And the writer emits it on request.
+        let mut written = VideoInformation::unknown();
+        written.timecode = TimeCode::UNUSED;
+        assert_eq!(&written.to_bytes().unwrap()[10..14], &[0, 0, 0, 0]);
+        // A real time code is not "unused".
+        assert!(!TimeCode::new(0, 0, 0, 1).is_unused());
+        assert!(TimeCode::new(23, 59, 59, 60).is_valid());
+        assert!(!TimeCode::new(0, 60, 0, 1).is_valid());
+    }
+
+    #[test]
+    fn jpvi_reserved_codes_round_trip_verbatim() {
+        // Issue #10 (3): Table A.10 (2019) reserves Sampling_Structure 3
+        // and 7–15, and Table A.7 reserves Interlace_Mode 3. A reader must
+        // not lose the box over a code a later table may assign; the code
+        // is surfaced as `Reserved` and written back bit-exactly.
+        let base = VideoInformation::unknown().to_bytes().unwrap();
+        for code in [3u8, 7, 15] {
+            let mut b = base;
+            b[8..10].copy_from_slice(&(0x8000u16 | 0x70 | u16::from(code)).to_be_bytes());
+            let info = VideoInformation::parse(&b).unwrap();
+            assert_eq!(
+                info.sample,
+                SampleCharacteristics::Valid {
+                    bitdepth_minus1: 7,
+                    sampling: SamplingStructure::Reserved(code),
+                }
+            );
+            assert_eq!(info.to_bytes().unwrap(), b);
+        }
+        let mut b = base;
+        b[4..8].copy_from_slice(&0xC100_0018u32.to_be_bytes()); // interlace=3, denom=1, num=24
+        let info = VideoInformation::parse(&b).unwrap();
+        assert_eq!(
+            info.frame_rate,
+            FrameRate::Known {
+                interlace: InterlaceMode::Reserved,
+                denominator: FrameRateDenominator::Integer,
+                numerator: 24,
+            }
+        );
+        assert_eq!(info.to_bytes().unwrap(), b);
+        // Assigned codes still decode to their named variants, and the
+        // code accessors invert each other over the whole nibble.
+        for code in 0..16u8 {
+            assert_eq!(SamplingStructure::from_code(code).code(), code);
+        }
+        for code in 0..4u8 {
+            assert_eq!(InterlaceMode::from_code(code).code(), code);
+        }
+        assert_eq!(
+            SamplingStructure::from_code(3),
+            SamplingStructure::Reserved(3)
+        );
+        assert_eq!(
+            SamplingStructure::from_code(4),
+            SamplingStructure::YuvAux422
+        );
+        assert_eq!(SamplingStructure::Yuv422.component_count(), Some(3));
+        assert_eq!(SamplingStructure::RgbAux444.component_count(), Some(4));
+        assert_eq!(SamplingStructure::Reserved(3).component_count(), None);
+    }
+
+    #[test]
+    fn jpvi_interlace_mode_is_a_frame_property_shared_by_both_fields() {
+        // Issue #10 (1): Interlace_Mode gives the frame's field order and
+        // is identical in both pictures of an interlaced frame. Wrapping
+        // the two field pictures with the same VideoInformation yields
+        // byte-identical Video Support superboxes.
+        assert!(!InterlaceMode::Progressive.is_interlaced());
+        assert!(InterlaceMode::InterlacedFirstField.is_interlaced());
+        assert!(InterlaceMode::InterlacedSecondField.is_interlaced());
+        assert!(!InterlaceMode::Reserved.is_interlaced());
+
+        let frame_info = VideoInformation {
+            max_bit_rate: 400,
+            frame_rate: FrameRate::Known {
+                interlace: InterlaceMode::InterlacedFirstField,
+                denominator: FrameRateDenominator::Ntsc,
+                numerator: 30,
+            },
+            sample: SampleCharacteristics::Valid {
+                bitdepth_minus1: 9,
+                sampling: SamplingStructure::Yuv422,
+            },
+            timecode: TimeCode::UNUSED,
+        };
+        let cs = luma_cs();
+        let jpvs_bytes = |file: &[u8]| -> Vec<u8> {
+            let span = parse_boxes(file, 0, file.len())
+                .unwrap()
+                .into_iter()
+                .find(|s| s.tbox == TBOX_VIDEO_SUPPORT)
+                .unwrap();
+            file[span.payload_start..span.payload_start + span.payload_len].to_vec()
+        };
+        let first_field = JxsFileBuilder::new(srgb())
+            .video_information(frame_info)
+            .build(&cs)
+            .unwrap();
+        let second_field = JxsFileBuilder::new(srgb())
+            .video_information(frame_info)
+            .build(&cs)
+            .unwrap();
+        assert_eq!(jpvs_bytes(&first_field), jpvs_bytes(&second_field));
+        for file in [&first_field, &second_field] {
+            let parsed = parse_jxs_file(file).unwrap().video_info.unwrap();
+            assert_eq!(parsed, frame_info);
+            match parsed.frame_rate {
+                FrameRate::Known { interlace, .. } => {
+                    assert_eq!(interlace, InterlaceMode::InterlacedFirstField);
+                }
+                FrameRate::Unknown => panic!("frame rate lost"),
+            }
+        }
     }
 
     #[test]
