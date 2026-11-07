@@ -18,6 +18,7 @@ use crate::error::{JpegXsError as Error, Result};
 
 /// Decoded CWD marker body — the single `Sd` field per Table A.18.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CwdMarker {
     /// `Sd` — number of trailing components suppressed from the wavelet
     /// decomposition. Range `1..=Nc-1` (the body-level parser only

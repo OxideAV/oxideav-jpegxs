@@ -18,6 +18,7 @@ use crate::error::{JpegXsError as Error, Result};
 
 /// One component's registration entry (per Table A.21).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CrgEntry {
     /// `Xcrg[c]` — relative horizontal placement, units of 1/65536.
     pub x_crg: u16,
@@ -27,6 +28,7 @@ pub struct CrgEntry {
 
 /// Decoded CRG marker body — one entry per component.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CrgMarker {
     pub entries: Vec<CrgEntry>,
 }

@@ -43,6 +43,7 @@ impl CtsExtent {
 
 /// Decoded CTS marker body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CtsMarker {
     /// `Cf` — transform extent.
     pub cf: CtsExtent,

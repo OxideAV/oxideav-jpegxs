@@ -29,6 +29,7 @@ use crate::error::{JpegXsError as Error, Result};
 
 /// Decoded picture header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PictureHeader {
     /// Total codestream byte count (SOC..EOC inclusive) for CBR, or 0
     /// for variable-bitrate coding.

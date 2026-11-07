@@ -44,6 +44,7 @@ use crate::error::{JpegXsError as Error, Result};
 /// hex values in [`Profile::ppih`] are the *normative* assignments
 /// (Table A.5); the bit-field breakdown is informative only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Profile {
     /// `Ppih == 0x0000`. No tool / parameter restrictions; §A.2.2 says
     /// "not a conformance point". Acts as a permissive default.
@@ -265,6 +266,7 @@ impl Profile {
 /// width, height, total sampling-grid points per image, and sample
 /// rate. Signalled in the high 8 bits of `Plev` (Table A.12).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Level {
     /// Unrestricted level (no decoded-domain bounds; §A.5 — "shall not
     /// be considered as a conformance point").
@@ -370,6 +372,7 @@ impl Level {
 /// nominal bits-per-pixel. Signalled in the low byte of `Plev` (Table
 /// A.13).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Sublevel {
     /// Unrestricted sublevel (no coded-domain bound).
     Unrestricted,
@@ -497,6 +500,7 @@ pub fn max_codestream_size(level: Level, sublevel: Sublevel, profile: Profile) -
 /// Chroma format families implied by the per-component sampling
 /// factors in the CDT. Matches the buckets in Tables A.1 / A.2 / A.3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ChromaFormat {
     /// Single luma plane (`Nc == 1`). Listed as `4:0:0` in the tables.
     Mono,
@@ -568,6 +572,7 @@ pub fn classify_chroma(components: &[Component]) -> ChromaFormat {
 
 /// Which `Qpih` (Table A.10) values a profile permits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum QpihAllowed {
     /// `Qpih ∈ {0}` only (Light family).
     DeadzoneOnly,
@@ -593,6 +598,7 @@ impl QpihAllowed {
 /// "Only one column permitted (full width)". Table A.2 row 3
 /// (Light-Subline) says "Max column width = 2 048".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ColumnMode {
     /// `Cw == 0` (full-width column) is the only permitted layout
     /// regardless of `NL,y`.
@@ -612,6 +618,7 @@ pub enum ColumnMode {
 /// the profile table is itself static. `max_column_width` is `Some`
 /// only for the Light-Subline 422.10 profile (Cs ≤ 2048).
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct ProfileLimits {
     pub profile: Profile,
     pub allowed_bit_depths: &'static [u8],

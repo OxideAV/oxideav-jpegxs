@@ -82,6 +82,7 @@ pub const COLR_METH_CICP: u8 = 5;
 /// `payload_start + payload_len` never exceeds the buffer length; the
 /// header (`LBox`/`TBox`/optional `XLBox`) is excluded from the payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BoxSpan {
     /// Four-byte big-endian `TBox` type code.
     pub tbox: u32,
@@ -253,6 +254,7 @@ pub fn media_type(buf: &[u8]) -> Option<&'static str> {
 /// File Type box contents (A.5.2 Table A.4): the brand, minor version and
 /// compatibility list.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FileType {
     /// `BR` — brand / major version code.
     pub brand: u32,
@@ -301,6 +303,7 @@ impl FileType {
 /// Image Header box contents (A.5.4.2 Table A.16). The length of this box
 /// is fixed at 22 bytes, so its `DBox` payload is exactly 14 bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ImageHeader {
     /// `HEIGHT` — image-area height in sample-grid rows.
     pub height: u32,
@@ -411,6 +414,7 @@ impl ImageHeader {
 /// only `meth`/`prec`/`approx` (their `METHDAT` is method-specific and
 /// out of scope per A.5.4.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ColourSpec {
     /// `METH` — specification method (5 = CICP).
     pub meth: u8,
@@ -483,6 +487,7 @@ impl ColourSpec {
 /// One channel description in a Channel Definition box (A.5.4.4
 /// Table A.25): channel index, type and association.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ChannelDef {
     /// `Cni` — channel index.
     pub channel: u16,
@@ -495,6 +500,7 @@ pub struct ChannelDef {
 /// Channel Definition box contents (A.5.4.4): an array of
 /// [`ChannelDef`] descriptions.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ChannelDefinition {
     /// `N` channel descriptions in file order.
     pub channels: Vec<ChannelDef>,
@@ -539,6 +545,7 @@ impl ChannelDefinition {
 
 /// JPEG XS Profile and Level box contents (A.5.3.3 Table A.11).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ProfileLevel {
     /// `Ppih` — profile of the codestream (ISO/IEC 21122-2 Annex A).
     pub ppih: u16,
@@ -809,6 +816,7 @@ impl TimeCode {
 /// and maximum bit rate for a JPEG XS codestream used in a video stream.
 /// This box is mandatory inside a JPEG XS Video Support superbox (A.5.3.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct VideoInformation {
     /// `brat` — maximum instantaneous bit rate in Mbit/s (1 … 2³²−1).
     pub max_bit_rate: u32,
@@ -988,6 +996,7 @@ impl VideoInformation {
 /// buffer model. 6 bytes: `Tbmd` (8), `Rd` (8), `Ncg,hz` (16), `Ncg,vt`
 /// (16), big-endian.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BufferModelDescription {
     /// `Tbmd` — buffer model type (0, 1 or 2; ISO/IEC 21122-2).
     pub model_type: u8,
@@ -1051,6 +1060,7 @@ impl BufferModelDescription {
 /// blue, `c2` the red (A.5.3.5). Luminance values are in 0.0001 cd/m²
 /// increments (`Lmin < Lmax`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MasteringDisplayMetadata {
     /// `Xc0`, `Yc0` — green primary chromaticity (0…50000).
     pub primary_green: (u16, u16),
@@ -1152,6 +1162,7 @@ impl MasteringDisplayMetadata {
 /// assignment and reorder-buffer sizing. 6 bytes: `Slgs` (16), `Rsync`
 /// (8), `Tseq` (8), `MTU` (16), big-endian.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct VideoTransportParameters {
     /// `Slgs` — contiguous slices suggested per processing unit (0 = no
     /// suggestion).
@@ -1205,6 +1216,7 @@ impl VideoTransportParameters {
 /// one or more Colour Specification boxes, and an optional Channel
 /// Definition box.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct HeaderBox {
     /// Mandatory Image Header box (A.5.4.2). Shall be the first box.
     pub image_header: ImageHeader,

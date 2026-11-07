@@ -52,6 +52,7 @@ pub const COM_MIN_BODY_LEN: usize = 2;
 
 /// Decoded COM marker body per Table A.22.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ComMarker {
     /// `Tcom` — type of the extension (Table A.23).
     pub tcom: u16,

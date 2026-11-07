@@ -15,6 +15,7 @@ use crate::error::{JpegXsError as Error, Result};
 
 /// Per-component description from the CDT segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Component {
     /// Bit precision (`B[c]`), 8..=16.
     pub bit_depth: u8,
@@ -26,6 +27,7 @@ pub struct Component {
 
 /// Parsed component table.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ComponentTable {
     pub components: Vec<Component>,
 }

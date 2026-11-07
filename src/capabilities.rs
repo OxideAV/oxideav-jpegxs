@@ -29,6 +29,7 @@ use crate::error::{JpegXsError as Error, Result};
 
 /// Decoded CAP `cap[]` array.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Capabilities {
     /// Bit 1 — Star-Tetrix transform + CTS marker support required.
     pub star_tetrix: bool,

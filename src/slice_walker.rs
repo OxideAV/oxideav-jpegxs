@@ -66,6 +66,7 @@ pub struct BandWeight {
 /// Plan for a single precinct: the [`PrecinctGeometry`] for the entropy
 /// decoder plus the ordered [`PacketLayout`]s.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PrecinctPlan {
     /// Precinct geometry consumed by [`crate::entropy::decode_packet_body`].
     pub geometry: PrecinctGeometry,
@@ -101,6 +102,7 @@ pub struct PrecinctPlan {
 
 /// Plan for a single slice: a contiguous run of precincts.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SlicePlan {
     /// Slice index `t` (matches SLH `Yslh`).
     pub t: u32,
@@ -114,6 +116,7 @@ pub struct SlicePlan {
 
 /// Plan for the entire picture: every slice in order.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PicturePlan {
     pub slices: Vec<SlicePlan>,
     /// Number of horizontal decomposition levels (`NL,x`).

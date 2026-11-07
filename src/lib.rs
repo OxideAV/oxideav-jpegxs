@@ -59,23 +59,30 @@
 pub mod api;
 pub mod capabilities;
 pub mod codestream;
+#[doc(hidden)]
 pub mod colour_transform;
 pub mod com;
 pub mod component_table;
+#[doc(hidden)]
 pub mod convert;
 pub mod crg;
 pub mod cts;
 pub mod cwd;
+#[doc(hidden)]
 pub mod decoder;
+#[doc(hidden)]
 pub mod dequant;
+#[doc(hidden)]
 pub mod dwt;
 pub mod encoder;
+#[doc(hidden)]
 pub mod entropy;
 pub mod error;
 pub mod fileformat;
 pub mod image;
 pub mod markers;
 pub mod options;
+#[doc(hidden)]
 pub mod output;
 pub mod picture_header;
 pub mod probe;

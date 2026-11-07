@@ -1,5 +1,18 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- `#[non_exhaustive]` on the growable enums `ChromaFormat`, `ColumnMode`, `Level`, `NltParams`, `Profile`, `QpihAllowed`, `Sublevel`.
+- `#[non_exhaustive]` on the parsed marker / file-format / profile / plan
+  records `BoxSpan`, `BufferModelDescription`, `Capabilities`, `ChannelDef`, `ChannelDefinition`, `Codestream`, `ColourSpec`, `ComMarker`, `Component`, `ComponentTable`, `CrgEntry`, `CrgMarker`, `CtsMarker`, `CwdMarker`, `FileType`, `HeaderBox`, `ImageHeader`, `JpegXsFileInfo`, `MasteringDisplayMetadata`, `PictureHeader`, `PicturePlan`, `PrecinctPlan`, `ProfileLevel`, `ProfileLimits`, `SlicePlan`, `VideoInformation`, `VideoTransportParameters`. `CtsExtent`, `FrameRate` and `SampleCharacteristics`
+  stay exhaustive (fixed two-way fields); `Cicp` stays exhaustive (built by
+  callers).
+- `#[doc(hidden)]` on the internal `colour_transform`, `convert`,
+  `decoder`, `dequant`, `dwt`, `entropy` and `output` modules (the
+  crate-root re-exports `NltParams` / `parse_nlt` stay visible).
+
 ## Unreleased — round 480 (issue #10: `jpvi` field semantics)
 
 ### Changed

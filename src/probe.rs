@@ -10,6 +10,7 @@ use crate::codestream::{self, Codestream};
 
 /// Summary information returned by [`inspect`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct JpegXsFileInfo {
     /// Image width on the sample grid (`Wf` from the picture header).
     pub width: u32,

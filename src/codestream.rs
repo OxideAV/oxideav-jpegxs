@@ -41,6 +41,7 @@ pub struct Slice {
 
 /// Full parse result for one JPEG XS codestream.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Codestream {
     /// Raw `cap[]` bit array from the CAP segment (after `Lcap`).
     pub cap: Vec<u8>,

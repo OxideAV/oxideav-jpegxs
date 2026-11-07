@@ -28,6 +28,7 @@ use crate::error::{JpegXsError as Error, Result};
 
 /// Decoded NLT marker segment body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum NltParams {
     /// Tnlt = 1 — quadratic non-linearity.
     /// `dco` is the DC offset (signed 16-bit, two's-complement encoded
