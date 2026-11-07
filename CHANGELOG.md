@@ -3583,6 +3583,12 @@ also passes 149 tests (was 140).
 
 ## Unreleased — encoder round 2 (multi-component RCT + multi-decomp + odd dims)
 
+## [0.0.10](https://github.com/OxideAV/oxideav-jpegxs/compare/v0.0.9...v0.0.10) - 2026-11-07
+
+### Other
+
+- API hygiene: non_exhaustive profile/marker/file-format records and enums, hide DSP / entropy internals
+
 ## [0.0.9](https://github.com/OxideAV/oxideav-jpegxs/compare/v0.0.8...v0.0.9) - 2026-10-23
 
 ### Other
