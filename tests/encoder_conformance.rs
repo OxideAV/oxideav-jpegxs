@@ -189,35 +189,35 @@ const H: usize = 64;
 const PINNED: &[(&str, &str)] = &[
     (
         "rgb_rct_lossless_nl51",
-        "2e9113193a1e229c86c15b2f9d8ba1a2a1d94b1393a0421d5cc6e3739969e245",
+        "ff3e625ba56e133e3ef91c1a41a195d82b08134e8612ede9499b459dbb157f9f",
     ),
     (
         "yuv420_lossless_nl31",
-        "745d28c8329569214c679115325edadfcf93156653d430050f56a8b8d4363f0d",
+        "39c3cf8f50e752d93983410d428ebcce30ec1be9c6c67894f19b3aba381a3fa1",
     ),
     (
         "star_tetrix_lossless_nl22",
-        "f6ed3025b62befc2fc9e08d7ace7be03fb8377abdfd88d367a7f1d2bca1a5271",
+        "c3ab0fd30d0fb2f6323e1c0f55853ed220bc5ea9b95f4f1d2fee15872ab94953",
     ),
     (
         "nlt_quadratic_lossless_nl21",
-        "81fa204281e44b044befb8cec5f1e706685c03aa58f21a229c6517146d608ac4",
+        "8e7a3b150f1793f79b307387278e2287fc08a44bfcf9ebd4d0b58f1a7c6935da",
     ),
     (
         "highbd12_lossless_nl21",
-        "b7821ae6afa15e73e3b10bff5605655bb25c125b99664cebaa43c8adcc24b751",
+        "4e186c344fa1756960e0846150ced6af5dfbfd78f22cf2e0c4593dba43543536",
     ),
     (
         "run_mode1_lossless_nl33",
-        "2bc2989076bf076ef4237f620e303372c6f6500e16d9f9115fab52529429cbeb",
+        "e537bd558c17f5e06ae1b8cc1c56c750353fad73d330633a1b687527a8c84679",
     ),
     (
         "cbr_exact_target",
-        "87cfebb1174c0c1fbd61c11a7f7750413ca8c1cd3f484e4998cbb7f3aacf621a",
+        "0b4fc38b52d1b2ef102e3559d1948abaef0edb4fca89996d779715ca5ed11ad3",
     ),
     (
         "profile_light422_10",
-        "9ee447c537b65b3ea2a3c5729e58dda26abcfda4c349ee3c9ba95a0b95e3fe6b",
+        "c3ee4be7cba7ed76f95465941972eba34e25ee532330aae790bfd2a8120ceb17",
     ),
     (
         "profile_light_subline422_10",
@@ -225,31 +225,31 @@ const PINNED: &[(&str, &str)] = &[
     ),
     (
         "profile_light444_12",
-        "90c1a5c221c5e2ebe023b0c12416d61bc64df837776af8ce39d02a37a97bc918",
+        "1d05c8a101fae715eda34101962da20e60be6cd4d206d9b222fde5baa4b3dc57",
     ),
     (
         "profile_main422_10",
-        "c8cba2c34ff2a427a4866a926e9119fd02e436bc01be632017731613a1cd85f0",
+        "6bf8ed81a7973735eb136d634872b69f805321bcc0f3f419029854e987c29bfa",
     ),
     (
         "profile_main444_12",
-        "9e29e2c7f4b46099f6e2a48b07af3da24063e306ee14e8f319e03f30f3e7ecac",
+        "101d1aa94f8429bfc0d862725d27277f98626a72084c4534877335d6eb04060d",
     ),
     (
         "profile_main4444_12",
-        "0926c2c912104a95e001c6791bd87a310831d963f9d0cba5cd0c2637f78e38e4",
+        "d137a6ffc069439210822443d14a07698868918ad0e397fccd96a0f672690728",
     ),
     (
         "profile_high444_12",
-        "493178b6aae2259328d62b9a66c182d93421075dfc42722f5313fcf9a5fda30d",
+        "fe4cdae661956ebf787e69d518aeb55493ad2b0ed939693bb6f2721c05fa24b5",
     ),
     (
         "profile_high4444_12",
-        "4840fe9964afa18dd5db6c9f4e9ad855fed4b78f839cf644e9db7937597fb30b",
+        "82449da609041d4306efa0bcf07601613f3056df49bfde7427dde8e253efd45f",
     ),
     (
         "profile_cbr_exact_target_main422_10",
-        "f1288e5336d3ee84e17ae8083fa82b7c0f933d3f97c6ff40a5351598c995a41d",
+        "a4d6dd38dde4bb35dc64058ceb54c85f3eab5b76aad5e33a3a7efd229db7cdd7",
     ),
 ];
 

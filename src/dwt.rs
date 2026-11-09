@@ -27,8 +27,7 @@
 //! * [`inverse_vertical_1d`] / [`forward_vertical_1d`] — Annex E.5 /
 //!   E.12, the column equivalent.
 //! * [`inverse_2d`] / [`forward_2d`] — single-level 2-D composition
-//!   (vertical first on the inverse to mirror the encoder's
-//!   horizontal-first decomposition, per Annex E.2 / E.9).
+//!   (horizontal first on the inverse, vertical first on the forward).
 //!
 //! Boundary handling. Annex E.6 NOTE guarantees every band is at
 //! least two coefficients wide / tall, because of the picture-header
@@ -36,13 +35,10 @@
 //! inputs. The pad of two samples on each side of the working buffer
 //! is exactly what the 5/3 filter taps reach.
 //!
-//! Allocation. The DWT works on caller-owned slices. The only
-//! internal heap use is the `Vec<i32>` working buffer for one row /
-//! column at a time; its capacity is `len + 4` where `len` is the band
-//! dimension supplied by the caller. The per-call allocation is
-//! therefore bounded by the picture-header geometry the codestream
-//! parser already validated, never by an unbounded length on the
-//! wire.
+//! Allocation. The 2-D compositions retain the vertically split planes
+//! (together `w * h` coefficients) and reusable column buffers. Horizontal
+//! kernels operate directly on row slices; the 1-D kernels also allocate
+//! their existing padded working buffer for each invocation.
 
 use crate::error::{JpegXsError as Error, Result};
 
@@ -310,11 +306,9 @@ pub fn forward_vertical_1d(input: &[i32], low: &mut [i32], high: &mut [i32]) -> 
 ///
 /// where `ll_w = (w + 1) / 2`, `hl_w = w / 2`, `ll_h = (h + 1) / 2`,
 /// `lh_h = h / 2`. `out` is the reconstructed `h × w` band, also
-/// row-major. Vertical synthesis runs first (LL+LH → temporary low
-/// column, HL+HH → temporary high column), followed by horizontal
-/// synthesis on each row. This mirrors the encoder side, where Annex
-/// E.9 / Table E.8 performs vertical decomposition before horizontal
-/// at every level.
+/// row-major. Horizontal synthesis runs first (LL+HL and LH+HH),
+/// followed by vertical synthesis. See the ISO/IEC 21122-5 edition-3
+/// reference software, `libjxs/src/dwt.c`, `dwt_inverse_transform`.
 pub fn inverse_2d(
     w: usize,
     h: usize,
@@ -349,53 +343,38 @@ pub fn inverse_2d(
         ));
     }
 
-    // Vertical synthesis: independently reconstruct the left
-    // (low-pass-horizontal) column-set and the right
-    // (high-pass-horizontal) column-set into temporaries `tmp_l`
-    // (h x ll_w) and `tmp_h` (h x hl_w).
-    let mut tmp_l = vec![0i32; h * ll_w];
-    let mut tmp_h = vec![0i32; h * hl_w];
-
+    // Reverse the forward order: horizontal synthesis of LL+HL and
+    // LH+HH, then vertical synthesis. Rounding makes the order observable.
+    let mut tmp_l = vec![0i32; ll_h * w];
+    let mut tmp_h = vec![0i32; lh_h * w];
+    for y in 0..ll_h {
+        inverse_horizontal_1d(
+            &ll[y * ll_w..(y + 1) * ll_w],
+            &hl[y * hl_w..(y + 1) * hl_w],
+            &mut tmp_l[y * w..(y + 1) * w],
+        )?;
+    }
+    for y in 0..lh_h {
+        inverse_horizontal_1d(
+            &lh[y * ll_w..(y + 1) * ll_w],
+            &hh[y * hl_w..(y + 1) * hl_w],
+            &mut tmp_h[y * w..(y + 1) * w],
+        )?;
+    }
     let mut col_low = vec![0i32; ll_h];
     let mut col_high = vec![0i32; lh_h];
     let mut col_out = vec![0i32; h];
-
-    for x in 0..ll_w {
+    for x in 0..w {
         for y in 0..ll_h {
-            col_low[y] = ll[y * ll_w + x];
+            col_low[y] = tmp_l[y * w + x];
         }
         for y in 0..lh_h {
-            col_high[y] = lh[y * ll_w + x];
+            col_high[y] = tmp_h[y * w + x];
         }
         inverse_vertical_1d(&col_low, &col_high, &mut col_out)?;
         for y in 0..h {
-            tmp_l[y * ll_w + x] = col_out[y];
+            out[y * w + x] = col_out[y];
         }
-    }
-    for x in 0..hl_w {
-        for y in 0..ll_h {
-            col_low[y] = hl[y * hl_w + x];
-        }
-        for y in 0..lh_h {
-            col_high[y] = hh[y * hl_w + x];
-        }
-        inverse_vertical_1d(&col_low, &col_high, &mut col_out)?;
-        for y in 0..h {
-            tmp_h[y * hl_w + x] = col_out[y];
-        }
-    }
-
-    // Horizontal synthesis: for each row, combine the matched columns
-    // of `tmp_l` (low-pass) and `tmp_h` (high-pass) into the final
-    // row of `out`.
-    let mut row_low = vec![0i32; ll_w];
-    let mut row_high = vec![0i32; hl_w];
-    let mut row_out = vec![0i32; w];
-    for y in 0..h {
-        row_low.copy_from_slice(&tmp_l[y * ll_w..(y + 1) * ll_w]);
-        row_high.copy_from_slice(&tmp_h[y * hl_w..(y + 1) * hl_w]);
-        inverse_horizontal_1d(&row_low, &row_high, &mut row_out)?;
-        out[y * w..(y + 1) * w].copy_from_slice(&row_out);
     }
 
     Ok(())
@@ -756,48 +735,38 @@ pub fn forward_2d(
         ));
     }
 
-    // Horizontal pass: split each row into low/high column-sets,
-    // stored in temporaries `tmp_l` (h x ll_w) and `tmp_h` (h x hl_w).
-    let mut tmp_l = vec![0i32; h * ll_w];
-    let mut tmp_h = vec![0i32; h * hl_w];
-    let mut row_in = vec![0i32; w];
-    let mut row_low = vec![0i32; ll_w];
-    let mut row_high = vec![0i32; hl_w];
-    for y in 0..h {
-        row_in.copy_from_slice(&input[y * w..(y + 1) * w]);
-        forward_horizontal_1d(&row_in, &mut row_low, &mut row_high)?;
-        tmp_l[y * ll_w..(y + 1) * ll_w].copy_from_slice(&row_low);
-        tmp_h[y * hl_w..(y + 1) * hl_w].copy_from_slice(&row_high);
-    }
-
-    // Vertical pass: split each column of `tmp_l` into LL/LH and each
-    // column of `tmp_h` into HL/HH.
+    // ISO/IEC 21122-5 edition-3 reference software, libjxs/src/dwt.c,
+    // dwt_forward_transform: vertical then horizontal at each joint level.
+    let mut tmp_l = vec![0i32; ll_h * w];
+    let mut tmp_h = vec![0i32; lh_h * w];
     let mut col_in = vec![0i32; h];
     let mut col_low = vec![0i32; ll_h];
     let mut col_high = vec![0i32; lh_h];
-    for x in 0..ll_w {
+    for x in 0..w {
         for y in 0..h {
-            col_in[y] = tmp_l[y * ll_w + x];
+            col_in[y] = input[y * w + x];
         }
         forward_vertical_1d(&col_in, &mut col_low, &mut col_high)?;
         for y in 0..ll_h {
-            ll[y * ll_w + x] = col_low[y];
+            tmp_l[y * w + x] = col_low[y];
         }
         for y in 0..lh_h {
-            lh[y * ll_w + x] = col_high[y];
+            tmp_h[y * w + x] = col_high[y];
         }
     }
-    for x in 0..hl_w {
-        for y in 0..h {
-            col_in[y] = tmp_h[y * hl_w + x];
-        }
-        forward_vertical_1d(&col_in, &mut col_low, &mut col_high)?;
-        for y in 0..ll_h {
-            hl[y * hl_w + x] = col_low[y];
-        }
-        for y in 0..lh_h {
-            hh[y * hl_w + x] = col_high[y];
-        }
+    for y in 0..ll_h {
+        forward_horizontal_1d(
+            &tmp_l[y * w..(y + 1) * w],
+            &mut ll[y * ll_w..(y + 1) * ll_w],
+            &mut hl[y * hl_w..(y + 1) * hl_w],
+        )?;
+    }
+    for y in 0..lh_h {
+        forward_horizontal_1d(
+            &tmp_h[y * w..(y + 1) * w],
+            &mut lh[y * ll_w..(y + 1) * ll_w],
+            &mut hh[y * hl_w..(y + 1) * hl_w],
+        )?;
     }
 
     Ok(())
@@ -1403,5 +1372,134 @@ mod tests {
         let mut out = vec![0i32; w];
         inverse_horizontal_1d(&low, &high, &mut out).unwrap();
         assert_eq!(out, input);
+    }
+}
+
+#[cfg(test)]
+mod reference_order_tests {
+    use super::*;
+
+    #[test]
+    fn joint_order_integer_witness() {
+        // Two-sample 5/3: high=b-a, low=a+((high+1)>>1).
+        // Columns (0,1),(0,0) become (1,1),(0,0); both rows
+        // (1,0) then become (1,-1). Integer rounding is noncommutative.
+        let input = [0, 0, 1, 0];
+        let (mut ll, mut hl, mut lh, mut hh) = ([0], [0], [0], [0]);
+        forward_2d(2, 2, &input, &mut ll, &mut hl, &mut lh, &mut hh).unwrap();
+        assert_eq!([ll[0], hl[0], lh[0], hh[0]], [1, -1, 1, -1]);
+        let mut out = [0; 4];
+        inverse_2d(2, 2, &[1], &[-1], &[1], &[-1], &mut out).unwrap();
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn inverse_joint_order_integer_witness() {
+        let mut out = [0; 4];
+        inverse_2d(2, 2, &[1], &[-1], &[1], &[-1], &mut out).unwrap();
+        assert_eq!(out, [0, 0, 1, 0]);
+    }
+
+    #[test]
+    fn joint_order_signed_edges_and_fractional_precision() {
+        let mut checked = 0;
+        for depth in 8..=16 {
+            let min = -(1 << (depth - 1));
+            let max = (1 << (depth - 1)) - 1;
+            let values = [min, min + 1, -1, 0, 1, max - 1, max];
+            for fq in [0, 6, 8] {
+                for a in values {
+                    for b in values {
+                        for c in values {
+                            for d in values {
+                                let input = [a << fq, b << fq, c << fq, d << fq];
+                                let pair = |a: i32, b: i32| {
+                                    let high = b - a;
+                                    [a + ((high + 1) >> 1), high]
+                                };
+                                let left = pair(input[0], input[2]);
+                                let right = pair(input[1], input[3]);
+                                let low = pair(left[0], right[0]);
+                                let high = pair(left[1], right[1]);
+                                let expected = [low[0], low[1], high[0], high[1]];
+                                let (mut ll, mut hl, mut lh, mut hh) = ([0], [0], [0], [0]);
+                                forward_2d(2, 2, &input, &mut ll, &mut hl, &mut lh, &mut hh)
+                                    .unwrap();
+                                assert_eq!(
+                                    [ll[0], hl[0], lh[0], hh[0]],
+                                    expected,
+                                    "depth={depth} fq={fq} input={input:?}"
+                                );
+                                let mut out = [0; 4];
+                                inverse_2d(
+                                    2,
+                                    2,
+                                    &expected[..1],
+                                    &expected[1..2],
+                                    &expected[2..3],
+                                    &expected[3..],
+                                    &mut out,
+                                )
+                                .unwrap();
+                                assert_eq!(out, input);
+                                checked += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 64_827);
+    }
+
+    #[test]
+    fn cascade_matches_iso_edition_3_coefficients() {
+        // Independent executable oracle: ISO/IEC 21122-5 edition-3 archive,
+        // libjxs/src/dwt.c:143-175. Each hash covers every interleaved i32
+        // coefficient in little-endian order. See tests/data/dwt-ed3.txt.
+        let mut checked = 0;
+        for line in include_str!("../tests/data/dwt-ed3.txt").lines() {
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
+            let fields: Vec<_> = line.split_whitespace().collect();
+            let n: Vec<usize> = fields[..6].iter().map(|v| v.parse().unwrap()).collect();
+            let (w, h, nlx, nly, depth, fq) = (n[0], n[1], n[2] as u8, n[3] as u8, n[4], n[5]);
+            let input: Vec<i32> = (0..w * h)
+                .map(|i| {
+                    let k = i as u64;
+                    let v = (k * 73 + k * k * 19 + 17) & ((1 << depth) - 1);
+                    (v as i32 - (1 << (depth - 1))) * (1 << fq)
+                })
+                .collect();
+            let bands = forward_cascade_2d(w, h, nlx, nly, &input).unwrap();
+            let mut grid = vec![0; w * h];
+            for (beta, band) in bands.iter().enumerate() {
+                let k = beta_to_band_key(beta as u32, nlx, nly);
+                let (sx, sy) = (1usize << k.dx, 1usize << k.dy);
+                let ox = if k.tau_x { sx / 2 } else { 0 };
+                let oy = if k.tau_y { sy / 2 } else { 0 };
+                let mut j = 0;
+                for y in (oy..h).step_by(sy) {
+                    for x in (ox..w).step_by(sx) {
+                        grid[y * w + x] = band[j];
+                        j += 1;
+                    }
+                }
+                assert_eq!(j, band.len(), "{line} beta={beta}");
+            }
+            let hash = grid
+                .iter()
+                .flat_map(|x| x.to_le_bytes())
+                .fold(0xcbf29ce484222325u64, |h, b| {
+                    (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
+                });
+            assert_eq!(format!("{hash:016x}"), fields[6], "{line}");
+            let mut out = vec![0; w * h];
+            inverse_cascade_2d(w, h, nlx, nly, &bands, &mut out).unwrap();
+            assert_eq!(out, input, "inverse {line}");
+            checked += 1;
+        }
+        assert_eq!(checked, 798);
     }
 }
