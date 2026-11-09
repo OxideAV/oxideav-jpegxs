@@ -1402,6 +1402,7 @@ mod reference_order_tests {
 
     #[test]
     fn joint_order_signed_edges_and_fractional_precision() {
+        let mut checked = 0;
         for depth in 8..=16 {
             let min = -(1 << (depth - 1));
             let max = (1 << (depth - 1)) - 1;
@@ -1441,12 +1442,14 @@ mod reference_order_tests {
                                 )
                                 .unwrap();
                                 assert_eq!(out, input);
+                                checked += 1;
                             }
                         }
                     }
                 }
             }
         }
+        assert_eq!(checked, 64_827);
     }
 
     #[test]
@@ -1454,6 +1457,7 @@ mod reference_order_tests {
         // Independent executable oracle: ISO/IEC 21122-5 edition-3 archive,
         // libjxs/src/dwt.c:143-175. Each hash covers every interleaved i32
         // coefficient in little-endian order. See tests/data/dwt-ed3.txt.
+        let mut checked = 0;
         for line in include_str!("../tests/data/dwt-ed3.txt").lines() {
             if line.starts_with('#') || line.is_empty() {
                 continue;
@@ -1494,6 +1498,8 @@ mod reference_order_tests {
             let mut out = vec![0; w * h];
             inverse_cascade_2d(w, h, nlx, nly, &bands, &mut out).unwrap();
             assert_eq!(out, input, "inverse {line}");
+            checked += 1;
         }
+        assert_eq!(checked, 798);
     }
 }
