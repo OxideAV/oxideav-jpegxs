@@ -740,6 +740,86 @@ crate's self-roundtrips could never catch:
   path remains for `NL,y = 0` where one single-column precinct row is a
   complete horizontal transform unit.
 
+#### Wavelet transform — pass order (ISO/IEC 21122-1:2022 Annex E)
+
+What the standard mandates, by clause:
+
+- **E.1** — Annex E *specifies* the inverse transform and *describes*
+  the forward one; the tables are normative in the sense that their
+  output shall be duplicated.
+- **E.2, Table E.1 (inverse)** — per component, first the horizontal-only
+  levels `dx = N'L,x … Dx+1` (`Dx = min(N'L,x, N'L,y)`), each
+  `hor_transform(LL[dx−1,N'L,y] ← LL[dx,N'L,y], HL[dx,N'L,y])`; then the
+  joint levels `d = Dx … 1`, each made of **three calls in this order**:
+  `hor_transform(LL[d−1,d] ← LL[d,d], HL[d,d])`,
+  `hor_transform(LH[d−1,d] ← LH[d,d], HH[d,d])`,
+  `ver_transform(LL[d−1,d−1] ← LL[d−1,d], LH[d−1,d])`.
+  A joint level is therefore synthesised **horizontally first, vertically
+  last**.
+- **E.9, Table E.8 (forward)** — the exact reverse: joint levels
+  `d = 1 … Dx`, each `ver_fwd_transform(LL[d−1,d−1] → LL[d−1,d], LH[d−1,d])`
+  then `hor_fwd_transform(LL[d−1,d] → LL[d,d], HL[d,d])` and
+  `hor_fwd_transform(LH[d−1,d] → LH[d,d], HH[d,d])` — **vertically first,
+  horizontally last** — followed by the horizontal-only levels
+  `dx = Dx+1 … N'L,x`.
+- **E.4 / E.5 / E.11 / E.12 (Tables E.3 / E.4 / E.10 / E.11)** — a
+  horizontal (vertical) pass interleaves low-pass samples at even and
+  high-pass samples at odd positions of each row (column).
+- **E.6, Table E.5** — whole-sample symmetric extension by two samples,
+  `X[−i] = X[i]`, `X[Z+i−1] = X[Z−i−1]`, at the edges of the *band* being
+  filtered (picture-level, never per precinct).
+- **E.7, Table E.6 / E.13, Table E.12** — the 5/3 lifting steps:
+  inverse `Y[2n] = X[2n] − ((X[2n−1] + X[2n+1] + 2) >> 2)` then
+  `Y[2n+1] = X[2n+1] + ((Y[2n] + Y[2n+2]) >> 1)`; forward
+  `Y[2n+1] = X[2n+1] − ((X[2n] + X[2n+2]) >> 1)` then
+  `Y[2n] = X[2n] + ((Y[2n−1] + Y[2n+1] + 2) >> 2)`. Shifts are arithmetic
+  (floor), so every step rounds.
+- **E.3, Table E.2 / E.14, Table E.13** — coefficients enter the inverse
+  as `c << Fq` and leave the forward as `sign(T)·((|T| + ((1 << Fq) >> 1)) >> Fq)`.
+
+Because the lifting steps round, "rows then columns" and "columns then
+rows" are two different integer transforms; a 2×2 block already separates
+them (`[15 14; 15 12]` analyses to `LL = 14` in Table E.8 order and to
+`LL = 15` in the other). Both `dwt::inverse_2d` and `dwt::forward_2d`
+follow the tables above. Before this was fixed the crate ran every joint
+level in the opposite order in both directions (columns first on the
+inverse, rows first on the forward): self-consistent, so its own round
+trips were lossless, but
+
+- a `Fq = 0` stream with `NL,y ≥ 1` from this encoder did **not**
+  reconstruct exactly on a conforming decoder, and
+- this decoder did **not** reconstruct conforming `Fq = 0` streams with
+  `NL,y ≥ 1` exactly (nor, in general, `Fq = 6` streams with
+  `NL,x + NL,y = 7`, where the six fractional bits no longer cover every
+  rounding step).
+
+Why the 65 ISO/IEC 21122-4 vectors never showed it: they are all
+`Fq = 8`. Every coefficient entering the inverse is then a multiple of
+`2^8`; a horizontal-only level consumes one bit of that headroom and a
+joint level two, so with `NL,x + NL,y ≤ 7` no lifting step ever rounds,
+the inverse is exactly linear, and the two orders coincide. The suite
+passes 65 / 65 sample-exact with either order (measured), so it does not
+constrain the order; Table E.1 does.
+
+Evidence in the test suite:
+
+- `src/dwt.rs` — 2×2 and 3×3 blocks worked by hand from the tables for
+  both directions (including blocks where the two orders differ); a
+  literal one-function-per-table transcription of Annex E against which
+  the production cascades are compared band for band over every shape
+  `NL,y ≤ min(NL,x, 3)`, `NL,x ≤ 5`, all sizes 2…17 × 2…17, 1- to 20-bit
+  magnitudes (forward, inverse on free coefficients, and
+  inverse ∘ forward identity); and the `Fq`-headroom linearity argument
+  above as a test.
+- `tests/wavelet_conformance.rs` — the coefficients carried by encoded
+  lossless streams, read back before any inverse transform, equal the
+  Table E.8 transform of the picture on pictures that separate the two
+  orders; lossless encoder → decoder round trips over every decomposition
+  shape, odd / even sizes, 8…16 bits, RCT, 4:2:2 and 4:2:0; and a
+  cross-check against a black-box JPEG XS decoder binary when one is
+  installed (run-time skip otherwise — none was available on the
+  development machine, so this leg has not run yet).
+
 #### Not yet covered
 
 - Bit depths above 16 (would need a `u32` plane format; B > 16 also has

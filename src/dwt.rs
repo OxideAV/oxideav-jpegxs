@@ -26,9 +26,16 @@
 //!   bands stored in coefficient memory.
 //! * [`inverse_vertical_1d`] / [`forward_vertical_1d`] — Annex E.5 /
 //!   E.12, the column equivalent.
-//! * [`inverse_2d`] / [`forward_2d`] — single-level 2-D composition
-//!   (vertical first on the inverse to mirror the encoder's
-//!   horizontal-first decomposition, per Annex E.2 / E.9).
+//! * [`inverse_2d`] / [`forward_2d`] — one joint (horizontal + vertical)
+//!   decomposition level in the pass order of Annex E.2 Table E.1 and
+//!   Annex E.9 Table E.8. The inverse filters **horizontally first**
+//!   (`LL_{d,d}` + `HL_{d,d}` → `LL_{d-1,d}`, `LH_{d,d}` + `HH_{d,d}` →
+//!   `LH_{d-1,d}`) and **then vertically** (`LL_{d-1,d}` + `LH_{d-1,d}` →
+//!   `LL_{d-1,d-1}`); the forward transform is the exact reverse,
+//!   **vertically first** and then horizontally on both halves. The 5/3
+//!   lifting steps round (`>> 1`, `+ 2 >> 2`), so the two possible pass
+//!   orders are different integer transforms: a 2×2 block is already
+//!   enough to tell them apart (see the unit tests).
 //!
 //! Boundary handling. Annex E.6 NOTE guarantees every band is at
 //! least two coefficients wide / tall, because of the picture-header
@@ -310,11 +317,14 @@ pub fn forward_vertical_1d(input: &[i32], low: &mut [i32], high: &mut [i32]) -> 
 ///
 /// where `ll_w = (w + 1) / 2`, `hl_w = w / 2`, `ll_h = (h + 1) / 2`,
 /// `lh_h = h / 2`. `out` is the reconstructed `h × w` band, also
-/// row-major. Vertical synthesis runs first (LL+LH → temporary low
-/// column, HL+HH → temporary high column), followed by horizontal
-/// synthesis on each row. This mirrors the encoder side, where Annex
-/// E.9 / Table E.8 performs vertical decomposition before horizontal
-/// at every level.
+/// row-major.
+///
+/// Pass order is the one Annex E.2 Table E.1 writes for a joint level
+/// `d`: `hor_transform(LL_{d-1,d} ← LL_{d,d}, HL_{d,d})`,
+/// `hor_transform(LH_{d-1,d} ← LH_{d,d}, HH_{d,d})`, then
+/// `ver_transform(LL_{d-1,d-1} ← LL_{d-1,d}, LH_{d-1,d})` — horizontal
+/// synthesis on the low rows and on the high rows first, vertical
+/// synthesis last.
 pub fn inverse_2d(
     w: usize,
     h: usize,
@@ -349,53 +359,42 @@ pub fn inverse_2d(
         ));
     }
 
-    // Vertical synthesis: independently reconstruct the left
-    // (low-pass-horizontal) column-set and the right
-    // (high-pass-horizontal) column-set into temporaries `tmp_l`
-    // (h x ll_w) and `tmp_h` (h x hl_w).
-    let mut tmp_l = vec![0i32; h * ll_w];
-    let mut tmp_h = vec![0i32; h * hl_w];
+    // Table E.1, first two calls: horizontal synthesis of the
+    // vertically low-pass rows (LL + HL → `rows_low`, `ll_h × w`) and of
+    // the vertically high-pass rows (LH + HH → `rows_high`, `lh_h × w`).
+    let mut rows_low = vec![0i32; ll_h * w];
+    let mut rows_high = vec![0i32; lh_h * w];
+    for ((dst, low), high) in rows_low
+        .chunks_exact_mut(w)
+        .zip(ll.chunks_exact(ll_w))
+        .zip(hl.chunks_exact(hl_w))
+    {
+        inverse_horizontal_1d(low, high, dst)?;
+    }
+    for ((dst, low), high) in rows_high
+        .chunks_exact_mut(w)
+        .zip(lh.chunks_exact(ll_w))
+        .zip(hh.chunks_exact(hl_w))
+    {
+        inverse_horizontal_1d(low, high, dst)?;
+    }
 
+    // Table E.1, third call: vertical synthesis of every column from
+    // the two horizontally reconstructed halves.
     let mut col_low = vec![0i32; ll_h];
     let mut col_high = vec![0i32; lh_h];
     let mut col_out = vec![0i32; h];
-
-    for x in 0..ll_w {
-        for y in 0..ll_h {
-            col_low[y] = ll[y * ll_w + x];
+    for x in 0..w {
+        for (c, row) in col_low.iter_mut().zip(rows_low.chunks_exact(w)) {
+            *c = row[x];
         }
-        for y in 0..lh_h {
-            col_high[y] = lh[y * ll_w + x];
-        }
-        inverse_vertical_1d(&col_low, &col_high, &mut col_out)?;
-        for y in 0..h {
-            tmp_l[y * ll_w + x] = col_out[y];
-        }
-    }
-    for x in 0..hl_w {
-        for y in 0..ll_h {
-            col_low[y] = hl[y * hl_w + x];
-        }
-        for y in 0..lh_h {
-            col_high[y] = hh[y * hl_w + x];
+        for (c, row) in col_high.iter_mut().zip(rows_high.chunks_exact(w)) {
+            *c = row[x];
         }
         inverse_vertical_1d(&col_low, &col_high, &mut col_out)?;
-        for y in 0..h {
-            tmp_h[y * hl_w + x] = col_out[y];
+        for (c, row) in col_out.iter().zip(out.chunks_exact_mut(w)) {
+            row[x] = *c;
         }
-    }
-
-    // Horizontal synthesis: for each row, combine the matched columns
-    // of `tmp_l` (low-pass) and `tmp_h` (high-pass) into the final
-    // row of `out`.
-    let mut row_low = vec![0i32; ll_w];
-    let mut row_high = vec![0i32; hl_w];
-    let mut row_out = vec![0i32; w];
-    for y in 0..h {
-        row_low.copy_from_slice(&tmp_l[y * ll_w..(y + 1) * ll_w]);
-        row_high.copy_from_slice(&tmp_h[y * hl_w..(y + 1) * hl_w]);
-        inverse_horizontal_1d(&row_low, &row_high, &mut row_out)?;
-        out[y * w..(y + 1) * w].copy_from_slice(&row_out);
     }
 
     Ok(())
@@ -421,7 +420,8 @@ pub fn inverse_2d(
 ///    `LL_{dx-1, nly}`. (Skipped when `nlx == nly`.)
 /// 2. Joint horizontal+vertical levels `d = min(nlx, nly) .. 1`:
 ///    combine `LL_{d,d}, HL_{d,d}, LH_{d,d}, HH_{d,d}` to obtain
-///    `LL_{d-1, d-1}`.
+///    `LL_{d-1, d-1}` — horizontally first, then vertically
+///    ([`inverse_2d`]).
 ///
 /// The output `out` is the reconstructed `wc × hc` plane (row-major).
 ///
@@ -722,6 +722,13 @@ fn beta_to_band_key(beta: u32, nlx: u8, nly: u8) -> BandKey {
 ///
 /// `input[h × w]` is decomposed into the four sub-bands
 /// `ll`, `hl`, `lh`, `hh`. Layout matches [`inverse_2d`].
+///
+/// Pass order is the one Annex E.9 Table E.8 writes for a joint level
+/// `d`: `ver_fwd_transform(LL_{d-1,d-1} → LL_{d-1,d}, LH_{d-1,d})`, then
+/// `hor_fwd_transform(LL_{d-1,d} → LL_{d,d}, HL_{d,d})` and
+/// `hor_fwd_transform(LH_{d-1,d} → LH_{d,d}, HH_{d,d})` — vertical
+/// analysis first, horizontal analysis of both halves last, which undoes
+/// [`inverse_2d`] step for step.
 pub fn forward_2d(
     w: usize,
     h: usize,
@@ -756,48 +763,42 @@ pub fn forward_2d(
         ));
     }
 
-    // Horizontal pass: split each row into low/high column-sets,
-    // stored in temporaries `tmp_l` (h x ll_w) and `tmp_h` (h x hl_w).
-    let mut tmp_l = vec![0i32; h * ll_w];
-    let mut tmp_h = vec![0i32; h * hl_w];
-    let mut row_in = vec![0i32; w];
-    let mut row_low = vec![0i32; ll_w];
-    let mut row_high = vec![0i32; hl_w];
-    for y in 0..h {
-        row_in.copy_from_slice(&input[y * w..(y + 1) * w]);
-        forward_horizontal_1d(&row_in, &mut row_low, &mut row_high)?;
-        tmp_l[y * ll_w..(y + 1) * ll_w].copy_from_slice(&row_low);
-        tmp_h[y * hl_w..(y + 1) * hl_w].copy_from_slice(&row_high);
-    }
-
-    // Vertical pass: split each column of `tmp_l` into LL/LH and each
-    // column of `tmp_h` into HL/HH.
+    // Table E.8, first call: vertical analysis of every column into
+    // the vertically low-pass rows (`rows_low`, `ll_h × w`) and the
+    // vertically high-pass rows (`rows_high`, `lh_h × w`).
+    let mut rows_low = vec![0i32; ll_h * w];
+    let mut rows_high = vec![0i32; lh_h * w];
     let mut col_in = vec![0i32; h];
     let mut col_low = vec![0i32; ll_h];
     let mut col_high = vec![0i32; lh_h];
-    for x in 0..ll_w {
-        for y in 0..h {
-            col_in[y] = tmp_l[y * ll_w + x];
+    for x in 0..w {
+        for (c, row) in col_in.iter_mut().zip(input.chunks_exact(w)) {
+            *c = row[x];
         }
         forward_vertical_1d(&col_in, &mut col_low, &mut col_high)?;
-        for y in 0..ll_h {
-            ll[y * ll_w + x] = col_low[y];
+        for (c, row) in col_low.iter().zip(rows_low.chunks_exact_mut(w)) {
+            row[x] = *c;
         }
-        for y in 0..lh_h {
-            lh[y * ll_w + x] = col_high[y];
+        for (c, row) in col_high.iter().zip(rows_high.chunks_exact_mut(w)) {
+            row[x] = *c;
         }
     }
-    for x in 0..hl_w {
-        for y in 0..h {
-            col_in[y] = tmp_h[y * hl_w + x];
-        }
-        forward_vertical_1d(&col_in, &mut col_low, &mut col_high)?;
-        for y in 0..ll_h {
-            hl[y * hl_w + x] = col_low[y];
-        }
-        for y in 0..lh_h {
-            hh[y * hl_w + x] = col_high[y];
-        }
+
+    // Table E.8, second and third calls: horizontal analysis of the low
+    // rows into LL / HL and of the high rows into LH / HH.
+    for ((src, low), high) in rows_low
+        .chunks_exact(w)
+        .zip(ll.chunks_exact_mut(ll_w))
+        .zip(hl.chunks_exact_mut(hl_w))
+    {
+        forward_horizontal_1d(src, low, high)?;
+    }
+    for ((src, low), high) in rows_high
+        .chunks_exact(w)
+        .zip(lh.chunks_exact_mut(ll_w))
+        .zip(hh.chunks_exact_mut(hl_w))
+    {
+        forward_horizontal_1d(src, low, high)?;
     }
 
     Ok(())
@@ -1403,5 +1404,466 @@ mod tests {
         let mut out = vec![0i32; w];
         inverse_horizontal_1d(&low, &high, &mut out).unwrap();
         assert_eq!(out, input);
+    }
+
+    // -----------------------------------------------------------------
+    // Pass order of a joint level (Annex E.2 Table E.1 / E.9 Table E.8).
+    // -----------------------------------------------------------------
+
+    /// Split a row-major `h × w` block with [`forward_2d`].
+    fn split_2d(w: usize, h: usize, input: &[i32]) -> [Vec<i32>; 4] {
+        let (ll_w, hl_w, ll_h, lh_h) = (w.div_ceil(2), w / 2, h.div_ceil(2), h / 2);
+        let mut ll = vec![0i32; ll_w * ll_h];
+        let mut hl = vec![0i32; hl_w * ll_h];
+        let mut lh = vec![0i32; ll_w * lh_h];
+        let mut hh = vec![0i32; hl_w * lh_h];
+        forward_2d(w, h, input, &mut ll, &mut hl, &mut lh, &mut hh).unwrap();
+        [ll, hl, lh, hh]
+    }
+
+    fn merge_2d(w: usize, h: usize, b: &[Vec<i32>; 4]) -> Vec<i32> {
+        let mut out = vec![0i32; w * h];
+        inverse_2d(w, h, &b[0], &b[1], &b[2], &b[3], &mut out).unwrap();
+        out
+    }
+
+    /// 2×2 block worked by hand from Tables E.8 / E.11 / E.10 / E.12.
+    ///
+    /// Input rows `[15, 14]`, `[15, 12]`. For `Z = 2` the extension of
+    /// Table E.5 gives `X[-1] = X[1]`, `X[2] = X[0]`, so the filter of
+    /// Table E.12 reduces to `H = X[1] - X[0]`, `L = X[0] + ((2H + 2) >> 2)`.
+    ///
+    /// Vertical first (Table E.8 call 1):
+    ///   column 0 `(15, 15)`: `H = 0`,  `L = 15 + (2 >> 2)  = 15`
+    ///   column 1 `(14, 12)`: `H = -2`, `L = 14 + (-2 >> 2) = 13`
+    ///   low row `[15, 13]`, high row `[0, -2]`.
+    /// Horizontal (calls 2 and 3):
+    ///   low row:  `HL = 13 - 15 = -2`, `LL = 15 + (-2 >> 2) = 14`
+    ///   high row: `HH = -2 - 0  = -2`, `LH = 0  + (-2 >> 2) = -1`
+    ///
+    /// The other pass order (rows first) would give `LL = 15`: rows
+    /// `(15, 14) → L 15, H -1` and `(15, 12) → L 14, H -3`, then column
+    /// `(15, 14) → L = 15 + (-2 + 2 >> 2) = 15`. The block therefore pins
+    /// the order.
+    #[test]
+    fn forward_2x2_hand_computed_is_vertical_then_horizontal() {
+        let b = split_2d(2, 2, &[15, 14, 15, 12]);
+        assert_eq!(b, [vec![14], vec![-2], vec![-1], vec![-2]]);
+    }
+
+    /// Inverse of the block above worked by hand from Tables E.1 / E.3 /
+    /// E.4 / E.6. For `Z = 2` Table E.6 reduces to
+    /// `Y[0] = X[0] - ((2 X[1] + 2) >> 2)`, `Y[1] = X[1] + Y[0]`.
+    ///
+    /// Horizontal first (Table E.1 calls 1 and 2):
+    ///   `(LL, HL) = (14, -2)`: `Y0 = 14 - (-2 >> 2) = 15`, `Y1 = -2 + 15 = 13`
+    ///   `(LH, HH) = (-1, -2)`: `Y0 = -1 - (-2 >> 2) = 0`,  `Y1 = -2 + 0  = -2`
+    /// Vertical (call 3):
+    ///   column 0 `(15, 0)`:  `Y0 = 15 - (2 >> 2)  = 15`, `Y1 = 0 + 15  = 15`
+    ///   column 1 `(13, -2)`: `Y0 = 13 - (-2 >> 2) = 14`, `Y1 = -2 + 14 = 12`
+    #[test]
+    fn inverse_2x2_hand_computed_is_horizontal_then_vertical() {
+        let b = [vec![14], vec![-2], vec![-1], vec![-2]];
+        assert_eq!(merge_2d(2, 2, &b), vec![15, 14, 15, 12]);
+    }
+
+    /// The inverse order is observable on its own: these four
+    /// coefficients reconstruct differently under the two orders.
+    ///
+    /// Table E.1 order — rows `(1, 0) → (1, 1)` and `(1, -1) → (1, 0)`
+    /// (`Y0 = 1 - (2 >> 2) = 1`, `Y1 = 0 + 1`; `Y0 = 1 - (0 >> 2) = 1`,
+    /// `Y1 = -1 + 1`), then columns `(1, 1) → (0, 1)`
+    /// (`Y0 = 1 - (4 >> 2) = 0`, `Y1 = 1 + 0`) and `(1, 0) → (1, 1)`.
+    /// Columns first would end in `[0, 0, 1, 0]` instead.
+    #[test]
+    fn inverse_2x2_order_is_observable() {
+        let b = [vec![1], vec![0], vec![1], vec![-1]];
+        assert_eq!(merge_2d(2, 2, &b), vec![0, 1, 1, 1]);
+    }
+
+    /// 3×3 block worked by hand (odd sizes: `Z = 3`, Table E.5 gives
+    /// `X[-1] = X[1]`, `X[3] = X[1]`, so `H = X[1] - ((X[0] + X[2]) >> 1)`,
+    /// `L0 = X[0] + ((2H + 2) >> 2)`, `L1 = X[2] + ((2H + 2) >> 2)`).
+    ///
+    /// Input rows `[12, 3, 0]`, `[15, 5, 11]`, `[13, 6, 15]`.
+    /// Vertical first:
+    ///   column `(12, 15, 13)`: `H = 15 - 12 = 3`, `L = 12 + 2, 13 + 2 = 14, 15`
+    ///   column `(3, 5, 6)`:    `H = 5 - 4  = 1`, `L = 3 + 1,  6 + 1  = 4, 7`
+    ///   column `(0, 11, 15)`:  `H = 11 - 7 = 4`, `L = 0 + 2,  15 + 2 = 2, 17`
+    ///   low rows `[14, 4, 2]`, `[15, 7, 17]`; high row `[3, 1, 4]`.
+    /// Horizontal:
+    ///   `[14, 4, 2]`:  `H = 4 - 8  = -4`, `L = 14 - 2, 2 - 2   = 12, 0`
+    ///   `[15, 7, 17]`: `H = 7 - 16 = -9`, `L = 15 - 4, 17 - 4  = 11, 13`
+    ///   `[3, 1, 4]`:   `H = 1 - 3  = -2`, `L = 3 - 1,  4 - 1   = 2, 3`
+    #[test]
+    fn forward_and_inverse_3x3_hand_computed() {
+        let input = [12, 3, 0, 15, 5, 11, 13, 6, 15];
+        let b = split_2d(3, 3, &input);
+        assert_eq!(b, [vec![12, 0, 11, 13], vec![-4, -9], vec![2, 3], vec![-2]]);
+        assert_eq!(merge_2d(3, 3, &b), input.to_vec());
+    }
+
+    // -----------------------------------------------------------------
+    // Literal transcription of Annex E as an independent model: one
+    // function per table, `X` / `Y` scratch arrays with the two-sample
+    // margin of Table E.5, bands addressed by `(dx, dy, τx, τy)`.
+    // -----------------------------------------------------------------
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct ModelBand {
+        w: usize,
+        h: usize,
+        t: Vec<i64>,
+    }
+
+    /// Table E.5 on an array whose index 0 sits at offset 2.
+    fn model_extend(x: &mut [i64], z: usize) {
+        for i in 1..=2usize {
+            x[2 - i] = x[2 + i];
+            x[2 + z + i - 1] = x[2 + z - i - 1];
+        }
+    }
+
+    /// Table E.6. Returns `Y[0 .. Z]`.
+    fn model_inverse_filter(mut x: Vec<i64>, z: usize) -> Vec<i64> {
+        model_extend(&mut x, z);
+        let mut y = x.clone();
+        for i in (0..z + 1).step_by(2) {
+            y[2 + i] = x[2 + i] - ((x[2 + i - 1] + x[2 + i + 1] + 2) >> 2);
+        }
+        for i in (1..z).step_by(2) {
+            y[2 + i] = x[2 + i] + ((y[2 + i - 1] + y[2 + i + 1]) >> 1);
+        }
+        y[2..2 + z].to_vec()
+    }
+
+    /// Table E.12. Returns `Y[0 .. Z]`.
+    fn model_forward_filter(mut x: Vec<i64>, z: usize) -> Vec<i64> {
+        model_extend(&mut x, z);
+        let mut y = x.clone();
+        // i = -1, 1, 3, … < Z + 1, written with the offset folded in.
+        for k in (1..z + 3).step_by(2) {
+            y[k] = x[k] - ((x[k - 1] + x[k + 1]) >> 1);
+        }
+        for i in (0..z).step_by(2) {
+            y[2 + i] = x[2 + i] + ((y[2 + i - 1] + y[2 + i + 1] + 2) >> 2);
+        }
+        y[2..2 + z].to_vec()
+    }
+
+    /// Table E.3.
+    fn model_hor_inverse(low: &ModelBand, high: &ModelBand) -> ModelBand {
+        let (w, h) = (low.w + high.w, low.h);
+        assert_eq!(high.h, h);
+        let mut out = ModelBand {
+            w,
+            h,
+            t: vec![0; w * h],
+        };
+        for y in 0..h {
+            let mut x = vec![0i64; w + 4];
+            for c in 0..w {
+                x[2 + c] = if c % 2 == 0 {
+                    low.t[y * low.w + c / 2]
+                } else {
+                    high.t[y * high.w + c / 2]
+                };
+            }
+            let r = model_inverse_filter(x, w);
+            out.t[y * w..(y + 1) * w].copy_from_slice(&r);
+        }
+        out
+    }
+
+    /// Table E.4.
+    fn model_ver_inverse(low: &ModelBand, high: &ModelBand) -> ModelBand {
+        let (w, h) = (low.w, low.h + high.h);
+        assert_eq!(high.w, w);
+        let mut out = ModelBand {
+            w,
+            h,
+            t: vec![0; w * h],
+        };
+        for c in 0..w {
+            let mut x = vec![0i64; h + 4];
+            for y in 0..h {
+                x[2 + y] = if y % 2 == 0 {
+                    low.t[(y / 2) * w + c]
+                } else {
+                    high.t[(y / 2) * w + c]
+                };
+            }
+            let r = model_inverse_filter(x, h);
+            for (y, v) in r.into_iter().enumerate() {
+                out.t[y * w + c] = v;
+            }
+        }
+        out
+    }
+
+    /// Table E.10.
+    fn model_hor_forward(src: &ModelBand) -> (ModelBand, ModelBand) {
+        let (w, h) = (src.w, src.h);
+        let (lw, hw) = (w.div_ceil(2), w / 2);
+        let mut low = ModelBand {
+            w: lw,
+            h,
+            t: vec![0; lw * h],
+        };
+        let mut high = ModelBand {
+            w: hw,
+            h,
+            t: vec![0; hw * h],
+        };
+        for y in 0..h {
+            let mut x = vec![0i64; w + 4];
+            x[2..2 + w].copy_from_slice(&src.t[y * w..(y + 1) * w]);
+            let r = model_forward_filter(x, w);
+            for (c, v) in r.into_iter().enumerate() {
+                if c % 2 == 0 {
+                    low.t[y * lw + c / 2] = v;
+                } else {
+                    high.t[y * hw + c / 2] = v;
+                }
+            }
+        }
+        (low, high)
+    }
+
+    /// Table E.11.
+    fn model_ver_forward(src: &ModelBand) -> (ModelBand, ModelBand) {
+        let (w, h) = (src.w, src.h);
+        let (lh, hh) = (h.div_ceil(2), h / 2);
+        let mut low = ModelBand {
+            w,
+            h: lh,
+            t: vec![0; w * lh],
+        };
+        let mut high = ModelBand {
+            w,
+            h: hh,
+            t: vec![0; w * hh],
+        };
+        for c in 0..w {
+            let mut x = vec![0i64; h + 4];
+            for y in 0..h {
+                x[2 + y] = src.t[y * w + c];
+            }
+            let r = model_forward_filter(x, h);
+            for (y, v) in r.into_iter().enumerate() {
+                if y % 2 == 0 {
+                    low.t[(y / 2) * w + c] = v;
+                } else {
+                    high.t[(y / 2) * w + c] = v;
+                }
+            }
+        }
+        (low, high)
+    }
+
+    /// Annex B.3 filter index for `NL,x ≥ NL,y`.
+    fn model_beta(nlx: usize, nly: usize, dx: usize, dy: usize, tx: usize, ty: usize) -> usize {
+        if dx > dy {
+            nlx - dx + tx
+        } else {
+            nlx - nly + tx + 2 * ty + 3 * (nly - dy)
+        }
+    }
+
+    /// Table E.8 for one component. Bands come back in β order.
+    fn model_forward(wc: usize, hc: usize, nlx: usize, nly: usize, o: &[i32]) -> Vec<ModelBand> {
+        let nbeta = 2 * nlx.min(nly) + nlx.max(nly) + 1;
+        let mut bands: Vec<Option<ModelBand>> = vec![None; nbeta];
+        let mut ll = ModelBand {
+            w: wc,
+            h: hc,
+            t: o.iter().map(|&v| v as i64).collect(),
+        };
+        let dmin = nlx.min(nly);
+        for d in 1..=dmin {
+            let (ll_v, lh_v) = model_ver_forward(&ll);
+            let (ll_d, hl_d) = model_hor_forward(&ll_v);
+            let (lh_d, hh_d) = model_hor_forward(&lh_v);
+            bands[model_beta(nlx, nly, d, d, 1, 0)] = Some(hl_d);
+            bands[model_beta(nlx, nly, d, d, 0, 1)] = Some(lh_d);
+            bands[model_beta(nlx, nly, d, d, 1, 1)] = Some(hh_d);
+            ll = ll_d;
+        }
+        for dx in dmin + 1..=nlx {
+            let (ll_d, hl_d) = model_hor_forward(&ll);
+            bands[model_beta(nlx, nly, dx, nly, 1, 0)] = Some(hl_d);
+            ll = ll_d;
+        }
+        bands[0] = Some(ll);
+        bands
+            .into_iter()
+            .map(|b| b.expect("every β assigned"))
+            .collect()
+    }
+
+    /// Table E.1 for one component.
+    fn model_inverse(nlx: usize, nly: usize, bands: &[ModelBand]) -> ModelBand {
+        let dmin = nlx.min(nly);
+        let mut ll = bands[0].clone();
+        for dx in (dmin + 1..=nlx).rev() {
+            ll = model_hor_inverse(&ll, &bands[model_beta(nlx, nly, dx, nly, 1, 0)]);
+        }
+        for d in (1..=dmin).rev() {
+            let ll_v = model_hor_inverse(&ll, &bands[model_beta(nlx, nly, d, d, 1, 0)]);
+            let lh_v = model_hor_inverse(
+                &bands[model_beta(nlx, nly, d, d, 0, 1)],
+                &bands[model_beta(nlx, nly, d, d, 1, 1)],
+            );
+            ll = model_ver_inverse(&ll_v, &lh_v);
+        }
+        ll
+    }
+
+    /// Deterministic sample generator: `bits`-wide signed values.
+    fn model_samples(n: usize, bits: u32, seed: u64) -> Vec<i32> {
+        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                let span = 1i64 << bits;
+                ((s >> 11) as i64 % span - span / 2) as i32
+            })
+            .collect()
+    }
+
+    /// Whether every 1-D pass of the `(nlx, nly)` cascade sees at least
+    /// two samples (Annex E.6 NOTE).
+    fn cascade_is_defined(wc: usize, hc: usize, nlx: usize, nly: usize) -> bool {
+        let (mut w, mut h) = (wc, hc);
+        for _ in 0..nly {
+            if h < 2 {
+                return false;
+            }
+            h = h.div_ceil(2);
+        }
+        for _ in 0..nlx {
+            if w < 2 {
+                return false;
+            }
+            w = w.div_ceil(2);
+        }
+        wc >= 2 && hc >= 2
+    }
+
+    /// The production cascades equal the literal Annex E model, band for
+    /// band and sample for sample, for every decomposition shape
+    /// `NL,y ≤ NL,x ≤ 5`, every size 2..=17 in both directions (odd and
+    /// even), and sample magnitudes from 1 bit to the 20-bit wavelet
+    /// precision; and the inverse undoes the forward exactly.
+    #[test]
+    fn cascades_match_literal_annex_e_model() {
+        let mut checked = 0usize;
+        for nlx in 0..=5usize {
+            for nly in 0..=nlx.min(3) {
+                for wc in 2..=17usize {
+                    for hc in 2..=17usize {
+                        if !cascade_is_defined(wc, hc, nlx, nly) {
+                            continue;
+                        }
+                        let bits = [1u32, 8, 12, 16, 20][(wc + 3 * hc + nlx) % 5];
+                        let seed = (wc * 131 + hc * 17 + nlx * 7 + nly) as u64;
+                        let input = model_samples(wc * hc, bits, seed);
+                        let model = model_forward(wc, hc, nlx, nly, &input);
+                        let ours =
+                            forward_cascade_2d(wc, hc, nlx as u8, nly as u8, &input).unwrap();
+                        assert_eq!(ours.len(), model.len());
+                        for (beta, (a, m)) in ours.iter().zip(&model).enumerate() {
+                            let m32: Vec<i32> = m.t.iter().map(|&v| v as i32).collect();
+                            assert_eq!(
+                                a, &m32,
+                                "forward β={beta} {wc}x{hc} NL={nlx}/{nly} bits={bits}"
+                            );
+                        }
+                        // Inverse on coefficients that are not the image
+                        // of any picture (independent random bands), so
+                        // the inverse is checked on its own.
+                        let free: Vec<ModelBand> = model
+                            .iter()
+                            .enumerate()
+                            .map(|(beta, m)| ModelBand {
+                                w: m.w,
+                                h: m.h,
+                                t: model_samples(m.t.len(), bits, seed * 31 + beta as u64)
+                                    .into_iter()
+                                    .map(i64::from)
+                                    .collect(),
+                            })
+                            .collect();
+                        let free32: Vec<Vec<i32>> = free
+                            .iter()
+                            .map(|m| m.t.iter().map(|&v| v as i32).collect())
+                            .collect();
+                        let want = model_inverse(nlx, nly, &free);
+                        let mut got = vec![0i32; wc * hc];
+                        inverse_cascade_2d(wc, hc, nlx as u8, nly as u8, &free32, &mut got)
+                            .unwrap();
+                        let want32: Vec<i32> = want.t.iter().map(|&v| v as i32).collect();
+                        assert_eq!(got, want32, "inverse {wc}x{hc} NL={nlx}/{nly} bits={bits}");
+                        // Identity: inverse ∘ forward.
+                        let mut back = vec![0i32; wc * hc];
+                        inverse_cascade_2d(wc, hc, nlx as u8, nly as u8, &ours, &mut back).unwrap();
+                        assert_eq!(back, input, "identity {wc}x{hc} NL={nlx}/{nly}");
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 2000, "sweep covered only {checked} shapes");
+    }
+
+    /// With `Fq` fractional bits every coefficient entering the inverse
+    /// is a multiple of `2^Fq`, each horizontal-only level consumes one
+    /// bit of that headroom and each joint level two, so for
+    /// `NL,x + NL,y ≤ Fq` no lifting step ever rounds and the inverse is
+    /// linear — the pass order cannot be observed. This is why decoding
+    /// the regular `Fq = 8` configurations never depended on the order,
+    /// while `Fq = 0` (lossless) and `Fq = 6` with seven levels do.
+    #[test]
+    fn inverse_is_exactly_linear_under_fractional_headroom() {
+        let (wc, hc, nlx, nly) = (24usize, 12usize, 5usize, 2usize);
+        let shape = model_forward(wc, hc, nlx, nly, &vec![0i32; wc * hc]);
+        let rand_bands = |seed: u64, fq: u32| -> Vec<ModelBand> {
+            shape
+                .iter()
+                .enumerate()
+                .map(|(beta, m)| ModelBand {
+                    w: m.w,
+                    h: m.h,
+                    t: model_samples(m.t.len(), 10, seed + beta as u64)
+                        .into_iter()
+                        .map(|v| i64::from(v) << fq)
+                        .collect(),
+                })
+                .collect()
+        };
+        let add = |a: &[ModelBand], b: &[ModelBand]| -> Vec<ModelBand> {
+            a.iter()
+                .zip(b)
+                .map(|(p, q)| ModelBand {
+                    w: p.w,
+                    h: p.h,
+                    t: p.t.iter().zip(&q.t).map(|(x, y)| x + y).collect(),
+                })
+                .collect()
+        };
+        // Fq = 8 ≥ NL,x + NL,y = 7: additive.
+        let (a, b) = (rand_bands(1, 8), rand_bands(100, 8));
+        let (ra, rb) = (model_inverse(nlx, nly, &a), model_inverse(nlx, nly, &b));
+        let rs = model_inverse(nlx, nly, &add(&a, &b));
+        let sum: Vec<i64> = ra.t.iter().zip(&rb.t).map(|(x, y)| x + y).collect();
+        assert_eq!(rs.t, sum);
+        // Fq = 0: rounding makes it non-additive.
+        let (a, b) = (rand_bands(1, 0), rand_bands(100, 0));
+        let (ra, rb) = (model_inverse(nlx, nly, &a), model_inverse(nlx, nly, &b));
+        let rs = model_inverse(nlx, nly, &add(&a, &b));
+        let sum: Vec<i64> = ra.t.iter().zip(&rb.t).map(|(x, y)| x + y).collect();
+        assert_ne!(rs.t, sum);
     }
 }

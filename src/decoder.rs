@@ -44,6 +44,29 @@ use crate::slice_walker::{PicturePlan, PrecinctPlan};
 /// [`crate::DecodeOptions`] limits against the header before any sample
 /// buffer is allocated here.
 pub(crate) fn decode_parsed(buf: &[u8], cs: &codestream::Codestream) -> Result<Components> {
+    decode_parsed_tap(buf, cs, None)
+}
+
+/// The coefficients of a bare codestream exactly as the inverse wavelet
+/// transformation receives them: `T[β,x,y]` of Annex E.3 Table E.2
+/// (inversely quantized, scaled by `<< Fq`), one row-major array per
+/// filter type, per wavelet-decomposed component. Lets a test compare an
+/// encoder's forward transform against Annex E without going through
+/// this decoder's inverse. Empty for the streaming layouts
+/// (`NL,x ≤ 1`, `NL,y = 0`, one precinct per line, `Sd = 0`).
+#[doc(hidden)]
+pub fn wavelet_coefficients(buf: &[u8]) -> Result<Vec<Vec<Vec<i32>>>> {
+    let cs = codestream::parse(buf)?;
+    let mut tap = Vec::new();
+    decode_parsed_tap(buf, &cs, Some(&mut tap))?;
+    Ok(tap)
+}
+
+fn decode_parsed_tap(
+    buf: &[u8],
+    cs: &codestream::Codestream,
+    tap: Option<&mut Vec<Vec<Vec<i32>>>>,
+) -> Result<Components> {
     let pih = cs.pih;
     let cdt = cs.cdt.clone();
     let wgt = cs.wgt.clone();
@@ -375,6 +398,9 @@ pub(crate) fn decode_parsed(buf: &[u8], cs: &codestream::Codestream) -> Result<C
     }
 
     if multi_level {
+        if let Some(tap) = tap {
+            tap.clone_from(&gathered);
+        }
         // Run the inverse-DWT cascade per component now that all band
         // coefficients have been gathered. Skip suppressed (Sd) components:
         // their samples were written directly during gather_precinct.
