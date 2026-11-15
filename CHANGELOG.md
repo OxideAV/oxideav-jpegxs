@@ -44,6 +44,15 @@
 
 ### Fixed
 
+- **Encoder writes the long packet header when Table C.3 requires it.**
+  Annex C.3 selects the 7-byte header (`Ldat` / `Lcnt` / `Lsgn` of 20 / 20 /
+  15 bits) whenever `Wf × Nc ≥ 32752` or `Lh = 1`; the encoder always wrote
+  the 5-byte form, so pictures at or past that product (for instance four
+  components 8192 wide) produced streams no decoder could parse — this
+  crate's included. It also failed with "exceeds short packet header
+  capacity" when one line of a component without vertical decomposition
+  outgrew the 15-bit `Ldat` (Annex C.3 NOTE 2); it now re-runs with
+  `Lh = 1`. Streams that were valid before are byte-identical.
 - **Corrupt streams no longer trip integer-overflow checks** in the
   inverse wavelet transform, colour transforms and output scaling (debug
   / overflow-checked builds panicked with "attempt to add with overflow";

@@ -820,6 +820,17 @@ Evidence in the test suite:
   installed (run-time skip otherwise — none was available on the
   development machine, so this leg has not run yet).
 
+#### Packet header form (ISO/IEC 21122-1:2022 Annex C.3)
+
+Table C.3 gives the packet header two layouts: short (`Dr` + 15-bit
+`Ldat` + 13-bit `Lcnt` + 11-bit `Lsgn`, 5 bytes) when `Wf × Nc < 32752`
+and `Lh = 0`, long (20 / 20 / 15 bits, 7 bytes) otherwise. The encoder
+follows the same rule the decoder always applied: long headers for
+`Wf × Nc ≥ 32752`, and `Lh = 1` (PIH, Table A.7) as soon as a sub-packet
+does not fit the short fields — NOTE 2 of Annex C.3, the case of a wide
+component without vertical decomposition. Both are covered by round-trip
+tests in `tests/wavelet_conformance.rs`.
+
 #### Throughput
 
 `cargo bench --bench throughput` (plain timing loop, median of 5 runs,

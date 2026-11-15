@@ -417,3 +417,38 @@ fn black_box_decoder_agrees_with_this_decoder() {
     }
     eprintln!("black-box decoder agreed on {compared} stream(s)");
 }
+
+// ---------------------------------------------------------------------
+// Packet header form (Annex C.3, Table C.3).
+// ---------------------------------------------------------------------
+
+/// `Wf × Nc ≥ 32752` selects the long packet header (Table C.3) whatever
+/// `Lh` says; the encoder must write that form for such pictures.
+#[test]
+fn wide_pictures_use_the_long_packet_header() {
+    let (w, h) = (8192usize, 4usize);
+    let planes: Vec<Vec<u8>> = (0..4).map(|c| to_u8(&noise(w * h, 8, 700 + c))).collect();
+    for &(nlx, nly) in &[(5u8, 1u8), (5, 0), (3, 2)] {
+        let buf = encoder::encode_planar(w as u16, h as u16, 4, 0, nlx, nly, &planes)
+            .unwrap_or_else(|e| panic!("encode NL={nlx}/{nly}: {e}"));
+        let img = oxideav_jpegxs::decode_components(&buf)
+            .unwrap_or_else(|e| panic!("decode NL={nlx}/{nly}: {e}"));
+        for (c, p) in planes.iter().enumerate() {
+            assert_eq!(&img.planes[c].data, p, "NL={nlx}/{nly} component {c}");
+        }
+    }
+}
+
+/// A line too large for the short header's 15-bit `Ldat` makes the
+/// encoder raise `Lh` (Annex A.4.4 NOTE 2) instead of failing.
+#[test]
+fn oversized_packets_switch_to_long_headers() {
+    let (w, h) = (8000usize, 2usize);
+    let planes: Vec<Vec<u16>> = (0..3).map(|c| noise(w * h, 16, 800 + c)).collect();
+    let buf = encoder::encode_planar_highbd(w as u16, h as u16, 3, 0, 5, 0, 16, &planes)
+        .expect("encode with long headers");
+    let img = oxideav_jpegxs::decode_components(&buf).expect("decode");
+    for (c, p) in planes.iter().enumerate() {
+        assert_eq!(img.planes[c].data, to_le(p), "component {c}");
+    }
+}

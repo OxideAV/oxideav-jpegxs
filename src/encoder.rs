@@ -120,6 +120,10 @@ struct EncodeConfig {
     /// and the deadzone quantizer drops bottom bitplanes via T, not via
     /// extra fractional bits.
     bw: u8,
+    /// Long-header enforcement flag (`Lh`, Annex A.4.4 Table A.7). The
+    /// packet header takes its long form (Annex C.3 Table C.3) when this
+    /// is 1 or when `Wf × Nc ≥ 32752`.
+    lh: u8,
     /// Coefficients per code group (`Ng`), Annex C constant = 4.
     ng: u8,
     /// Code groups per significance group (`Ss`), Annex C constant = 8.
@@ -6388,6 +6392,7 @@ pub(crate) fn encode_planar_inner_bd(
         nc,
         bit_depth: bd,
         bw,
+        lh: 0,
         ng: 4,
         ss: 8,
         br: 8,
@@ -6461,12 +6466,23 @@ pub(crate) fn encode_planar_inner_bd(
         }
     }
     let total: usize = planes.iter().map(|p| p.len()).sum();
-    let mut out = Vec::with_capacity(total + 256);
-    write_main_header(&mut out, &cfg)?;
-    write_slice(&mut out, &cfg, planes)?;
-    // EOC.
-    out.extend_from_slice(&[0xff, 0x11]);
-    Ok(out)
+    let build = |cfg: &EncodeConfig| -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(total + 256);
+        write_main_header(&mut out, cfg)?;
+        write_slice(&mut out, cfg, planes)?;
+        // EOC.
+        out.extend_from_slice(&[0xff, 0x11]);
+        Ok(out)
+    };
+    match build(&cfg) {
+        // A sub-packet outgrew the short packet header (possible below
+        // the `Wf × Nc ≥ 32752` switch when a component is not vertically
+        // decomposed, Annex C.3 NOTE 2): enforce long headers and redo.
+        Err(e) if cfg.lh == 0 && e.to_string().contains(SHORT_HEADER_OVERFLOW) => {
+            build(&EncodeConfig { lh: 1, ..cfg })
+        }
+        result => result,
+    }
 }
 
 /// Build the CAP marker `cap[]` byte array (the bytes after `Lcap`) for
@@ -6674,11 +6690,18 @@ fn write_pih_body(out: &mut Vec<u8>, cfg: &EncodeConfig) {
     // automatically because each packet's chosen size never exceeds its raw
     // size. Signal `Rl = 1` so the construction is conformant and the
     // decoder's Annex C.3 consistency gate does not reject the encoder's own
-    // streams. `Lh` stays 0. `Rm` (bits 1:0, Table A.12) selects the
+    // streams. `Lh` (bit 7) is raised only when a sub-packet outgrows the
+    // short packet header (see the encode driver). `Rm` (bits 1:0, Table A.12) selects the
     // insignificant-group interpretation in vertical prediction — the
     // encoder emits `Rm = 0` (zero prediction residual) by default and
     // `Rm = 1` (zero coefficients) via the run-mode-1 entry point.
-    out.push((1 << 6) | ((cfg.qpih & 0x03) << 4) | ((cfg.fs & 0x03) << 2) | (cfg.rm & 0x03));
+    out.push(
+        ((cfg.lh & 1) << 7)
+            | (1 << 6)
+            | ((cfg.qpih & 0x03) << 4)
+            | ((cfg.fs & 0x03) << 2)
+            | (cfg.rm & 0x03),
+    );
 }
 
 /// Build a slice-local `EncodeConfig` whose `q` is overridden by the
@@ -9066,8 +9089,22 @@ fn emit_packet(out: &mut Vec<u8>, cfg: &EncodeConfig, entries: &[PerBandEntry]) 
     Ok(())
 }
 
+/// Error text of a sub-packet that does not fit the short packet header;
+/// the driver recognises it to re-run the encode with `Lh = 1`.
+const SHORT_HEADER_OVERFLOW: &str = "exceeds short packet header capacity";
+
+impl EncodeConfig {
+    /// Table C.3: the packet header is long unless `Wf × Nc < 32752` and
+    /// `Lh == 0`.
+    fn long_packet_headers(&self) -> bool {
+        self.lh != 0 || u32::from(self.width) * u32::from(self.nc) >= 32752
+    }
+}
+
 #[derive(Debug)]
 struct PacketBytes {
+    /// Long (7-byte) or short (5-byte) packet header, Table C.3.
+    long_header: bool,
     dr: u8,
     /// Significance sub-packet (may be empty when `D[p,b] & 2 = 0`).
     sig: Vec<u8>,
@@ -9078,39 +9115,41 @@ struct PacketBytes {
 
 impl PacketBytes {
     fn total_len(&self) -> usize {
-        // Short header is 5 bytes.
-        5 + self.sig.len() + self.cnt.len() + self.data.len() + self.sgn.len()
+        // Header: 1 + 15 + 13 + 11 bits short, 1 + 20 + 20 + 15 bits long.
+        let header = if self.long_header { 7 } else { 5 };
+        header + self.sig.len() + self.cnt.len() + self.data.len() + self.sgn.len()
     }
 }
 
 fn write_packet(out: &mut Vec<u8>, pkt: &PacketBytes) -> Result<()> {
-    let lcnt = pkt.cnt.len() as u32;
-    let ldat = pkt.data.len() as u32;
-    let lsgn = pkt.sgn.len() as u32;
-    if ldat > (1 << 15) - 1 {
-        return Err(Error::invalid(format!(
-            "jpegxs encoder: Ldat = {ldat} exceeds short packet header capacity (15 bits)."
-        )));
+    let lcnt = pkt.cnt.len() as u64;
+    let ldat = pkt.data.len() as u64;
+    let lsgn = pkt.sgn.len() as u64;
+    // Field widths of Table C.3 (Ldat, Lcnt, Lsgn).
+    let (wd, wc, ws) = if pkt.long_header {
+        (20u32, 20u32, 15u32)
+    } else {
+        (15, 13, 11)
+    };
+    for (name, len, width) in [("Ldat", ldat, wd), ("Lcnt", lcnt, wc), ("Lsgn", lsgn, ws)] {
+        if len >= 1u64 << width {
+            return Err(Error::invalid(if pkt.long_header {
+                format!(
+                    "jpegxs encoder: {name} = {len} exceeds long packet header capacity ({width} bits)."
+                )
+            } else {
+                format!("jpegxs encoder: {name} = {len} {SHORT_HEADER_OVERFLOW} ({width} bits).")
+            }));
+        }
     }
-    if lcnt > (1 << 13) - 1 {
-        return Err(Error::invalid(format!(
-            "jpegxs encoder: Lcnt = {lcnt} exceeds short packet header capacity (13 bits)."
-        )));
-    }
-    if lsgn > (1 << 11) - 1 {
-        return Err(Error::invalid(format!(
-            "jpegxs encoder: Lsgn = {lsgn} exceeds short packet header capacity (11 bits)."
-        )));
-    }
-    let mut hdr_bits: u64 = 0;
-    hdr_bits = (hdr_bits << 1) | (pkt.dr as u64 & 1);
-    hdr_bits = (hdr_bits << 15) | (ldat as u64 & 0x7fff);
-    hdr_bits = (hdr_bits << 13) | (lcnt as u64 & 0x1fff);
-    hdr_bits = (hdr_bits << 11) | (lsgn as u64 & 0x07ff);
-    let mut header = vec![0u8; 5];
-    for (k, byte) in header.iter_mut().enumerate() {
-        *byte = ((hdr_bits >> (8 * (4 - k))) & 0xff) as u8;
-    }
+    let mut hdr_bits: u64 = u64::from(pkt.dr & 1);
+    hdr_bits = (hdr_bits << wd) | ldat;
+    hdr_bits = (hdr_bits << wc) | lcnt;
+    hdr_bits = (hdr_bits << ws) | lsgn;
+    let header_len = (1 + wd + wc + ws) as usize / 8;
+    let header: Vec<u8> = (0..header_len)
+        .map(|k| (hdr_bits >> (8 * (header_len - 1 - k))) as u8)
+        .collect();
     out.extend_from_slice(&header);
     // Significance sub-packet precedes bitplane-count sub-packet
     // (Annex C.4, Table C.5). Only present when has_sig == true.
@@ -9496,6 +9535,7 @@ fn build_packet_body_around(
         BitplaneMode::Vlc(_) => 0,
     };
     Ok(PacketBytes {
+        long_header: cfg.long_packet_headers(),
         dr,
         sig: sig_bytes,
         cnt: cnt_bytes,
@@ -12801,6 +12841,7 @@ mod tests {
             nc: 1,
             bit_depth: 8,
             bw: 8,
+            lh: 0,
             ng: 4,
             ss: 8,
             br: 8,
@@ -14272,6 +14313,7 @@ mod tests {
             nc: 1,
             bit_depth: 8,
             bw: 8,
+            lh: 0,
             ng: 4,
             ss: 8,
             br: 4,
