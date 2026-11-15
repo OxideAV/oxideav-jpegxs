@@ -53,6 +53,11 @@
   capacity" when one line of a component without vertical decomposition
   outgrew the 15-bit `Ldat` (Annex C.3 NOTE 2); it now re-runs with
   `Lh = 1`. Streams that were valid before are byte-identical.
+- **Picture headers with a large column width `Cw` no longer overflow the
+  precinct-grid computation** (`Cs = 8 × Cw × max(sx) × 2^NL,x` was
+  multiplied in 32 bits; found by the `decode` / `jxs_file` fuzz targets,
+  minimised input kept in `tests/robustness.rs`). Any `Cs` at or beyond
+  the picture width is one precinct per row.
 - **Corrupt streams no longer trip integer-overflow checks** in the
   inverse wavelet transform, colour transforms and output scaling (debug
   / overflow-checked builds panicked with "attempt to add with overflow";

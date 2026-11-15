@@ -539,9 +539,13 @@ pub fn build_plan_sd(
     let cs: u32 = if pih.cw == 0 {
         wf
     } else {
-        let max_sx = sx.iter().copied().max().unwrap_or(1) as u32;
-        let pow = 1u32 << nlx;
-        8u32 * (pih.cw as u32) * max_sx * pow
+        let max_sx = sx.iter().copied().max().unwrap_or(1) as u64;
+        // A 16-bit Cw times 8 × max(sx) × 2^NL,x can exceed 32 bits. Any
+        // Cs at or past the picture width means one precinct per row, so
+        // saturating keeps the arithmetic below exact for every value a
+        // header can carry.
+        let wide = 8u64 * u64::from(pih.cw) * max_sx * (1u64 << nlx.min(31));
+        u32::try_from(wide).unwrap_or(u32::MAX)
     };
     if cs == 0 {
         return Err(Error::invalid(
