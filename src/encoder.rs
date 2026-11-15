@@ -8612,13 +8612,13 @@ fn encode_precinct_cascade(
                 for beta in beta0..(beta0 + 3).min(nbeta_pic) {
                     let mut entries: Vec<PerBandEntry> = Vec::new();
                     let mut coords: Vec<(usize, u32)> = Vec::new();
-                    for i in 0..n_decomposed {
+                    for (i, &sy) in cfg.sy.iter().enumerate().take(n_decomposed) {
                         let s_idx = (beta as usize) * n_decomposed + i;
                         let s = &slices[s_idx];
                         if !s.exists {
                             continue;
                         }
-                        let sy_i = cfg.sy[i] as usize;
+                        let sy_i = sy as usize;
                         let pic_grid_line = lambda_within;
                         if sy_i != 0 && pic_grid_line % sy_i != 0 {
                             continue;
