@@ -42,6 +42,19 @@
   | `profile_high4444_12` | `4840fe9964afa18dd5db6c9f4e9ad855fed4b78f839cf644e9db7937597fb30b` | `82449da609041d4306efa0bcf07601613f3056df49bfde7427dde8e253efd45f` |
   | `profile_cbr_exact_target_main422_10` | `f1288e5336d3ee84e17ae8083fa82b7c0f933d3f97c6ff40a5351598c995a41d` | `a4d6dd38dde4bb35dc64058ceb54c85f3eab5b76aad5e33a3a7efd229db7cdd7` |
 
+### Fixed
+
+- **Corrupt streams no longer trip integer-overflow checks** in the
+  inverse wavelet transform, colour transforms and output scaling (debug
+  / overflow-checked builds panicked with "attempt to add with overflow";
+  release builds wrapped silently). The inverse lifting steps wrap, and
+  the wavelet output is limited to ±2^26 — 64 times the largest range a
+  `Bw = 20` stream can legitimately produce — before Annex F / G. No
+  conforming stream is affected (65 / 65 unchanged). Covered by the new
+  `tests/robustness.rs` (deterministic bit-flip / overwrite / truncation
+  sweep over eight encoder streams; 320 000 mutations soaked locally in
+  a debug build).
+
 ### Performance
 
 - Encoder packet building: the data / sign sub-packets are built once per
@@ -53,6 +66,11 @@
   in-place row-slice vertical pass, no per-row / per-column allocation.
   One 1920×1080 plane, `NL = 5/2`: forward 124 → 1143 MP/s, inverse
   119 → 1063 MP/s; full lossless encode 16.3 → 23.9 MP/s. Output identical.
+- Decoder entropy stage: no per-packet copy of the precinct's coefficient
+  arrays, flat significance flags instead of a hash map, word-based bit
+  reader / unary prefix, group-wise bitplane reads. Decode of Part 4
+  stream 60 (4064×2704, `NL = 3/2`) 19.9 → 30–38 MP/s, 1080p lossless
+  8.4 → 29–36 MP/s. Output identical (65 / 65).
 - `benches/throughput.rs`: dependency-free timing probe (wavelet cascades,
   full encode / decode, optional Part 4 codestreams).
 

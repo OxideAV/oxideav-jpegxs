@@ -31,7 +31,7 @@ use crate::dwt::inverse_cascade_2d;
 use crate::entropy::packet_body::{PrecinctState, PrecinctTop};
 use crate::entropy::{
     BandCoefficients, PacketWireSize, PrecinctHeader, check_raw_mode_consistency,
-    decode_packet_body, parse_packet_header, parse_precinct_header, precinct_filler_bytes,
+    decode_packet_body_into, parse_packet_header, parse_precinct_header, precinct_filler_bytes,
     precinct_truncation,
 };
 use crate::error::{JpegXsError as Error, Result};
@@ -421,6 +421,21 @@ fn decode_parsed_tap(
         }
     }
 
+    // Guard band ahead of the colour transform and output scaling. The
+    // wavelet output of a conforming stream is a `Bw ≤ 20`-bit quantity
+    // (plus a little quantization overshoot); a corrupt stream can carry
+    // 31-bitplane coefficients and drive `O[c,x,y]` anywhere in `i32`.
+    // Limiting it to 64 times the largest legal range changes nothing a
+    // conforming stream can produce (Annex G clips to `B[i]` bits at the
+    // end anyway) and keeps the integer arithmetic of Annexes F and G
+    // inside `i32` on hostile input.
+    const SAMPLE_GUARD: i32 = 1 << 26;
+    for plane in samples.iter_mut() {
+        for v in plane.iter_mut() {
+            *v = (*v).clamp(-SAMPLE_GUARD, SAMPLE_GUARD);
+        }
+    }
+
     // Annex F inverse colour transform — Table F.1 dispatches by Cpih.
     // The transform reads the wavelet output O[c,x,y] for every operand
     // component (c < 3 for RCT, c < 4 for Star-Tetrix). When Sd > 0 the
@@ -578,7 +593,7 @@ fn decode_slice(
             let body = slice_data
                 .get(entropy_cursor..entropy_end)
                 .ok_or_else(|| Error::invalid("jpegxs decoder: packet body past precinct end"))?;
-            let dec = decode_packet_body(
+            let consumed = decode_packet_body_into(
                 body,
                 &precinct_plan.geometry,
                 &precinct_header,
@@ -587,7 +602,7 @@ fn decode_slice(
                 &mut state,
                 top_above.as_ref(),
             )?;
-            entropy_cursor += dec.bytes_consumed;
+            entropy_cursor += consumed;
 
             wire_sizes.push(PacketWireSize {
                 header_bytes: packet_header.header_bytes as u32,

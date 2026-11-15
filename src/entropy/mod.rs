@@ -36,7 +36,9 @@ pub mod packet_header;
 pub mod precinct_header;
 
 pub use bits::{BitReader, vlc, vlc_codeword_bits};
-pub use packet_body::{BandCoefficients, PacketDecode, PrecinctTop, decode_packet_body};
+pub use packet_body::{
+    BandCoefficients, PacketDecode, PrecinctTop, decode_packet_body, decode_packet_body_into,
+};
 pub use packet_header::{PacketHeader, parse_packet_header};
 pub use precinct_header::{PrecinctHeader, parse_precinct_header};
 

@@ -90,6 +90,7 @@ impl<'a> BitReader<'a> {
     }
 
     /// Read a single bit. Returns 0 or 1.
+    #[inline]
     pub fn read_bit(&mut self) -> Result<u8> {
         if self.byte_pos >= self.buf.len() {
             return Err(Error::invalid(
@@ -106,7 +107,29 @@ impl<'a> BitReader<'a> {
         Ok(bit)
     }
 
-    /// Read `n` bits (1..=32) MSB-first as an unsigned integer.
+    /// The next bits of the stream left-aligned in a 64-bit word (zero
+    /// beyond the end of the buffer), and how many of them are real
+    /// (at least 57 while eight or more bytes remain).
+    #[inline]
+    fn peek_word(&self) -> (u64, usize) {
+        let rest = self.buf.get(self.byte_pos..).unwrap_or(&[]);
+        let n = rest.len().min(8);
+        let mut bytes = [0u8; 8];
+        bytes[..n].copy_from_slice(&rest[..n]);
+        let word = u64::from_be_bytes(bytes) << self.bit_pos;
+        (word, (n * 8).saturating_sub(self.bit_pos as usize))
+    }
+
+    /// Move the cursor forward by `n` bits.
+    #[inline]
+    fn advance(&mut self, n: usize) {
+        let pos = self.bit_pos as usize + n;
+        self.byte_pos += pos / 8;
+        self.bit_pos = (pos % 8) as u8;
+    }
+
+    /// Read `n` bits MSB-first (`n ≤ 32`).
+    #[inline]
     pub fn read_bits(&mut self, n: u8) -> Result<u32> {
         if n == 0 {
             return Ok(0);
@@ -116,11 +139,35 @@ impl<'a> BitReader<'a> {
                 "jpegxs entropy: read_bits({n}) > 32"
             )));
         }
-        let mut out: u32 = 0;
-        for _ in 0..n {
-            out = (out << 1) | (self.read_bit()? as u32);
+        let (word, valid) = self.peek_word();
+        if usize::from(n) > valid {
+            return Err(Error::invalid(
+                "jpegxs entropy: read_bit past end of buffer",
+            ));
         }
-        Ok(out)
+        self.advance(usize::from(n));
+        Ok((word >> (64 - u32::from(n))) as u32)
+    }
+
+    /// Consume a unary run: the number of one-bits before the
+    /// terminating zero bit, which is consumed too. `Ok(Err(()))` when
+    /// 32 one-bits arrive without a terminator (exactly those 32 bits
+    /// are consumed); a stream ending inside the run is an error.
+    #[inline]
+    fn read_unary_capped(&mut self) -> Result<core::result::Result<u32, ()>> {
+        let (word, valid) = self.peek_word();
+        let ones = word.leading_ones() as usize;
+        if ones >= 32 {
+            self.advance(32);
+            return Ok(Err(()));
+        }
+        if ones >= valid {
+            return Err(Error::invalid(
+                "jpegxs entropy: read_bit past end of buffer",
+            ));
+        }
+        self.advance(ones + 1);
+        Ok(Ok(ones as u32))
     }
 }
 
@@ -150,23 +197,11 @@ impl<'a> BitReader<'a> {
 /// Returns the decoded signed value as `i32`.
 pub fn vlc(reader: &mut BitReader<'_>, r: i32, t: i32) -> Result<i32> {
     let theta = (r - t).max(0);
-    let mut x: u32 = 0;
-    loop {
-        let b = reader.read_bit()?;
-        if b == 1 {
-            x += 1;
-        }
-        // `while (b && x < 32)` — stop on the comma bit (`b == 0`) or
-        // the instant the 32nd consecutive 1-bit lands (`x == 32`).
-        if b == 0 || x >= 32 {
-            break;
-        }
-    }
-    if x >= 32 {
+    let Ok(x) = reader.read_unary_capped()? else {
         return Err(Error::invalid(
             "jpegxs entropy: vlc decoder saw 32 consecutive 1-bits (lost synchronisation, ISO/IEC 21122-1 Table C.15)",
         ));
-    }
+    };
     let xi = x as i32;
     if xi > 2 * theta {
         Ok(xi - theta)

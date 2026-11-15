@@ -833,11 +833,25 @@ decoder rows.
 
 | 1920×1080, three 8-bit components, RCT, `NL = 5/2` | before | after |
 |---|---|---|
-| encode, lossless (`Fq = 0`) | 4.0 MP/s | 23.9 MP/s |
-| encode, `Fq = 8`, `q = 4` | 2.3 MP/s | 16.1 MP/s |
+| encode, lossless (`Fq = 0`) | 4.0 MP/s | 24–33 MP/s |
+| encode, `Fq = 8`, `q = 4` | 2.3 MP/s | 16–30 MP/s |
+| decode, lossless (`Fq = 0`) | 8.4 MP/s | 29–36 MP/s |
+| decode, `Fq = 8`, `q = 4` | 13.2 MP/s | 27–31 MP/s |
 | forward wavelet cascade alone, one plane, `NL = 5/2` | 124 MP/s | 1143 MP/s |
 | inverse wavelet cascade alone, one plane, `NL = 5/2` | 119 MP/s | 1063 MP/s |
 | forward / inverse cascade alone, `NL = 5/0` | 437 / 485 MP/s | 1421 / 1387 MP/s |
+
+| ISO/IEC 21122-4 codestream (decode) | before | after |
+|---|---|---|
+| stream 5, 4064×2704, `NL = 3/0` | 27.4 MP/s | 41–43 MP/s |
+| stream 29, 4095×1744, `NL = 1/1` | 33.7 MP/s | 45–54 MP/s |
+| stream 60, 4064×2704, `NL = 3/2` | 19.9 MP/s | 30–38 MP/s |
+
+"After" ranges are the medians of two separate bench runs taken while
+other builds were using the machine. Decode profile before the change
+(stream 60): packet-body decode 30 %, inverse wavelet 23 %, inverse
+quantization 14 %, bitplane-count VLC 10 %, buffer copies 6 %, hashing 6 %
+(13 % on the lossless 1080p stream).
 
 What changed (encoded bytes identical — the encoder pins did not move):
 
@@ -849,6 +863,12 @@ What changed (encoded bytes identical — the encoder pins did not move):
   instead of once per bit);
 - the bit writer accumulates into a 64-bit word instead of touching the
   output vector for every bit.
+- decoder: a packet-body decode no longer returns a copy of every
+  coefficient array of the precinct (one copy per packet); the
+  significance flags live in a flat per-packet array instead of a hash
+  map keyed by band / line / group; the bit reader serves multi-bit reads
+  and the unary bitplane-count prefix from a 64-bit window; data
+  sub-packet bitplanes are read a code group at a time;
 - the wavelet kernels work on de-interleaved data with the Table E.5
   reflection folded into two mirror rules (no margin buffer, no per-row or
   per-column allocation and copy), the vertical pass of a joint level

@@ -54,8 +54,6 @@
 
 use crate::error::{JpegXsError as Error, Result};
 
-use std::collections::HashMap;
-
 use crate::entropy::bits::{BitReader, vlc};
 use crate::entropy::packet_header::PacketHeader;
 use crate::entropy::precinct_header::PrecinctHeader;
@@ -119,6 +117,46 @@ pub fn decode_packet_body(
     prev_state: &mut PrecinctState,
     top: Option<&PrecinctTop>,
 ) -> Result<PacketDecode> {
+    let bytes_consumed =
+        decode_packet_body_into(buf, geom, precinct, packet, layout, prev_state, top)?;
+    Ok(PacketDecode {
+        bands: prev_state.coefficients.clone(),
+        bytes_consumed,
+    })
+}
+
+/// Read `ng` bits (one code group's worth of one bitplane, or its sign
+/// bits) and hand them out one at a time, first position first.
+#[inline]
+fn for_each_group_bit(
+    reader: &mut BitReader<'_>,
+    ng: usize,
+    mut f: impl FnMut(usize, u32),
+) -> Result<()> {
+    let mut k = 0;
+    while k < ng {
+        let n = (ng - k).min(32);
+        let bits = reader.read_bits(n as u8)?;
+        for i in 0..n {
+            f(k + i, (bits >> (n - 1 - i)) & 1);
+        }
+        k += n;
+    }
+    Ok(())
+}
+
+/// [`decode_packet_body`] without the snapshot: the coefficients stay in
+/// `prev_state` (where the precinct accumulates them packet by packet)
+/// and only the number of bytes consumed is returned.
+pub fn decode_packet_body_into(
+    buf: &[u8],
+    geom: &PrecinctGeometry,
+    precinct: &PrecinctHeader,
+    packet: &PacketHeader,
+    layout: &PacketLayout,
+    prev_state: &mut PrecinctState,
+    top: Option<&PrecinctTop>,
+) -> Result<usize> {
     let truncation = precinct_truncation(geom, precinct);
 
     // Lazy-initialise the per-band coefficient buffers if the caller
@@ -148,37 +186,27 @@ pub fn decode_packet_body(
             Error::invalid("jpegxs entropy: packet body truncated at sig sub-packet")
         })?;
         let mut reader = BitReader::new(buf_sig);
+        // Z flags of this packet, entry after entry; `sig_start[e]` is
+        // where entry `e`'s `Ns` flags begin. Bands without significance
+        // information keep no flags: per Table C.5 the neutral value is
+        // Z = 0 ("significant" — bitplane counts are VLC-coded).
+        prev_state.sig_flags.clear();
+        prev_state.sig_start.clear();
         for entry in &layout.entries {
             let bi = entry.band as usize;
             let band = &geom.bands[bi];
+            prev_state.sig_start.push(prev_state.sig_flags.len());
             if !band.exists {
                 continue;
             }
-            let line_index = (entry.line - band.l0) as usize;
             let dpb = precinct.d[bi];
             if packet.dr == 0 && (dpb & 2) != 0 {
                 let ns = geom.ns(bi) as usize;
-                for j in 0..ns {
+                for _ in 0..ns {
                     let z = reader.read_bit()?;
-                    prev_state
-                        .sig_flags
-                        .insert((entry.band, entry.line, j as u32), z);
-                }
-            } else {
-                // No significance information for this band+line. Per
-                // Table C.5 a Z bit of 1 flags the significance group
-                // as all-insignificant, so the neutral default is
-                // Z = 0 ("significant" — bitplane counts are VLC-coded).
-                let ns = geom.ns(bi) as usize;
-                for j in 0..ns {
-                    prev_state
-                        .sig_flags
-                        .insert((entry.band, entry.line, j as u32), 0);
+                    prev_state.sig_flags.push(z);
                 }
             }
-            // Drop unused: line_index isn't needed here; it's used by
-            // the bitplane-count decoder below.
-            let _ = line_index;
         }
         reader.align_to_byte();
         total_consumed += reader.bytes_consumed();
@@ -193,7 +221,7 @@ pub fn decode_packet_body(
                 Error::invalid("jpegxs entropy: packet body truncated at bitplane-count sub-packet")
             })?;
         let mut reader = BitReader::new(buf_cnt);
-        for entry in &layout.entries {
+        for (e, entry) in layout.entries.iter().enumerate() {
             let bi = entry.band as usize;
             let band = &geom.bands[bi];
             if !band.exists {
@@ -203,7 +231,13 @@ pub fn decode_packet_body(
             let ncg = geom.ncg(bi) as usize;
             let t = truncation[bi] as i32;
             let dpb = precinct.d[bi];
-            let coef = &mut prev_state.coefficients[bi];
+            let PrecinctState {
+                coefficients,
+                sig_flags,
+                sig_start,
+            } = &mut *prev_state;
+            let coef = &mut coefficients[bi];
+            let sig_start = sig_start[e];
 
             // Bitplane-count upper bound 2^Br − 1. Tables C.12/C.13/C.14
             // all require 0 ≤ M[p,λ,b,g] ≤ (2^Br − 1) regardless of the
@@ -261,11 +295,7 @@ pub fn decode_packet_body(
                     let z = if (dpb & 2) != 0 {
                         // Significance coding enabled. Z = 1 flags the
                         // group as all-insignificant (Table C.5).
-                        prev_state
-                            .sig_flags
-                            .get(&(entry.band, entry.line, sig_group as u32))
-                            .copied()
-                            .unwrap_or(0)
+                        sig_flags.get(sig_start + sig_group).copied().unwrap_or(0)
                     } else {
                         0
                     };
@@ -328,11 +358,7 @@ pub fn decode_packet_body(
                     let z = if (dpb & 2) != 0 {
                         // Z = 1 flags the group as all-insignificant
                         // (Table C.5).
-                        prev_state
-                            .sig_flags
-                            .get(&(entry.band, entry.line, sig_group as u32))
-                            .copied()
-                            .unwrap_or(0)
+                        sig_flags.get(sig_start + sig_group).copied().unwrap_or(0)
                     } else {
                         0
                     };
@@ -405,45 +431,42 @@ pub fn decode_packet_body(
             let line_offset = line_index * (band.wpb as usize);
             let tail_len = (ncg * geom.ng as usize).saturating_sub(band.wpb as usize);
             tail_v[e] = vec![0u32; tail_len];
+            let ng = geom.ng as usize;
+            let wpb = band.wpb as usize;
+            let (line_v, line_s) = (
+                &mut coef.v[line_offset..line_offset + wpb],
+                &mut coef.s[line_offset..line_offset + wpb],
+            );
+            let tail = &mut tail_v[e];
             for g in 0..ncg {
                 let m = coef.m[line_index * ncg + g] as u32;
-                // Reset magnitudes for this group (per Table C.8:
-                // "v[p,λ,b,Ng×g+k] = 0").
-                for k in 0..geom.ng as usize {
-                    let xpos = g * geom.ng as usize + k;
-                    if xpos < band.wpb as usize {
-                        coef.v[line_offset + xpos] = 0;
-                    }
-                }
+                let base = g * ng;
+                // Initialise v[] for the code group; positions past the
+                // band width live in `tail`.
+                let in_band = (base + ng).min(wpb).saturating_sub(base.min(wpb));
+                line_v[base.min(wpb)..base.min(wpb) + in_band].fill(0);
                 if m > t {
+                    // Fs == 0: sign bits come first inside the code group.
                     if geom.fs == 0 {
-                        // Signs are interleaved into the data sub-packet.
-                        for k in 0..geom.ng as usize {
-                            let s = reader.read_bit()?;
-                            let xpos = g * geom.ng as usize + k;
-                            if xpos < band.wpb as usize {
-                                coef.s[line_offset + xpos] = s;
+                        for_each_group_bit(&mut reader, ng, |k, bit| {
+                            if let Some(slot) = line_s.get_mut(base + k) {
+                                *slot = bit as u8;
                             }
-                        }
+                        })?;
                     }
-                    // M - T bitplanes, MSB-first per spec ("for(i =
-                    // M-T-1; i >= 0; i = i - 1)").
+                    // Bitplanes from MSB (M-1) down to T. Meaningless
+                    // coefficients (past the band width) are still
+                    // transmitted, Table C.8 NOTE 2.
                     let nplanes = m - t;
                     for plane in (0..nplanes).rev() {
-                        for k in 0..geom.ng as usize {
-                            let d = reader.read_bit()? as u32;
-                            let xpos = g * geom.ng as usize + k;
-                            if xpos < band.wpb as usize {
-                                coef.v[line_offset + xpos] |= d << plane;
+                        for_each_group_bit(&mut reader, ng, |k, bit| {
+                            let xpos = base + k;
+                            if xpos < wpb {
+                                line_v[xpos] |= bit << plane;
                             } else {
-                                // Meaningless tail coefficient: the
-                                // magnitude is discarded, but whether it
-                                // is non-zero decides a sign bit in the
-                                // Fs = 1 sign sub-packet (Table C.9
-                                // NOTE 2).
-                                tail_v[e][xpos - band.wpb as usize] |= d << plane;
+                                tail[xpos - wpb] |= bit << plane;
                             }
-                        }
+                        })?;
                     }
                 }
             }
@@ -510,10 +533,7 @@ pub fn decode_packet_body(
 
     // The PacketDecode `bands` is a copy of the running state for
     // callers that want it. The state mutation is the source of truth.
-    Ok(PacketDecode {
-        bands: prev_state.coefficients.clone(),
-        bytes_consumed: total_consumed,
-    })
+    Ok(total_consumed)
 }
 
 /// Mutable per-precinct state carried across packet bodies. Round 3
@@ -524,8 +544,10 @@ pub fn decode_packet_body(
 pub struct PrecinctState {
     /// Per-band coefficient buffers; one entry per band id.
     pub coefficients: Vec<BandCoefficients>,
-    /// `Z[p,λ,b,j]` indexed by `(band, line, sig_group)`.
-    pub sig_flags: HashMap<(u16, u16, u32), u8>,
+    /// `Z[p,λ,b,j]` of the packet being decoded, entry after entry.
+    pub sig_flags: Vec<u8>,
+    /// Start of each packet entry's flags in `sig_flags`.
+    pub sig_start: Vec<usize>,
 }
 
 /// Vertical-prediction predecessor carried from the precinct directly

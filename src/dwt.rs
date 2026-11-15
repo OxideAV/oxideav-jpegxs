@@ -173,16 +173,16 @@ fn synth_line(low: &[i32], high: &[i32], out: &mut [i32]) {
     let (nl, nh) = (low.len(), high.len());
     debug_assert!(nh >= 1 && (nl == nh || nl == nh + 1) && out.len() == nl + nh);
     // Even phase.
-    out[0] = low[0] - ((high[0] + high[0] + 2) >> 2);
+    out[0] = synth_even(low[0], high[0], high[0]);
     for n in 1..nh {
-        out[2 * n] = low[n] - ((high[n - 1] + high[n] + 2) >> 2);
+        out[2 * n] = synth_even(low[n], high[n - 1], high[n]);
     }
     if nl > nh {
-        out[2 * nh] = low[nh] - ((high[nh - 1] + high[nh - 1] + 2) >> 2);
+        out[2 * nh] = synth_even(low[nh], high[nh - 1], high[nh - 1]);
     }
     // Odd phase.
     for n in 0..nh - 1 {
-        out[2 * n + 1] = high[n] + ((out[2 * n] + out[2 * n + 2]) >> 1);
+        out[2 * n + 1] = synth_odd(high[n], out[2 * n], out[2 * n + 2]);
     }
     let last = nh - 1;
     let right = if nl > nh {
@@ -190,7 +190,25 @@ fn synth_line(low: &[i32], high: &[i32], out: &mut [i32]) {
     } else {
         out[2 * last]
     };
-    out[2 * last + 1] = high[last] + ((out[2 * last] + right) >> 1);
+    out[2 * last + 1] = synth_odd(high[last], out[2 * last], right);
+}
+
+/// Table E.6 even step, `X − ((a + b + 2) >> 2)`.
+///
+/// The inverse runs on whatever a codestream carries. Coefficients of a
+/// conforming stream stay far inside `i32` (at most `Bw = 20` bits plus
+/// the filter gain), where wrapping and plain arithmetic agree; a
+/// corrupt stream can carry magnitudes up to 31 bitplanes, and wrapping
+/// keeps the transform total (no overflow trap) on such input.
+#[inline(always)]
+fn synth_even(x: i32, a: i32, b: i32) -> i32 {
+    x.wrapping_sub(a.wrapping_add(b).wrapping_add(2) >> 2)
+}
+
+/// Table E.6 odd step, `X + ((a + b) >> 1)`; wrapping as [`synth_even`].
+#[inline(always)]
+fn synth_odd(x: i32, a: i32, b: i32) -> i32 {
+    x.wrapping_add(a.wrapping_add(b) >> 1)
 }
 
 /// Forward lifting of one line: interleaved `x` → `low` / `high`
@@ -251,7 +269,7 @@ fn synth_rows_in_place(buf: &mut [i32], w: usize, h: usize) {
             (None, None) => unreachable!("h >= 2"),
         };
         for ((t, &p), &q) in row.iter_mut().zip(a).zip(b) {
-            *t -= (p + q + 2) >> 2;
+            *t = synth_even(*t, p, q);
         }
     }
     // Odd rows: O[n] = H[n] + ((E[n] + E[n+1]) >> 1).
@@ -260,7 +278,7 @@ fn synth_rows_in_place(buf: &mut [i32], w: usize, h: usize) {
         let a = above.expect("odd row has a row above");
         let b = below.unwrap_or(a);
         for ((t, &p), &q) in row.iter_mut().zip(a).zip(b) {
-            *t += (p + q) >> 1;
+            *t = synth_odd(*t, p, q);
         }
     }
 }
