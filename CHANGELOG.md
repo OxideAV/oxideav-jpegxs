@@ -49,6 +49,10 @@
   group at a time through a word-accumulating bit writer. 1920×1080 4:4:4
   8-bit `NL = 5/2`: lossless encode 4.0 → 16.3 MP/s, `Fq = 8` encode
   2.3 → 16.1 MP/s (median of 5, single thread). Output bytes identical.
+- Wavelet transform: margin-free lifting kernels on de-interleaved data,
+  in-place row-slice vertical pass, no per-row / per-column allocation.
+  One 1920×1080 plane, `NL = 5/2`: forward 124 → 1143 MP/s, inverse
+  119 → 1063 MP/s; full lossless encode 16.3 → 23.9 MP/s. Output identical.
 - `benches/throughput.rs`: dependency-free timing probe (wavelet cascades,
   full encode / decode, optional Part 4 codestreams).
 

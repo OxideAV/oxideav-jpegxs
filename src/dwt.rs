@@ -1,31 +1,30 @@
 //! Reversible 5/3 discrete wavelet transform (ISO/IEC 21122-1:2022,
 //! Annex E).
 //!
-//! This module implements the single-level forward and inverse 2-D
-//! reversible 5/3 DWT used by every JPEG XS profile. The decomposition
-//! itself (which bands feed which bands across multiple levels) lives
-//! in the slice walker — that walker isn't ready yet, so this round
-//! exposes only the per-band 1-D and 2-D primitives.
+//! Forward and inverse 5/3 transform of one component: the 1-D lifting
+//! kernels, one joint (horizontal + vertical) level, and the multi-level
+//! cascades of Tables E.1 / E.8.
 //!
 //! Spec mapping:
 //!
-//! * [`extend_symmetric`] — Annex E.6, Table E.5 (whole-sample even
-//!   symmetric reflection: `X[-i] = X[i]`, `X[Z+i-1] = X[Z-i-1]` for
-//!   `i = 1, 2`).
-//! * [`inverse_filter_1d`] — Annex E.7, Table E.6 (inverse 5/3 lifting:
-//!   even samples reconstructed from low-pass via `Y[i] = X[i] -
-//!   ((X[i-1] + X[i+1] + 2) >> 2)`, then odd samples via `Y[i] = X[i]
-//!   + ((Y[i-1] + Y[i+1]) >> 1)`).
-//! * [`forward_filter_1d`] — Annex E.13, Table E.12 (forward 5/3
-//!   lifting: odd samples first via `Y[i] = X[i] - ((X[i-1] + X[i+1])
-//!   >> 1)`, then even samples via `Y[i] = X[i] + ((Y[i-1] + Y[i+1] +
-//!   2) >> 2)`).
+//! * [`extend_symmetric`] — Annex E.6, Table E.5 (whole-sample symmetric
+//!   reflection: `X[-i] = X[i]`, `X[Z+i-1] = X[Z-i-1]` for `i = 1, 2`),
+//!   kept as the literal statement of the boundary rule. The production
+//!   kernels fold the reflection into two mirror rules on de-interleaved
+//!   data (derivation next to the kernels) and never materialise the
+//!   margin.
+//! * Annex E.7, Table E.6 (inverse lifting: even samples
+//!   `Y[i] = X[i] - ((X[i-1] + X[i+1] + 2) >> 2)`, then odd samples
+//!   `Y[i] = X[i] + ((Y[i-1] + Y[i+1]) >> 1)`) and Annex E.13, Table E.12
+//!   (forward lifting: odd samples `Y[i] = X[i] - ((X[i-1] + X[i+1]) >> 1)`,
+//!   then even samples `Y[i] = X[i] + ((Y[i-1] + Y[i+1] + 2) >> 2)`).
 //! * [`inverse_horizontal_1d`] / [`forward_horizontal_1d`] — Annex E.4
-//!   / E.11, single-row bridge between the interleaved L|H|L|H ordering
-//!   used by the filter and the de-interleaved low-pass / high-pass
-//!   bands stored in coefficient memory.
+//!   / E.11, one row between interleaved samples and the de-interleaved
+//!   low-pass / high-pass bands.
 //! * [`inverse_vertical_1d`] / [`forward_vertical_1d`] — Annex E.5 /
-//!   E.12, the column equivalent.
+//!   E.12, the column equivalent. Inside a joint level the vertical pass
+//!   runs on whole rows at a time (the table's column loop becomes the
+//!   inner contiguous loop; same arithmetic per sample).
 //! * [`inverse_2d`] / [`forward_2d`] — one joint (horizontal + vertical)
 //!   decomposition level in the pass order of Annex E.2 Table E.1 and
 //!   Annex E.9 Table E.8. The inverse filters **horizontally first**
@@ -36,20 +35,16 @@
 //!   lifting steps round (`>> 1`, `+ 2 >> 2`), so the two possible pass
 //!   orders are different integer transforms: a 2×2 block is already
 //!   enough to tell them apart (see the unit tests).
+//! * [`inverse_cascade_2d`] / [`forward_cascade_2d`] — Tables E.1 / E.8
+//!   for one component.
 //!
 //! Boundary handling. Annex E.6 NOTE guarantees every band is at
 //! least two coefficients wide / tall, because of the picture-header
-//! constraints on `Wf`, `Hf`, `Cw`. The extension code rejects shorter
-//! inputs. The pad of two samples on each side of the working buffer
-//! is exactly what the 5/3 filter taps reach.
+//! constraints on `Wf`, `Hf`, `Cw`. Shorter inputs are rejected.
 //!
-//! Allocation. The DWT works on caller-owned slices. The only
-//! internal heap use is the `Vec<i32>` working buffer for one row /
-//! column at a time; its capacity is `len + 4` where `len` is the band
-//! dimension supplied by the caller. The per-call allocation is
-//! therefore bounded by the picture-header geometry the codestream
-//! parser already validated, never by an unbounded length on the
-//! wire.
+//! Allocation. A joint level allocates its output block and nothing per
+//! row or per column; every size is bounded by the picture-header
+//! geometry the codestream parser already validated.
 
 use crate::error::{JpegXsError as Error, Result};
 
@@ -126,92 +121,177 @@ pub fn extend_symmetric(buf: &mut [i32], z: usize) -> Result<()> {
     Ok(())
 }
 
-/// Annex E.7, Table E.6 — inverse 5/3 reversible filter. The input
-/// `buf` holds interleaved low-pass / high-pass samples in
-/// `buf[PAD .. PAD+Z]` (low-pass at even indices, high-pass at odd),
-/// with `extend_symmetric` already applied to the pad slots. The
-/// output overwrites the same range with reconstructed samples.
-fn inverse_filter_1d(buf: &mut [i32], z: usize) {
-    // Index helper: read sample at logical position `i` (which may be
-    // `-2 ..= Z+1`) by adding the PAD shift.
-    let pad = PAD as isize;
-    let z_i = z as isize;
-
-    // Step 1 — even samples: Y[i] = X[i] - ((X[i-1] + X[i+1] + 2) >> 2)
-    // for i = 0, 2, ..., last even index < Z+1. The spec loop runs
-    // `for(i=0; i<Z+1; i+=2)`, so when Z is even the last update is at
-    // i = Z (in the right pad slot). That synthetic write is required:
-    // step 2 below reads Y[Z] when Z is even (e.g. for Z=8, the i=7
-    // odd-sample update reads Y[8]).
-    let mut i: isize = 0;
-    while i < z_i + 1 {
-        let left = buf[(pad + i - 1) as usize];
-        let right = buf[(pad + i + 1) as usize];
-        let centre_idx = (pad + i) as usize;
-        buf[centre_idx] -= (left + right + 2) >> 2;
-        i += 2;
+/// Check a 1-D pass length against the Annex E.6 NOTE minimum and the
+/// working cap.
+fn check_pass_len(z: usize) -> Result<()> {
+    if z < 2 {
+        return Err(Error::invalid(format!(
+            "JPEG XS DWT: row width {z} below the spec minimum of 2"
+        )));
     }
-
-    // Step 2 — odd samples: Y[i] = X[i] + ((Y[i-1] + Y[i+1]) >> 1)
-    // for i = 1, 3, ..., Z-1.
-    let mut i: isize = 1;
-    while i < z_i {
-        let left = buf[(pad + i - 1) as usize];
-        let right = buf[(pad + i + 1) as usize];
-        buf[(pad + i) as usize] += (left + right) >> 1;
-        i += 2;
-    }
-}
-
-/// Annex E.13, Table E.12 — forward 5/3 reversible filter. The input
-/// `buf` holds raw samples in `buf[PAD .. PAD+Z]` with
-/// `extend_symmetric` already applied to the pad slots. The output
-/// overwrites the same range with interleaved low-pass / high-pass
-/// coefficients (low-pass at even indices, high-pass at odd).
-fn forward_filter_1d(buf: &mut [i32], z: usize) {
-    let pad = PAD as isize;
-    let z_i = z as isize;
-
-    // Step 1 — odd samples first: Y[i] = X[i] - ((X[i-1] + X[i+1]) >> 1)
-    // for i = -1, 1, 3, ..., last odd <= Z. The spec loop is
-    // `for(i=-1; i<Z+1; i+=2)`.
-    let mut i: isize = -1;
-    while i < z_i + 1 {
-        let left = buf[(pad + i - 1) as usize];
-        let right = buf[(pad + i + 1) as usize];
-        let centre_idx = (pad + i) as usize;
-        // Only write into real or right-pad slots that are valid as
-        // sources for the next step. The spec writes into the
-        // extension area too because the next step reads it, so allow
-        // writes across `[-1 ..= Z]`.
-        if i >= -1 && i <= z_i {
-            buf[centre_idx] -= (left + right) >> 1;
-        }
-        i += 2;
-    }
-
-    // Step 2 — even samples: Y[i] = X[i] + ((Y[i-1] + Y[i+1] + 2) >> 2)
-    // for i = 0, 2, ..., Z-1. Spec loop `for(i=0; i<Z; i+=2)`.
-    let mut i: isize = 0;
-    while i < z_i {
-        let left = buf[(pad + i - 1) as usize];
-        let right = buf[(pad + i + 1) as usize];
-        buf[(pad + i) as usize] += (left + right + 2) >> 2;
-        i += 2;
-    }
-}
-
-/// Helper: build a working buffer of length `z + 2*PAD` with the band
-/// data placed at the central `[PAD .. PAD+z]` slots and the pad slots
-/// zero-initialised. Caller is expected to call `extend_symmetric`
-/// before invoking the lifting filter.
-fn make_work_buf(z: usize) -> Result<Vec<i32>> {
-    if z == 0 || z > MAX_DIM {
+    if z > MAX_DIM {
         return Err(Error::invalid(format!(
             "JPEG XS DWT: band dimension {z} out of range (1..={MAX_DIM})"
         )));
     }
-    Ok(vec![0i32; z + 2 * PAD])
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Lifting kernels on de-interleaved data.
+//
+// Tables E.6 / E.12 are written on an interleaved array `X` extended by
+// two samples (Table E.5). With `L[n] = X[2n]`, `H[n] = X[2n+1]`,
+// `NL = ⌈Z/2⌉` low and `NH = ⌊Z/2⌋` high samples, the extension reduces to
+// two mirror rules on the *other* phase, so no margin is materialised:
+//
+//   inverse  E[n] = L[n] − ((H[n−1] + H[n] + 2) >> 2)   H[−1] := H[0]
+//                                                        H[NH] := H[NH−1]   (Z odd)
+//            O[n] = H[n] + ((E[n] + E[n+1]) >> 1)       E[NL] := E[NL−1]   (Z even)
+//
+//   forward  H[n] = X[2n+1] − ((X[2n] + X[2n+2]) >> 1)  X[Z]  := X[Z−2]    (Z even)
+//            L[n] = X[2n] + ((H[n−1] + H[n] + 2) >> 2)  H[−1] := H[0]
+//                                                        H[NH] := H[NH−1]   (Z odd)
+//
+// Derivation of the mirrors from Table E.5 (`X[−i] = X[i]`,
+// `X[Z+i−1] = X[Z−i−1]`, `i = 1, 2`):
+//   * `X[−1] = X[1]` is `H[−1] = H[0]` on the inverse; on the forward,
+//     `Y[−1] = X[−1] − ((X[−2] + X[0]) >> 1) = X[1] − ((X[2] + X[0]) >> 1)`
+//     is the already-computed `H[0]`.
+//   * Z odd: `X[Z] = X[Z−2]` is `H[NH] = H[NH−1]` on the inverse; on the
+//     forward `Y[Z] = X[Z−2] − ((X[Z−1] + X[Z−3]) >> 1) = H[NH−1]`.
+//   * Z even: the inverse reads `Y[Z] = X[Z−2] − ((X[Z−1] + X[Z−3] + 2) >> 2)`
+//     `= E[NL−1]`; the forward reads `X[Z] = X[Z−2]` directly.
+// The unit tests compare these kernels with a literal transcription of
+// the tables for every length from 2 up.
+// ---------------------------------------------------------------------
+
+/// Inverse lifting of one line: `low` / `high` → interleaved `out`
+/// (`out.len() == low.len() + high.len() ≥ 2`).
+#[inline]
+fn synth_line(low: &[i32], high: &[i32], out: &mut [i32]) {
+    let (nl, nh) = (low.len(), high.len());
+    debug_assert!(nh >= 1 && (nl == nh || nl == nh + 1) && out.len() == nl + nh);
+    // Even phase.
+    out[0] = low[0] - ((high[0] + high[0] + 2) >> 2);
+    for n in 1..nh {
+        out[2 * n] = low[n] - ((high[n - 1] + high[n] + 2) >> 2);
+    }
+    if nl > nh {
+        out[2 * nh] = low[nh] - ((high[nh - 1] + high[nh - 1] + 2) >> 2);
+    }
+    // Odd phase.
+    for n in 0..nh - 1 {
+        out[2 * n + 1] = high[n] + ((out[2 * n] + out[2 * n + 2]) >> 1);
+    }
+    let last = nh - 1;
+    let right = if nl > nh {
+        out[2 * last + 2]
+    } else {
+        out[2 * last]
+    };
+    out[2 * last + 1] = high[last] + ((out[2 * last] + right) >> 1);
+}
+
+/// Forward lifting of one line: interleaved `x` → `low` / `high`
+/// (`x.len() == low.len() + high.len() ≥ 2`).
+#[inline]
+fn analyse_line(x: &[i32], low: &mut [i32], high: &mut [i32]) {
+    let (nl, nh) = (low.len(), high.len());
+    debug_assert!(nh >= 1 && (nl == nh || nl == nh + 1) && x.len() == nl + nh);
+    // High phase.
+    for n in 0..nh - 1 {
+        high[n] = x[2 * n + 1] - ((x[2 * n] + x[2 * n + 2]) >> 1);
+    }
+    let last = nh - 1;
+    let right = if nl > nh {
+        x[2 * last + 2]
+    } else {
+        x[2 * last]
+    };
+    high[last] = x[2 * last + 1] - ((x[2 * last] + right) >> 1);
+    // Low phase.
+    low[0] = x[0] + ((high[0] + high[0] + 2) >> 2);
+    for n in 1..nh {
+        low[n] = x[2 * n] + ((high[n - 1] + high[n] + 2) >> 2);
+    }
+    if nl > nh {
+        low[nh] = x[2 * nh] + ((high[nh - 1] + high[nh - 1] + 2) >> 2);
+    }
+}
+
+/// Split `buf` (rows of `w`) around row `y`: `(row y−1, row y, row y+1)`,
+/// the neighbours being `None` outside the buffer.
+#[inline]
+fn row_and_neighbours(
+    buf: &mut [i32],
+    w: usize,
+    y: usize,
+) -> (Option<&[i32]>, &mut [i32], Option<&[i32]>) {
+    let (before, rest) = buf.split_at_mut(y * w);
+    let (row, after) = rest.split_at_mut(w);
+    let above = (y > 0).then(|| &before[(y - 1) * w..]);
+    let below = (after.len() >= w).then(|| &after[..w]);
+    (above, row, below)
+}
+
+/// Inverse vertical lifting in place on a block whose even rows hold the
+/// vertically low-pass lines and whose odd rows the high-pass lines
+/// (Table E.4 with whole rows as the unit — the column loop of the table
+/// becomes the inner, contiguous loop).
+fn synth_rows_in_place(buf: &mut [i32], w: usize, h: usize) {
+    debug_assert!(h >= 2 && buf.len() == w * h);
+    // Even rows: E[n] = L[n] − ((H[n−1] + H[n] + 2) >> 2).
+    for y in (0..h).step_by(2) {
+        let (above, row, below) = row_and_neighbours(buf, w, y);
+        let (a, b) = match (above, below) {
+            (Some(a), Some(b)) => (a, b),
+            (None, Some(b)) => (b, b),
+            (Some(a), None) => (a, a),
+            (None, None) => unreachable!("h >= 2"),
+        };
+        for ((t, &p), &q) in row.iter_mut().zip(a).zip(b) {
+            *t -= (p + q + 2) >> 2;
+        }
+    }
+    // Odd rows: O[n] = H[n] + ((E[n] + E[n+1]) >> 1).
+    for y in (1..h).step_by(2) {
+        let (above, row, below) = row_and_neighbours(buf, w, y);
+        let a = above.expect("odd row has a row above");
+        let b = below.unwrap_or(a);
+        for ((t, &p), &q) in row.iter_mut().zip(a).zip(b) {
+            *t += (p + q) >> 1;
+        }
+    }
+}
+
+/// Forward vertical lifting in place: on return even rows hold the
+/// vertically low-pass lines, odd rows the high-pass lines (Table E.11
+/// with whole rows as the unit).
+fn analyse_rows_in_place(buf: &mut [i32], w: usize, h: usize) {
+    debug_assert!(h >= 2 && buf.len() == w * h);
+    // Odd rows: H[n] = X[2n+1] − ((X[2n] + X[2n+2]) >> 1).
+    for y in (1..h).step_by(2) {
+        let (above, row, below) = row_and_neighbours(buf, w, y);
+        let a = above.expect("odd row has a row above");
+        let b = below.unwrap_or(a);
+        for ((t, &p), &q) in row.iter_mut().zip(a).zip(b) {
+            *t -= (p + q) >> 1;
+        }
+    }
+    // Even rows: L[n] = X[2n] + ((H[n−1] + H[n] + 2) >> 2).
+    for y in (0..h).step_by(2) {
+        let (above, row, below) = row_and_neighbours(buf, w, y);
+        let (a, b) = match (above, below) {
+            (Some(a), Some(b)) => (a, b),
+            (None, Some(b)) => (b, b),
+            (Some(a), None) => (a, a),
+            (None, None) => unreachable!("h >= 2"),
+        };
+        for ((t, &p), &q) in row.iter_mut().zip(a).zip(b) {
+            *t += (p + q + 2) >> 2;
+        }
+    }
 }
 
 /// Annex E.4, Table E.3 — single-row inverse horizontal filter.
@@ -223,11 +303,7 @@ fn make_work_buf(z: usize) -> Result<Vec<i32>> {
 /// `out.len()` must equal `w`. The result is the reconstructed row.
 pub fn inverse_horizontal_1d(low: &[i32], high: &[i32], out: &mut [i32]) -> Result<()> {
     let w = out.len();
-    if w < 2 {
-        return Err(Error::invalid(format!(
-            "JPEG XS DWT: row width {w} below the spec minimum of 2"
-        )));
-    }
+    check_pass_len(w)?;
     let low_len = w.div_ceil(2);
     let high_len = w / 2;
     if low.len() != low_len || high.len() != high_len {
@@ -237,34 +313,18 @@ pub fn inverse_horizontal_1d(low: &[i32], high: &[i32], out: &mut [i32]) -> Resu
             high.len(),
         )));
     }
-    let mut buf = make_work_buf(w)?;
-    // Interleave: even indices ← low, odd indices ← high.
-    for x in 0..w {
-        let i = x / 2;
-        if x % 2 == 0 {
-            buf[PAD + x] = low[i];
-        } else {
-            buf[PAD + x] = high[i];
-        }
-    }
-    extend_symmetric(&mut buf, w)?;
-    inverse_filter_1d(&mut buf, w);
-    out.copy_from_slice(&buf[PAD..PAD + w]);
+    synth_line(low, high, out);
     Ok(())
 }
 
 /// Annex E.11, Table E.10 — single-row forward horizontal filter.
 ///
 /// `input.len()` is the row width `w`. `low` and `high` are the
-/// interleaved low-pass / high-pass output sub-bands of lengths
-/// `(w+1)/2` and `w/2` respectively.
+/// low-pass / high-pass output sub-bands of lengths `(w+1)/2` and `w/2`
+/// respectively.
 pub fn forward_horizontal_1d(input: &[i32], low: &mut [i32], high: &mut [i32]) -> Result<()> {
     let w = input.len();
-    if w < 2 {
-        return Err(Error::invalid(format!(
-            "JPEG XS DWT: row width {w} below the spec minimum of 2"
-        )));
-    }
+    check_pass_len(w)?;
     let low_len = w.div_ceil(2);
     let high_len = w / 2;
     if low.len() != low_len || high.len() != high_len {
@@ -274,19 +334,7 @@ pub fn forward_horizontal_1d(input: &[i32], low: &mut [i32], high: &mut [i32]) -
             high.len(),
         )));
     }
-    let mut buf = make_work_buf(w)?;
-    buf[PAD..PAD + w].copy_from_slice(input);
-    extend_symmetric(&mut buf, w)?;
-    forward_filter_1d(&mut buf, w);
-    // De-interleave: even indices → low, odd indices → high.
-    for x in 0..w {
-        let i = x / 2;
-        if x % 2 == 0 {
-            low[i] = buf[PAD + x];
-        } else {
-            high[i] = buf[PAD + x];
-        }
-    }
+    analyse_line(input, low, high);
     Ok(())
 }
 
@@ -359,45 +407,63 @@ pub fn inverse_2d(
         ));
     }
 
-    // Table E.1, first two calls: horizontal synthesis of the
-    // vertically low-pass rows (LL + HL → `rows_low`, `ll_h × w`) and of
-    // the vertically high-pass rows (LH + HH → `rows_high`, `lh_h × w`).
-    let mut rows_low = vec![0i32; ll_h * w];
-    let mut rows_high = vec![0i32; lh_h * w];
-    for ((dst, low), high) in rows_low
-        .chunks_exact_mut(w)
-        .zip(ll.chunks_exact(ll_w))
-        .zip(hl.chunks_exact(hl_w))
-    {
-        inverse_horizontal_1d(low, high, dst)?;
-    }
-    for ((dst, low), high) in rows_high
-        .chunks_exact_mut(w)
-        .zip(lh.chunks_exact(ll_w))
-        .zip(hh.chunks_exact(hl_w))
-    {
-        inverse_horizontal_1d(low, high, dst)?;
-    }
-
-    // Table E.1, third call: vertical synthesis of every column from
-    // the two horizontally reconstructed halves.
-    let mut col_low = vec![0i32; ll_h];
-    let mut col_high = vec![0i32; lh_h];
-    let mut col_out = vec![0i32; h];
-    for x in 0..w {
-        for (c, row) in col_low.iter_mut().zip(rows_low.chunks_exact(w)) {
-            *c = row[x];
-        }
-        for (c, row) in col_high.iter_mut().zip(rows_high.chunks_exact(w)) {
-            *c = row[x];
-        }
-        inverse_vertical_1d(&col_low, &col_high, &mut col_out)?;
-        for (c, row) in col_out.iter().zip(out.chunks_exact_mut(w)) {
-            row[x] = *c;
-        }
-    }
-
+    synth_joint_level(w, h, ll, hl, lh, hh, out);
     Ok(())
+}
+
+/// One joint level of Table E.1 with validated geometry. The two
+/// horizontal calls write straight into the rows of `out` they belong to
+/// (low rows at even, high rows at odd positions — the interleaving
+/// Table E.4 asks for), then the vertical call lifts `out` in place.
+fn synth_joint_level(
+    w: usize,
+    h: usize,
+    ll: &[i32],
+    hl: &[i32],
+    lh: &[i32],
+    hh: &[i32],
+    out: &mut [i32],
+) {
+    let (ll_w, hl_w) = (w.div_ceil(2), w / 2);
+    for (y, dst) in out.chunks_exact_mut(w).enumerate() {
+        let n = y / 2;
+        let (low, high) = if y % 2 == 0 { (ll, hl) } else { (lh, hh) };
+        synth_line(
+            &low[n * ll_w..(n + 1) * ll_w],
+            &high[n * hl_w..(n + 1) * hl_w],
+            dst,
+        );
+    }
+    synth_rows_in_place(out, w, h);
+}
+
+/// One joint level of Table E.8 with validated geometry; `block` (the
+/// `h × w` input) is used as the workspace of the vertical call and is
+/// left holding its interleaved output.
+fn analyse_joint_level(
+    w: usize,
+    h: usize,
+    block: &mut [i32],
+    ll: &mut [i32],
+    hl: &mut [i32],
+    lh: &mut [i32],
+    hh: &mut [i32],
+) {
+    let (ll_w, hl_w) = (w.div_ceil(2), w / 2);
+    analyse_rows_in_place(block, w, h);
+    for (y, src) in block.chunks_exact(w).enumerate() {
+        let n = y / 2;
+        let (low, high) = if y % 2 == 0 {
+            (&mut *ll, &mut *hl)
+        } else {
+            (&mut *lh, &mut *hh)
+        };
+        analyse_line(
+            src,
+            &mut low[n * ll_w..(n + 1) * ll_w],
+            &mut high[n * hl_w..(n + 1) * hl_w],
+        );
+    }
 }
 
 /// Multi-level 2-D inverse 5/3 DWT cascade (Annex E.2, Table E.1).
@@ -763,44 +829,8 @@ pub fn forward_2d(
         ));
     }
 
-    // Table E.8, first call: vertical analysis of every column into
-    // the vertically low-pass rows (`rows_low`, `ll_h × w`) and the
-    // vertically high-pass rows (`rows_high`, `lh_h × w`).
-    let mut rows_low = vec![0i32; ll_h * w];
-    let mut rows_high = vec![0i32; lh_h * w];
-    let mut col_in = vec![0i32; h];
-    let mut col_low = vec![0i32; ll_h];
-    let mut col_high = vec![0i32; lh_h];
-    for x in 0..w {
-        for (c, row) in col_in.iter_mut().zip(input.chunks_exact(w)) {
-            *c = row[x];
-        }
-        forward_vertical_1d(&col_in, &mut col_low, &mut col_high)?;
-        for (c, row) in col_low.iter().zip(rows_low.chunks_exact_mut(w)) {
-            row[x] = *c;
-        }
-        for (c, row) in col_high.iter().zip(rows_high.chunks_exact_mut(w)) {
-            row[x] = *c;
-        }
-    }
-
-    // Table E.8, second and third calls: horizontal analysis of the low
-    // rows into LL / HL and of the high rows into LH / HH.
-    for ((src, low), high) in rows_low
-        .chunks_exact(w)
-        .zip(ll.chunks_exact_mut(ll_w))
-        .zip(hl.chunks_exact_mut(hl_w))
-    {
-        forward_horizontal_1d(src, low, high)?;
-    }
-    for ((src, low), high) in rows_high
-        .chunks_exact(w)
-        .zip(lh.chunks_exact_mut(ll_w))
-        .zip(hh.chunks_exact_mut(hl_w))
-    {
-        forward_horizontal_1d(src, low, high)?;
-    }
-
+    let mut block = input.to_vec();
+    analyse_joint_level(w, h, &mut block, ll, hl, lh, hh);
     Ok(())
 }
 
@@ -967,15 +997,20 @@ pub fn forward_cascade_2d(
         let mut hl_buf = vec![0i32; hl_w_d * ll_h];
         let mut lh_buf = vec![0i32; ll_w * lh_h];
         let mut hh_buf = vec![0i32; hl_w_d * lh_h];
-        forward_2d(
+        if cur_w < 2 || cur_h < 2 {
+            return Err(Error::invalid(format!(
+                "JPEG XS DWT: 2-D band dimensions ({cur_w}x{cur_h}) below the spec minimum of 2x2"
+            )));
+        }
+        analyse_joint_level(
             cur_w,
             cur_h,
-            &current_ll,
+            &mut current_ll,
             &mut ll_buf,
             &mut hl_buf,
             &mut lh_buf,
             &mut hh_buf,
-        )?;
+        );
         bands_out[hl_b] = hl_buf;
         bands_out[lh_b] = lh_buf;
         bands_out[hh_b] = hh_buf;

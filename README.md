@@ -833,8 +833,11 @@ decoder rows.
 
 | 1920×1080, three 8-bit components, RCT, `NL = 5/2` | before | after |
 |---|---|---|
-| encode, lossless (`Fq = 0`) | 4.0 MP/s | 16.3 MP/s |
+| encode, lossless (`Fq = 0`) | 4.0 MP/s | 23.9 MP/s |
 | encode, `Fq = 8`, `q = 4` | 2.3 MP/s | 16.1 MP/s |
+| forward wavelet cascade alone, one plane, `NL = 5/2` | 124 MP/s | 1143 MP/s |
+| inverse wavelet cascade alone, one plane, `NL = 5/2` | 119 MP/s | 1063 MP/s |
+| forward / inverse cascade alone, `NL = 5/0` | 437 / 485 MP/s | 1421 / 1387 MP/s |
 
 What changed (encoded bytes identical — the encoder pins did not move):
 
@@ -846,6 +849,13 @@ What changed (encoded bytes identical — the encoder pins did not move):
   instead of once per bit);
 - the bit writer accumulates into a 64-bit word instead of touching the
   output vector for every bit.
+- the wavelet kernels work on de-interleaved data with the Table E.5
+  reflection folded into two mirror rules (no margin buffer, no per-row or
+  per-column allocation and copy), the vertical pass of a joint level
+  lifts whole rows in place (contiguous inner loop instead of a column
+  gather / scatter), and the horizontal pass reads and writes the band
+  rows directly. Same arithmetic per sample: the literal Annex E model
+  sweep, the encoder pins and the 65 / 65 Part 4 result are unchanged.
 
 #### Not yet covered
 
