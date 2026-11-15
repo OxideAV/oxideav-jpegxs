@@ -3681,6 +3681,20 @@ also passes 149 tests (was 140).
 
 ## Unreleased — encoder round 2 (multi-component RCT + multi-decomp + odd dims)
 
+## [0.0.10](https://github.com/OxideAV/oxideav-jpegxs/compare/v0.0.9...v0.0.10) - 2026-11-15
+
+### Other
+
+- slice walker: precinct column width Cs computed without 32-bit overflow (fuzz-found), regression input
+- quick smoke pass when run without --bench (cargo test --all-targets); lighter default robustness sweep
+- long packet headers per Table C.3 (Wf x Nc >= 32752, or Lh = 1 when a sub-packet outgrows the short fields)
+- entropy stage without per-packet coefficient copies or hashing, word-based bit reader; hostile-input overflow guard
+- margin-free lifting kernels, in-place row-slice vertical pass
+- build data / sign sub-packets once per packet, group-wise bit packing; throughput bench
+- iterate the sampling factors instead of indexing by component (needless_range_loop on newer toolchains)
+- joint levels follow Annex E pass order (Table E.1 horizontal then vertical, Table E.8 vertical then horizontal)
+- API hygiene: non_exhaustive profile/marker/file-format records and enums, hide DSP / entropy internals
+
 ## [0.0.9](https://github.com/OxideAV/oxideav-jpegxs/compare/v0.0.8...v0.0.9) - 2026-10-23
 
 ### Other
