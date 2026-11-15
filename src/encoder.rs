@@ -8713,19 +8713,22 @@ fn encode_precinct_cascade(
             .map(|e| compute_m_per_group(cfg, e))
             .collect::<Result<Vec<_>>>()?;
 
-        let raw = build_packet_body_with_m(cfg, &job.entries, &m_per_entry, BitplaneMode::Raw)?;
-        let no_pred = build_packet_body_with_m(
-            cfg,
-            &job.entries,
-            &m_per_entry,
-            BitplaneMode::Vlc(VlcKind::NoPred),
-        )?;
-        let no_pred_sig = build_packet_body_with_m(
-            cfg,
-            &job.entries,
-            &m_per_entry,
-            BitplaneMode::Vlc(VlcKind::NoPredSig),
-        )?;
+        // The data / sign sub-packets are the same for every candidate
+        // coding mode of the packet: build them once.
+        let (data, sgn) = build_data_subpackets(cfg, &job.entries, &m_per_entry);
+        let form = |mode: BitplaneMode| {
+            build_packet_body_around(
+                cfg,
+                &job.entries,
+                &m_per_entry,
+                mode,
+                data.clone(),
+                sgn.clone(),
+            )
+        };
+        let raw = form(BitplaneMode::Raw)?;
+        let no_pred = form(BitplaneMode::Vlc(VlcKind::NoPred))?;
+        let no_pred_sig = form(BitplaneMode::Vlc(VlcKind::NoPredSig))?;
 
         // Vertical-prediction is only attempted when EVERY entry of the
         // packet has a predecessor-line M cached for its (comp, beta).
@@ -8745,22 +8748,12 @@ fn encode_precinct_cascade(
             }
         }
         let (vert, vert_sig) = if have_all_predecessors {
-            let v = build_packet_body_with_m(
-                cfg,
-                &job.entries,
-                &m_per_entry,
-                BitplaneMode::Vlc(VlcKind::VertPred {
-                    predecessor: vert_predecessor_per_entry.clone(),
-                }),
-            )?;
-            let vs = build_packet_body_with_m(
-                cfg,
-                &job.entries,
-                &m_per_entry,
-                BitplaneMode::Vlc(VlcKind::VertPredSig {
-                    predecessor: vert_predecessor_per_entry.clone(),
-                }),
-            )?;
+            let v = form(BitplaneMode::Vlc(VlcKind::VertPred {
+                predecessor: vert_predecessor_per_entry.clone(),
+            }))?;
+            let vs = form(BitplaneMode::Vlc(VlcKind::VertPredSig {
+                predecessor: vert_predecessor_per_entry,
+            }))?;
             (Some(v), Some(vs))
         } else {
             (None, None)
@@ -9047,12 +9040,22 @@ fn emit_packet(out: &mut Vec<u8>, cfg: &EncodeConfig, entries: &[PerBandEntry]) 
         .iter()
         .map(|e| compute_m_per_group(cfg, e))
         .collect::<Result<Vec<_>>>()?;
-    let raw = build_packet_body_with_m(cfg, entries, &m_per_entry, BitplaneMode::Raw)?;
-    let no_pred = build_packet_body_with_m(
+    let (data, sgn) = build_data_subpackets(cfg, entries, &m_per_entry);
+    let raw = build_packet_body_around(
+        cfg,
+        entries,
+        &m_per_entry,
+        BitplaneMode::Raw,
+        data.clone(),
+        sgn.clone(),
+    )?;
+    let no_pred = build_packet_body_around(
         cfg,
         entries,
         &m_per_entry,
         BitplaneMode::Vlc(VlcKind::NoPred),
+        data,
+        sgn,
     )?;
     let chosen = if no_pred.total_len() <= raw.total_len() {
         no_pred
@@ -9215,21 +9218,104 @@ fn forward_quant_index(qpih: u8, c: i32, m: u32, t: u32) -> u32 {
 /// sub-packet (one bit per significance group, padded to byte) before
 /// the bitplane-count sub-packet. Insignificant groups (all M[g] for
 /// the group = T) skip their VLC code entirely (Δm = 0 inferred).
+#[cfg(test)]
 fn build_packet_body_with_m(
     cfg: &EncodeConfig,
     entries: &[PerBandEntry],
     m_per_entry: &[Vec<u8>],
     mode: BitplaneMode,
 ) -> Result<PacketBytes> {
+    let (data, sgn) = build_data_subpackets(cfg, entries, m_per_entry);
+    build_packet_body_around(cfg, entries, m_per_entry, mode, data, sgn)
+}
+
+/// Upper bound on `Ng` for the packed data-sub-packet writer (the
+/// standard fixes `Ng = 4`).
+const MAX_GROUP: usize = 8;
+
+/// Data sub-packet (Annex C.5.4, Table C.8) and sign sub-packet (Annex
+/// C.5.5, Table C.9) of one packet. Neither depends on how the bitplane
+/// counts are coded, so every candidate coding mode of a packet shares
+/// one copy.
+fn build_data_subpackets(
+    cfg: &EncodeConfig,
+    entries: &[PerBandEntry],
+    m_per_entry: &[Vec<u8>],
+) -> (Vec<u8>, Vec<u8>) {
     let mut data_writer = BitWriter::default();
-    let mut cnt_writer = BitWriter::default();
-    let mut sig_writer = BitWriter::default();
-    // Separate sign sub-packet (Annex C.5.5, Table C.9), only used when
-    // Fs=1. Stays empty for Fs=0 (signs interleaved in the data sub-packet
-    // per Table C.8).
+    // Separate sign sub-packet, only used when Fs = 1; stays empty for
+    // Fs = 0 (signs interleaved in the data sub-packet per Table C.8).
     let mut sgn_writer = BitWriter::default();
     let fs1 = cfg.fs == 1;
-    let ng_u = cfg.ng as usize;
+    let ng_u = (cfg.ng as usize).min(MAX_GROUP);
+    debug_assert_eq!(ng_u, cfg.ng as usize, "Ng above the packed-writer bound");
+    let ng_bits = ng_u as u8;
+
+    for (entry, m_per_group) in entries.iter().zip(m_per_entry) {
+        let wpb = entry.wpb as usize;
+        let band_line: &[i32] = entry.line.as_slice();
+        let t = entry.t as u32;
+        for (g, &m_u8) in m_per_group.iter().enumerate() {
+            let m = m_u8 as u32;
+            // Coefficients of the code group; positions past the band
+            // width read as zero (Annex C.5.4 NOTE 2).
+            let mut c = [0i32; MAX_GROUP];
+            let start = (g * ng_u).min(wpb);
+            let end = (start + ng_u).min(wpb);
+            c[..end - start].copy_from_slice(&band_line[start..end]);
+            // Quantization indices by the active forward quantizer
+            // (`Qpih`): deadzone `|c| >> T` (Table D.3) or uniform
+            // (Table D.4); all zero when `M ≤ T`.
+            let mut v = [0u32; MAX_GROUP];
+            for (vk, &ck) in v.iter_mut().zip(&c).take(ng_u) {
+                *vk = forward_quant_index(cfg.qpih, ck, m, t);
+            }
+            if m > t {
+                // Fs = 0: Ng sign bits ahead of the magnitudes of every
+                // group that stores bitplanes (Table C.8).
+                if !fs1 {
+                    let signs = c[..ng_u]
+                        .iter()
+                        .fold(0u32, |acc, &ck| (acc << 1) | u32::from(ck < 0));
+                    data_writer.write_bits(signs, ng_bits);
+                }
+                // `M − T` magnitude bitplanes, most significant first,
+                // Ng bits each.
+                for bplane in (0..(m - t)).rev() {
+                    let plane = v[..ng_u]
+                        .iter()
+                        .fold(0u32, |acc, &vk| (acc << 1) | ((vk >> bplane) & 1));
+                    data_writer.write_bits(plane, ng_bits);
+                }
+            }
+            // Fs = 1: one sign bit per coefficient whose stored index is
+            // non-zero, in decoder read order (Table C.9). The decoder
+            // gates on the index it read, so the gate is the same
+            // forward-quantized index.
+            if fs1 {
+                for (&vk, &ck) in v.iter().zip(&c).take(ng_u) {
+                    if vk != 0 {
+                        sgn_writer.write_bit(u8::from(ck < 0));
+                    }
+                }
+            }
+        }
+    }
+    (data_writer.into_bytes(), sgn_writer.into_bytes())
+}
+
+/// Wrap the shared data / sign sub-packets with the significance and
+/// bitplane-count sub-packets of one coding mode.
+fn build_packet_body_around(
+    cfg: &EncodeConfig,
+    entries: &[PerBandEntry],
+    m_per_entry: &[Vec<u8>],
+    mode: BitplaneMode,
+    data_bytes: Vec<u8>,
+    sgn_bytes: Vec<u8>,
+) -> Result<PacketBytes> {
+    let mut cnt_writer = BitWriter::default();
+    let mut sig_writer = BitWriter::default();
     let ss_u = cfg.ss as usize; // code groups per significance group
 
     // Determine if this mode uses significance coding.
@@ -9315,14 +9401,8 @@ fn build_packet_body_with_m(
     }
 
     for (entry_idx, entry) in entries.iter().enumerate() {
-        let wpb = entry.wpb as usize;
-        let band_line: &[i32] = entry.line.as_slice();
         let t = entry.t as u32;
         let m_per_group = &m_per_entry[entry_idx];
-        let coef = |g: usize, k: usize| -> i32 {
-            let xpos = g * ng_u + k;
-            if xpos < wpb { band_line[xpos] } else { 0 }
-        };
 
         // Helper to check if a code group is in a significant sig group.
         let group_sig = |g: usize| -> bool {
@@ -9408,72 +9488,9 @@ fn build_packet_body_with_m(
                 }
             }
         }
-
-        // Data sub-packet — independent of bitplane-count mode.
-        for (g, &m_u8) in m_per_group.iter().enumerate() {
-            let m = m_u8 as u32;
-            if m <= t {
-                continue;
-            }
-            // Fs = 0: signs interleaved here, Ng bits per significant code
-            // group (Table C.8). Fs = 1: signs deferred to the sign
-            // sub-packet (Table C.9), so the data sub-packet carries only
-            // magnitude bitplanes.
-            if !fs1 {
-                for k in 0..ng_u {
-                    let v = coef(g, k);
-                    let sign_bit = if v < 0 { 1 } else { 0 };
-                    data_writer.write_bit(sign_bit);
-                }
-            }
-            // Magnitude bitplanes: store the `M - T` bits of the
-            // quantization index `v` (Annex C.5.4), MSB-first. The index
-            // is derived from the raw coefficient by the active forward
-            // quantizer (`Qpih`): deadzone (`v = |c| >> T`, Table D.3) or
-            // uniform / round-to-nearest (Table D.4). For deadzone the
-            // index `v` equals `|c| >> T`, so writing `v`'s bits
-            // `[0, M-T)` is byte-identical to the round-3 path that wrote
-            // `|c|`'s bits `[T, M)`.
-            for bplane in (0..(m - t)).rev() {
-                for k in 0..ng_u {
-                    let v = forward_quant_index(cfg.qpih, coef(g, k), m, t);
-                    let bit = ((v >> bplane) & 1) as u8;
-                    data_writer.write_bit(bit);
-                }
-            }
-        }
-
-        // Sign sub-packet (Fs = 1, Table C.9). One bit per coefficient
-        // whose stored quantization index `v` is non-zero, iterating
-        // bands → lines → groups → members in the same order the decoder
-        // reads. The decoder gates each sign bit on `coef.v != 0` (the
-        // index it just read off the wire), so the encoder must gate on
-        // the same forward-quantized index — for `Qpih = 1` the uniform
-        // round-to-nearest can map a coefficient to a non-zero index that
-        // a plain `|c| >> T` truncation would have zeroed (or vice
-        // versa), so reusing the active forward quantizer keeps the two
-        // sides in lockstep.
-        if fs1 {
-            for (g, &m_u8) in m_per_group.iter().enumerate() {
-                let m = m_u8 as u32;
-                for k in 0..ng_u {
-                    let c = coef(g, k);
-                    let v = forward_quant_index(cfg.qpih, c, m, t);
-                    if v != 0 {
-                        let sign_bit = if c < 0 { 1 } else { 0 };
-                        sgn_writer.write_bit(sign_bit);
-                    }
-                }
-            }
-        }
     }
-    cnt_writer.align_to_byte();
-    data_writer.align_to_byte();
-    sgn_writer.align_to_byte();
     let sig_bytes = sig_writer.into_bytes();
     let cnt_bytes = cnt_writer.into_bytes();
-    let data_bytes = data_writer.into_bytes();
-    let sgn_bytes = sgn_writer.into_bytes();
     let dr = match mode {
         BitplaneMode::Raw => 1,
         BitplaneMode::Vlc(_) => 0,
@@ -9515,45 +9532,63 @@ fn emit_vlc_signed(writer: &mut BitWriter, value: i32, theta: i32) {
         (2 * (-value) - 1) as u32
     };
     debug_assert!(x <= 32, "VLC codeword length {x} exceeds 32-bit cap");
-    for _ in 0..x {
-        writer.write_bit(1);
-    }
+    writer.write_ones(x);
     writer.write_bit(0);
 }
 
-/// Tiny MSB-first bit writer.
+/// MSB-first bit writer. Bits collect in a 64-bit accumulator and leave
+/// as whole bytes; a trailing partial byte is zero-padded on
+/// [`BitWriter::align_to_byte`] / [`BitWriter::into_bytes`].
 #[derive(Debug, Default)]
 struct BitWriter {
     bytes: Vec<u8>,
-    bit_pos: u8,
+    /// Pending bits in the low `fill` positions (`fill < 8` between calls).
+    acc: u64,
+    fill: u32,
 }
 
 impl BitWriter {
+    #[inline]
     fn write_bit(&mut self, bit: u8) {
-        if self.bit_pos == 0 {
-            self.bytes.push(0);
+        self.write_bits(u32::from(bit & 1), 1);
+    }
+
+    /// Append the low `n` bits of `value` (`n ≤ 32`), most significant
+    /// first.
+    #[inline]
+    fn write_bits(&mut self, value: u32, n: u8) {
+        debug_assert!(n <= 32);
+        let n = u32::from(n);
+        if n == 0 {
+            return;
         }
-        let last = self.bytes.last_mut().unwrap();
-        *last |= (bit & 1) << (7 - self.bit_pos);
-        self.bit_pos += 1;
-        if self.bit_pos == 8 {
-            self.bit_pos = 0;
+        let masked = u64::from(value) & ((1u64 << n) - 1);
+        self.acc = (self.acc << n) | masked;
+        self.fill += n;
+        while self.fill >= 8 {
+            self.fill -= 8;
+            self.bytes.push((self.acc >> self.fill) as u8);
         }
     }
 
-    fn write_bits(&mut self, value: u32, n: u8) {
-        for i in (0..n).rev() {
-            self.write_bit(((value >> i) & 1) as u8);
+    /// Append `count` one-bits (`count ≤ 32`).
+    #[inline]
+    fn write_ones(&mut self, count: u32) {
+        debug_assert!(count <= 32);
+        if count > 0 {
+            self.write_bits(u32::MAX >> (32 - count), count as u8);
         }
     }
 
     fn align_to_byte(&mut self) {
-        if self.bit_pos != 0 {
-            self.bit_pos = 0;
+        if self.fill != 0 {
+            self.bytes.push((self.acc << (8 - self.fill)) as u8);
+            self.fill = 0;
         }
     }
 
-    fn into_bytes(self) -> Vec<u8> {
+    fn into_bytes(mut self) -> Vec<u8> {
+        self.align_to_byte();
         self.bytes
     }
 }

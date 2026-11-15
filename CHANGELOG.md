@@ -42,6 +42,16 @@
   | `profile_high4444_12` | `4840fe9964afa18dd5db6c9f4e9ad855fed4b78f839cf644e9db7937597fb30b` | `82449da609041d4306efa0bcf07601613f3056df49bfde7427dde8e253efd45f` |
   | `profile_cbr_exact_target_main422_10` | `f1288e5336d3ee84e17ae8083fa82b7c0f933d3f97c6ff40a5351598c995a41d` | `a4d6dd38dde4bb35dc64058ceb54c85f3eab5b76aad5e33a3a7efd229db7cdd7` |
 
+### Performance
+
+- Encoder packet building: the data / sign sub-packets are built once per
+  packet instead of once per candidate bitplane-count mode, written a code
+  group at a time through a word-accumulating bit writer. 1920×1080 4:4:4
+  8-bit `NL = 5/2`: lossless encode 4.0 → 16.3 MP/s, `Fq = 8` encode
+  2.3 → 16.1 MP/s (median of 5, single thread). Output bytes identical.
+- `benches/throughput.rs`: dependency-free timing probe (wavelet cascades,
+  full encode / decode, optional Part 4 codestreams).
+
 ### Added
 
 - `tests/wavelet_conformance.rs`: encoded coefficients against a literal

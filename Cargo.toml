@@ -26,3 +26,7 @@ default = ["registry"]
 # standalone contract API (`probe` / `info` / `decode*` / `encode*`,
 # `JpegXsImage`, `EncodeOptions`, …) and every depth module stay available.
 registry = ["dep:oxideav-core"]
+
+[[bench]]
+name = "throughput"
+harness = false

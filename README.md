@@ -820,6 +820,33 @@ Evidence in the test suite:
   installed (run-time skip otherwise — none was available on the
   development machine, so this leg has not run yet).
 
+#### Throughput
+
+`cargo bench --bench throughput` (plain timing loop, median of 5 runs,
+single thread, Apple-silicon development machine shared with other
+builds — treat the figures as relative). Megapixels per second count
+picture pixels once, whatever the component count. Profiling the
+1920×1080 4:4:4 encode before any change put 78 % of the samples in the
+packet-body builder, 11 % in the forward wavelet, 5 % in the bitplane-count
+VLC and the rest in allocation; the decode split is given with the
+decoder rows.
+
+| 1920×1080, three 8-bit components, RCT, `NL = 5/2` | before | after |
+|---|---|---|
+| encode, lossless (`Fq = 0`) | 4.0 MP/s | 16.3 MP/s |
+| encode, `Fq = 8`, `q = 4` | 2.3 MP/s | 16.1 MP/s |
+
+What changed (encoded bytes identical — the encoder pins did not move):
+
+- every packet is tried in up to five bitplane-count coding modes, and
+  each try used to rebuild the mode-independent data and sign sub-packets
+  (Annex C.5.4 / C.5.5); they are now built once per packet and shared;
+- the data sub-packet is written a code group at a time (one `Ng`-bit
+  word per bitplane, quantization index computed once per coefficient
+  instead of once per bit);
+- the bit writer accumulates into a 64-bit word instead of touching the
+  output vector for every bit.
+
 #### Not yet covered
 
 - Bit depths above 16 (would need a `u32` plane format; B > 16 also has
