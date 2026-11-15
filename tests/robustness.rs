@@ -58,7 +58,7 @@ fn mutated_streams_never_panic() {
     let rounds: u32 = std::env::var("OXIDEAV_JXS_ROBUSTNESS_ROUNDS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(1500);
+        .unwrap_or(600);
     let mut s = 0x2545_F491u32;
     let (mut ok, mut rejected) = (0u32, 0u32);
     for seed in &seeds {

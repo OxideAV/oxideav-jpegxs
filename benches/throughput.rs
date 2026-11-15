@@ -11,6 +11,10 @@
 //!   `OXIDEAV_JXS_CONFORMANCE_DIR` points at the unpacked vectors
 //!   (`OXIDEAV_JXS_BENCH_STREAMS=5,29,60` picks the streams).
 //!
+//! Without `--bench` on the command line (as when `cargo test
+//! --all-targets` runs this target) it does one quick pass on a small
+//! picture instead.
+//!
 //! Each figure is the median of `OXIDEAV_JXS_BENCH_RUNS` (default 5)
 //! runs. `OXIDEAV_JXS_BENCH_FILTER=decode` times only the rows whose
 //! label contains the given text (handy under a sampling profiler).
@@ -21,6 +25,9 @@ use std::time::Instant;
 use oxideav_jpegxs::{dwt, encoder};
 
 fn runs() -> usize {
+    if !timed_run() {
+        return 1;
+    }
     std::env::var("OXIDEAV_JXS_BENCH_RUNS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -88,8 +95,19 @@ fn row(label: &str, pixels: usize, f: impl FnMut()) {
     report(label, pixels, t);
 }
 
+/// `cargo bench` passes `--bench`; anything else (`cargo test
+/// --all-targets` builds and runs this target too) gets a quick smoke
+/// run on a small picture.
+fn timed_run() -> bool {
+    std::env::args().any(|a| a == "--bench")
+}
+
 fn main() {
-    let (w, h) = (1920usize, 1080usize);
+    let (w, h) = if timed_run() {
+        (1920usize, 1080usize)
+    } else {
+        (160, 96)
+    };
     let px = w * h;
 
     // --- Wavelet cascades alone. ---
@@ -118,7 +136,7 @@ fn main() {
         .map(|c| picture(w, h, 11 + c, 8).iter().map(|&v| v as u8).collect())
         .collect();
     let mut buf = Vec::new();
-    row("encode 1080p 4:4:4 8-bit RCT lossless NL=5/2", px, || {
+    row("encode 4:4:4 8-bit RCT lossless NL=5/2", px, || {
         buf = encoder::encode_planar(w as u16, h as u16, 3, 1, 5, 2, &rgb).unwrap()
     });
     println!(
@@ -126,10 +144,10 @@ fn main() {
         buf.len(),
         buf.len() as f64 * 8.0 / px as f64
     );
-    row("decode 1080p 4:4:4 8-bit RCT lossless NL=5/2", px, || {
+    row("decode 4:4:4 8-bit RCT lossless NL=5/2", px, || {
         oxideav_jpegxs::decode_components(&buf).unwrap();
     });
-    row("encode 1080p 4:4:4 8-bit RCT Fq=8 q=4 NL=5/2", px, || {
+    row("encode 4:4:4 8-bit RCT Fq=8 q=4 NL=5/2", px, || {
         buf =
             encoder::encode_planar_highprec_lossy(w as u16, h as u16, 3, 1, 5, 2, 4, &rgb).unwrap()
     });
@@ -138,11 +156,14 @@ fn main() {
         buf.len(),
         buf.len() as f64 * 8.0 / px as f64
     );
-    row("decode 1080p 4:4:4 8-bit RCT Fq=8 q=4 NL=5/2", px, || {
+    row("decode 4:4:4 8-bit RCT Fq=8 q=4 NL=5/2", px, || {
         oxideav_jpegxs::decode_components(&buf).unwrap();
     });
 
     // --- Part 4 vectors. ---
+    if !timed_run() {
+        return;
+    }
     let Some(dir) = std::env::var_os("OXIDEAV_JXS_CONFORMANCE_DIR") else {
         println!("(set OXIDEAV_JXS_CONFORMANCE_DIR to time ISO/IEC 21122-4 codestreams)");
         return;
